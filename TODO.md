@@ -316,8 +316,8 @@ This checklist tracks end-to-end development of Teri, organized by implementatio
 
 ### Future: Vector Search (Stub)
 
-- [ ] Add placeholder for vector similarity search
-- [ ] Document integration points for `hnswlib-rs` or FAISS
+- [x] Add placeholder for vector similarity search
+- [x] Document integration points for `hnswlib-rs` or FAISS
 
 ---
 

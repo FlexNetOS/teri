@@ -11,11 +11,21 @@ use uuid::Uuid;
 pub const AGENT_LTM_KEY_PREFIX: &str = "agent";
 // world:{sim_id}:tick:{n} → WorldSnapshot
 pub const WORLD_SNAPSHOT_KEY_PREFIX: &str = "world";
+// agent:{uuid}:vec:{timestamp} → VectorEntry
+pub const AGENT_VEC_KEY_PREFIX: &str = "agent_vec";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
     pub timestamp: chrono::DateTime<chrono::Utc>,
     pub content: String,
+    pub importance: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorEntry {
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub content: String,
+    pub embedding: Vec<f32>,
     pub importance: f32,
 }
 
@@ -152,6 +162,120 @@ impl MemoryStore {
         })
         .await
         .map_err(|e| TeriError::Memory(format!("Task join error: {e}")))?
+    }
+
+    /// Write a vector embedding for an agent memory entry.
+    ///
+    /// When vector search backends are integrated, this should also add the vector to the index.
+    pub async fn write_vec(&self, agent_id: Uuid, entry: &VectorEntry) -> Result<()> {
+        let ts = entry.timestamp.timestamp_millis();
+        let key = format!("agent:{agent_id}:vec:{ts}");
+        let value = serde_json::to_vec(entry)
+            .map_err(|e| TeriError::Memory(format!("Serialization error: {e}")))?;
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            db.put(key.as_bytes(), &value)
+                .map_err(|e| TeriError::Memory(format!("Write error: {e}")))
+        })
+        .await
+        .map_err(|e| TeriError::Memory(format!("Task join error: {e}")))?
+    }
+
+    /// Read stored vector entries for an agent.
+    pub async fn read_vec(&self, agent_id: Uuid, limit: usize) -> Result<Vec<VectorEntry>> {
+        let prefix = format!("agent:{agent_id}:vec:");
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut entries = Vec::new();
+            let iter = db.prefix_iterator(prefix.as_bytes());
+            for item in iter {
+                let (_, v) = item.map_err(|e| TeriError::Memory(format!("Iterator error: {e}")))?;
+                let entry: VectorEntry = serde_json::from_slice(&v)
+                    .map_err(|e| TeriError::Memory(format!("Deserialization error: {e}")))?;
+                entries.push(entry);
+                if entries.len() >= limit {
+                    break;
+                }
+            }
+            Ok(entries)
+        })
+        .await
+        .map_err(|e| TeriError::Memory(format!("Task join error: {e}")))?
+    }
+
+    /// Vector similarity search — STUB.
+    ///
+    /// Currently returns an error indicating this is not yet implemented.
+    ///
+    /// ## Integration Points
+    ///
+    /// To implement semantic similarity search, you can use either:
+    ///
+    /// ### Option 1: `hnswlib-rs` (Pure Rust HNSW)
+    /// - **Add to `Cargo.toml`**: `hnswlib-rs = "0.4"`
+    /// - **On write** (in `write_vec`): After storing the embedding to RocksDB, add the vector to the index:
+    ///   ```ignore
+    ///   let mut index = HnswIndex::new_index(embedding_dim, agent_id as u64);
+    ///   index.add_point(vector.clone(), point_id);
+    ///   ```
+    /// - **On query**: Use `index.search_neighbors(query_vector, top_k)` to retrieve similar vectors
+    /// - **Advantages**: Pure Rust, no external dependencies
+    /// - **Trade-offs**: May be slower than FAISS for very large indices
+    ///
+    /// ### Option 2: FAISS (via `faiss` crate with C FFI)
+    /// - **Add to `Cargo.toml`**: `faiss = "0.12"`
+    /// - **System requirement**: FAISS C library must be installed
+    /// - **On write**: After storing to RocksDB, add to FAISS index:
+    ///   ```ignore
+    ///   index.add_vectors(&[embedding], &[vector_id])?;
+    ///   ```
+    /// - **On query**: Use `index.search(&query, top_k)` to retrieve similar vectors
+    /// - **Index types**:
+    ///   - `IndexFlatL2`: Exact L2 distance (baseline)
+    ///   - `IndexHNSWFlat`: HNSW with exact distances (recommended for most cases)
+    ///   - `IndexIVFFlat`: Inverted index with exact distances (faster for very large datasets)
+    /// - **Advantages**: Battle-tested, highly optimized, fast even for millions of vectors
+    /// - **Trade-offs**: External C dependency, requires FAISS installation
+    ///
+    /// ## Future Implementation Sketch
+    ///
+    /// ```ignore
+    /// struct VectorIndex {
+    ///     index: Arc<Mutex<HnswIndex>>,  // or FAISS equivalent
+    ///     agent_id: Uuid,
+    /// }
+    ///
+    /// impl MemoryStore {
+    ///     pub async fn query_vec_similarity(
+    ///         &self,
+    ///         agent_id: Uuid,
+    ///         query_embedding: &[f32],
+    ///         top_k: usize,
+    ///     ) -> Result<Vec<VectorEntry>> {
+    ///         // Retrieve vector IDs from index
+    ///         let index = self.vector_indices.get(&agent_id)?;
+    ///         let neighbors = index.search_neighbors(query_embedding, top_k)?;
+    ///
+    ///         // Load full entries from RocksDB
+    ///         let mut results = Vec::new();
+    ///         for (vector_id, distance) in neighbors {
+    ///             if let Some(entry) = self.load_vector_entry_by_id(vector_id).await? {
+    ///                 results.push(entry);
+    ///             }
+    ///         }
+    ///         Ok(results)
+    ///     }
+    /// }
+    /// ```
+    pub async fn query_vec_similarity(
+        &self,
+        _agent_id: Uuid,
+        _query_embedding: &[f32],
+        _top_k: usize,
+    ) -> Result<Vec<VectorEntry>> {
+        Err(TeriError::Memory(
+            "vector similarity search not yet implemented: see write_vec() doc comment for integration guidance (hnswlib-rs or FAISS)".to_string(),
+        ))
     }
 }
 
@@ -362,6 +486,50 @@ mod tests {
         match result {
             Err(TeriError::Memory(msg)) => assert!(msg.contains("not found")),
             _ => panic!("Expected Memory error with 'not found' message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_and_read_vec() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let db_path = temp_dir.path().join("test.redb");
+        let store = MemoryStore::new(&db_path).expect("Failed to create memory store");
+
+        let agent_id = Uuid::new_v4();
+        let entry = VectorEntry {
+            timestamp: chrono::Utc::now(),
+            content: "Test vector memory".to_string(),
+            embedding: vec![0.1, 0.2, 0.3, 0.4, 0.5],
+            importance: 0.9,
+        };
+
+        store.write_vec(agent_id, &entry).await.expect("Failed to write vector");
+
+        let entries = store.read_vec(agent_id, 10).await.expect("Failed to read vectors");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "Test vector memory");
+        assert_eq!(entries[0].embedding, vec![0.1, 0.2, 0.3, 0.4, 0.5]);
+        assert_eq!(entries[0].importance, 0.9);
+    }
+
+    #[tokio::test]
+    async fn test_query_vec_similarity_returns_not_implemented() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let db_path = temp_dir.path().join("test.redb");
+        let store = MemoryStore::new(&db_path).expect("Failed to create memory store");
+
+        let agent_id = Uuid::new_v4();
+        let query_embedding = vec![0.1, 0.2, 0.3];
+        let result = store.query_vec_similarity(agent_id, &query_embedding, 5).await;
+
+        assert!(result.is_err());
+        match result {
+            Err(TeriError::Memory(msg)) => {
+                assert!(msg.contains("not yet implemented"));
+                assert!(msg.contains("hnswlib-rs") || msg.contains("FAISS"));
+            }
+            _ => panic!("Expected Memory error with 'not yet implemented' message"),
         }
     }
 }
