@@ -325,20 +325,20 @@ This checklist tracks end-to-end development of Teri, organized by implementatio
 
 ### Core Types (`src/report/mod.rs`)
 
-- [ ] Define `TimelineEvent` struct
-  - [ ] `tick: u32`
-  - [ ] `description: String`
-  - [ ] `significance: f32`
-- [ ] Define `AgentHighlight` struct
-  - [ ] `agent_id: Uuid`
-  - [ ] `agent_name: String`
-  - [ ] `summary: String`
-- [ ] Define `PredictionReport` struct
-  - [ ] `summary: String`
-  - [ ] `timeline: Vec<TimelineEvent>`
-  - [ ] `agent_highlights: Vec<AgentHighlight>`
-  - [ ] `confidence: f32`
-  - [ ] `raw_query: String`
+- [x] Define `TimelineEvent` struct
+  - [x] `tick: u32`
+  - [x] `description: String`
+  - [x] `significance: f32`
+- [x] Define `AgentHighlight` struct
+  - [x] `agent_id: Uuid`
+  - [x] `agent_name: String`
+  - [x] `summary: String`
+- [x] Define `PredictionReport` struct
+  - [x] `summary: String`
+  - [x] `timeline: Vec<TimelineEvent>`
+  - [x] `agent_highlights: Vec<AgentHighlight>`
+  - [x] `confidence: f32`
+  - [x] `raw_query: String`
 
 ### Report Agent
 
