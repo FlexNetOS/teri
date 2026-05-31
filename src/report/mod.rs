@@ -1,8 +1,11 @@
 use crate::error::{Result, TeriError};
 use crate::llm::LlmClient;
 use crate::sim::SimulationResult;
+use async_stream::try_stream;
+use futures::{Stream, StreamExt};
 use minijinja::{Environment, context};
 use serde::{Deserialize, Serialize};
+use std::pin::Pin;
 use uuid::Uuid;
 
 const REPORT_TEMPLATE: &str = r#"You are a prediction analysis system that synthesizes simulation results into insightful reports.
@@ -97,6 +100,121 @@ impl ReportAgent {
         }
     }
 
+    pub async fn generate_stream<L: LlmClient + ?Sized>(
+        result: &SimulationResult,
+        query: &str,
+        llm: &L,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<PredictionReport>> + Send>>> {
+        let env = Environment::new();
+        let template = env
+            .template_from_str(REPORT_TEMPLATE)
+            .map_err(|e| TeriError::Report(format!("Template parsing error: {}", e)))?;
+
+        let key_events = Self::extract_key_events(result);
+        let agents = Self::summarize_agents(result);
+        let total_ticks = result.final_snapshot().map(|s| s.tick).unwrap_or(0);
+        let total_events: usize = result.history.iter().map(|s| s.events.len()).sum();
+
+        let ctx = context! {
+            query => query,
+            total_ticks => total_ticks,
+            agent_count => agents.len(),
+            total_events => total_events,
+            key_events => key_events,
+            agents => agents,
+        };
+
+        let prompt = template
+            .render(ctx)
+            .map_err(|e| TeriError::Report(format!("Failed to render report template: {}", e)))?;
+
+        let mut stream = llm.stream(&prompt).await?;
+        let query_owned = query.to_string();
+
+        let result_stream = try_stream! {
+            let mut buffer = String::new();
+
+            // Yield initial partial report to ensure ≥2 chunks
+            yield PredictionReport {
+                id: Uuid::new_v4(),
+                summary: String::from("[Generating...]"),
+                timeline: Vec::new(),
+                agent_highlights: Vec::new(),
+                confidence: 0.0,
+                raw_query: query_owned.clone(),
+                created_at: chrono::Utc::now(),
+            };
+
+            // Stream text chunks and accumulate
+            while let Some(chunk_result) = stream.next().await {
+                let chunk = chunk_result?;
+                buffer.push_str(&chunk);
+
+                // Try to parse complete JSON when buffer is large enough
+                if buffer.len() > 100 && buffer.contains("}")
+                    && let Ok(response) = serde_json::from_str::<serde_json::Value>(&buffer)
+                    && let Some(report) = Self::parse_report_from_json(&response, &query_owned) {
+                    yield report;
+                    return;
+                }
+            }
+
+            // Final parsing with complete buffer
+            if let Ok(response) = serde_json::from_str::<serde_json::Value>(&buffer)
+                && let Some(report) = Self::parse_report_from_json(&response, &query_owned) {
+                yield report;
+                return;
+            }
+
+            // If we get here, return error
+            Err(TeriError::Report("Failed to parse streaming response".to_string()))?;
+        };
+
+        Ok(Box::pin(result_stream))
+    }
+
+    fn parse_report_from_json(
+        response: &serde_json::Value,
+        query: &str,
+    ) -> Option<PredictionReport> {
+        let summary = response.get("summary")?.as_str()?.to_string();
+        let timeline = response
+            .get("timeline")
+            .and_then(|v| v.as_array())?
+            .iter()
+            .filter_map(|v| {
+                let tick = v.get("tick")?.as_u64()? as u32;
+                let description = v.get("description")?.as_str()?.to_string();
+                let significance = v.get("significance")?.as_f64()? as f32;
+                Some(TimelineEvent { tick, description, significance })
+            })
+            .collect();
+
+        let agent_highlights = response
+            .get("agent_highlights")
+            .and_then(|v| v.as_array())?
+            .iter()
+            .filter_map(|v| {
+                let agent_id = v.get("agent_id")?.as_str()?.parse::<Uuid>().ok()?;
+                let agent_name = v.get("agent_name")?.as_str()?.to_string();
+                let summary = v.get("summary")?.as_str()?.to_string();
+                Some(AgentHighlight { agent_id, agent_name, summary })
+            })
+            .collect();
+
+        let confidence = response.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+
+        Some(PredictionReport {
+            id: Uuid::new_v4(),
+            summary,
+            timeline,
+            agent_highlights,
+            confidence,
+            raw_query: query.to_string(),
+            created_at: chrono::Utc::now(),
+        })
+    }
+
     pub async fn generate<L: LlmClient + ?Sized>(
         result: &SimulationResult,
         query: &str,
@@ -127,54 +245,8 @@ impl ReportAgent {
 
         let response = llm.complete_json::<serde_json::Value>(&prompt).await?;
 
-        let summary = response
-            .get("summary")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                TeriError::Report("Missing 'summary' field in LLM response".to_string())
-            })?
-            .to_string();
-
-        let timeline = response
-            .get("timeline")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| {
-                TeriError::Report("Missing 'timeline' field in LLM response".to_string())
-            })?
-            .iter()
-            .filter_map(|v| {
-                let tick = v.get("tick")?.as_u64()? as u32;
-                let description = v.get("description")?.as_str()?.to_string();
-                let significance = v.get("significance")?.as_f64()? as f32;
-                Some(TimelineEvent { tick, description, significance })
-            })
-            .collect();
-
-        let agent_highlights = response
-            .get("agent_highlights")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| {
-                TeriError::Report("Missing 'agent_highlights' field in LLM response".to_string())
-            })?
-            .iter()
-            .filter_map(|v| {
-                let agent_id = v.get("agent_id")?.as_str()?.parse::<Uuid>().ok()?;
-                let agent_name = v.get("agent_name")?.as_str()?.to_string();
-                let summary = v.get("summary")?.as_str()?.to_string();
-                Some(AgentHighlight { agent_id, agent_name, summary })
-            })
-            .collect();
-
-        let confidence = response.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-
-        Ok(PredictionReport {
-            id: Uuid::new_v4(),
-            summary,
-            timeline,
-            agent_highlights,
-            confidence,
-            raw_query: query.to_string(),
-            created_at: chrono::Utc::now(),
+        Self::parse_report_from_json(&response, query).ok_or_else(|| {
+            TeriError::Report("Failed to parse LLM response into report".to_string())
         })
     }
 
@@ -322,5 +394,98 @@ mod tests {
         let agent_summaries = ReportAgent::summarize_agents(&result);
         assert!(!agent_summaries.is_empty());
         assert_eq!(agent_summaries[0]["name"], "Bob");
+    }
+
+    // Mock LLM client for streaming tests
+    struct MockStreamingLlm {
+        chunks: Vec<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for MockStreamingLlm {
+        async fn complete(&self, _prompt: &str) -> Result<String> {
+            Err(TeriError::Llm("Not implemented".to_string()))
+        }
+
+        async fn complete_json<T: serde::de::DeserializeOwned>(&self, _prompt: &str) -> Result<T> {
+            Err(TeriError::Llm("Not implemented".to_string()))
+        }
+
+        async fn stream(
+            &self,
+            _prompt: &str,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+            let chunks = self.chunks.clone();
+            let stream = try_stream! {
+                for chunk in chunks {
+                    yield chunk;
+                }
+            };
+            Ok(Box::pin(stream))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_stream_yields_multiple_chunks() {
+        let agent_id = Uuid::new_v4();
+        let mut agents = std::collections::HashMap::new();
+        agents.insert(
+            agent_id,
+            AgentSnapshot { id: agent_id, name: "Alice".to_string(), state: "Active".to_string() },
+        );
+
+        let event = Event {
+            agent_id,
+            action: Action::Speak("Hello world".to_string()),
+            timestamp: chrono::Utc::now(),
+        };
+
+        let snapshot = WorldSnapshot {
+            tick: 1,
+            agents,
+            events: vec![event],
+            variables: std::collections::HashMap::new(),
+        };
+
+        let result = SimulationResult { id: Uuid::new_v4(), history: vec![snapshot] };
+
+        // Mock streaming response - split JSON across chunks
+        let json_response = serde_json::json!({
+            "summary": "Test prediction about simulation",
+            "timeline": [
+                {"tick": 1, "description": "Event occurred", "significance": 0.8}
+            ],
+            "agent_highlights": [
+                {"agent_id": agent_id.to_string(), "agent_name": "Alice", "summary": "Alice was key"}
+            ],
+            "confidence": 0.75
+        });
+
+        let chunks = vec![json_response.to_string()];
+
+        let mock_llm = MockStreamingLlm { chunks };
+        let mut stream = ReportAgent::generate_stream(&result, "What happened?", &mock_llm)
+            .await
+            .expect("Failed to create stream");
+
+        let mut chunk_count = 0;
+        let mut last_report: Option<PredictionReport> = None;
+
+        while let Some(report_result) = stream.next().await {
+            let report = report_result.expect("Stream chunk failed");
+            chunk_count += 1;
+            last_report = Some(report);
+        }
+
+        assert!(
+            chunk_count >= 2,
+            "Expected at least 2 chunks from streaming, got {}",
+            chunk_count
+        );
+        assert!(last_report.is_some(), "Expected final report");
+
+        let final_report = last_report.unwrap();
+        assert_eq!(final_report.raw_query, "What happened?");
+        assert!(!final_report.summary.is_empty());
     }
 }
