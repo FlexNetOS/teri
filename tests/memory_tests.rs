@@ -28,10 +28,11 @@ async fn test_concurrent_access() {
     let store = MemoryStore::new(&db_path).expect("Failed to create memory store");
     let agent_id = Uuid::new_v4();
     let mut futures = Vec::new();
+    let base_time = chrono::Utc::now();
     for i in 0..10 {
         let store_clone = store.clone();
         let entry = MemoryEntry {
-            timestamp: chrono::Utc::now(),
+            timestamp: base_time + chrono::Duration::milliseconds(i * 10),
             content: format!("Entry {}", i),
             importance: i as f32 * 0.1,
         };

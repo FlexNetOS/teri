@@ -57,12 +57,7 @@ impl From<reqwest::Error> for TeriError {
     }
 }
 
-// Convert RocksDB errors into TeriError
-impl From<rocksdb::Error> for TeriError {
-    fn from(err: rocksdb::Error) -> Self {
-        TeriError::Database(err.to_string())
-    }
-}
+// Removed RocksDB conversion
 
 impl From<bincode::Error> for TeriError {
     fn from(err: bincode::Error) -> Self {

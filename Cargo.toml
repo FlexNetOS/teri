@@ -18,7 +18,7 @@ name = "teri"
 path = "src/lib.rs"
 
 [dependencies]
-rocksdb = "0.21"
+redb = "2"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 

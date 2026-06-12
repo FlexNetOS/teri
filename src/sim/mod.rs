@@ -208,6 +208,7 @@ impl SimConfig {
     /// # Example
     ///
     /// ```
+    /// # use teri::sim::SimConfig;
     /// let config = SimConfig::new(100, 8);
     /// ```
     pub fn new(max_ticks: u32, parallelism: usize) -> Self {
@@ -228,6 +229,7 @@ impl SimConfig {
     /// # Example
     ///
     /// ```
+    /// # use teri::sim::SimConfig;
     /// let config = SimConfig::new(100, 4)
     ///     .with_inject_fn(|tick, world| {
     ///         // Increase temperature every 10 ticks

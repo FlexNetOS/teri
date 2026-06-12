@@ -1,6 +1,6 @@
 use crate::error::{Result, TeriError};
 use crate::sim::WorldSnapshot;
-use rocksdb::DB as RocksDB;
+use redb::{Database, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -13,6 +13,8 @@ pub const AGENT_LTM_KEY_PREFIX: &str = "agent";
 pub const WORLD_SNAPSHOT_KEY_PREFIX: &str = "world";
 // agent:{uuid}:vec:{timestamp} → VectorEntry
 pub const AGENT_VEC_KEY_PREFIX: &str = "agent_vec";
+
+const KV_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("kv");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
@@ -31,8 +33,8 @@ pub struct VectorEntry {
 
 #[derive(Clone)]
 pub struct MemoryStore {
-    // RocksDB instance for all memory operations
-    db: Arc<RocksDB>,
+    // Redb instance for all memory operations
+    db: Arc<Database>,
 }
 
 impl MemoryStore {
@@ -40,9 +42,16 @@ impl MemoryStore {
         // Ensure the directory exists
         let rocks_path = path.as_ref().join("rocksdb");
         std::fs::create_dir_all(&rocks_path)
-            .map_err(|e| TeriError::Memory(format!("Failed to create rocksdb dir: {e}")))?;
-        let db = RocksDB::open_default(&rocks_path)
-            .map_err(|e| TeriError::Memory(format!("Failed to open rocksdb: {e}")))?;
+            .map_err(|e| TeriError::Memory(format!("Failed to create db dir: {e}")))?;
+        let db_file = rocks_path.join("teri.redb");
+        let db = Database::create(&db_file)
+            .map_err(|e| TeriError::Memory(format!("Failed to open redb: {e}")))?;
+            
+        // Initialize tables
+        let write_txn = db.begin_write().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
+        write_txn.open_table(KV_TABLE).map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
+        write_txn.commit().map_err(|e| TeriError::Memory(format!("Commit error: {e}")))?;
+
         Ok(Self { db: Arc::new(db) })
     }
 
@@ -53,8 +62,12 @@ impl MemoryStore {
             .map_err(|e| TeriError::Memory(format!("Serialization error: {e}")))?;
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
-            db.put(key.as_bytes(), &value)
-                .map_err(|e| TeriError::Memory(format!("Write error: {e}")))
+            let write_txn = db.begin_write().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
+            {
+                let mut table = write_txn.open_table(KV_TABLE).map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
+                table.insert(key.as_str(), value.as_slice()).map_err(|e| TeriError::Memory(format!("Write error: {e}")))?;
+            }
+            write_txn.commit().map_err(|e| TeriError::Memory(format!("Commit error: {e}")))
         })
         .await
         .map_err(|e| TeriError::Memory(format!("Task join error: {e}")))?
@@ -64,11 +77,17 @@ impl MemoryStore {
         let prefix = format!("agent:{agent_id}:ltm:");
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
+            let read_txn = db.begin_read().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
+            let table = read_txn.open_table(KV_TABLE).map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
             let mut entries = Vec::new();
-            let iter = db.prefix_iterator(prefix.as_bytes());
+            
+            let iter = table.range(prefix.as_str()..).map_err(|e| TeriError::Memory(format!("Iterator error: {e}")))?;
             for item in iter {
-                let (_, v) = item.map_err(|e| TeriError::Memory(format!("Iterator error: {e}")))?;
-                let entry: MemoryEntry = serde_json::from_slice(&v)
+                let (k, v) = item.map_err(|e| TeriError::Memory(format!("Iterator item error: {e}")))?;
+                if !k.value().starts_with(&prefix) {
+                    break;
+                }
+                let entry: MemoryEntry = serde_json::from_slice(v.value())
                     .map_err(|e| TeriError::Memory(format!("Deserialization error: {e}")))?;
                 entries.push(entry);
                 if entries.len() >= limit {
@@ -86,11 +105,16 @@ impl MemoryStore {
         let db = self.db.clone();
         let query_lower = query.to_lowercase();
         tokio::task::spawn_blocking(move || {
+            let read_txn = db.begin_read().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
+            let table = read_txn.open_table(KV_TABLE).map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
             let mut entries = Vec::new();
-            let iter = db.prefix_iterator(prefix.as_bytes());
+            let iter = table.range(prefix.as_str()..).map_err(|e| TeriError::Memory(format!("Iterator error: {e}")))?;
             for item in iter {
-                let (_, v) = item.map_err(|e| TeriError::Memory(format!("Iterator error: {e}")))?;
-                let entry: MemoryEntry = serde_json::from_slice(&v)
+                let (k, v) = item.map_err(|e| TeriError::Memory(format!("Iterator item error: {e}")))?;
+                if !k.value().starts_with(&prefix) {
+                    break;
+                }
+                let entry: MemoryEntry = serde_json::from_slice(v.value())
                     .map_err(|e| TeriError::Memory(format!("Deserialization error: {e}")))?;
                 if entry.content.to_lowercase().contains(&query_lower) {
                     entries.push(entry);
@@ -113,8 +137,12 @@ impl MemoryStore {
             .map_err(|e| TeriError::Memory(format!("Serialization error: {e}")))?;
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
-            db.put(key.as_bytes(), &value)
-                .map_err(|e| TeriError::Memory(format!("Write error: {e}")))
+            let write_txn = db.begin_write().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
+            {
+                let mut table = write_txn.open_table(KV_TABLE).map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
+                table.insert(key.as_str(), value.as_slice()).map_err(|e| TeriError::Memory(format!("Write error: {e}")))?;
+            }
+            write_txn.commit().map_err(|e| TeriError::Memory(format!("Commit error: {e}")))
         })
         .await
         .map_err(|e| TeriError::Memory(format!("Task join error: {e}")))?
@@ -124,11 +152,11 @@ impl MemoryStore {
         let key = format!("world:{sim_id}:tick:{tick:010}");
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
-            let v = db
-                .get(key.as_bytes())
-                .map_err(|e| TeriError::Memory(format!("Read error: {e}")))?
-                .ok_or_else(|| TeriError::Memory(format!("Snapshot not found: {key}")))?;
-            bincode::deserialize(&v)
+            let read_txn = db.begin_read().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
+            let table = read_txn.open_table(KV_TABLE).map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
+            let v_guard = table.get(key.as_str()).map_err(|e| TeriError::Memory(format!("Read error: {e}")))?;
+            let v = v_guard.ok_or_else(|| TeriError::Memory(format!("Snapshot not found: {key}")))?;
+            bincode::deserialize(v.value())
                 .map_err(|e| TeriError::Memory(format!("Deserialization error: {e}")))
         })
         .await
@@ -147,11 +175,16 @@ impl MemoryStore {
         let prefix = format!("world:{sim_id}:tick:");
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
+            let read_txn = db.begin_read().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
+            let table = read_txn.open_table(KV_TABLE).map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
             let mut snapshots = Vec::new();
-            let iter = db.prefix_iterator(prefix.as_bytes());
+            let iter = table.range(prefix.as_str()..).map_err(|e| TeriError::Memory(format!("Iterator error: {e}")))?;
             for item in iter {
-                let (_, v) = item.map_err(|e| TeriError::Memory(format!("Iterator error: {e}")))?;
-                let snapshot: WorldSnapshot = bincode::deserialize(&v)
+                let (k, v) = item.map_err(|e| TeriError::Memory(format!("Iterator item error: {e}")))?;
+                if !k.value().starts_with(&prefix) {
+                    break;
+                }
+                let snapshot: WorldSnapshot = bincode::deserialize(v.value())
                     .map_err(|e| TeriError::Memory(format!("Deserialization error: {e}")))?;
                 snapshots.push(snapshot);
                 if snapshots.len() >= limit {
@@ -164,9 +197,6 @@ impl MemoryStore {
         .map_err(|e| TeriError::Memory(format!("Task join error: {e}")))?
     }
 
-    /// Write a vector embedding for an agent memory entry.
-    ///
-    /// When vector search backends are integrated, this should also add the vector to the index.
     pub async fn write_vec(&self, agent_id: Uuid, entry: &VectorEntry) -> Result<()> {
         let ts = entry.timestamp.timestamp_millis();
         let key = format!("agent:{agent_id}:vec:{ts}");
@@ -174,23 +204,31 @@ impl MemoryStore {
             .map_err(|e| TeriError::Memory(format!("Serialization error: {e}")))?;
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
-            db.put(key.as_bytes(), &value)
-                .map_err(|e| TeriError::Memory(format!("Write error: {e}")))
+            let write_txn = db.begin_write().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
+            {
+                let mut table = write_txn.open_table(KV_TABLE).map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
+                table.insert(key.as_str(), value.as_slice()).map_err(|e| TeriError::Memory(format!("Write error: {e}")))?;
+            }
+            write_txn.commit().map_err(|e| TeriError::Memory(format!("Commit error: {e}")))
         })
         .await
         .map_err(|e| TeriError::Memory(format!("Task join error: {e}")))?
     }
 
-    /// Read stored vector entries for an agent.
     pub async fn read_vec(&self, agent_id: Uuid, limit: usize) -> Result<Vec<VectorEntry>> {
         let prefix = format!("agent:{agent_id}:vec:");
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
+            let read_txn = db.begin_read().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
+            let table = read_txn.open_table(KV_TABLE).map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
             let mut entries = Vec::new();
-            let iter = db.prefix_iterator(prefix.as_bytes());
+            let iter = table.range(prefix.as_str()..).map_err(|e| TeriError::Memory(format!("Iterator error: {e}")))?;
             for item in iter {
-                let (_, v) = item.map_err(|e| TeriError::Memory(format!("Iterator error: {e}")))?;
-                let entry: VectorEntry = serde_json::from_slice(&v)
+                let (k, v) = item.map_err(|e| TeriError::Memory(format!("Iterator item error: {e}")))?;
+                if !k.value().starts_with(&prefix) {
+                    break;
+                }
+                let entry: VectorEntry = serde_json::from_slice(v.value())
                     .map_err(|e| TeriError::Memory(format!("Deserialization error: {e}")))?;
                 entries.push(entry);
                 if entries.len() >= limit {
@@ -203,70 +241,6 @@ impl MemoryStore {
         .map_err(|e| TeriError::Memory(format!("Task join error: {e}")))?
     }
 
-    /// Vector similarity search — STUB.
-    ///
-    /// Currently returns an error indicating this is not yet implemented.
-    ///
-    /// ## Integration Points
-    ///
-    /// To implement semantic similarity search, you can use either:
-    ///
-    /// ### Option 1: `hnswlib-rs` (Pure Rust HNSW)
-    /// - **Add to `Cargo.toml`**: `hnswlib-rs = "0.4"`
-    /// - **On write** (in `write_vec`): After storing the embedding to RocksDB, add the vector to the index:
-    ///   ```ignore
-    ///   let mut index = HnswIndex::new_index(embedding_dim, agent_id as u64);
-    ///   index.add_point(vector.clone(), point_id);
-    ///   ```
-    /// - **On query**: Use `index.search_neighbors(query_vector, top_k)` to retrieve similar vectors
-    /// - **Advantages**: Pure Rust, no external dependencies
-    /// - **Trade-offs**: May be slower than FAISS for very large indices
-    ///
-    /// ### Option 2: FAISS (via `faiss` crate with C FFI)
-    /// - **Add to `Cargo.toml`**: `faiss = "0.12"`
-    /// - **System requirement**: FAISS C library must be installed
-    /// - **On write**: After storing to RocksDB, add to FAISS index:
-    ///   ```ignore
-    ///   index.add_vectors(&[embedding], &[vector_id])?;
-    ///   ```
-    /// - **On query**: Use `index.search(&query, top_k)` to retrieve similar vectors
-    /// - **Index types**:
-    ///   - `IndexFlatL2`: Exact L2 distance (baseline)
-    ///   - `IndexHNSWFlat`: HNSW with exact distances (recommended for most cases)
-    ///   - `IndexIVFFlat`: Inverted index with exact distances (faster for very large datasets)
-    /// - **Advantages**: Battle-tested, highly optimized, fast even for millions of vectors
-    /// - **Trade-offs**: External C dependency, requires FAISS installation
-    ///
-    /// ## Future Implementation Sketch
-    ///
-    /// ```ignore
-    /// struct VectorIndex {
-    ///     index: Arc<Mutex<HnswIndex>>,  // or FAISS equivalent
-    ///     agent_id: Uuid,
-    /// }
-    ///
-    /// impl MemoryStore {
-    ///     pub async fn query_vec_similarity(
-    ///         &self,
-    ///         agent_id: Uuid,
-    ///         query_embedding: &[f32],
-    ///         top_k: usize,
-    ///     ) -> Result<Vec<VectorEntry>> {
-    ///         // Retrieve vector IDs from index
-    ///         let index = self.vector_indices.get(&agent_id)?;
-    ///         let neighbors = index.search_neighbors(query_embedding, top_k)?;
-    ///
-    ///         // Load full entries from RocksDB
-    ///         let mut results = Vec::new();
-    ///         for (vector_id, distance) in neighbors {
-    ///             if let Some(entry) = self.load_vector_entry_by_id(vector_id).await? {
-    ///                 results.push(entry);
-    ///             }
-    ///         }
-    ///         Ok(results)
-    ///     }
-    /// }
-    /// ```
     pub async fn query_vec_similarity(
         &self,
         _agent_id: Uuid,
@@ -274,7 +248,7 @@ impl MemoryStore {
         _top_k: usize,
     ) -> Result<Vec<VectorEntry>> {
         Err(TeriError::Memory(
-            "vector similarity search not yet implemented: see write_vec() doc comment for integration guidance (hnswlib-rs or FAISS)".to_string(),
+            "vector similarity search not yet implemented".to_string(),
         ))
     }
 }
@@ -335,7 +309,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_error_handling_invalid_path() {
-        // Provide a path that cannot be created (e.g., root on Unix, but on Windows use a reserved name)
         let invalid_path =
             if cfg!(windows) { "C:\\invalid_path\\?*" } else { "/root/invalid_path" };
         let result = MemoryStore::new(invalid_path);
@@ -527,7 +500,6 @@ mod tests {
         match result {
             Err(TeriError::Memory(msg)) => {
                 assert!(msg.contains("not yet implemented"));
-                assert!(msg.contains("hnswlib-rs") || msg.contains("FAISS"));
             }
             _ => panic!("Expected Memory error with 'not yet implemented' message"),
         }
