@@ -869,7 +869,8 @@ mod tests {
         };
         graph.add_entity(entity).expect("Failed to add entity");
 
-        let file_path = "/tmp/test_graph.json";
+        let file_path = std::env::temp_dir().join("test_graph.json");
+        let file_path = file_path.to_str().expect("temp path is valid utf-8");
 
         // Serialize to file
         graph.serialize_to_file(file_path).expect("Failed to serialize to file");
@@ -910,7 +911,8 @@ mod tests {
             Relation::new(RelationKind::LocatedIn, 1.0).expect("Valid weight"),
         );
 
-        let file_path = "/tmp/test_graph.bin";
+        let file_path = std::env::temp_dir().join("test_graph.bin");
+        let file_path = file_path.to_str().expect("temp path is valid utf-8");
 
         // Serialize to binary file
         graph

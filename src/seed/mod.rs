@@ -269,7 +269,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_plain_text_file_format() {
-        let test_file = "/tmp/test_plain_text.txt";
+        let test_file = std::env::temp_dir().join("test_plain_text.txt");
+        let test_file = test_file.to_str().expect("temp path is valid utf-8");
         let test_content =
             "This is a test seed document\nWith multiple lines\nFor testing purposes";
 
@@ -291,7 +292,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_json_file_format() {
-        let test_file = "/tmp/test_data.json";
+        let test_file = std::env::temp_dir().join("test_data.json");
+        let test_file = test_file.to_str().expect("temp path is valid utf-8");
         let test_content = r#"{"name": "Test", "value": 42, "items": ["a", "b", "c"]}"#;
 
         tokio::fs::write(test_file, test_content)
@@ -368,7 +370,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_basic_file_metadata_extraction() {
-        let test_file = "/tmp/test_metadata.txt";
+        let test_file = std::env::temp_dir().join("test_metadata.txt");
+        let test_file = test_file.to_str().expect("temp path is valid utf-8");
         let test_content = "Test content for metadata extraction";
 
         tokio::fs::write(test_file, test_content)
@@ -393,7 +396,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_unknown_file_format_defaults_to_plain_text() {
-        let test_file = "/tmp/test_unknown.xyz";
+        let test_file = std::env::temp_dir().join("test_unknown.xyz");
+        let test_file = test_file.to_str().expect("temp path is valid utf-8");
         let test_content = "Unknown format content";
 
         tokio::fs::write(test_file, test_content)
@@ -410,7 +414,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_seed_document_creation() {
-        let test_file = "/tmp/test_seed_doc.txt";
+        let test_file = std::env::temp_dir().join("test_seed_doc.txt");
+        let test_file = test_file.to_str().expect("temp path is valid utf-8");
         let test_content = "Test seed document";
 
         tokio::fs::write(test_file, test_content)
@@ -435,7 +440,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_malformed_json_returns_error() {
-        let test_file = "/tmp/test_bad.json";
+        let test_file = std::env::temp_dir().join("test_bad.json");
+        let test_file = test_file.to_str().expect("temp path is valid utf-8");
         let bad_content = "{ invalid json }";
 
         tokio::fs::write(test_file, bad_content)
@@ -450,7 +456,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_pdf_returns_error() {
-        let test_file = "/tmp/test_bad.pdf";
+        let test_file = std::env::temp_dir().join("test_bad.pdf");
+        let test_file = test_file.to_str().expect("temp path is valid utf-8");
         tokio::fs::write(test_file, "not a real pdf")
             .await
             .expect("Failed to write test file");
