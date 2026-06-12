@@ -28,8 +28,12 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
+    // Parse BEFORE loading config: --help / --version / usage errors must work
+    // keyless (exit 0 / 0 / 2). The LLM_API_KEY requirement belongs to running
+    // a command, not to asking the CLI what it can do.
+    let cli = Cli::parse();
 
+    // Config::from_env() loads .env itself (dotenvy) and validates.
     let config = Config::from_env()?;
     tracing_subscriber::fmt().with_env_filter(&config.logging.level).init();
 
@@ -44,16 +48,26 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(graph_dir)
         .map_err(|e| TeriError::Config(format!("Failed to create graph dir: {e}")))?;
 
-    let cli = Cli::parse();
     match cli.command {
         Commands::Run { seed, query, agents } => {
             tracing::info!("Starting simulation: seed={seed}, agents={agents}");
             tracing::info!("Query: {query}");
-            tracing::info!("Configuration loaded successfully");
+            // A swarm pointed at a stub backend silently simulates on canned
+            // text — refuse before any pipeline work.
+            let backend = teri::preflight::verify_backend(&config.llm).await?;
+            tracing::info!(
+                "Inference backend accepted: {} model(s), probe ok",
+                backend.models.len()
+            );
             Err(TeriError::Unknown("Pipeline not yet implemented".to_string()))
         }
         Commands::Serve { addr } => {
             tracing::info!("Starting API server on {addr}");
+            let backend = teri::preflight::verify_backend(&config.llm).await?;
+            tracing::info!(
+                "Inference backend accepted: {} model(s), probe ok",
+                backend.models.len()
+            );
             Err(TeriError::Unknown("API server not yet implemented".to_string()))
         }
     }
