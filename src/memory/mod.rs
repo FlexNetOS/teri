@@ -46,11 +46,16 @@ impl MemoryStore {
         let db_file = rocks_path.join("teri.redb");
         let db = Database::create(&db_file)
             .map_err(|e| TeriError::Memory(format!("Failed to open redb: {e}")))?;
-            
+
         // Initialize tables
-        let write_txn = db.begin_write().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
-        write_txn.open_table(KV_TABLE).map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
-        write_txn.commit().map_err(|e| TeriError::Memory(format!("Commit error: {e}")))?;
+        let write_txn =
+            db.begin_write().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
+        write_txn
+            .open_table(KV_TABLE)
+            .map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
+        write_txn
+            .commit()
+            .map_err(|e| TeriError::Memory(format!("Commit error: {e}")))?;
 
         Ok(Self { db: Arc::new(db) })
     }
@@ -62,10 +67,15 @@ impl MemoryStore {
             .map_err(|e| TeriError::Memory(format!("Serialization error: {e}")))?;
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
-            let write_txn = db.begin_write().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
+            let write_txn =
+                db.begin_write().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
             {
-                let mut table = write_txn.open_table(KV_TABLE).map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
-                table.insert(key.as_str(), value.as_slice()).map_err(|e| TeriError::Memory(format!("Write error: {e}")))?;
+                let mut table = write_txn
+                    .open_table(KV_TABLE)
+                    .map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
+                table
+                    .insert(key.as_str(), value.as_slice())
+                    .map_err(|e| TeriError::Memory(format!("Write error: {e}")))?;
             }
             write_txn.commit().map_err(|e| TeriError::Memory(format!("Commit error: {e}")))
         })
@@ -77,13 +87,19 @@ impl MemoryStore {
         let prefix = format!("agent:{agent_id}:ltm:");
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
-            let read_txn = db.begin_read().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
-            let table = read_txn.open_table(KV_TABLE).map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
+            let read_txn =
+                db.begin_read().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
+            let table = read_txn
+                .open_table(KV_TABLE)
+                .map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
             let mut entries = Vec::new();
-            
-            let iter = table.range(prefix.as_str()..).map_err(|e| TeriError::Memory(format!("Iterator error: {e}")))?;
+
+            let iter = table
+                .range(prefix.as_str()..)
+                .map_err(|e| TeriError::Memory(format!("Iterator error: {e}")))?;
             for item in iter {
-                let (k, v) = item.map_err(|e| TeriError::Memory(format!("Iterator item error: {e}")))?;
+                let (k, v) =
+                    item.map_err(|e| TeriError::Memory(format!("Iterator item error: {e}")))?;
                 if !k.value().starts_with(&prefix) {
                     break;
                 }
@@ -105,12 +121,18 @@ impl MemoryStore {
         let db = self.db.clone();
         let query_lower = query.to_lowercase();
         tokio::task::spawn_blocking(move || {
-            let read_txn = db.begin_read().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
-            let table = read_txn.open_table(KV_TABLE).map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
+            let read_txn =
+                db.begin_read().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
+            let table = read_txn
+                .open_table(KV_TABLE)
+                .map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
             let mut entries = Vec::new();
-            let iter = table.range(prefix.as_str()..).map_err(|e| TeriError::Memory(format!("Iterator error: {e}")))?;
+            let iter = table
+                .range(prefix.as_str()..)
+                .map_err(|e| TeriError::Memory(format!("Iterator error: {e}")))?;
             for item in iter {
-                let (k, v) = item.map_err(|e| TeriError::Memory(format!("Iterator item error: {e}")))?;
+                let (k, v) =
+                    item.map_err(|e| TeriError::Memory(format!("Iterator item error: {e}")))?;
                 if !k.value().starts_with(&prefix) {
                     break;
                 }
@@ -137,10 +159,15 @@ impl MemoryStore {
             .map_err(|e| TeriError::Memory(format!("Serialization error: {e}")))?;
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
-            let write_txn = db.begin_write().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
+            let write_txn =
+                db.begin_write().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
             {
-                let mut table = write_txn.open_table(KV_TABLE).map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
-                table.insert(key.as_str(), value.as_slice()).map_err(|e| TeriError::Memory(format!("Write error: {e}")))?;
+                let mut table = write_txn
+                    .open_table(KV_TABLE)
+                    .map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
+                table
+                    .insert(key.as_str(), value.as_slice())
+                    .map_err(|e| TeriError::Memory(format!("Write error: {e}")))?;
             }
             write_txn.commit().map_err(|e| TeriError::Memory(format!("Commit error: {e}")))
         })
@@ -152,10 +179,16 @@ impl MemoryStore {
         let key = format!("world:{sim_id}:tick:{tick:010}");
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
-            let read_txn = db.begin_read().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
-            let table = read_txn.open_table(KV_TABLE).map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
-            let v_guard = table.get(key.as_str()).map_err(|e| TeriError::Memory(format!("Read error: {e}")))?;
-            let v = v_guard.ok_or_else(|| TeriError::Memory(format!("Snapshot not found: {key}")))?;
+            let read_txn =
+                db.begin_read().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
+            let table = read_txn
+                .open_table(KV_TABLE)
+                .map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
+            let v_guard = table
+                .get(key.as_str())
+                .map_err(|e| TeriError::Memory(format!("Read error: {e}")))?;
+            let v =
+                v_guard.ok_or_else(|| TeriError::Memory(format!("Snapshot not found: {key}")))?;
             bincode::deserialize(v.value())
                 .map_err(|e| TeriError::Memory(format!("Deserialization error: {e}")))
         })
@@ -175,12 +208,18 @@ impl MemoryStore {
         let prefix = format!("world:{sim_id}:tick:");
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
-            let read_txn = db.begin_read().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
-            let table = read_txn.open_table(KV_TABLE).map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
+            let read_txn =
+                db.begin_read().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
+            let table = read_txn
+                .open_table(KV_TABLE)
+                .map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
             let mut snapshots = Vec::new();
-            let iter = table.range(prefix.as_str()..).map_err(|e| TeriError::Memory(format!("Iterator error: {e}")))?;
+            let iter = table
+                .range(prefix.as_str()..)
+                .map_err(|e| TeriError::Memory(format!("Iterator error: {e}")))?;
             for item in iter {
-                let (k, v) = item.map_err(|e| TeriError::Memory(format!("Iterator item error: {e}")))?;
+                let (k, v) =
+                    item.map_err(|e| TeriError::Memory(format!("Iterator item error: {e}")))?;
                 if !k.value().starts_with(&prefix) {
                     break;
                 }
@@ -204,10 +243,15 @@ impl MemoryStore {
             .map_err(|e| TeriError::Memory(format!("Serialization error: {e}")))?;
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
-            let write_txn = db.begin_write().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
+            let write_txn =
+                db.begin_write().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
             {
-                let mut table = write_txn.open_table(KV_TABLE).map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
-                table.insert(key.as_str(), value.as_slice()).map_err(|e| TeriError::Memory(format!("Write error: {e}")))?;
+                let mut table = write_txn
+                    .open_table(KV_TABLE)
+                    .map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
+                table
+                    .insert(key.as_str(), value.as_slice())
+                    .map_err(|e| TeriError::Memory(format!("Write error: {e}")))?;
             }
             write_txn.commit().map_err(|e| TeriError::Memory(format!("Commit error: {e}")))
         })
@@ -219,12 +263,18 @@ impl MemoryStore {
         let prefix = format!("agent:{agent_id}:vec:");
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
-            let read_txn = db.begin_read().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
-            let table = read_txn.open_table(KV_TABLE).map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
+            let read_txn =
+                db.begin_read().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
+            let table = read_txn
+                .open_table(KV_TABLE)
+                .map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
             let mut entries = Vec::new();
-            let iter = table.range(prefix.as_str()..).map_err(|e| TeriError::Memory(format!("Iterator error: {e}")))?;
+            let iter = table
+                .range(prefix.as_str()..)
+                .map_err(|e| TeriError::Memory(format!("Iterator error: {e}")))?;
             for item in iter {
-                let (k, v) = item.map_err(|e| TeriError::Memory(format!("Iterator item error: {e}")))?;
+                let (k, v) =
+                    item.map_err(|e| TeriError::Memory(format!("Iterator item error: {e}")))?;
                 if !k.value().starts_with(&prefix) {
                     break;
                 }
@@ -247,9 +297,7 @@ impl MemoryStore {
         _query_embedding: &[f32],
         _top_k: usize,
     ) -> Result<Vec<VectorEntry>> {
-        Err(TeriError::Memory(
-            "vector similarity search not yet implemented".to_string(),
-        ))
+        Err(TeriError::Memory("vector similarity search not yet implemented".to_string()))
     }
 }
 

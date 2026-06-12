@@ -374,7 +374,7 @@ impl SimEngine {
                     .await;
 
             // Phase 2: commit results sequentially (mutable writes + world state).
-            for (agent, action_result) in pool.agents.iter_mut().zip(actions.into_iter()) {
+            for (agent, action_result) in pool.agents.iter_mut().zip(actions) {
                 let action = action_result?;
                 world.apply(agent.id, action.clone());
                 agent.commit_action(&action);
