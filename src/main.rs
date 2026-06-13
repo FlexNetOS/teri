@@ -30,7 +30,46 @@ enum Commands {
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
-    let config = Config::from_env()?;
+    // FIX-1.1: Parse CLI FIRST so --help/--version work keyless. Config is loaded lazily per-command.
+    let cli = Cli::parse();
+
+    match &cli.command {
+        Commands::Run { .. } => run_cmd().await,
+        Commands::Serve { .. } => serve_cmd().await,
+    }
+}
+
+async fn run_cmd() -> Result<()> {
+    // Lazy config load — only when actually needed (FIX-1.2: envctl injection seam).
+    let cli = Cli::parse();
+    let Commands::Run { seed, query, agents } = cli.command else { unreachable!() };
+
+    let config = match Config::load() {
+        Ok(c) => c,
+        Err(e) if e.config_missing() => {
+            // FIX-1.2: Friendly guidance toward envctl injection.
+            eprintln!(
+                "⚠️  teri: configuration unavailable — key may not be set.\n\
+                 ℹ️  If using envctl: `envctl run -- teri run --seed ...`\n\
+                 ℹ️  Otherwise set LLM_API_KEY or create a teri config file.\n\nError: {e}"
+            );
+            return Err(e);
+        }
+        Err(e) => return Err(e),
+    };
+
+    // FIX-1.3: GGUF/stub backend guard — preflight before sim run.
+    let is_stub = teri::preflight_check_backend(&config.llm).await.map_err(|e| {
+        TeriError::Config(format!("Backend probe failed: {e}"))
+    })?;
+    if is_stub {
+        return Err(TeriError::Config(
+            "GGUF/stub backend detected — simulation would produce canned text, not intelligence.\n\
+             Set a real LLM endpoint (LLM_BASE_URL with an OpenAI-compatible API) to run simulations."
+                .to_string(),
+        ));
+    }
+
     tracing_subscriber::fmt().with_env_filter(&config.logging.level).init();
 
     // Create data directories for persistence layer
@@ -44,17 +83,26 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(graph_dir)
         .map_err(|e| TeriError::Config(format!("Failed to create graph dir: {e}")))?;
 
+    tracing::info!(
+        "Starting simulation: seed={seed}, agents={agents}, query={query}"
+    );
+    tracing::info!("Query: {query}");
+    tracing::info!("Configuration loaded successfully");
+    Err(TeriError::Unknown("Pipeline not yet implemented".to_string()))
+}
+
+async fn serve_cmd() -> Result<()> {
     let cli = Cli::parse();
-    match cli.command {
-        Commands::Run { seed, query, agents } => {
-            tracing::info!("Starting simulation: seed={seed}, agents={agents}");
-            tracing::info!("Query: {query}");
-            tracing::info!("Configuration loaded successfully");
-            Err(TeriError::Unknown("Pipeline not yet implemented".to_string()))
-        }
-        Commands::Serve { addr } => {
-            tracing::info!("Starting API server on {addr}");
-            Err(TeriError::Unknown("API server not yet implemented".to_string()))
-        }
-    }
+    let Commands::Serve { addr } = cli.command else { unreachable!() };
+
+    let config = Config::load().map_err(|e| {
+        TeriError::Config(format!("Configuration error: {e}"))
+    })?;
+
+    tracing_subscriber::fmt()
+        .with_env_filter(&config.logging.level)
+        .init();
+
+    tracing::info!("Starting API server on {addr}");
+    Err(TeriError::Unknown("API server not yet implemented".to_string()))
 }

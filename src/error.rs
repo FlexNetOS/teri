@@ -29,6 +29,12 @@ pub enum TeriError {
     #[error("Configuration error: {0}")]
     Config(String),
 
+    /// Configuration is missing required keys (e.g., API key). Used for
+    /// graceful degradation: --help/--version work keyless, and config-required
+    /// commands guide users toward the correct invocation path.
+    #[error("{0}")]
+    ConfigMissing(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -82,5 +88,12 @@ where
 {
     fn with_context<F: FnOnce() -> String>(self, ctx: F) -> Result<T> {
         self.map_err(|e| TeriError::Unknown(format!("{}: {}", ctx(), e.into())))
+    }
+}
+
+// FIX-1.2: config_missing() helper for graceful degradation in main.rs
+impl TeriError {
+    pub fn config_missing(&self) -> bool {
+        matches!(self, TeriError::ConfigMissing(_))
     }
 }
