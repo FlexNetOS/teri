@@ -266,23 +266,27 @@
 
 ## U-015 — `backend/app/services/graph_builder.py`
 
-- [ ] S-181 · `unit:U-015` · `type` · `GraphInfo` · dataclass: graph_id,node_count,edge_count,entity_types · `graph_builder.py:24`
-- [ ] S-182 · `unit:U-015` · `field` · `GraphInfo.graph_id` · `graph_builder.py:26`
-- [ ] S-183 · `unit:U-015` · `field` · `GraphInfo.node_count` · `graph_builder.py:27`
-- [ ] S-184 · `unit:U-015` · `field` · `GraphInfo.edge_count` · `graph_builder.py:28`
-- [ ] S-185 · `unit:U-015` · `field` · `GraphInfo.entity_types` · `graph_builder.py:29`
-- [ ] S-186 · `unit:U-015` · `method` · `GraphInfo.to_dict` · `graph_builder.py:31`
-- [ ] S-187 · `unit:U-015` · `type` · `GraphBuilderService` · `graph_builder.py:40`
-- [ ] S-188 · `unit:U-015` · `method` · `GraphBuilderService.__init__` · `graph_builder.py:46`
-- [ ] S-189 · `unit:U-015` · `method` · `GraphBuilderService.build_graph_async` · spawns background thread → task_id · `graph_builder.py:54`
-- [ ] S-190 · `unit:U-015` · `method` · `GraphBuilderService._build_graph_worker` · create→ontology→split→batch→wait→info→complete · `graph_builder.py:100`
-- [ ] S-191 · `unit:U-015` · `method` · `GraphBuilderService.create_graph` · Zep graph_id = `mirofish_{uuid16}` · `graph_builder.py:193`
-- [ ] S-192 · `unit:U-015` · `method` · `GraphBuilderService.set_ontology` · dynamic Pydantic EntityModel/EdgeModel subclasses · `graph_builder.py:205`
-- [ ] S-193 · `unit:U-015` · `method` · `GraphBuilderService.add_text_batches` · sleeps 1s between batches · `graph_builder.py:294`
-- [ ] S-194 · `unit:U-015` · `method` · `GraphBuilderService._wait_for_episodes` · polls processed=True every 3s, 600s timeout · `graph_builder.py:347`
-- [ ] S-195 · `unit:U-015` · `method` · `GraphBuilderService._get_graph_info` · `graph_builder.py:403`
-- [ ] S-196 · `unit:U-015` · `method` · `GraphBuilderService.get_graph_data` · nodes+edges dict with temporal fields · `graph_builder.py:426`
-- [ ] S-197 · `unit:U-015` · `method` · `GraphBuilderService.delete_graph` · `graph_builder.py:503`
+<!-- map-onto-substrate: Zep Cloud API methods (create_graph, set_ontology, add_text_batches,
+     _wait_for_episodes, get_graph_data, delete_graph) are Zep SaaS calls with no Rust
+     equivalent; the extraction pipeline behavior is mapped onto KnowledgeGraph::build(). -->
+
+- [≠] S-181 · `unit:U-015` · `type` · `GraphInfo` · dataclass: graph_id,node_count,edge_count,entity_types · `graph_builder.py:24` · intentional-divergence: Zep-specific result type; teri exposes entity_count()/relation_count() directly on KnowledgeGraph
+- [≠] S-182 · `unit:U-015` · `field` · `GraphInfo.graph_id` · `graph_builder.py:26` · intentional-divergence: Zep graph_id not applicable; teri's KnowledgeGraph is in-process
+- [≠] S-183 · `unit:U-015` · `field` · `GraphInfo.node_count` · `graph_builder.py:27` · intentional-divergence: mapped to `KnowledgeGraph::entity_count()` at `src/graph/mod.rs:517`
+- [≠] S-184 · `unit:U-015` · `field` · `GraphInfo.edge_count` · `graph_builder.py:28` · intentional-divergence: mapped to `KnowledgeGraph::relation_count()` at `src/graph/mod.rs:521`
+- [≠] S-185 · `unit:U-015` · `field` · `GraphInfo.entity_types` · `graph_builder.py:29` · intentional-divergence: typed via `EntityKind` enum in `src/graph/mod.rs:11`
+- [≠] S-186 · `unit:U-015` · `method` · `GraphInfo.to_dict` · `graph_builder.py:31` · intentional-divergence: replaced by `KnowledgeGraph::serialize_to_json()` at `src/graph/mod.rs:245`
+- [≠] S-187 · `unit:U-015` · `type` · `GraphBuilderService` · `graph_builder.py:40` · intentional-divergence: no separate service type; build logic is a method on `KnowledgeGraph`
+- [≠] S-188 · `unit:U-015` · `method` · `GraphBuilderService.__init__` · `graph_builder.py:46` · intentional-divergence: no constructor needed; llm passed as generic param to build()
+- [≠] S-189 · `unit:U-015` · `method` · `GraphBuilderService.build_graph_async` · spawns background thread → task_id · `graph_builder.py:54` · intentional-divergence: task-management layer not yet ported; build() is async but caller-managed
+- [x] S-190 · `unit:U-015` · `method` · `GraphBuilderService._build_graph_worker` · create→ontology→split→batch→wait→info→complete · `graph_builder.py:100` · **rust-target:** `KnowledgeGraph::build()` at `src/graph/mod.rs:237`; 2-pass (entity→relation) extraction pipeline; PARITY-VERIFIED 2026-06-14 (5 branches happy/empty/dup/unknown-ref/llm-error all match MiroFish resilience contract — findings/parity.md). split_text/chunking distributed to U-013 (`- [!]` GAP-U015-1); S-189 task-layer → U-012
+- [≠] S-191 · `unit:U-015` · `method` · `GraphBuilderService.create_graph` · Zep graph_id = `mirofish_{uuid16}` · `graph_builder.py:193` · intentional-divergence: Zep SaaS call; teri uses in-process petgraph — no equivalent
+- [≠] S-192 · `unit:U-015` · `method` · `GraphBuilderService.set_ontology` · dynamic Pydantic EntityModel/EdgeModel subclasses · `graph_builder.py:205` · intentional-divergence: Zep SaaS call; teri uses EntityKind/RelationKind enums in graph types
+- [≠] S-193 · `unit:U-015` · `method` · `GraphBuilderService.add_text_batches` · sleeps 1s between batches · `graph_builder.py:294` · intentional-divergence: Zep episode batching not applicable to in-process petgraph
+- [≠] S-194 · `unit:U-015` · `method` · `GraphBuilderService._wait_for_episodes` · polls processed=True every 3s, 600s timeout · `graph_builder.py:347` · intentional-divergence: Zep async episode processing; in-process LLM call is synchronous/awaitable
+- [≠] S-195 · `unit:U-015` · `method` · `GraphBuilderService._get_graph_info` · `graph_builder.py:403` · intentional-divergence: Zep SaaS call; teri exposes entity_count()/relation_count() directly
+- [≠] S-196 · `unit:U-015` · `method` · `GraphBuilderService.get_graph_data` · nodes+edges dict with temporal fields · `graph_builder.py:426` · intentional-divergence: Zep SaaS read; teri uses serialize_to_json()/get_all_entities()/get_all_edges()
+- [≠] S-197 · `unit:U-015` · `method` · `GraphBuilderService.delete_graph` · `graph_builder.py:503` · intentional-divergence: Zep SaaS call; teri's KnowledgeGraph is in-process, dropped when out of scope
 
 ---
 

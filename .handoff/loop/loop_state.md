@@ -17,10 +17,15 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 0
-cycles_total: 0
-ledger: parity 0/50 units verified   # U-001..U-050 (+ SWEEP-1..4 deferred)
-symbols: 0/1087 symbols mapped+verified   # S-001..S-1087 harvested (real source only; venv excluded)
+cycles_this_session: 1
+cycles_total: 1
+ledger: parity 1/50 units verified   # U-015 [x] (KnowledgeGraph::build 2-pass extraction)
+symbols: 1/1087 [x] + ~16 [≠] (U-015 Zep-SaaS-N/A) of 1087 mapped   # S-190 [x]; S-181-197 resolved
+# TRUE BASELINE CORRECTION: DISCOVER baseline.md claimed 142 tests GREEN on c894de8 — FALSE-GREEN.
+#   c894de8 (PR #4 merge) was a BAD MERGE: duplicated api_key field (config.rs) + dead from_env/dup
+#   block (main.rs) => did NOT compile. Cycle 1 repaired both to clean fix-branch (d433f95) versions.
+#   TRUE no-downgrade baseline going forward = 156 tests green (verified). Cargo.toml has a worktree-only
+#   [workspace] build-aid (teri is a meta-root member; review before develop->main promotion).
 merge: 0/50 merged+reverified-in-Y (target==dest, so "merge" == landed-in-teri + teri-not-regressed)
 classes: port-fresh=17 extend-Y=6 reuse-Y=18 map-onto-substrate=13   # locked by architect 2026-06-14 (SWEEP-4 = [≠] dropped)
 # OQ resolutions (all no-downgrade): OQ-1 dual-platform=BOTH (MultiPlatformRunner + 2 SimEngine tokio::join!);

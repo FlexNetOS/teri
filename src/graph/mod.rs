@@ -1,4 +1,5 @@
 use crate::error::{Result, TeriError};
+use crate::llm::LlmClient;
 use crate::seed::SeedDocument;
 use petgraph::graph::{Graph, NodeIndex};
 use petgraph::visit::EdgeRef;
@@ -220,19 +221,92 @@ impl KnowledgeGraph {
         Ok(subgraph)
     }
 
-    pub fn build(doc: &SeedDocument) -> Result<Self> {
-        // Minimal placeholder build: create a single entity from document metadata or ID.
+    /// Builds a knowledge graph from a seed document using a two-pass LLM extraction pipeline.
+    ///
+    /// Pass 1: entity extraction — prompt the LLM, parse the JSON response, add each entity
+    /// to the graph (duplicate names are skipped rather than faulted — resilience matches
+    /// MiroFish's tolerant contract).
+    ///
+    /// Pass 2: relation extraction — prompt the LLM with the extracted entity list, parse
+    /// the JSON response, resolve entity names to NodeIndex values, add each relation (relations
+    /// that reference an unknown entity name are skipped, not faulted).
+    ///
+    /// Empty extraction (LLM returns no entities) yields a valid empty graph, not an error.
+    ///
+    /// LLM errors and JSON parse errors are propagated as `TeriError`.
+    pub async fn build<L: LlmClient>(doc: &SeedDocument, llm: &L) -> Result<Self> {
         let mut graph = KnowledgeGraph::new();
-        let name = doc
-            .metadata
-            .get("title")
-            .cloned()
-            .or_else(|| doc.metadata.get("filename").cloned())
-            .unwrap_or_else(|| doc.id.to_string());
 
-        let entity = Entity { id: doc.id, name, kind: EntityKind::Other };
+        // ---- Pass 1: entity extraction ----
+        let entity_prompt = Self::entity_extraction_prompt(doc);
+        let entity_json = llm.complete(&entity_prompt).await?;
 
-        graph.add_entity(entity)?;
+        let entities = Self::parse_entities_json(&entity_json)?;
+
+        // Add entities; skip duplicates (MiroFish resilience contract).
+        for entity in &entities {
+            if !graph.index.contains_key(&entity.name) {
+                graph.add_entity(entity.clone())?;
+            }
+        }
+
+        // If no entities were extracted, return a valid empty graph (not an error).
+        if graph.entity_count() == 0 {
+            return Ok(graph);
+        }
+
+        // ---- Pass 2: relation extraction ----
+        // Collect the entities actually in the graph (post-dedup) for the prompt.
+        let graph_entities: Vec<Entity> = graph.get_all_entities().into_iter().cloned().collect();
+        let relation_prompt = Self::relation_extraction_prompt(doc, &graph_entities);
+        let relation_json = llm.complete(&relation_prompt).await?;
+
+        // Parse relations, skipping any that reference an unknown entity name.
+        let value: Value = serde_json::from_str(&relation_json)
+            .map_err(|e| TeriError::Graph(format!("Invalid relation JSON from LLM: {e}")))?;
+
+        if let Some(arr) = value.as_array() {
+            for item in arr {
+                let from_name = match item.get("from").and_then(Value::as_str) {
+                    Some(n) => n,
+                    None => continue, // skip malformed item
+                };
+                let to_name = match item.get("to").and_then(Value::as_str) {
+                    Some(n) => n,
+                    None => continue, // skip malformed item
+                };
+
+                // Skip relations referencing entities not in the graph.
+                let from_idx = match graph.index.get(from_name).copied() {
+                    Some(idx) => idx,
+                    None => continue,
+                };
+                let to_idx = match graph.index.get(to_name).copied() {
+                    Some(idx) => idx,
+                    None => continue,
+                };
+
+                let kind_str = item.get("kind").and_then(Value::as_str).unwrap_or("Other");
+                let kind = match kind_str {
+                    "WorksFor" => RelationKind::WorksFor,
+                    "LocatedIn" => RelationKind::LocatedIn,
+                    "RelatedTo" => RelationKind::RelatedTo,
+                    "Causes" => RelationKind::Causes,
+                    "Affects" => RelationKind::Affects,
+                    _ => RelationKind::Other,
+                };
+
+                let weight = match item.get("weight").and_then(Value::as_f64) {
+                    Some(w) if (0.0..=1.0).contains(&w) => w as f32,
+                    // Skip relations with missing or out-of-range weight.
+                    _ => continue,
+                };
+
+                graph.add_relation(from_idx, to_idx, Relation { kind, weight });
+            }
+        }
+        // A non-array relation response is tolerated as empty — no relations added.
+
         Ok(graph)
     }
 
@@ -651,21 +725,145 @@ mod tests {
         assert!(b_found);
     }
 
-    #[test]
-    fn test_build_from_seed_document() {
+    /// build() now performs the real two-pass LLM extraction pipeline.
+    /// This test uses the mock LLM (same pattern as test_graph_construction_with_mock_llm)
+    /// and verifies that build() wires the full pipeline end-to-end.
+    #[tokio::test]
+    async fn test_build_from_seed_document() {
+        let entity_response = r#"[
+            {"name": "Alice", "kind": "Person"},
+            {"name": "Acme Corp", "kind": "Organization"}
+        ]"#;
+        let relation_response = r#"[
+            {"from": "Alice", "to": "Acme Corp", "kind": "WorksFor", "weight": 0.9}
+        ]"#;
+
+        let mock_llm = MockLlmClient::new(entity_response, relation_response);
+
         let mut metadata = HashMap::new();
         metadata.insert("title".to_string(), "Test Doc".to_string());
         let doc = SeedDocument {
             id: Uuid::new_v4(),
-            raw_text: "body".to_string(),
+            raw_text: "Alice works at Acme Corp.".to_string(),
             metadata,
             created_at: Utc::now(),
         };
 
-        let graph = KnowledgeGraph::build(&doc).expect("build graph");
+        let graph = KnowledgeGraph::build(&doc, &mock_llm).await.expect("build graph");
+
+        // Two entities extracted and added.
+        assert_eq!(graph.entity_count(), 2, "expected 2 entities");
+        let alice = graph.get_entity("Alice").expect("Alice must be present");
+        assert_eq!(alice.kind, EntityKind::Person);
+        let acme = graph.get_entity("Acme Corp").expect("Acme Corp must be present");
+        assert_eq!(acme.kind, EntityKind::Organization);
+
+        // One relation extracted and wired.
+        assert_eq!(graph.relation_count(), 1, "expected 1 relation");
+
+        // Alice's neighbor is Acme Corp.
+        let neighbors = graph.get_neighbors(alice.id).expect("neighbors");
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].name, "Acme Corp");
+    }
+
+    /// build() with an empty entity response must return a valid empty graph, not an error.
+    #[tokio::test]
+    async fn test_build_empty_extraction_tolerates() {
+        let mock_llm = MockLlmClient::new("[]", "[]");
+
+        let doc = SeedDocument {
+            id: Uuid::new_v4(),
+            raw_text: "Completely unrecognizable gibberish.".to_string(),
+            metadata: HashMap::new(),
+            created_at: Utc::now(),
+        };
+
+        let graph = KnowledgeGraph::build(&doc, &mock_llm).await.expect("empty extraction is not an error");
+        assert_eq!(graph.entity_count(), 0, "empty extraction yields empty graph");
+        assert_eq!(graph.relation_count(), 0);
+    }
+
+    /// build() must skip duplicate entity names from the LLM response rather than aborting.
+    #[tokio::test]
+    async fn test_build_duplicate_entity_is_skipped() {
+        // LLM returns "Alice" twice — second occurrence must be silently dropped.
+        let entity_response = r#"[
+            {"name": "Alice", "kind": "Person"},
+            {"name": "Alice", "kind": "Organization"}
+        ]"#;
+        let mock_llm = MockLlmClient::new(entity_response, "[]");
+
+        let doc = SeedDocument {
+            id: Uuid::new_v4(),
+            raw_text: "Duplicate test.".to_string(),
+            metadata: HashMap::new(),
+            created_at: Utc::now(),
+        };
+
+        // Must NOT error — only one entity in the graph.
+        let graph = KnowledgeGraph::build(&doc, &mock_llm).await
+            .expect("duplicate entity must not abort build");
+        assert_eq!(graph.entity_count(), 1, "second Alice must be silently skipped");
+        let alice = graph.get_entity("Alice").expect("Alice must be present");
+        // First occurrence wins — kind is Person.
+        assert_eq!(alice.kind, EntityKind::Person);
+    }
+
+    /// build() must skip relations that reference an entity name not in the graph.
+    #[tokio::test]
+    async fn test_build_unknown_entity_relation_is_skipped() {
+        let entity_response = r#"[{"name": "Alice", "kind": "Person"}]"#;
+        // "Bob" is not in the entity list — this relation must be skipped, not faulted.
+        let relation_response = r#"[
+            {"from": "Alice", "to": "Bob", "kind": "RelatedTo", "weight": 0.5}
+        ]"#;
+        let mock_llm = MockLlmClient::new(entity_response, relation_response);
+
+        let doc = SeedDocument {
+            id: Uuid::new_v4(),
+            raw_text: "Alice mentions Bob.".to_string(),
+            metadata: HashMap::new(),
+            created_at: Utc::now(),
+        };
+
+        let graph = KnowledgeGraph::build(&doc, &mock_llm).await
+            .expect("unknown-entity relation must not abort build");
         assert_eq!(graph.entity_count(), 1);
-        let ent = graph.get_entity("Test Doc").expect("entity present");
-        assert_eq!(ent.kind, EntityKind::Other);
+        // The relation referencing unknown "Bob" must be dropped.
+        assert_eq!(graph.relation_count(), 0, "relation to unknown entity must be skipped");
+    }
+
+    /// build() must propagate LLM errors as TeriError rather than swallowing them.
+    #[tokio::test]
+    async fn test_build_propagates_llm_error() {
+        struct ErrorLlmClient;
+        #[async_trait]
+        impl LlmClient for ErrorLlmClient {
+            async fn complete(&self, _prompt: &str) -> Result<String> {
+                Err(TeriError::Llm("simulated LLM failure".to_string()))
+            }
+            async fn complete_json<T: serde::de::DeserializeOwned>(&self, _prompt: &str) -> Result<T> {
+                Err(TeriError::Llm("simulated LLM failure".to_string()))
+            }
+            async fn stream(
+                &self,
+                _prompt: &str,
+            ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+                Err(TeriError::Llm("simulated LLM failure".to_string()))
+            }
+        }
+
+        let doc = SeedDocument {
+            id: Uuid::new_v4(),
+            raw_text: "Some text.".to_string(),
+            metadata: HashMap::new(),
+            created_at: Utc::now(),
+        };
+
+        let result = KnowledgeGraph::build(&doc, &ErrorLlmClient).await;
+        assert!(result.is_err(), "LLM error must propagate");
+        assert!(result.unwrap_err().to_string().contains("simulated LLM failure"));
     }
 
     #[test]

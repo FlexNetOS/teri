@@ -29,7 +29,7 @@ Status legend: `pending` (not started).
 ## Layer 3 — External Integration Services
 - [ ] U-013 · reuse-Y · — · verify-only `src/seed` · -> seed chunk/preprocess · refs: — · pending · verify-only vs X (skip fresh port)
 - [ ] U-014 · port-fresh · `OntologyGenerator` · new module src/graph/ontology.rs · -> teri::graph::ontology · refs: graph (EntityKind::Custom), llm · pending
-- [ ] U-015 · map-onto-substrate · `KnowledgeGraph::build` · map-onto `src/graph` (wire pipeline) · -> teri::graph::KnowledgeGraph::build · refs: extraction helpers, llm, models::task · pending · verify-only vs X (build() pipeline must land first)
+- [x] U-015 · map-onto-substrate · `KnowledgeGraph::build` · map-onto `src/graph` (wire pipeline) · -> teri::graph::KnowledgeGraph::build · refs: extraction helpers, llm, models::task · VERIFIED-IN-TERI 2026-06-14 · build() pipeline landed + parity-verified (5 branches match MiroFish; 156-test baseline intact; findings/parity.md). Open `- [!]` GAP-U015-1: chunking → U-013
 - [ ] U-016 · map-onto-substrate · — · map-onto `src/graph` · -> get_entity_with_context/get_entities_by_type · refs: graph::get_subgraph · pending · verify-only vs X (skip fresh port)
 - [ ] U-017 · map-onto-substrate · — · map-onto `src/graph`+`src/report` · -> graph::search/panorama_search/insight_forge · refs: GAP-1 valid_at, GAP-2 vec, sim::ipc · pending · verify-only vs X (needs valid_at + vec impl)
 - [ ] U-018 · extend-Y · `PersonaGenerator` · merge-into `src/agent` · -> teri::agent::Persona (social fields) · refs: agent/mod.rs:14, sim · pending
