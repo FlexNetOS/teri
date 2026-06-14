@@ -40,8 +40,8 @@ classes: port-fresh=17 extend-Y=6 reuse-Y=18 map-onto-substrate=13   # locked by
 #   LLM_API_KEY; Zep/OASIS-path units are map-onto-substrate (verified as behavioral equivalence of the
 #   mapped teri path, not by running MiroFish's Zep/OASIS path which needs external creds).
 last_item: (none — DISCOVER complete)
-status: HAND OFF at cycle budget (2 ITERATE cycles done this session). U-015 + GAP-1 + GAP-2 [x], 171 green. develop tip repair staged (9836238, not yet PR'd). evolution-find iter-2 applied (harness_hub PR #31 merged, 4fb5f71: build-health-auditor EXECUTES baseline + fail-closed on red tip; relay-noise return-integrity rule).
-loop_iteration: 2 (ITERATE c1-c2 + eval) done; next = 3 (ITERATE c3 = Action social variants)
-next_iterate: Action enum social variants (sim Action + agent parser + WorldState::apply) — unlocks U-022/028/029/030
+status: HAND OFF at cycle budget (3 ITERATE cycles total). U-015 + GAP-1 + GAP-2 + GAP-ACTION-TAXONOMY [x], 220 green. develop tip repair staged (9836238, not yet PR'd). evolution-find applied each loop: harness_hub PR #30/#31/#32 merged.
+loop_iteration: 3 (ITERATE c3 Action taxonomy + eval) done; next = 4 (reuse-Y verify-only quick-wins, then extend-Y/port-fresh)
+next_iterate: reuse-Y verify-only quick-wins (18 units — differential verify teri's existing symbols vs MiroFish; mark [x] or reclassify extend-Y). Then U-013/text_processor, extend-Y, port-fresh (HTTP API, sim lifecycle, community adapters+social-sim, IPC, config-gen, ontology, Vue re-point).
 last_update: 2026-06-14T12:30:00Z
 next_iterate: U-015 (wire KnowledgeGraph::build) -> OQ-2/OQ-3 (Relation.valid_at + query_vec_similarity) -> Action enum social variants (unlocks U-022/028/029/030)

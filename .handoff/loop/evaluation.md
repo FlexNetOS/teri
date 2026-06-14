@@ -69,3 +69,7 @@ The baseline-gate edit only **strengthens**: it converts "confirm it builds" int
 task) on a non-compiling dest tip — never emit GREEN you did not run." No parity, symbol, merge, or DONE
 condition is loosened. The relay-noise rule adds a return-integrity requirement; it relaxes nothing. F-G3
 is proposed, not applied, because it is promotion-adjacent. Scope law honored (rust-port harness only).
+
+## ITERATE cycle-3 addendum (2026-06-14, LIGHTWEIGHT find)
+- **Gate worked, twice:** opus parity gate caught 2 no-downgrade defects in the social-taxonomy port by reading source dispatch + `to_episode_text` — TREND dropped (survives `FILTERED_ACTIONS`, IS recorded) and Like/Dislike post-vs-comment narrowed (separate render paths + ID namespaces). FAIL→fix→re-verify→PASS (parity.md l104-171, commit dabcb77). Keep this source-reading strength.
+- **Lesson applied (strengthen-only, in-scope):** added a consolidation/omission-discriminant rule to `rust-port-porter` agent def + `rust-port-translate` SKILL — prove downstream-indistinguishability before COLLAPSING/OMITTING a variant, else preserve the discriminant. Cuts collapse-then-bounce retries across the remaining ~45 units. LESSONS.md row appended.
