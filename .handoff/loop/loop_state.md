@@ -17,9 +17,12 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 9
-cycles_total: 9
-ledger: parity 8/50 units verified [x] (U-004, U-006, U-008, U-009, U-013, U-015, U-018, U-048) + GAP-1/2/6/U015-1/ACTION-TAXONOMY resolved   # +U-004 rotating-file logging (file-rotate 10MB×5, opt-in TERI_LOG_DIR) — both owner-flagged [≠] feature-skips now PORTED; 315 green
+cycles_this_session: 10
+cycles_total: 10
+HANDOFF: SESSION BUDGET EXHAUSTED 2026-06-14 — see HANDOFF.md (authoritative). FIRST next-session action = re-run the parity gate for the [≠]-audit ports S-360/361/356/048 (committed green 20e2e48, parity-pending [~]). NO ScheduleWakeup armed (owner ended session).
+ledger: parity 8/50 units verified [x] (U-004, U-006, U-008, U-009, U-013, U-015, U-018, U-048) + GAP-1/2/6/U015-1/ACTION-TAXONOMY resolved; +4 [≠]-audit symbol ports [~] parity-pending (S-360/361 JSON-salvage, S-356 graph-enrichment, S-048 batch-retry)   # 333 green
+# [≠] RE-AUDIT DONE (owner-flagged): 47 [≠] re-challenged under tightened bar (harness PR #34). 4 disguised
+#   skips ported [~]; S-189->U-012 + S-192->U-014 reclassified pending; Zep-SaaS/jitter/REFRESH/json-superset keep.
 # NO-DOWNGRADE CORRECTION (owner-flagged): [≠] is for genuinely-inexpressible/non-contractual ONLY,
 #   never "destination won't use it". U-018 to_reddit/twitter_format/to_dict were wrongly [≠]-skipped ->
 #   PORTED. U-004 rotating-file logging same error -> reclassify extend-Y, port next. Audit other [≠].
