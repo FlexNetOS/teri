@@ -45,18 +45,13 @@ impl SeedIngestor {
 
         for (i, path) in paths.iter().enumerate() {
             let idx = i + 1;
-            let filename = Path::new(path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(path);
+            let filename = Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path);
             match Self::from_file(path).await {
                 Ok(doc) => {
                     all_texts.push(format!("=== 文档 {idx}: {filename} ===\n{}", doc.raw_text));
                 }
                 Err(e) => {
-                    all_texts.push(format!(
-                        "=== 文档 {idx}: {path} (提取失败: {e}) ==="
-                    ));
+                    all_texts.push(format!("=== 文档 {idx}: {path} (提取失败: {e}) ==="));
                 }
             }
         }
@@ -636,7 +631,10 @@ mod tests {
         let latin1_bytes: &[u8] = &[0x63, 0x61, 0x66, 0xE9];
         let result = SeedIngestor::read_text_with_fallback(latin1_bytes);
         // Windows-1252 maps 0xE9 → é (U+00E9), identical to Latin-1
-        assert_eq!(result, "café", "Latin-1 bytes should decode correctly via Windows-1252 fallback");
+        assert_eq!(
+            result, "café",
+            "Latin-1 bytes should decode correctly via Windows-1252 fallback"
+        );
     }
 
     /// Valid UTF-8 must pass through unchanged (first-path short-circuit).
@@ -702,8 +700,7 @@ mod tests {
         let content = "Markdown with .markdown extension.";
         tokio::fs::write(test_file, content).await.expect("write .markdown fixture");
 
-        let doc =
-            SeedIngestor::from_file(test_file).await.expect("should ingest .markdown file");
+        let doc = SeedIngestor::from_file(test_file).await.expect("should ingest .markdown file");
         assert_eq!(doc.raw_text, content);
         assert_eq!(doc.metadata.get("file_format").unwrap(), "markdown");
 
@@ -773,7 +770,9 @@ mod tests {
         tokio::fs::write(file1, "Good content").await.expect("write ok file");
 
         let missing = "/tmp/does_not_exist_for_batch_test_99999.txt";
-        let doc = SeedIngestor::from_files(&[file1, missing]).await.expect("from_files returns Ok");
+        let doc = SeedIngestor::from_files(&[file1, missing])
+            .await
+            .expect("from_files returns Ok");
 
         assert!(doc.raw_text.contains("Good content"), "good file must be in output");
         assert!(doc.raw_text.contains("提取失败"), "failed file must produce an error marker");

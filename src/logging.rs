@@ -34,12 +34,7 @@
 //! bytes, and inspect the rotated files.
 
 use crate::error::Result;
-use file_rotate::{
-    ContentLimit,
-    FileRotate,
-    compression::Compression,
-    suffix::AppendCount,
-};
+use file_rotate::{ContentLimit, FileRotate, compression::Compression, suffix::AppendCount};
 use std::path::{Path, PathBuf};
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -72,10 +67,7 @@ pub const LOG_DIR_ENV: &str = "TERI_LOG_DIR";
 ///
 /// # Errors
 /// Returns an error if the directory cannot be created.
-pub fn build_rotating_writer(
-    log_dir: &Path,
-    filename: &str,
-) -> Result<FileRotate<AppendCount>> {
+pub fn build_rotating_writer(log_dir: &Path, filename: &str) -> Result<FileRotate<AppendCount>> {
     std::fs::create_dir_all(log_dir).map_err(|e| {
         crate::error::TeriError::Config(format!(
             "Failed to create log directory '{}': {e}",
@@ -118,31 +110,21 @@ pub fn init_logging(level: &str) -> Result<()> {
             let writer = build_rotating_writer(&log_dir, "teri.log")?;
 
             // File layer always at DEBUG+ (MiroFish: file_handler.setLevel(DEBUG))
-            let file_filter =
-                EnvFilter::try_new("debug").expect("static filter string is valid");
+            let file_filter = EnvFilter::try_new("debug").expect("static filter string is valid");
 
             let file_layer = fmt::layer()
                 .with_ansi(false)
                 .with_writer(std::sync::Mutex::new(writer))
                 .with_filter(file_filter);
 
-            let console_layer = fmt::layer()
-                .with_target(true)
-                .with_level(true)
-                .with_filter(console_filter);
+            let console_layer =
+                fmt::layer().with_target(true).with_level(true).with_filter(console_filter);
 
-            tracing_subscriber::registry()
-                .with(console_layer)
-                .with(file_layer)
-                .init();
+            tracing_subscriber::registry().with(console_layer).with(file_layer).init();
         }
         _ => {
             // Console-only — identical to the original implementation
-            fmt()
-                .with_env_filter(console_filter)
-                .with_target(true)
-                .with_level(true)
-                .init();
+            fmt().with_env_filter(console_filter).with_target(true).with_level(true).init();
         }
     }
 
@@ -215,7 +197,7 @@ mod tests {
         let mut writer: FileRotate<AppendCount> = FileRotate::new(
             &log_path,
             AppendCount::new(LOG_BACKUP_COUNT),
-            ContentLimit::Bytes(100),      // tiny limit for fast rotation
+            ContentLimit::Bytes(100), // tiny limit for fast rotation
             Compression::None,
             None,
         );

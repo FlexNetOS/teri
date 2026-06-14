@@ -58,8 +58,7 @@ pub fn split_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> 
     }
 
     // Separator priority list — identical to MiroFish's `for sep in [...]` loop order.
-    const SEPS: &[&str] =
-        &["。", "！", "？", ".\n", "!\n", "?\n", "\n\n", ". ", "! ", "? "];
+    const SEPS: &[&str] = &["。", "！", "？", ".\n", "!\n", "?\n", "\n\n", ". ", "! ", "? "];
 
     let mut chunks: Vec<String> = Vec::new();
     let mut start_char: usize = 0; // cursor in char positions

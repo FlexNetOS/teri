@@ -345,8 +345,8 @@ impl MemoryStore {
                     .map_err(|e| TeriError::Memory(format!("Iterator error: {e}")))?;
 
                 for item in iter {
-                    let (k, v) = item
-                        .map_err(|e| TeriError::Memory(format!("Iterator item error: {e}")))?;
+                    let (k, v) =
+                        item.map_err(|e| TeriError::Memory(format!("Iterator item error: {e}")))?;
                     if !k.value().starts_with(&prefix) {
                         break;
                     }
@@ -359,8 +359,7 @@ impl MemoryStore {
                     }
 
                     // Compute entry L2-norm; skip zero-norm.
-                    let entry_norm: f32 =
-                        entry.embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    let entry_norm: f32 = entry.embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
                     if entry_norm == 0.0 {
                         continue;
                     }
@@ -635,7 +634,9 @@ mod tests {
 
         let agent_id = Uuid::new_v4();
         let query_embedding = vec![0.1, 0.2, 0.3];
-        let result = store.query_vec_similarity(agent_id, &query_embedding, 5).await
+        let result = store
+            .query_vec_similarity(agent_id, &query_embedding, 5)
+            .await
             .expect("empty store must succeed, not error");
         assert!(result.is_empty(), "empty store must return empty vec");
     }
@@ -678,16 +679,30 @@ mod tests {
         }
 
         let query = vec![0.0, 1.0, 0.0];
-        let results = store.query_vec_similarity(agent_id, &query, 3).await
+        let results = store
+            .query_vec_similarity(agent_id, &query, 3)
+            .await
             .expect("query must succeed");
 
         assert_eq!(results.len(), 3);
         // B must rank first (similarity ≈ 1.0)
-        assert!(results[0].content.contains("B"), "B must rank first; got: {}", results[0].content);
+        assert!(
+            results[0].content.contains("B"),
+            "B must rank first; got: {}",
+            results[0].content
+        );
         // C must rank second (similarity = 0.8)
-        assert!(results[1].content.contains("C"), "C must rank second; got: {}", results[1].content);
+        assert!(
+            results[1].content.contains("C"),
+            "C must rank second; got: {}",
+            results[1].content
+        );
         // A must rank last (similarity = 0.0)
-        assert!(results[2].content.contains("A"), "A must rank last; got: {}", results[2].content);
+        assert!(
+            results[2].content.contains("A"),
+            "A must rank last; got: {}",
+            results[2].content
+        );
     }
 
     #[tokio::test]
@@ -712,7 +727,9 @@ mod tests {
 
         // Request only 2
         let query = vec![1.0, 0.0, 0.0];
-        let results = store.query_vec_similarity(agent_id, &query, 2).await
+        let results = store
+            .query_vec_similarity(agent_id, &query, 2)
+            .await
             .expect("query must succeed");
         assert_eq!(results.len(), 2, "must return at most top_k=2");
     }
@@ -724,8 +741,8 @@ mod tests {
         let store = MemoryStore::new(&db_path).expect("Failed to create memory store");
         let agent_id = Uuid::new_v4();
         // Use a fixed base so timestamps are well-separated (100ms apart) to avoid key collision.
-        let base_time = chrono::DateTime::from_timestamp(1_700_000_000, 0)
-            .expect("valid timestamp");
+        let base_time =
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp");
 
         // Store 3 vectors with non-zero embeddings and well-separated timestamps (100ms apart).
         // i+1 avoids the [0.0, 0.0] zero-norm case that would be silently skipped.
@@ -741,7 +758,9 @@ mod tests {
 
         // Request more than available
         let query = vec![1.0, 0.0];
-        let results = store.query_vec_similarity(agent_id, &query, 100).await
+        let results = store
+            .query_vec_similarity(agent_id, &query, 100)
+            .await
             .expect("query must succeed");
         assert_eq!(results.len(), 3, "when top_k >= available, must return all");
     }
@@ -774,7 +793,9 @@ mod tests {
 
         // Query with 2-dim → 3-dim entry is skipped, 2-dim entry is returned
         let query = vec![1.0, 0.0];
-        let results = store.query_vec_similarity(agent_id, &query, 10).await
+        let results = store
+            .query_vec_similarity(agent_id, &query, 10)
+            .await
             .expect("dimension mismatch must not error");
         assert_eq!(results.len(), 1, "3-dim entry must be skipped; only 2-dim returned");
         assert!(results[0].content.contains("2-dim"));
@@ -796,8 +817,8 @@ mod tests {
         };
         store.write_vec(agent_id, &entry).await.expect("write");
 
-        let results = store.query_vec_similarity(agent_id, &vec, 1).await
-            .expect("query must succeed");
+        let results =
+            store.query_vec_similarity(agent_id, &vec, 1).await.expect("query must succeed");
         assert_eq!(results.len(), 1);
         // We can't directly read the score but the identical vector must rank first (and only).
         assert_eq!(results[0].content, "identical");

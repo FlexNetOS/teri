@@ -956,25 +956,35 @@ mod tests {
 
     #[test]
     fn test_social_action_display_like_post() {
-        let a = SocialAction::Like { target_kind: TargetKind::Post, target_id: "post-42".to_string() };
+        let a =
+            SocialAction::Like { target_kind: TargetKind::Post, target_id: "post-42".to_string() };
         assert_eq!(a.to_string(), "Liked post: post-42");
     }
 
     #[test]
     fn test_social_action_display_like_comment() {
-        let a = SocialAction::Like { target_kind: TargetKind::Comment, target_id: "comment-7".to_string() };
+        let a = SocialAction::Like {
+            target_kind: TargetKind::Comment,
+            target_id: "comment-7".to_string(),
+        };
         assert_eq!(a.to_string(), "Liked comment: comment-7");
     }
 
     #[test]
     fn test_social_action_display_dislike_post() {
-        let a = SocialAction::Dislike { target_kind: TargetKind::Post, target_id: "post-7".to_string() };
+        let a = SocialAction::Dislike {
+            target_kind: TargetKind::Post,
+            target_id: "post-7".to_string(),
+        };
         assert_eq!(a.to_string(), "Disliked post: post-7");
     }
 
     #[test]
     fn test_social_action_display_dislike_comment() {
-        let a = SocialAction::Dislike { target_kind: TargetKind::Comment, target_id: "comment-3".to_string() };
+        let a = SocialAction::Dislike {
+            target_kind: TargetKind::Comment,
+            target_id: "comment-3".to_string(),
+        };
         assert_eq!(a.to_string(), "Disliked comment: comment-3");
     }
 
@@ -994,7 +1004,10 @@ mod tests {
 
     #[test]
     fn test_social_action_display_quote() {
-        let a = SocialAction::Quote { post_id: "post-5".to_string(), content: "great take".to_string() };
+        let a = SocialAction::Quote {
+            post_id: "post-5".to_string(),
+            content: "great take".to_string(),
+        };
         assert_eq!(a.to_string(), "Quoted post post-5: great take");
     }
 
@@ -1006,7 +1019,8 @@ mod tests {
 
     #[test]
     fn test_social_action_display_comment() {
-        let a = SocialAction::Comment { post_id: "post-3".to_string(), content: "nice!".to_string() };
+        let a =
+            SocialAction::Comment { post_id: "post-3".to_string(), content: "nice!".to_string() };
         assert_eq!(a.to_string(), "Commented on post-3: nice!");
     }
 
@@ -1043,14 +1057,32 @@ mod tests {
 
         let cases = vec![
             Action::Social(SocialAction::CreatePost { content: "test".to_string() }),
-            Action::Social(SocialAction::Like { target_kind: TargetKind::Post, target_id: "p1".to_string() }),
-            Action::Social(SocialAction::Like { target_kind: TargetKind::Comment, target_id: "c1".to_string() }),
-            Action::Social(SocialAction::Dislike { target_kind: TargetKind::Post, target_id: "p2".to_string() }),
-            Action::Social(SocialAction::Dislike { target_kind: TargetKind::Comment, target_id: "c2".to_string() }),
+            Action::Social(SocialAction::Like {
+                target_kind: TargetKind::Post,
+                target_id: "p1".to_string(),
+            }),
+            Action::Social(SocialAction::Like {
+                target_kind: TargetKind::Comment,
+                target_id: "c1".to_string(),
+            }),
+            Action::Social(SocialAction::Dislike {
+                target_kind: TargetKind::Post,
+                target_id: "p2".to_string(),
+            }),
+            Action::Social(SocialAction::Dislike {
+                target_kind: TargetKind::Comment,
+                target_id: "c2".to_string(),
+            }),
             Action::Social(SocialAction::Repost { post_id: "p3".to_string() }),
-            Action::Social(SocialAction::Quote { post_id: "p4".to_string(), content: "q".to_string() }),
+            Action::Social(SocialAction::Quote {
+                post_id: "p4".to_string(),
+                content: "q".to_string(),
+            }),
             Action::Social(SocialAction::Follow { user_id: "u1".to_string() }),
-            Action::Social(SocialAction::Comment { post_id: "p5".to_string(), content: "c".to_string() }),
+            Action::Social(SocialAction::Comment {
+                post_id: "p5".to_string(),
+                content: "c".to_string(),
+            }),
             Action::Social(SocialAction::SearchPosts { query: "q1".to_string() }),
             Action::Social(SocialAction::SearchUser { query: "q2".to_string() }),
             Action::Social(SocialAction::Mute { user_id: "u2".to_string() }),
@@ -1256,7 +1288,10 @@ mod tests {
         // Late subscriber: subscribes after run() has already sent the completion signal.
         let late_rx = engine.subscribe_completion();
         let completion = late_rx.borrow().clone();
-        assert!(completion.is_some(), "late subscriber must see completion immediately via watch");
+        assert!(
+            completion.is_some(),
+            "late subscriber must see completion immediately via watch"
+        );
         assert_eq!(completion.unwrap().total_ticks, N);
     }
 

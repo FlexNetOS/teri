@@ -254,8 +254,7 @@ impl OpenAiAdapter {
                         return resp.json().await.map_err(|e| TeriError::Http(e.to_string()));
                     } else if resp.status().is_server_error() && retries < self.max_retries {
                         retries += 1;
-                        let delay =
-                            (2_u64.pow(retries)).min(MAX_BACKOFF_SECS);
+                        let delay = (2_u64.pow(retries)).min(MAX_BACKOFF_SECS);
                         tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                         continue;
                     } else {
@@ -907,9 +906,9 @@ mod tests {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
             when.method(POST).path("/chat/completions");
-            then.status(200).header("Content-Type", "application/json").body(
-                r#"{"choices":[{"message":{"content":"Hello from mock"}}]}"#,
-            );
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"choices":[{"message":{"content":"Hello from mock"}}]}"#);
         });
 
         let client = OpenAiAdapter::new(&openai_config(&server, 0));
@@ -923,9 +922,9 @@ mod tests {
         let server = MockServer::start();
         server.mock(|when, then| {
             when.method(POST).path("/chat/completions");
-            then.status(200).header("Content-Type", "application/json").body(
-                r#"{"choices":[{"message":{"content":"<think>inner</think>Result"}}]}"#,
-            );
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"choices":[{"message":{"content":"<think>inner</think>Result"}}]}"#);
         });
 
         let client = OpenAiAdapter::new(&openai_config(&server, 0));
@@ -957,9 +956,9 @@ mod tests {
         let server = MockServer::start();
         server.mock(|when, then| {
             when.method(POST).path("/chat/completions");
-            then.status(200).header("Content-Type", "application/json").body(
-                r#"{"choices":[{"message":{"content":"{\"v\":42}"}}]}"#,
-            );
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"choices":[{"message":{"content":"{\"v\":42}"}}]}"#);
         });
 
         let client = OpenAiAdapter::new(&openai_config(&server, 0));
@@ -1012,9 +1011,9 @@ mod tests {
         let server = MockServer::start();
         server.mock(|when, then| {
             when.method(POST).path("/v1/messages");
-            then.status(200).header("Content-Type", "application/json").body(
-                r#"{"content":[{"text":"<think>internal</think>Answer"}]}"#,
-            );
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"content":[{"text":"<think>internal</think>Answer"}]}"#);
         });
 
         let client = AnthropicAdapter::new_with_base(
@@ -1163,9 +1162,9 @@ mod tests {
         let server = MockServer::start();
         let mock_200 = server.mock(|when, then| {
             when.method(POST).path("/chat/completions");
-            then.status(200).header("Content-Type", "application/json").body(
-                r#"{"choices":[{"message":{"content":"immediate-ok"}}]}"#,
-            );
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"choices":[{"message":{"content":"immediate-ok"}}]}"#);
         });
 
         let client = OpenAiAdapter::new(&openai_config(&server, 3));
@@ -1195,9 +1194,9 @@ mod tests {
         });
         let mock_200 = server.mock(|when, then| {
             when.method(POST).path("/chat/completions");
-            then.status(200).header("Content-Type", "application/json").body(
-                r#"{"choices":[{"message":{"content":"recovered-ok"}}]}"#,
-            );
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"choices":[{"message":{"content":"recovered-ok"}}]}"#);
         });
 
         let client = OpenAiAdapter::new(&openai_config(&server, 3));
@@ -1277,9 +1276,7 @@ data: [DONE]\n",
     }
 
     fn err_op(msg: &'static str) -> BoxOp {
-        Box::new(move || {
-            Box::pin(async move { Err(TeriError::Llm(msg.to_string())) })
-        })
+        Box::new(move || Box::pin(async move { Err(TeriError::Llm(msg.to_string())) }))
     }
 
     /// All ops succeed → results contains every value in input order; no failures.
@@ -1350,22 +1347,14 @@ data: [DONE]\n",
         let ops: Vec<BoxOp> = vec![Box::new(|| {
             Box::pin(async {
                 let attempt = CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-                if attempt == 0 {
-                    Err(TeriError::Llm("transient".to_string()))
-                } else {
-                    Ok(42u32)
-                }
+                if attempt == 0 { Err(TeriError::Llm("transient".to_string())) } else { Ok(42u32) }
             })
         })];
         // max_retries=1 → up to 2 total attempts; op recovers on attempt 1
         let batch = call_batch_with_retry(ops, 1, true).await.unwrap();
         assert_eq!(batch.results, vec![42], "must recover on retry");
         assert!(batch.failures.is_empty(), "no permanent failures");
-        assert_eq!(
-            CALL_COUNT.load(Ordering::SeqCst),
-            2,
-            "must have been called exactly twice"
-        );
+        assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 2, "must have been called exactly twice");
     }
 
     #[tokio::test]

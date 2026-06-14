@@ -142,21 +142,15 @@ impl Config {
         }
 
         if self.sim.default_agent_count == 0 {
-            return Err(TeriError::Config(
-                "DEFAULT_AGENT_COUNT must be > 0".to_string(),
-            ));
+            return Err(TeriError::Config("DEFAULT_AGENT_COUNT must be > 0".to_string()));
         }
 
         if self.sim.max_ticks == 0 {
-            return Err(TeriError::Config(
-                "SIM_MAX_TICKS must be > 0".to_string(),
-            ));
+            return Err(TeriError::Config("SIM_MAX_TICKS must be > 0".to_string()));
         }
 
         if self.sim.parallelism == 0 {
-            return Err(TeriError::Config(
-                "SIM_PARALLELISM must be > 0".to_string(),
-            ));
+            return Err(TeriError::Config("SIM_PARALLELISM must be > 0".to_string()));
         }
 
         if self.api.bind_addr.trim().is_empty() {
@@ -164,15 +158,11 @@ impl Config {
         }
 
         if self.persistence.memory_db_path.trim().is_empty() {
-            return Err(
-                TeriError::Config("MEMORY_DB_PATH cannot be empty".to_string()),
-            );
+            return Err(TeriError::Config("MEMORY_DB_PATH cannot be empty".to_string()));
         }
 
         if self.persistence.graph_db_path.trim().is_empty() {
-            return Err(TeriError::Config(
-                "GRAPH_DB_PATH cannot be empty".to_string(),
-            ));
+            return Err(TeriError::Config("GRAPH_DB_PATH cannot be empty".to_string()));
         }
 
         Ok(())

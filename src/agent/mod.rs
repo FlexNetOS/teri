@@ -152,7 +152,8 @@ impl Persona {
             profile["profession"] = serde_json::Value::from(profession.as_str());
         }
         if !social.interested_topics.is_empty() {
-            profile["interested_topics"] = serde_json::Value::from(social.interested_topics.clone());
+            profile["interested_topics"] =
+                serde_json::Value::from(social.interested_topics.clone());
         }
 
         Some(profile)
@@ -209,7 +210,8 @@ impl Persona {
             profile["profession"] = serde_json::Value::from(profession.as_str());
         }
         if !social.interested_topics.is_empty() {
-            profile["interested_topics"] = serde_json::Value::from(social.interested_topics.clone());
+            profile["interested_topics"] =
+                serde_json::Value::from(social.interested_topics.clone());
         }
 
         Some(profile)
@@ -566,9 +568,9 @@ impl Agent {
         }
 
         match action_type {
-            "CREATE_POST" => Some(SocialAction::CreatePost {
-                content: get_arg(content, "content"),
-            }),
+            "CREATE_POST" => {
+                Some(SocialAction::CreatePost { content: get_arg(content, "content") })
+            }
             "LIKE_POST" => Some(SocialAction::Like {
                 target_kind: TargetKind::Post,
                 target_id: get_arg(content, "target_id"),
@@ -585,29 +587,19 @@ impl Agent {
                 target_kind: TargetKind::Comment,
                 target_id: get_arg(content, "target_id"),
             }),
-            "REPOST" => Some(SocialAction::Repost {
-                post_id: get_arg(content, "post_id"),
-            }),
+            "REPOST" => Some(SocialAction::Repost { post_id: get_arg(content, "post_id") }),
             "QUOTE_POST" => Some(SocialAction::Quote {
                 post_id: get_arg(content, "post_id"),
                 content: get_arg(content, "content"),
             }),
-            "FOLLOW" => Some(SocialAction::Follow {
-                user_id: get_arg(content, "user_id"),
-            }),
+            "FOLLOW" => Some(SocialAction::Follow { user_id: get_arg(content, "user_id") }),
             "CREATE_COMMENT" => Some(SocialAction::Comment {
                 post_id: get_arg(content, "post_id"),
                 content: get_arg(content, "content"),
             }),
-            "SEARCH_POSTS" => Some(SocialAction::SearchPosts {
-                query: get_arg(content, "query"),
-            }),
-            "SEARCH_USER" => Some(SocialAction::SearchUser {
-                query: get_arg(content, "query"),
-            }),
-            "MUTE" => Some(SocialAction::Mute {
-                user_id: get_arg(content, "user_id"),
-            }),
+            "SEARCH_POSTS" => Some(SocialAction::SearchPosts { query: get_arg(content, "query") }),
+            "SEARCH_USER" => Some(SocialAction::SearchUser { query: get_arg(content, "query") }),
+            "MUTE" => Some(SocialAction::Mute { user_id: get_arg(content, "user_id") }),
             "TREND" | "trend" => Some(SocialAction::Trend),
             "DO_NOTHING" => Some(SocialAction::DoNothing),
             _ => None,
@@ -639,20 +631,14 @@ impl Agent {
             Action::Social(sa) => {
                 let (desc, imp) = match sa {
                     // High-signal: original content creation
-                    SocialAction::CreatePost { content } => {
-                        (format!("Posted: {}", content), 0.85)
-                    }
+                    SocialAction::CreatePost { content } => (format!("Posted: {}", content), 0.85),
                     // Medium-high: social graph modifications
                     SocialAction::Follow { user_id } => {
                         (format!("Followed user: {}", user_id), 0.75)
                     }
-                    SocialAction::Mute { user_id } => {
-                        (format!("Muted user: {}", user_id), 0.75)
-                    }
+                    SocialAction::Mute { user_id } => (format!("Muted user: {}", user_id), 0.75),
                     // Medium: content amplification
-                    SocialAction::Repost { post_id } => {
-                        (format!("Reposted: {}", post_id), 0.65)
-                    }
+                    SocialAction::Repost { post_id } => (format!("Reposted: {}", post_id), 0.65),
                     SocialAction::Quote { post_id, content } => {
                         (format!("Quoted post {} with: {}", post_id, content), 0.70)
                     }
@@ -984,11 +970,9 @@ impl PersonaGenerator {
         let mut content = content.trim().to_string();
 
         // Count unbalanced braces/brackets
-        let open_braces =
-            content.chars().filter(|&c| c == '{').count() as isize
+        let open_braces = content.chars().filter(|&c| c == '{').count() as isize
             - content.chars().filter(|&c| c == '}').count() as isize;
-        let open_brackets =
-            content.chars().filter(|&c| c == '[').count() as isize
+        let open_brackets = content.chars().filter(|&c| c == '[').count() as isize
             - content.chars().filter(|&c| c == ']').count() as isize;
 
         // Close a dangling (truncated) string: if the last char is not a valid JSON terminal char
@@ -1061,20 +1045,20 @@ impl PersonaGenerator {
                 format!("{}: {}", entity_type, entity_name)
             }
         });
-        let persona = Self::extract_json_string_field_partial(&content, "persona").unwrap_or_else(
-            || {
+        let persona =
+            Self::extract_json_string_field_partial(&content, "persona").unwrap_or_else(|| {
                 if !entity_summary.is_empty() {
                     entity_summary.to_string()
                 } else {
                     format!("{entity_name} is a {entity_type}.")
                 }
-            },
-        );
+            });
 
         // Only return a partial result if we actually extracted something from the content
         // (mirrors MiroFish's `if bio_match or persona_match:` guard)
         let has_bio_match = Self::extract_json_string_field(&content, "bio").is_some();
-        let has_persona_match = Self::extract_json_string_field_partial(&content, "persona").is_some();
+        let has_persona_match =
+            Self::extract_json_string_field_partial(&content, "persona").is_some();
         if has_bio_match || has_persona_match {
             return Some(serde_json::json!({
                 "bio": bio,
@@ -1164,10 +1148,8 @@ impl PersonaGenerator {
                     i += 1;
                 }
                 // Collapse multiple whitespace into single space inside the string
-                let normalized: String = string_content
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let normalized: String =
+                    string_content.split_whitespace().collect::<Vec<_>>().join(" ");
                 result.push_str(&normalized);
                 result.push('"');
             } else {
@@ -1186,11 +1168,7 @@ impl PersonaGenerator {
             .chars()
             .map(|c| {
                 let cp = c as u32;
-                if cp <= 0x1f || (0x7f..=0x9f).contains(&cp) {
-                    ' '
-                } else {
-                    c
-                }
+                if cp <= 0x1f || (0x7f..=0x9f).contains(&cp) { ' ' } else { c }
             })
             .collect();
         // Collapse multiple whitespace
@@ -1205,7 +1183,9 @@ impl PersonaGenerator {
         let field_start = content.find(&needle)?;
         let after_key = &content[field_start + needle.len()..];
         // Skip whitespace and colon
-        let after_colon = after_key.trim_start_matches(|c: char| c.is_whitespace() || c == ':').trim_start();
+        let after_colon = after_key
+            .trim_start_matches(|c: char| c.is_whitespace() || c == ':')
+            .trim_start();
         if !after_colon.starts_with('"') {
             return None;
         }
@@ -1222,7 +1202,9 @@ impl PersonaGenerator {
         let needle = format!("\"{}\"", field);
         let field_start = content.find(&needle)?;
         let after_key = &content[field_start + needle.len()..];
-        let after_colon = after_key.trim_start_matches(|c: char| c.is_whitespace() || c == ':').trim_start();
+        let after_colon = after_key
+            .trim_start_matches(|c: char| c.is_whitespace() || c == ':')
+            .trim_start();
         if !after_colon.starts_with('"') {
             return None;
         }
@@ -1259,14 +1241,9 @@ impl PersonaGenerator {
         // Mirrors `entity.related_nodes` iteration in _build_entity_context:456-472.
         let neighbors = graph.get_neighbors(entity.id).unwrap_or_default();
         if !neighbors.is_empty() {
-            let related_info: Vec<String> = neighbors
-                .iter()
-                .map(|n| format!("- **{}** ({})", n.name, n.kind))
-                .collect();
-            context_parts.push(format!(
-                "### Related Entities\n{}",
-                related_info.join("\n")
-            ));
+            let related_info: Vec<String> =
+                neighbors.iter().map(|n| format!("- **{}** ({})", n.name, n.kind)).collect();
+            context_parts.push(format!("### Related Entities\n{}", related_info.join("\n")));
         }
 
         context_parts.join("\n\n")
@@ -1358,12 +1335,15 @@ Return only valid JSON."#,
                     Ok(v) => Some(v),
                     Err(_) => {
                         // Salvage attempt (S-360 + S-361): try_fix_json before rule-based
-                        Self::try_fix_json(&response, entity_name, entity_type, entity_summary)
-                            .map(|mut v| {
+                        Self::try_fix_json(&response, entity_name, entity_type, entity_summary).map(
+                            |mut v| {
                                 // Strip internal _fixed marker before use
-                                if let Some(m) = v.as_object_mut() { m.remove("_fixed"); }
+                                if let Some(m) = v.as_object_mut() {
+                                    m.remove("_fixed");
+                                }
                                 v
-                            })
+                            },
+                        )
                     }
                 }
             }
@@ -1393,11 +1373,7 @@ Return only valid JSON."#,
             let profession = data["profession"].as_str().map(|s| s.to_string());
             let interested_topics = data["interested_topics"]
                 .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect()
-                })
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
                 .unwrap_or_default();
             let posting_style = data["posting_style"].as_str().map(|s| s.to_string());
 
@@ -1453,87 +1429,124 @@ Return only valid JSON."#,
         let entity_type_lower = entity_type.to_lowercase();
 
         // Individual entity types → personal profile defaults
-        let (bio, persona, age, gender, mbti, country, profession, interested_topics, posting_style) =
-            if matches!(
-                entity_type_lower.as_str(),
-                "student" | "alumni"
-            ) {
-                (
-                    format!("{} with interests in academics and social issues.", entity_type),
-                    if entity_summary.is_empty() {
-                        format!("{entity_name} is a {etl} who is actively engaged in academic and social discussions. They enjoy sharing perspectives and connecting with peers.", etl = entity_type.to_lowercase())
-                    } else {
-                        entity_summary.to_string()
-                    },
-                    Some(22u32),
-                    Some("other".to_string()),
-                    Some("INFP".to_string()),
-                    Some("US".to_string()),
-                    Some("Student".to_string()),
-                    vec!["Education".to_string(), "Social Issues".to_string(), "Technology".to_string()],
-                    Some("Casual, frequent posts on campus life and social topics".to_string()),
-                )
-            } else if matches!(
-                entity_type_lower.as_str(),
-                "publicfigure" | "expert" | "faculty" | "professor"
-            ) {
-                (
-                    "Expert and thought leader in their field.".to_string(),
-                    if entity_summary.is_empty() {
-                        format!("{entity_name} is a recognized {etl} who shares insights and opinions on important matters. They are known for their expertise and influence in public discourse.", etl = entity_type.to_lowercase())
-                    } else {
-                        entity_summary.to_string()
-                    },
-                    Some(45u32),
-                    Some("other".to_string()),
-                    Some("INTJ".to_string()),
-                    Some("US".to_string()),
-                    Some("Expert".to_string()),
-                    vec!["Politics".to_string(), "Economics".to_string(), "Culture & Society".to_string()],
-                    Some("Thoughtful, infrequent posts with expert analysis".to_string()),
-                )
-            } else if matches!(
-                entity_type_lower.as_str(),
-                "university" | "governmentagency" | "organization" | "ngo" | "mediaoutlet" | "company" | "institution" | "group" | "community"
-            ) {
-                // Group/institution entity types → institutional account defaults
-                (
-                    format!("Official account of {}.", entity_name),
-                    if entity_summary.is_empty() {
-                        format!("{entity_name} is an institutional entity that communicates official positions, announcements, and engages with stakeholders on relevant matters.")
-                    } else {
-                        entity_summary.to_string()
-                    },
-                    Some(30u32),
-                    Some("other".to_string()),
-                    Some("ISTJ".to_string()),
-                    Some("China".to_string()),
-                    Some(entity_type.to_string()),
-                    vec!["Public Policy".to_string(), "Community".to_string(), "Official Announcements".to_string()],
-                    Some(format!("Official account for {entity_name}. Professional, measured tone.")),
-                )
-            } else {
-                // Default: generic participant
-                (
-                    if entity_summary.is_empty() {
-                        format!("{}: {}", entity_type, entity_name)
-                    } else {
-                        entity_summary.chars().take(150).collect()
-                    },
-                    if entity_summary.is_empty() {
-                        format!("{entity_name} is a {etl} participating in social discussions.", etl = entity_type.to_lowercase())
-                    } else {
-                        entity_summary.to_string()
-                    },
-                    Some(30u32),
-                    Some("other".to_string()),
-                    Some("ISTJ".to_string()),
-                    Some("US".to_string()),
-                    Some(entity_type.to_string()),
-                    vec!["General".to_string(), "Social Issues".to_string()],
-                    Some("Occasional posts on general topics".to_string()),
-                )
-            };
+        let (
+            bio,
+            persona,
+            age,
+            gender,
+            mbti,
+            country,
+            profession,
+            interested_topics,
+            posting_style,
+        ) = if matches!(entity_type_lower.as_str(), "student" | "alumni") {
+            (
+                format!("{} with interests in academics and social issues.", entity_type),
+                if entity_summary.is_empty() {
+                    format!(
+                        "{entity_name} is a {etl} who is actively engaged in academic and social discussions. They enjoy sharing perspectives and connecting with peers.",
+                        etl = entity_type.to_lowercase()
+                    )
+                } else {
+                    entity_summary.to_string()
+                },
+                Some(22u32),
+                Some("other".to_string()),
+                Some("INFP".to_string()),
+                Some("US".to_string()),
+                Some("Student".to_string()),
+                vec![
+                    "Education".to_string(),
+                    "Social Issues".to_string(),
+                    "Technology".to_string(),
+                ],
+                Some("Casual, frequent posts on campus life and social topics".to_string()),
+            )
+        } else if matches!(
+            entity_type_lower.as_str(),
+            "publicfigure" | "expert" | "faculty" | "professor"
+        ) {
+            (
+                "Expert and thought leader in their field.".to_string(),
+                if entity_summary.is_empty() {
+                    format!(
+                        "{entity_name} is a recognized {etl} who shares insights and opinions on important matters. They are known for their expertise and influence in public discourse.",
+                        etl = entity_type.to_lowercase()
+                    )
+                } else {
+                    entity_summary.to_string()
+                },
+                Some(45u32),
+                Some("other".to_string()),
+                Some("INTJ".to_string()),
+                Some("US".to_string()),
+                Some("Expert".to_string()),
+                vec![
+                    "Politics".to_string(),
+                    "Economics".to_string(),
+                    "Culture & Society".to_string(),
+                ],
+                Some("Thoughtful, infrequent posts with expert analysis".to_string()),
+            )
+        } else if matches!(
+            entity_type_lower.as_str(),
+            "university"
+                | "governmentagency"
+                | "organization"
+                | "ngo"
+                | "mediaoutlet"
+                | "company"
+                | "institution"
+                | "group"
+                | "community"
+        ) {
+            // Group/institution entity types → institutional account defaults
+            (
+                format!("Official account of {}.", entity_name),
+                if entity_summary.is_empty() {
+                    format!(
+                        "{entity_name} is an institutional entity that communicates official positions, announcements, and engages with stakeholders on relevant matters."
+                    )
+                } else {
+                    entity_summary.to_string()
+                },
+                Some(30u32),
+                Some("other".to_string()),
+                Some("ISTJ".to_string()),
+                Some("China".to_string()),
+                Some(entity_type.to_string()),
+                vec![
+                    "Public Policy".to_string(),
+                    "Community".to_string(),
+                    "Official Announcements".to_string(),
+                ],
+                Some(format!("Official account for {entity_name}. Professional, measured tone.")),
+            )
+        } else {
+            // Default: generic participant
+            (
+                if entity_summary.is_empty() {
+                    format!("{}: {}", entity_type, entity_name)
+                } else {
+                    entity_summary.chars().take(150).collect()
+                },
+                if entity_summary.is_empty() {
+                    format!(
+                        "{entity_name} is a {etl} participating in social discussions.",
+                        etl = entity_type.to_lowercase()
+                    )
+                } else {
+                    entity_summary.to_string()
+                },
+                Some(30u32),
+                Some("other".to_string()),
+                Some("ISTJ".to_string()),
+                Some("US".to_string()),
+                Some(entity_type.to_string()),
+                vec!["General".to_string(), "Social Issues".to_string()],
+                Some("Occasional posts on general topics".to_string()),
+            )
+        };
 
         SocialProfile {
             user_id: 0,
@@ -1572,9 +1585,8 @@ Return only valid JSON."#,
             .collect();
         // Use a stable hash-derived suffix so the output is deterministic in tests.
         // Simple djb2-style fold over the name bytes.
-        let hash: u32 = name
-            .bytes()
-            .fold(5381u32, |acc, b| acc.wrapping_mul(33).wrapping_add(b as u32));
+        let hash: u32 =
+            name.bytes().fold(5381u32, |acc, b| acc.wrapping_mul(33).wrapping_add(b as u32));
         let suffix = 100 + (hash % 900); // 100..=999
         format!("{base}_{suffix}")
     }
@@ -2950,7 +2962,8 @@ mod tests {
             user_id: 7,
             user_name: "alice_wonder_42".to_string(),
             bio: "Tech journalist covering AI".to_string(),
-            persona: "Alice is a seasoned tech journalist with strong opinions on AI ethics.".to_string(),
+            persona: "Alice is a seasoned tech journalist with strong opinions on AI ethics."
+                .to_string(),
             platform: Platform::Twitter,
             karma: 2500,
             friend_count: 200,
@@ -3088,7 +3101,14 @@ mod tests {
         let generator = PersonaGenerator::new();
 
         let sp = generator
-            .generate_social("Jane Doe", "journalist", "A seasoned reporter", Platform::Twitter, &mock_llm, None)
+            .generate_social(
+                "Jane Doe",
+                "journalist",
+                "A seasoned reporter",
+                Platform::Twitter,
+                &mock_llm,
+                None,
+            )
             .await
             .expect("generate_social must succeed with valid mock LLM");
 
@@ -3125,14 +3145,22 @@ mod tests {
             async fn stream(
                 &self,
                 _: &str,
-            ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>>
+            {
                 Err(TeriError::Llm("not implemented".to_string()))
             }
         }
 
         let generator = PersonaGenerator::new();
         let sp = generator
-            .generate_social("State University", "university", "A public university", Platform::Reddit, &ErrorLlm, None)
+            .generate_social(
+                "State University",
+                "university",
+                "A public university",
+                Platform::Reddit,
+                &ErrorLlm,
+                None,
+            )
             .await
             .expect("rule-based fallback must succeed even when LLM errors");
 
@@ -3156,7 +3184,14 @@ mod tests {
         let generator = PersonaGenerator::new();
 
         let sp = generator
-            .generate_social("John Student", "student", "A university student", Platform::Twitter, &bad_llm, None)
+            .generate_social(
+                "John Student",
+                "student",
+                "A university student",
+                Platform::Twitter,
+                &bad_llm,
+                None,
+            )
             .await
             .expect("rule-based fallback must succeed for bad LLM JSON");
 
@@ -3273,7 +3308,10 @@ mod tests {
         assert!(v.get("mbti").is_none(), "mbti must be absent when None");
         assert!(v.get("country").is_none(), "country must be absent when None");
         assert!(v.get("profession").is_none(), "profession must be absent when None");
-        assert!(v.get("interested_topics").is_none(), "interested_topics must be absent when empty");
+        assert!(
+            v.get("interested_topics").is_none(),
+            "interested_topics must be absent when empty"
+        );
     }
 
     #[test]
@@ -3365,8 +3403,14 @@ mod tests {
         let twitter = p.to_twitter_format().unwrap();
 
         // bio != persona (they have different values in make_social_persona)
-        assert_ne!(reddit["bio"], reddit["persona"], "bio and persona must be distinct in reddit format");
-        assert_ne!(twitter["bio"], twitter["persona"], "bio and persona must be distinct in twitter format");
+        assert_ne!(
+            reddit["bio"], reddit["persona"],
+            "bio and persona must be distinct in reddit format"
+        );
+        assert_ne!(
+            twitter["bio"], twitter["persona"],
+            "bio and persona must be distinct in twitter format"
+        );
 
         // Both appear with their correct distinct values
         assert_eq!(reddit["bio"], "Short public bio line");
@@ -3478,7 +3522,8 @@ mod tests {
         // Valid JSON should still round-trip through fix
         let input = r#"{"bio": "ok", "karma": 1000}"#;
         let fixed = PersonaGenerator::fix_truncated_json(input);
-        let v: serde_json::Value = serde_json::from_str(&fixed).expect("valid input should still parse");
+        let v: serde_json::Value =
+            serde_json::from_str(&fixed).expect("valid input should still parse");
         assert_eq!(v["karma"], 1000);
     }
 
@@ -3503,7 +3548,8 @@ mod tests {
     fn test_try_fix_json_salvages_string_truncated_mid_value() {
         // When a JSON string value is truncated (last char IS a quote boundary), fix_truncated_json
         // closes the brace and the structural parse succeeds — all fields including numerics survive.
-        let truncated = r#"{"bio": "Journalist bio", "persona": "Detailed persona", "karma": 3500, "age": 31}"#;
+        let truncated =
+            r#"{"bio": "Journalist bio", "persona": "Detailed persona", "karma": 3500, "age": 31}"#;
         // This is actually valid JSON — prove fix_truncated_json doesn't break it
         let result = PersonaGenerator::try_fix_json(truncated, "Jane", "journalist", "");
         assert!(result.is_some(), "valid truncated JSON should parse");
@@ -3546,12 +3592,20 @@ mod tests {
         //
         // The truncation scenario: JSON is missing the closing `}` (common max_tokens cutoff),
         // and the last key:value pair is a string (so fix_truncated_json can properly close it).
-        let truncated_llm_response = r#"{"bio": "UNIQUE_LLM_SIGNATURE bio", "persona": "UNIQUE_LLM_SIGNATURE persona""#;
+        let truncated_llm_response =
+            r#"{"bio": "UNIQUE_LLM_SIGNATURE bio", "persona": "UNIQUE_LLM_SIGNATURE persona""#;
         let mock_llm = MockPersonaLlm::new(truncated_llm_response);
         let generator = PersonaGenerator::new();
 
         let sp = generator
-            .generate_social("Test Entity", "expert", "A test expert", Platform::Twitter, &mock_llm, None)
+            .generate_social(
+                "Test Entity",
+                "expert",
+                "A test expert",
+                Platform::Twitter,
+                &mock_llm,
+                None,
+            )
             .await
             .expect("salvage path must succeed");
 
@@ -3576,7 +3630,14 @@ mod tests {
         let generator = PersonaGenerator::new();
 
         let sp = generator
-            .generate_social("John Student", "student", "A university student", Platform::Twitter, &bad_llm, None)
+            .generate_social(
+                "John Student",
+                "student",
+                "A university student",
+                Platform::Twitter,
+                &bad_llm,
+                None,
+            )
             .await
             .expect("rule-based fallback must succeed for garbage LLM output");
 
@@ -3611,7 +3672,8 @@ mod tests {
             async fn stream(
                 &self,
                 _: &str,
-            ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>>
+            {
                 Err(TeriError::Llm("not implemented".to_string()))
             }
         }
@@ -3684,7 +3746,8 @@ mod tests {
             async fn stream(
                 &self,
                 _: &str,
-            ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>>
+            {
                 Err(TeriError::Llm("not implemented".to_string()))
             }
         }
@@ -3741,7 +3804,8 @@ mod tests {
             async fn stream(
                 &self,
                 _: &str,
-            ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>>
+            {
                 Err(TeriError::Llm("not implemented".to_string()))
             }
         }

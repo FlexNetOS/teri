@@ -59,9 +59,9 @@ async fn run_cmd() -> Result<()> {
     };
 
     // FIX-1.3: GGUF/stub backend guard — preflight before sim run.
-    let is_stub = teri::preflight_check_backend(&config.llm).await.map_err(|e| {
-        TeriError::Config(format!("Backend probe failed: {e}"))
-    })?;
+    let is_stub = teri::preflight_check_backend(&config.llm)
+        .await
+        .map_err(|e| TeriError::Config(format!("Backend probe failed: {e}")))?;
     if is_stub {
         return Err(TeriError::Config(
             "GGUF/stub backend detected — simulation would produce canned text, not intelligence.\n\
@@ -83,9 +83,7 @@ async fn run_cmd() -> Result<()> {
     std::fs::create_dir_all(graph_dir)
         .map_err(|e| TeriError::Config(format!("Failed to create graph dir: {e}")))?;
 
-    tracing::info!(
-        "Starting simulation: seed={seed}, agents={agents}, query={query}"
-    );
+    tracing::info!("Starting simulation: seed={seed}, agents={agents}, query={query}");
     tracing::info!("Query: {query}");
     tracing::info!("Configuration loaded successfully");
     Err(TeriError::Unknown("Pipeline not yet implemented".to_string()))
@@ -95,9 +93,8 @@ async fn serve_cmd() -> Result<()> {
     let cli = Cli::parse();
     let Commands::Serve { addr } = cli.command else { unreachable!() };
 
-    let config = Config::load().map_err(|e| {
-        TeriError::Config(format!("Configuration error: {e}"))
-    })?;
+    let config =
+        Config::load().map_err(|e| TeriError::Config(format!("Configuration error: {e}")))?;
 
     init_logging(&config.logging.level)?;
 

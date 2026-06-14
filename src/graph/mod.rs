@@ -1,7 +1,7 @@
 use crate::error::{Result, TeriError};
 use crate::llm::LlmClient;
-use crate::seed::text_processor;
 use crate::seed::SeedDocument;
+use crate::seed::text_processor;
 use petgraph::graph::{Graph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use serde::{Deserialize, Serialize};
@@ -933,7 +933,9 @@ mod tests {
             created_at: Utc::now(),
         };
 
-        let graph = KnowledgeGraph::build(&doc, &mock_llm).await.expect("empty extraction is not an error");
+        let graph = KnowledgeGraph::build(&doc, &mock_llm)
+            .await
+            .expect("empty extraction is not an error");
         assert_eq!(graph.entity_count(), 0, "empty extraction yields empty graph");
         assert_eq!(graph.relation_count(), 0);
     }
@@ -956,7 +958,8 @@ mod tests {
         };
 
         // Must NOT error — only one entity in the graph.
-        let graph = KnowledgeGraph::build(&doc, &mock_llm).await
+        let graph = KnowledgeGraph::build(&doc, &mock_llm)
+            .await
             .expect("duplicate entity must not abort build");
         assert_eq!(graph.entity_count(), 1, "second Alice must be silently skipped");
         let alice = graph.get_entity("Alice").expect("Alice must be present");
@@ -981,7 +984,8 @@ mod tests {
             created_at: Utc::now(),
         };
 
-        let graph = KnowledgeGraph::build(&doc, &mock_llm).await
+        let graph = KnowledgeGraph::build(&doc, &mock_llm)
+            .await
             .expect("unknown-entity relation must not abort build");
         assert_eq!(graph.entity_count(), 1);
         // The relation referencing unknown "Bob" must be dropped.
@@ -997,7 +1001,10 @@ mod tests {
             async fn complete(&self, _prompt: &str) -> Result<String> {
                 Err(TeriError::Llm("simulated LLM failure".to_string()))
             }
-            async fn complete_json<T: serde::de::DeserializeOwned>(&self, _prompt: &str) -> Result<T> {
+            async fn complete_json<T: serde::de::DeserializeOwned>(
+                &self,
+                _prompt: &str,
+            ) -> Result<T> {
                 Err(TeriError::Llm("simulated LLM failure".to_string()))
             }
             async fn stream(
@@ -1135,7 +1142,7 @@ mod tests {
         // valid since t=1000, still current (no end)
         let rel = Relation::with_validity(RelationKind::Causes, 0.7, Some((1000, None)))
             .expect("valid weight");
-        assert!(!rel.is_active_at(999));  // before start → inactive
+        assert!(!rel.is_active_at(999)); // before start → inactive
         assert!(rel.is_active_at(1000)); // at start → active
         assert!(rel.is_active_at(9999)); // well after start → active
     }
@@ -1145,7 +1152,7 @@ mod tests {
         // valid [1000, 2000)
         let rel = Relation::with_validity(RelationKind::WorksFor, 0.9, Some((1000, Some(2000))))
             .expect("valid weight");
-        assert!(!rel.is_active_at(999));  // before window
+        assert!(!rel.is_active_at(999)); // before window
         assert!(rel.is_active_at(1000)); // start (inclusive)
         assert!(rel.is_active_at(1500)); // inside
         assert!(!rel.is_active_at(2000)); // end (exclusive) → expired
@@ -1193,7 +1200,8 @@ mod tests {
     fn test_knowledge_graph_serde_roundtrip_with_valid_at() {
         // Full graph roundtrip: old-shape (no valid_at) relations survive JSON/bincode deserialization.
         let mut graph = KnowledgeGraph::new();
-        let alice = Entity { id: Uuid::new_v4(), name: "Alice".to_string(), kind: EntityKind::Person };
+        let alice =
+            Entity { id: Uuid::new_v4(), name: "Alice".to_string(), kind: EntityKind::Person };
         let bob = Entity { id: Uuid::new_v4(), name: "Bob".to_string(), kind: EntityKind::Person };
         let alice_idx = graph.add_entity(alice.clone()).expect("add Alice");
         let bob_idx = graph.add_entity(bob.clone()).expect("add Bob");
@@ -1220,14 +1228,36 @@ mod tests {
     #[test]
     fn test_partition_edges_at() {
         let mut graph = KnowledgeGraph::new();
-        let a = graph.add_entity(Entity { id: Uuid::new_v4(), name: "A".to_string(), kind: EntityKind::Concept }).expect("A");
-        let b = graph.add_entity(Entity { id: Uuid::new_v4(), name: "B".to_string(), kind: EntityKind::Concept }).expect("B");
-        let c = graph.add_entity(Entity { id: Uuid::new_v4(), name: "C".to_string(), kind: EntityKind::Concept }).expect("C");
+        let a = graph
+            .add_entity(Entity {
+                id: Uuid::new_v4(),
+                name: "A".to_string(),
+                kind: EntityKind::Concept,
+            })
+            .expect("A");
+        let b = graph
+            .add_entity(Entity {
+                id: Uuid::new_v4(),
+                name: "B".to_string(),
+                kind: EntityKind::Concept,
+            })
+            .expect("B");
+        let c = graph
+            .add_entity(Entity {
+                id: Uuid::new_v4(),
+                name: "C".to_string(),
+                kind: EntityKind::Concept,
+            })
+            .expect("C");
 
         // Active edge: always-valid
         graph.add_relation(a, b, Relation::new(RelationKind::RelatedTo, 0.5).expect("r1"));
         // Historical edge: expired window [100, 200)
-        graph.add_relation(a, c, Relation::with_validity(RelationKind::Causes, 0.5, Some((100, Some(200)))).expect("r2"));
+        graph.add_relation(
+            a,
+            c,
+            Relation::with_validity(RelationKind::Causes, 0.5, Some((100, Some(200)))).expect("r2"),
+        );
 
         let t = 500u64; // after expiry
         let (active, historical) = graph.partition_edges_at(t);
@@ -1641,7 +1671,7 @@ mod tests {
         // Build a document that is clearly > 500 chars so it gets split into at least 2 chunks.
         // Pad with unique filler so the chunks are distinct.
         let chunk1_filler = "Alpha ".repeat(50); // ~300 chars, first chunk territory
-        let chunk2_filler = "Beta ".repeat(50);  // ~300 chars, second chunk territory
+        let chunk2_filler = "Beta ".repeat(50); // ~300 chars, second chunk territory
         // Use ". " as sentence boundary separator to encourage clean splits.
         let large_text = format!(
             "{}. Context for Alice and her team at Sunrise Corp. {}. Context for Bob and his division at Sunset Inc.",
@@ -1686,7 +1716,10 @@ mod tests {
 
         // All 4 entities (2 per chunk) should be present in the merged graph.
         assert!(graph.get_entity("Alice").is_some(), "Alice must be in merged graph");
-        assert!(graph.get_entity("Sunrise Corp").is_some(), "Sunrise Corp must be in merged graph");
+        assert!(
+            graph.get_entity("Sunrise Corp").is_some(),
+            "Sunrise Corp must be in merged graph"
+        );
         assert!(graph.get_entity("Bob").is_some(), "Bob must be in merged graph");
         assert!(graph.get_entity("Sunset Inc").is_some(), "Sunset Inc must be in merged graph");
         assert_eq!(graph.entity_count(), 4, "4 unique entities, none dropped");
