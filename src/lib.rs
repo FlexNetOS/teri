@@ -6,6 +6,7 @@ pub mod graph;
 pub mod llm;
 pub mod logging;
 pub mod memory;
+pub mod preflight;
 pub mod report;
 pub mod seed;
 pub mod sim;
