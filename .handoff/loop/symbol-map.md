@@ -56,16 +56,16 @@
 
 ## U-004 — `backend/app/utils/logger.py`
 
-- [ ] S-026 · `unit:U-004` · `const` · `LOG_DIR` · path to `backend/logs/` · `logger.py:27`
-- [ ] S-027 · `unit:U-004` · `fn` · `_ensure_utf8_stdout` · reconfigures stdout/stderr to UTF-8 on Windows · `logger.py:13`
-- [ ] S-028 · `unit:U-004` · `fn` · `setup_logger` · configures rotating file + console handlers · `logger.py:30`
-- [ ] S-029 · `unit:U-004` · `fn` · `get_logger` · returns named logger · `logger.py:91`
-- [ ] S-030 · `unit:U-004` · `const` · `logger` · module-level logger instance · `logger.py:108`
-- [ ] S-031 · `unit:U-004` · `fn` · `debug` · shortcut · `logger.py:112`
-- [ ] S-032 · `unit:U-004` · `fn` · `info` · shortcut · `logger.py:115`
-- [ ] S-033 · `unit:U-004` · `fn` · `warning` · shortcut · `logger.py:118`
-- [ ] S-034 · `unit:U-004` · `fn` · `error` · shortcut · `logger.py:121`
-- [ ] S-035 · `unit:U-004` · `fn` · `critical` · shortcut · `logger.py:124`
+- [x] S-026 · `unit:U-004` · `const` · `LOG_DIR` · path to `backend/logs/` · `logger.py:27` · **rust-target:** `LOG_DIR_ENV="TERI_LOG_DIR"` + `LOG_BACKUP_COUNT=5` + `MAX_LOG_BYTES=10*1024*1024` consts at `src/logging.rs`; directory is opt-in via env var (no hardcoded path — teri's config-is-env design)
+- [x] S-027 · `unit:U-004` · `fn` · `_ensure_utf8_stdout` · reconfigures stdout/stderr to UTF-8 on Windows · `logger.py:13` · **rust-target:** `[≠]` N/A — Rust stdout is UTF-8 on all platforms teri targets; no reconfiguration needed. Noted in module doc comment. No capability lost.
+- [x] S-028 · `unit:U-004` · `fn` · `setup_logger` · configures rotating file + console handlers · `logger.py:30` · **rust-target:** `init_logging(level)` at `src/logging.rs`; composes console layer (EnvFilter) + optional file layer (DEBUG+, size-based rotation 10MB×5 via `file-rotate` crate, `ContentLimit::Bytes` + `AppendCount::new(5)`); file layer opt-in via `TERI_LOG_DIR` env; tested via `build_rotating_writer` (5 tests)
+- [x] S-029 · `unit:U-004` · `fn` · `get_logger` · returns named logger · `logger.py:91` · **rust-target:** `[≠]` idiomatic-mapping: tracing uses targets (`tracing::info!(target: "name", …)`) rather than named logger objects; same conceptual contract (per-name routing), different form. No dropped capability.
+- [x] S-030 · `unit:U-004` · `const` · `logger` · module-level logger instance · `logger.py:108` · **rust-target:** `[≠]` idiomatic-mapping: tracing has no module-level logger instance; macros (`tracing::info!` etc.) address the global subscriber directly; identical runtime behavior
+- [x] S-031 · `unit:U-004` · `fn` · `debug` · shortcut · `logger.py:112` · **rust-target:** `[≠]` idiomatic-mapping: `tracing::debug!(…)` macro; no wrapper fn needed (macros are zero-cost call sites)
+- [x] S-032 · `unit:U-004` · `fn` · `info` · shortcut · `logger.py:115` · **rust-target:** `[≠]` idiomatic-mapping: `tracing::info!(…)` macro
+- [x] S-033 · `unit:U-004` · `fn` · `warning` · shortcut · `logger.py:118` · **rust-target:** `[≠]` idiomatic-mapping: `tracing::warn!(…)` macro
+- [x] S-034 · `unit:U-004` · `fn` · `error` · shortcut · `logger.py:121` · **rust-target:** `[≠]` idiomatic-mapping: `tracing::error!(…)` macro
+- [x] S-035 · `unit:U-004` · `fn` · `critical` · shortcut · `logger.py:124` · **rust-target:** `[≠]` idiomatic-mapping: `tracing::error!(…)` macro (tracing has no separate critical level; ERROR is the highest level — same severity semantics)
 
 ---
 

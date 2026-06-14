@@ -368,3 +368,40 @@ Full `cargo test` (all targets) = **310 passed, 0 failed, 3 ignored** (was 285, 
 
 ### Symbols
 26 ported symbols → `- [x]` (S-325/326/327, S-329..S-347, S-353/354/359/365). 23 `[≠]` rows retained as audited (no real feature among them). U-018 ledger → `- [x]`.
+
+---
+
+## Cycle 9 — U-004 `backend/app/utils/logger.py` (rotating-FILE logging — [≠]→[~]→extend-Y no-downgrade correction) — 2026-06-14
+
+**Verdict: PASS.** The rotating-file-logging capability genuinely EXISTS, matches MiroFish's `RotatingFileHandler(maxBytes=10MB, backupCount=5)`, and the previously-skipped feature is now ported and parity-proven. No `[≠]` feature-skip remains on the file-logging row. 10/10 U-004 symbols → `- [x]`.
+
+### 1. Rotating-file contract matches MiroFish (size-based 10MB × 5)
+- `MAX_LOG_BYTES = 10 * 1024 * 1024` (`src/logging.rs:49`) == MiroFish `maxBytes=10*1024*1024` (logger.py:70). Asserted by `test_constants_match_mirofish_contract`.
+- `LOG_BACKUP_COUNT = 5` (`src/logging.rs:52`) == MiroFish `backupCount=5` (logger.py:71).
+- Writer built via `FileRotate::new(path, AppendCount::new(5), ContentLimit::Bytes(MAX_LOG_BYTES), Compression::None, None)` (`src/logging.rs:88-94`). **Confirmed SIZE-based, not time-based** by reading file-rotate 0.8.0 source: `ContentLimit::Bytes(N)` is the byte-count rotation variant (lib.rs:47-62 "Rotating by Bytes"); `AppendTimestamp`/`FileLimit::Age` (the time path) is NOT used.
+- **File layer writes DEBUG+** — `EnvFilter::try_new("debug")` on the file layer (`src/logging.rs:121-127`), matching MiroFish `file_handler.setLevel(logging.DEBUG)` (logger.py:74). Console layer keeps its own EnvFilter/`RUST_LOG`/`level` (logger.py console_handler at INFO is caller-driven here).
+
+### 2. Rotation genuinely WORKS (not a stub)
+- `test_rotation_produces_backup_after_size_limit` writes 11 × 1 MB = 11 MB through the **real `FileRotate` writer** (no mock) with a 10 MB limit, then asserts `teri.log.1` exists. This exercises the actual `file_rotate` rotation path and proves a backup file is produced once the byte limit is surpassed. PASS.
+- `test_rotation_keeps_at_most_backup_count_files` uses a tiny `ContentLimit::Bytes(100)` to force ≥8 rotations, then asserts the count of `teri-small.log.*` backups `<= LOG_BACKUP_COUNT` (5) — proving the backup-count CEILING. Confirmed against file-rotate source: `AppendCount` enforces `file_number >= max_files` deletion (suffix.rs:113-139: "if max_files is 3 … log.3 may exist but not log.4"). PASS.
+- `test_writer_produces_expected_content` proves written bytes land in `teri.log` legibly. No `todo!`/`unimplemented!`/`stub`/`simplified` markers in `src/logging.rs`.
+
+### 3. Opt-in + default preserved (NO regression)
+- `TERI_LOG_DIR` UNSET (or empty) → the `_ =>` arm (`src/logging.rs:139-146`) builds **console-only** via `fmt().with_env_filter(...).with_target(true).with_level(true).init()` — byte-for-byte the prior `init_logging` console behavior. No file layer, no `file-rotate` writer opened. Default path UNCHANGED.
+- `TERI_LOG_DIR` SET → `Ok(dir) if !dir.is_empty()` arm composes console layer + DEBUG+ file layer via `registry()` (`src/logging.rs:114-138`). File logging is purely additive/opt-in. Matches the no-hardcoded-path teri config-is-env design (MiroFish's hardcoded `LOG_DIR` becomes the opt-in env var — no capability lost, directory still auto-created via `create_dir_all`).
+
+### 4. Idiomatic mappings — judged TRUE equivalents (not dropped capabilities)
+- `get_logger(name)` (S-029) → tracing `target:` field. tracing is process-global; per-name routing IS the `target:` on each macro. True equivalent.
+- module-level `logger` instance (S-030) → tracing's global subscriber addressed directly by macros. Equivalent.
+- `debug/info/warning/error` shortcuts (S-031..S-034) → `tracing::debug!/info!/warn!/error!`. Confirmed tracing 0.1 provides each level (tracing-core `Level::{TRACE,DEBUG,INFO,WARN,ERROR}`). Equivalent.
+- `critical` (S-035) → `tracing::error!`. **Confirmed correct**: tracing's `Level` has NO level above ERROR (read tracing-core metadata.rs:513-529 — ERROR is the highest of 5). Python CRITICAL maps to the highest available severity. No-downgrade.
+- `_ensure_utf8_stdout` (S-027) → N/A. Confirmed Windows-only Python workaround; Rust stdout is UTF-8 on all platforms teri targets. No reconfiguration capability is lost (Rust never had the mojibake problem).
+
+### 5. NO `[≠]` feature-skip remains on U-004
+The rotating-FILE row (S-026/S-028 + `build_rotating_writer`) is the genuine CAPABILITY and is now `- [x]` (was wrongly `[≠]`-adjacent / skipped). The remaining `[≠]`-noted symbols (S-027/S-029..S-035) are API-SURFACE idiomatic mappings, NOT dropped features — each judged a true tracing equivalent above. No real feature is skipped.
+
+### 6. No regression — 310 → 315
+Full `cargo test` (all targets): **315 passed, 0 failed, 3 ignored** (was 310, +5 = the 5 logging tests). lib = 306, integration suites = 9. clippy `--all-targets -- -D warnings` clean (independently confirmed). main.rs: both init sites (`src/main.rs:73` run_cmd, `src/main.rs:102` serve_cmd) call `init_logging(&config.logging.level)` which composes the SAME console behavior when `TERI_LOG_DIR` is unset — behavior-preserving. The 3 ignored are the pre-existing illustrative doctests (unchanged).
+
+### Symbols
+10 U-004 symbols → `- [x]` (S-026..S-035, incl. `build_rotating_writer` + the file layer). U-004 ledger → `- [x]`. get_logger / shortcuts / utf8 recorded as idiomatic-equivalent mappings, NOT gaps.

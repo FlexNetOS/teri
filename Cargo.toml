@@ -61,6 +61,8 @@ async-trait = "0.1"
 # Logging & tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Size-based rotating file appender (10 MB x 5 backups — matches MiroFish RotatingFileHandler)
+file-rotate = "0.8"
 
 # Config & env
 dotenvy = "0.15"

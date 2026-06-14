@@ -17,9 +17,9 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 8
-cycles_total: 8
-ledger: parity 7/50 units verified [x] (U-006, U-008, U-009, U-013, U-015, U-018, U-048) + GAP-1/2/6/U015-1/ACTION-TAXONOMY resolved   # +U-018 Persona social fields + OASIS serializers; 310 green
+cycles_this_session: 9
+cycles_total: 9
+ledger: parity 8/50 units verified [x] (U-004, U-006, U-008, U-009, U-013, U-015, U-018, U-048) + GAP-1/2/6/U015-1/ACTION-TAXONOMY resolved   # +U-004 rotating-file logging (file-rotate 10MB×5, opt-in TERI_LOG_DIR) — both owner-flagged [≠] feature-skips now PORTED; 315 green
 # NO-DOWNGRADE CORRECTION (owner-flagged): [≠] is for genuinely-inexpressible/non-contractual ONLY,
 #   never "destination won't use it". U-018 to_reddit/twitter_format/to_dict were wrongly [≠]-skipped ->
 #   PORTED. U-004 rotating-file logging same error -> reclassify extend-Y, port next. Audit other [≠].

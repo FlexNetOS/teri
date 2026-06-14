@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use teri::{Config, Result, TeriError};
+use teri::{Config, Result, TeriError, init_logging};
 
 #[derive(Parser)]
 #[command(name = "teri", version, about = "Swarm Intelligence Prediction Engine")]
@@ -70,7 +70,7 @@ async fn run_cmd() -> Result<()> {
         ));
     }
 
-    tracing_subscriber::fmt().with_env_filter(&config.logging.level).init();
+    init_logging(&config.logging.level)?;
 
     // Create data directories for persistence layer
     let memory_dir = std::path::Path::new(&config.persistence.memory_db_path)
@@ -99,9 +99,7 @@ async fn serve_cmd() -> Result<()> {
         TeriError::Config(format!("Configuration error: {e}"))
     })?;
 
-    tracing_subscriber::fmt()
-        .with_env_filter(&config.logging.level)
-        .init();
+    init_logging(&config.logging.level)?;
 
     tracing::info!("Starting API server on {addr}");
     Err(TeriError::Unknown("API server not yet implemented".to_string()))
