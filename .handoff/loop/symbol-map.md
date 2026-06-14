@@ -1396,3 +1396,39 @@
 ## GAP-OQ3-EMBED — Embedding generation (blocked, substrate decision needed)
 
 - [!] S-EMBED-001 · `unit:GAP-OQ3-EMBED` · BLOCKED · Embedding generation (text → vector) has no backend. shimmy has no /v1/embeddings route. Decision: add /v1/embeddings to shimmy OR add EmbeddingClient trait in teri. Do NOT implement a fake/random embedder.
+
+---
+
+## GAP-ACTION-TAXONOMY — MiroFish/OASIS social-media action taxonomy (cycle-3 additions)
+
+Sources: `backend/app/config.py` (OASIS_TWITTER_ACTIONS/OASIS_REDDIT_ACTIONS), `backend/app/services/zep_graph_memory_updater.py` (AgentActivity.to_episode_text 12-type dispatch).
+Rust target: `src/sim/mod.rs` + `src/agent/mod.rs`.
+Status: `- [x]` (cycle-3 RE-VERIFY PASS 2026-06-14 — both defects resolved, differentially confirmed; S-TAX-001..019+021 → `- [x]`, S-TAX-020 stays `- [≠]`). FIX-1: `SocialAction::Trend` added (no-arg variant, parser arm "TREND"/"trend", Display "Performed trend operation", importance 0.25). FIX-2: `TargetKind {Post,Comment}` discriminant added to `Like` and `Dislike`; LIKE_POST→Post, LIKE_COMMENT→Comment, DISLIKE_POST→Post, DISLIKE_COMMENT→Comment; Display produces "Liked post:" vs "Liked comment:" matching to_episode_text distinct render paths. REFRESH omission remains CORRECT (`- [≠]`).
+
+- [x] S-TAX-001 · `unit:GAP-ACTION-TAXONOMY` · `type` · `SocialAction` · enum with 13 OASIS social action variants (12 active + DoNothing) · `src/sim/mod.rs` → `teri::sim::SocialAction`
+- [x] S-TAX-002 · `unit:GAP-ACTION-TAXONOMY` · `variant` · `SocialAction::CreatePost` · args: content · `src/sim/mod.rs` → `teri::sim::SocialAction::CreatePost`; source: CREATE_POST
+- [x] S-TAX-003 · `unit:GAP-ACTION-TAXONOMY` · `variant` · `SocialAction::Like` · args: target_kind: TargetKind, target_id · LIKE_POST→Post, LIKE_COMMENT→Comment · `src/sim/mod.rs` → `teri::sim::SocialAction::Like` · FIX-2 applied: post-vs-comment discriminant restored via `TargetKind` enum; Display "Liked post: X" vs "Liked comment: Y" matching to_episode_text :70-81 vs :153-164.
+- [x] S-TAX-004 · `unit:GAP-ACTION-TAXONOMY` · `variant` · `SocialAction::Dislike` · args: target_kind: TargetKind, target_id · DISLIKE_POST→Post, DISLIKE_COMMENT→Comment · `src/sim/mod.rs` → `teri::sim::SocialAction::Dislike` · FIX-2 applied: same post-vs-comment discriminant as Like.
+- [x] S-TAX-005 · `unit:GAP-ACTION-TAXONOMY` · `variant` · `SocialAction::Repost` · args: post_id · source: REPOST · `src/sim/mod.rs` → `teri::sim::SocialAction::Repost`
+- [x] S-TAX-006 · `unit:GAP-ACTION-TAXONOMY` · `variant` · `SocialAction::Quote` · args: post_id, content · source: QUOTE_POST · `src/sim/mod.rs` → `teri::sim::SocialAction::Quote`
+- [x] S-TAX-007 · `unit:GAP-ACTION-TAXONOMY` · `variant` · `SocialAction::Follow` · args: user_id · source: FOLLOW · `src/sim/mod.rs` → `teri::sim::SocialAction::Follow`
+- [x] S-TAX-008 · `unit:GAP-ACTION-TAXONOMY` · `variant` · `SocialAction::Comment` · args: post_id, content · source: CREATE_COMMENT · `src/sim/mod.rs` → `teri::sim::SocialAction::Comment`
+- [x] S-TAX-009 · `unit:GAP-ACTION-TAXONOMY` · `variant` · `SocialAction::SearchPosts` · args: query · source: SEARCH_POSTS · `src/sim/mod.rs` → `teri::sim::SocialAction::SearchPosts`
+- [x] S-TAX-010 · `unit:GAP-ACTION-TAXONOMY` · `variant` · `SocialAction::SearchUser` · args: query · source: SEARCH_USER · `src/sim/mod.rs` → `teri::sim::SocialAction::SearchUser`
+- [x] S-TAX-011 · `unit:GAP-ACTION-TAXONOMY` · `variant` · `SocialAction::Mute` · args: user_id · source: MUTE · `src/sim/mod.rs` → `teri::sim::SocialAction::Mute`
+- [x] S-TAX-012 · `unit:GAP-ACTION-TAXONOMY` · `variant` · `SocialAction::DoNothing` · no args · source: DO_NOTHING · `src/sim/mod.rs` → `teri::sim::SocialAction::DoNothing`
+- [x] S-TAX-013 · `unit:GAP-ACTION-TAXONOMY` · `impl` · `SocialAction::fmt (Display)` · 13 arms producing readable English descriptions (Like/Dislike each have 2 TargetKind arms) · `src/sim/mod.rs`
+- [x] S-TAX-014 · `unit:GAP-ACTION-TAXONOMY` · `variant` · `Action::Social(SocialAction)` · wrapper variant on `Action` enum; 5 generic variants intact · `src/sim/mod.rs`
+- [x] S-TAX-015 · `unit:GAP-ACTION-TAXONOMY` · `impl` · `Action::fmt (Display)` · Social arm delegates to SocialAction Display · `src/sim/mod.rs`
+- [x] S-TAX-016 · `unit:GAP-ACTION-TAXONOMY` · `method` · `Agent::parse_and_validate_action` · OASIS SCREAMING_SNAKE_CASE name matching + bare-value/key=value arg parsing for all 13 social names · `src/agent/mod.rs`
+- [x] S-TAX-017 · `unit:GAP-ACTION-TAXONOMY` · `method` · `Agent::parse_social_action` · private helper; LIKE_POST→Like{Post,…}, LIKE_COMMENT→Like{Comment,…}, DISLIKE_POST→Dislike{Post,…}, DISLIKE_COMMENT→Dislike{Comment,…}, "TREND"/"trend"→Trend · `src/agent/mod.rs`
+- [x] S-TAX-018 · `unit:GAP-ACTION-TAXONOMY` · `method` · `Agent::store_action_in_memory` · Social arm with 13 sub-arms; Like/Dislike each have 2 TargetKind arms (0.30 each); Trend 0.25; weights: 0.85 CreatePost, 0.75 Follow/Mute, 0.70 Quote/Comment, 0.65 Repost, 0.30 Like/Dislike, 0.25 Search*/Trend, 0.05 DoNothing · `src/agent/mod.rs`
+- [x] S-TAX-019 · `unit:GAP-ACTION-TAXONOMY` · `variant` · `SocialAction::Trend` · no args · source: TREND (ACTION_TYPE_MAP run_parallel_simulation.py:627, NOT in FILTERED_ACTIONS, agent_action.py:507) · `src/sim/mod.rs` → `teri::sim::SocialAction::Trend` · FIX-1 applied: parser "TREND"/"trend"→Trend; Display "Performed trend operation"; importance 0.25; apply no-panic; 4 new tests.
+- [x] S-TAX-021 · `unit:GAP-ACTION-TAXONOMY` · `type` · `TargetKind` · `{Post, Comment}` discriminant enum for Like/Dislike · `src/sim/mod.rs` → `teri::sim::TargetKind` · FIX-2 applied.
+- [≠] S-TAX-020 · `unit:GAP-ACTION-TAXONOMY` · `variant` · `REFRESH` intentionally NOT represented · source: REFRESH · INTENTIONAL DIVERGENCE (justified): REFRESH is in `FILTERED_ACTIONS = {'refresh','sign_up'}` (run_parallel_simulation.py:611) → never reaches actions.jsonl / `AgentActivity` / `to_episode_text`. Omission is correct and not a downgrade.
+
+---
+
+## GAP-SOCIAL-WORLDSTATE — Rich social world-state (deferred; not a downgrade)
+
+- [!] S-SWS-001 · `unit:GAP-SOCIAL-WORLDSTATE` · DEFERRED · `WorldState::apply`/`apply_at` records `Action::Social(...)` generically (same event-push path as generic actions). Rich social-world-state (timeline, post store, engagement counts, follower graph, comment threads) is the dedicated work of U-022/U-028/U-029/U-030. Those units stay `- [ ]`. This item is a scope-boundary marker, not a missing implementation.

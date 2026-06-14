@@ -5,13 +5,108 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Discriminant for Like/Dislike actions: preserves the post-vs-comment distinction that
+/// `to_episode_text` renders as "liked **post** X" vs "liked **comment** Y"
+/// (zep_graph_memory_updater.py:_describe_like_post:70-81, _describe_like_comment:153-164).
+/// Post and comment IDs belong to separate namespaces; collapsing them erases episode-text fidelity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum TargetKind {
+    Post,
+    Comment,
+}
+
+/// MiroFish/OASIS social-media action taxonomy.
+///
+/// Sourced from:
+/// - `backend/app/config.py`: `OASIS_TWITTER_ACTIONS` / `OASIS_REDDIT_ACTIONS`
+/// - `backend/app/services/zep_graph_memory_updater.py`: `AgentActivity.to_episode_text` (12 types)
+///
+/// DO_NOTHING is excluded: the source (`add_activity`) skips it before recording, matching the
+/// intentional omission in `to_episode_text`'s dispatch table.
+///
+/// `TREND` IS in `ACTION_TYPE_MAP` ('trend'→'TREND', run_parallel_simulation.py:627), NOT in
+/// `FILTERED_ACTIONS` (only refresh/sign_up are filtered), and IS agent-selectable
+/// (agent_action.py:507, OASIS_REDDIT_ACTIONS:197). It passes the filter → becomes an
+/// `AgentActivity` → `_describe_generic` renders "performed TREND operation". Added here.
+///
+/// `REFRESH` IS in `FILTERED_ACTIONS` and is never an agent activity; correctly omitted (`- [≠]`).
+///
+/// Note: Exact arg naming follows zep_graph_memory_updater.py `action_args.get(...)` key patterns.
+/// Like/Dislike carry a `target_kind` discriminant (Post vs Comment) to preserve the distinct
+/// episode-text render paths (_describe_like_post vs _describe_like_comment).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum SocialAction {
+    /// CREATE_POST — args: content
+    CreatePost { content: String },
+    /// LIKE_POST — target_kind: Post; LIKE_COMMENT — target_kind: Comment
+    Like { target_kind: TargetKind, target_id: String },
+    /// DISLIKE_POST — target_kind: Post; DISLIKE_COMMENT — target_kind: Comment
+    Dislike { target_kind: TargetKind, target_id: String },
+    /// REPOST — args: post_id
+    Repost { post_id: String },
+    /// QUOTE_POST — args: post_id, content (the quote comment)
+    Quote { post_id: String, content: String },
+    /// FOLLOW — args: user_id
+    Follow { user_id: String },
+    /// CREATE_COMMENT — args: post_id, content
+    Comment { post_id: String, content: String },
+    /// SEARCH_POSTS — args: query
+    SearchPosts { query: String },
+    /// SEARCH_USER — args: query
+    SearchUser { query: String },
+    /// MUTE — args: user_id
+    Mute { user_id: String },
+    /// TREND — no args; browse/discovery operation rendered as "performed TREND operation"
+    Trend,
+    /// DO_NOTHING — no args
+    DoNothing,
+}
+
+impl std::fmt::Display for SocialAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SocialAction::CreatePost { content } => write!(f, "Posted: {}", content),
+            SocialAction::Like { target_kind: TargetKind::Post, target_id } => {
+                write!(f, "Liked post: {}", target_id)
+            }
+            SocialAction::Like { target_kind: TargetKind::Comment, target_id } => {
+                write!(f, "Liked comment: {}", target_id)
+            }
+            SocialAction::Dislike { target_kind: TargetKind::Post, target_id } => {
+                write!(f, "Disliked post: {}", target_id)
+            }
+            SocialAction::Dislike { target_kind: TargetKind::Comment, target_id } => {
+                write!(f, "Disliked comment: {}", target_id)
+            }
+            SocialAction::Repost { post_id } => write!(f, "Reposted: {}", post_id),
+            SocialAction::Quote { post_id, content } => {
+                write!(f, "Quoted post {}: {}", post_id, content)
+            }
+            SocialAction::Follow { user_id } => write!(f, "Followed user: {}", user_id),
+            SocialAction::Comment { post_id, content } => {
+                write!(f, "Commented on {}: {}", post_id, content)
+            }
+            SocialAction::SearchPosts { query } => write!(f, "Searched posts: {}", query),
+            SocialAction::SearchUser { query } => write!(f, "Searched user: {}", query),
+            SocialAction::Mute { user_id } => write!(f, "Muted user: {}", user_id),
+            SocialAction::Trend => write!(f, "Performed trend operation"),
+            SocialAction::DoNothing => write!(f, "Did nothing"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Action {
+    // --- Generic simulation actions (pre-existing; must not be altered) ---
     Speak(String),
     Move(String),
     Interact(String),
     Observe(String),
     Think(String),
+    // --- MiroFish/OASIS social-media actions ---
+    /// Wraps the OASIS social taxonomy. Using a nested enum keeps all generic match arms
+    /// untouched (no churn) and colocalizes the 11 new social arms in `SocialAction`.
+    Social(SocialAction),
 }
 
 impl std::fmt::Display for Action {
@@ -22,6 +117,7 @@ impl std::fmt::Display for Action {
             Action::Interact(target) => write!(f, "Interacted with: {}", target),
             Action::Observe(target) => write!(f, "Observed: {}", target),
             Action::Think(content) => write!(f, "Thought: {}", content),
+            Action::Social(sa) => write!(f, "Social: {}", sa),
         }
     }
 }
@@ -776,5 +872,154 @@ mod tests {
         for (i, snap) in received.iter().enumerate() {
             assert_eq!(snap.tick, (i + 1) as u32, "broadcast tick order wrong at index {i}");
         }
+    }
+
+    // ===== Social Action Tests =====
+
+    #[test]
+    fn test_social_action_display_create_post() {
+        let a = SocialAction::CreatePost { content: "hello world".to_string() };
+        assert_eq!(a.to_string(), "Posted: hello world");
+        let wrapped = Action::Social(a);
+        assert!(wrapped.to_string().starts_with("Social: Posted:"));
+    }
+
+    #[test]
+    fn test_social_action_display_like_post() {
+        let a = SocialAction::Like { target_kind: TargetKind::Post, target_id: "post-42".to_string() };
+        assert_eq!(a.to_string(), "Liked post: post-42");
+    }
+
+    #[test]
+    fn test_social_action_display_like_comment() {
+        let a = SocialAction::Like { target_kind: TargetKind::Comment, target_id: "comment-7".to_string() };
+        assert_eq!(a.to_string(), "Liked comment: comment-7");
+    }
+
+    #[test]
+    fn test_social_action_display_dislike_post() {
+        let a = SocialAction::Dislike { target_kind: TargetKind::Post, target_id: "post-7".to_string() };
+        assert_eq!(a.to_string(), "Disliked post: post-7");
+    }
+
+    #[test]
+    fn test_social_action_display_dislike_comment() {
+        let a = SocialAction::Dislike { target_kind: TargetKind::Comment, target_id: "comment-3".to_string() };
+        assert_eq!(a.to_string(), "Disliked comment: comment-3");
+    }
+
+    #[test]
+    fn test_social_action_display_trend() {
+        let a = SocialAction::Trend;
+        assert_eq!(a.to_string(), "Performed trend operation");
+        let wrapped = Action::Social(a);
+        assert_eq!(wrapped.to_string(), "Social: Performed trend operation");
+    }
+
+    #[test]
+    fn test_social_action_display_repost() {
+        let a = SocialAction::Repost { post_id: "post-1".to_string() };
+        assert_eq!(a.to_string(), "Reposted: post-1");
+    }
+
+    #[test]
+    fn test_social_action_display_quote() {
+        let a = SocialAction::Quote { post_id: "post-5".to_string(), content: "great take".to_string() };
+        assert_eq!(a.to_string(), "Quoted post post-5: great take");
+    }
+
+    #[test]
+    fn test_social_action_display_follow() {
+        let a = SocialAction::Follow { user_id: "user-99".to_string() };
+        assert_eq!(a.to_string(), "Followed user: user-99");
+    }
+
+    #[test]
+    fn test_social_action_display_comment() {
+        let a = SocialAction::Comment { post_id: "post-3".to_string(), content: "nice!".to_string() };
+        assert_eq!(a.to_string(), "Commented on post-3: nice!");
+    }
+
+    #[test]
+    fn test_social_action_display_search_posts() {
+        let a = SocialAction::SearchPosts { query: "climate".to_string() };
+        assert_eq!(a.to_string(), "Searched posts: climate");
+    }
+
+    #[test]
+    fn test_social_action_display_search_user() {
+        let a = SocialAction::SearchUser { query: "alice".to_string() };
+        assert_eq!(a.to_string(), "Searched user: alice");
+    }
+
+    #[test]
+    fn test_social_action_display_mute() {
+        let a = SocialAction::Mute { user_id: "user-bad".to_string() };
+        assert_eq!(a.to_string(), "Muted user: user-bad");
+    }
+
+    #[test]
+    fn test_social_action_display_do_nothing() {
+        let a = SocialAction::DoNothing;
+        assert_eq!(a.to_string(), "Did nothing");
+    }
+
+    #[test]
+    fn test_action_social_apply_no_panic() {
+        // GAP-SOCIAL-WORLDSTATE: apply records the event generically; no rich social state yet.
+        let mut world = WorldState::new();
+        let agent_id = Uuid::new_v4();
+        let ts = chrono::DateTime::from_timestamp(0, 0).unwrap();
+
+        let cases = vec![
+            Action::Social(SocialAction::CreatePost { content: "test".to_string() }),
+            Action::Social(SocialAction::Like { target_kind: TargetKind::Post, target_id: "p1".to_string() }),
+            Action::Social(SocialAction::Like { target_kind: TargetKind::Comment, target_id: "c1".to_string() }),
+            Action::Social(SocialAction::Dislike { target_kind: TargetKind::Post, target_id: "p2".to_string() }),
+            Action::Social(SocialAction::Dislike { target_kind: TargetKind::Comment, target_id: "c2".to_string() }),
+            Action::Social(SocialAction::Repost { post_id: "p3".to_string() }),
+            Action::Social(SocialAction::Quote { post_id: "p4".to_string(), content: "q".to_string() }),
+            Action::Social(SocialAction::Follow { user_id: "u1".to_string() }),
+            Action::Social(SocialAction::Comment { post_id: "p5".to_string(), content: "c".to_string() }),
+            Action::Social(SocialAction::SearchPosts { query: "q1".to_string() }),
+            Action::Social(SocialAction::SearchUser { query: "q2".to_string() }),
+            Action::Social(SocialAction::Mute { user_id: "u2".to_string() }),
+            Action::Social(SocialAction::Trend),
+            Action::Social(SocialAction::DoNothing),
+        ];
+
+        for action in cases {
+            world.apply_at(agent_id, action, ts);
+        }
+        assert_eq!(world.events.len(), 14);
+    }
+
+    #[test]
+    fn test_generic_actions_still_intact() {
+        // Confirm all 5 pre-existing generic variants are unaltered.
+        let mut world = WorldState::new();
+        let id = Uuid::new_v4();
+        let ts = chrono::DateTime::from_timestamp(0, 0).unwrap();
+
+        world.apply_at(id, Action::Speak("hi".to_string()), ts);
+        world.apply_at(id, Action::Move("park".to_string()), ts);
+        world.apply_at(id, Action::Interact("door".to_string()), ts);
+        world.apply_at(id, Action::Observe("sky".to_string()), ts);
+        world.apply_at(id, Action::Think("plan".to_string()), ts);
+
+        assert_eq!(world.events.len(), 5);
+        assert_eq!(world.events[0].action, Action::Speak("hi".to_string()));
+        assert_eq!(world.events[1].action, Action::Move("park".to_string()));
+        assert_eq!(world.events[2].action, Action::Interact("door".to_string()));
+        assert_eq!(world.events[3].action, Action::Observe("sky".to_string()));
+        assert_eq!(world.events[4].action, Action::Think("plan".to_string()));
+    }
+
+    #[test]
+    fn test_social_action_serde_roundtrip() {
+        let action = Action::Social(SocialAction::CreatePost { content: "serde test".to_string() });
+        let json = serde_json::to_string(&action).expect("serialize failed");
+        let back: Action = serde_json::from_str(&json).expect("deserialize failed");
+        assert_eq!(action, back);
     }
 }

@@ -1,7 +1,7 @@
 use crate::error::{Result, TeriError};
 use crate::graph::{Entity, KnowledgeGraph};
 use crate::llm::LlmClient;
-use crate::sim::{Action, WorldState};
+use crate::sim::{Action, SocialAction, TargetKind, WorldState};
 use chrono::Utc;
 use minijinja::{Environment, context};
 use serde::{Deserialize, Serialize};
@@ -274,7 +274,13 @@ impl Agent {
         llm.complete(&prompt).await
     }
 
-    /// Parse and validate the action string with robust parsing
+    /// Parse and validate the action string with robust parsing.
+    ///
+    /// Generic actions use the single-arg form: `Speak(hello world)`
+    /// Social actions use the same outer form with either a single arg or comma-separated key=value
+    /// args matching the MiroFish OASIS action name strings (SCREAMING_SNAKE_CASE from config.py).
+    /// Example: `CREATE_POST(content=hello world)` or `LIKE_POST(target_id=post-42)`.
+    /// Single-field social actions also accept a bare value: `LIKE_POST(post-42)`.
     fn parse_and_validate_action(&self, action_str: &str) -> Result<Action> {
         let action_str = action_str.trim();
 
@@ -283,23 +289,106 @@ impl Agent {
             && let Some(paren_end) = action_str.rfind(')')
             && paren_end > paren_start
         {
-            let action_type = &action_str[..paren_start];
-            let content = &action_str[paren_start + 1..paren_end];
+            let action_type = action_str[..paren_start].trim();
+            let content = action_str[paren_start + 1..paren_end].trim();
 
-            return match action_type.trim() {
-                "Speak" => Ok(Action::Speak(content.trim().to_string())),
-                "Move" => Ok(Action::Move(content.trim().to_string())),
-                "Interact" => Ok(Action::Interact(content.trim().to_string())),
-                "Observe" => Ok(Action::Observe(content.trim().to_string())),
-                "Think" => Ok(Action::Think(content.trim().to_string())),
-                _ => Err(TeriError::Agent(format!("Unknown action type: {}", action_type))),
-            };
+            // Generic simulation actions (5 pre-existing variants — must remain unchanged)
+            match action_type {
+                "Speak" => return Ok(Action::Speak(content.to_string())),
+                "Move" => return Ok(Action::Move(content.to_string())),
+                "Interact" => return Ok(Action::Interact(content.to_string())),
+                "Observe" => return Ok(Action::Observe(content.to_string())),
+                "Think" => return Ok(Action::Think(content.to_string())),
+                _ => {}
+            }
+
+            // MiroFish/OASIS social action names (SCREAMING_SNAKE_CASE per config.py)
+            // Args parsed as key=value pairs; bare values accepted for single-field actions.
+            let social = self.parse_social_action(action_type, content);
+            if let Some(sa) = social {
+                return Ok(Action::Social(sa));
+            }
+
+            return Err(TeriError::Agent(format!("Unknown action type: {}", action_type)));
         }
 
         Err(TeriError::Agent(format!("Invalid action format: {}", action_str)))
     }
 
-    /// Store the executed action in memory with dynamic importance
+    /// Parse an OASIS social action name + content string into a `SocialAction`.
+    ///
+    /// Returns `None` if the action name is not a known social action (caller will then emit
+    /// `Unknown action type`). Returns `Some(SocialAction)` — including defaults for missing
+    /// optional args — for known social action names.
+    fn parse_social_action(&self, action_type: &str, content: &str) -> Option<SocialAction> {
+        /// Extract a named key from `key=value,...` content, falling back to the whole string.
+        fn get_arg(content: &str, key: &str) -> String {
+            for part in content.split(',') {
+                let part = part.trim();
+                if let Some(rest) = part.strip_prefix(key)
+                    && let Some(val) = rest.strip_prefix('=')
+                {
+                    return val.trim().to_string();
+                }
+            }
+            // Bare value: the entire content is the argument (for single-arg actions)
+            content.to_string()
+        }
+
+        match action_type {
+            "CREATE_POST" => Some(SocialAction::CreatePost {
+                content: get_arg(content, "content"),
+            }),
+            "LIKE_POST" => Some(SocialAction::Like {
+                target_kind: TargetKind::Post,
+                target_id: get_arg(content, "target_id"),
+            }),
+            "LIKE_COMMENT" => Some(SocialAction::Like {
+                target_kind: TargetKind::Comment,
+                target_id: get_arg(content, "target_id"),
+            }),
+            "DISLIKE_POST" => Some(SocialAction::Dislike {
+                target_kind: TargetKind::Post,
+                target_id: get_arg(content, "target_id"),
+            }),
+            "DISLIKE_COMMENT" => Some(SocialAction::Dislike {
+                target_kind: TargetKind::Comment,
+                target_id: get_arg(content, "target_id"),
+            }),
+            "REPOST" => Some(SocialAction::Repost {
+                post_id: get_arg(content, "post_id"),
+            }),
+            "QUOTE_POST" => Some(SocialAction::Quote {
+                post_id: get_arg(content, "post_id"),
+                content: get_arg(content, "content"),
+            }),
+            "FOLLOW" => Some(SocialAction::Follow {
+                user_id: get_arg(content, "user_id"),
+            }),
+            "CREATE_COMMENT" => Some(SocialAction::Comment {
+                post_id: get_arg(content, "post_id"),
+                content: get_arg(content, "content"),
+            }),
+            "SEARCH_POSTS" => Some(SocialAction::SearchPosts {
+                query: get_arg(content, "query"),
+            }),
+            "SEARCH_USER" => Some(SocialAction::SearchUser {
+                query: get_arg(content, "query"),
+            }),
+            "MUTE" => Some(SocialAction::Mute {
+                user_id: get_arg(content, "user_id"),
+            }),
+            "TREND" | "trend" => Some(SocialAction::Trend),
+            "DO_NOTHING" => Some(SocialAction::DoNothing),
+            _ => None,
+        }
+    }
+
+    /// Store the executed action in memory with dynamic importance.
+    ///
+    /// Importance weights for social actions follow MiroFish's behavioural significance model:
+    /// high for content-creation / social-graph changes; low for passive engagement; near-zero
+    /// for no-ops. (Exact episode-text natural-language fidelity is U-021's job, not this unit's.)
     fn store_action_in_memory(&mut self, action: &Action) {
         let (memory_content, importance) = match action {
             Action::Speak(content) => {
@@ -316,6 +405,56 @@ impl Agent {
                     0.4
                 };
                 (format!("Thought: {}", content), importance)
+            }
+            Action::Social(sa) => {
+                let (desc, imp) = match sa {
+                    // High-signal: original content creation
+                    SocialAction::CreatePost { content } => {
+                        (format!("Posted: {}", content), 0.85)
+                    }
+                    // Medium-high: social graph modifications
+                    SocialAction::Follow { user_id } => {
+                        (format!("Followed user: {}", user_id), 0.75)
+                    }
+                    SocialAction::Mute { user_id } => {
+                        (format!("Muted user: {}", user_id), 0.75)
+                    }
+                    // Medium: content amplification
+                    SocialAction::Repost { post_id } => {
+                        (format!("Reposted: {}", post_id), 0.65)
+                    }
+                    SocialAction::Quote { post_id, content } => {
+                        (format!("Quoted post {} with: {}", post_id, content), 0.70)
+                    }
+                    SocialAction::Comment { post_id, content } => {
+                        (format!("Commented on {}: {}", post_id, content), 0.70)
+                    }
+                    // Low: passive engagement
+                    SocialAction::Like { target_kind: TargetKind::Post, target_id } => {
+                        (format!("Liked post: {}", target_id), 0.30)
+                    }
+                    SocialAction::Like { target_kind: TargetKind::Comment, target_id } => {
+                        (format!("Liked comment: {}", target_id), 0.30)
+                    }
+                    SocialAction::Dislike { target_kind: TargetKind::Post, target_id } => {
+                        (format!("Disliked post: {}", target_id), 0.30)
+                    }
+                    SocialAction::Dislike { target_kind: TargetKind::Comment, target_id } => {
+                        (format!("Disliked comment: {}", target_id), 0.30)
+                    }
+                    // Low: informational / search / discovery
+                    SocialAction::SearchPosts { query } => {
+                        (format!("Searched posts: {}", query), 0.25)
+                    }
+                    SocialAction::SearchUser { query } => {
+                        (format!("Searched user: {}", query), 0.25)
+                    }
+                    // Low: browse/discovery operation
+                    SocialAction::Trend => ("Performed trend operation".to_string(), 0.25),
+                    // Near-zero: no-op
+                    SocialAction::DoNothing => ("Did nothing".to_string(), 0.05),
+                };
+                (desc, imp)
             }
         };
 
@@ -1519,5 +1658,371 @@ mod tests {
         // Verify agent has memory of the action
         let memories = agent.memory.get_recent(10);
         assert!(!memories.is_empty());
+    }
+
+    // ===== Social Action Parse Tests =====
+    //
+    // Each test covers: parse string → correct variant (parse), Display (display), and memory
+    // storage with expected importance band (apply-record). This satisfies all three gates from
+    // the cycle-3 spec.
+
+    fn make_test_agent() -> Agent {
+        Agent::new(Persona {
+            name: "SocialBot".to_string(),
+            background: "A social media agent".to_string(),
+            traits: vec!["engaged".to_string()],
+            role: "Poster".to_string(),
+        })
+    }
+
+    #[test]
+    fn test_parse_social_create_post_bare() {
+        let agent = make_test_agent();
+        let action = agent.parse_and_validate_action("CREATE_POST(hello world)").unwrap();
+        assert!(matches!(
+            action,
+            Action::Social(SocialAction::CreatePost { ref content }) if content == "hello world"
+        ));
+    }
+
+    #[test]
+    fn test_parse_social_create_post_key_value() {
+        let agent = make_test_agent();
+        let action = agent.parse_and_validate_action("CREATE_POST(content=breaking news)").unwrap();
+        assert!(matches!(
+            action,
+            Action::Social(SocialAction::CreatePost { ref content }) if content == "breaking news"
+        ));
+    }
+
+    #[test]
+    fn test_parse_social_like_post() {
+        let agent = make_test_agent();
+        let action = agent.parse_and_validate_action("LIKE_POST(post-42)").unwrap();
+        assert!(matches!(
+            action,
+            Action::Social(SocialAction::Like { target_kind: TargetKind::Post, ref target_id })
+                if target_id == "post-42"
+        ));
+    }
+
+    #[test]
+    fn test_parse_social_like_comment() {
+        let agent = make_test_agent();
+        let action = agent.parse_and_validate_action("LIKE_COMMENT(comment-7)").unwrap();
+        assert!(matches!(
+            action,
+            Action::Social(SocialAction::Like { target_kind: TargetKind::Comment, ref target_id })
+                if target_id == "comment-7"
+        ));
+    }
+
+    #[test]
+    fn test_parse_social_like_post_vs_comment_are_distinct() {
+        // Prove LIKE_POST and LIKE_COMMENT produce DISTINCT parse results (different target_kind).
+        let agent = make_test_agent();
+        let post_action = agent.parse_and_validate_action("LIKE_POST(id-1)").unwrap();
+        let comment_action = agent.parse_and_validate_action("LIKE_COMMENT(id-1)").unwrap();
+        // Same target_id, but different target_kind — must NOT be equal.
+        assert_ne!(post_action, comment_action);
+        // And Display strings must also be distinct.
+        assert_ne!(post_action.to_string(), comment_action.to_string());
+        assert!(post_action.to_string().contains("post"));
+        assert!(comment_action.to_string().contains("comment"));
+    }
+
+    #[test]
+    fn test_parse_social_dislike_post() {
+        let agent = make_test_agent();
+        let action = agent.parse_and_validate_action("DISLIKE_POST(post-5)").unwrap();
+        assert!(matches!(
+            action,
+            Action::Social(SocialAction::Dislike { target_kind: TargetKind::Post, ref target_id })
+                if target_id == "post-5"
+        ));
+    }
+
+    #[test]
+    fn test_parse_social_dislike_comment() {
+        let agent = make_test_agent();
+        let action = agent.parse_and_validate_action("DISLIKE_COMMENT(comment-3)").unwrap();
+        assert!(matches!(
+            action,
+            Action::Social(SocialAction::Dislike { target_kind: TargetKind::Comment, ref target_id })
+                if target_id == "comment-3"
+        ));
+    }
+
+    #[test]
+    fn test_parse_social_dislike_post_vs_comment_are_distinct() {
+        // Prove DISLIKE_POST and DISLIKE_COMMENT produce DISTINCT parse results.
+        let agent = make_test_agent();
+        let post_action = agent.parse_and_validate_action("DISLIKE_POST(id-2)").unwrap();
+        let comment_action = agent.parse_and_validate_action("DISLIKE_COMMENT(id-2)").unwrap();
+        assert_ne!(post_action, comment_action);
+        assert_ne!(post_action.to_string(), comment_action.to_string());
+        assert!(post_action.to_string().contains("post"));
+        assert!(comment_action.to_string().contains("comment"));
+    }
+
+    #[test]
+    fn test_parse_social_repost() {
+        let agent = make_test_agent();
+        let action = agent.parse_and_validate_action("REPOST(post_id=post-99)").unwrap();
+        assert!(matches!(
+            action,
+            Action::Social(SocialAction::Repost { ref post_id }) if post_id == "post-99"
+        ));
+    }
+
+    #[test]
+    fn test_parse_social_repost_bare() {
+        let agent = make_test_agent();
+        let action = agent.parse_and_validate_action("REPOST(post-55)").unwrap();
+        assert!(matches!(
+            action,
+            Action::Social(SocialAction::Repost { ref post_id }) if post_id == "post-55"
+        ));
+    }
+
+    #[test]
+    fn test_parse_social_quote_post() {
+        let agent = make_test_agent();
+        // Key-value form for multi-arg social action
+        let action = agent
+            .parse_and_validate_action("QUOTE_POST(post_id=post-12,content=great take)")
+            .unwrap();
+        assert!(matches!(
+            action,
+            Action::Social(SocialAction::Quote { ref post_id, ref content })
+                if post_id == "post-12" && content == "great take"
+        ));
+    }
+
+    #[test]
+    fn test_parse_social_follow() {
+        let agent = make_test_agent();
+        let action = agent.parse_and_validate_action("FOLLOW(user_id=user-77)").unwrap();
+        assert!(matches!(
+            action,
+            Action::Social(SocialAction::Follow { ref user_id }) if user_id == "user-77"
+        ));
+    }
+
+    #[test]
+    fn test_parse_social_follow_bare() {
+        let agent = make_test_agent();
+        let action = agent.parse_and_validate_action("FOLLOW(user-33)").unwrap();
+        assert!(matches!(
+            action,
+            Action::Social(SocialAction::Follow { ref user_id }) if user_id == "user-33"
+        ));
+    }
+
+    #[test]
+    fn test_parse_social_create_comment() {
+        let agent = make_test_agent();
+        let action = agent
+            .parse_and_validate_action("CREATE_COMMENT(post_id=post-2,content=nice post)")
+            .unwrap();
+        assert!(matches!(
+            action,
+            Action::Social(SocialAction::Comment { ref post_id, ref content })
+                if post_id == "post-2" && content == "nice post"
+        ));
+    }
+
+    #[test]
+    fn test_parse_social_search_posts() {
+        let agent = make_test_agent();
+        let action = agent.parse_and_validate_action("SEARCH_POSTS(query=climate change)").unwrap();
+        assert!(matches!(
+            action,
+            Action::Social(SocialAction::SearchPosts { ref query }) if query == "climate change"
+        ));
+    }
+
+    #[test]
+    fn test_parse_social_search_posts_bare() {
+        let agent = make_test_agent();
+        let action = agent.parse_and_validate_action("SEARCH_POSTS(elections)").unwrap();
+        assert!(matches!(
+            action,
+            Action::Social(SocialAction::SearchPosts { ref query }) if query == "elections"
+        ));
+    }
+
+    #[test]
+    fn test_parse_social_search_user() {
+        let agent = make_test_agent();
+        let action = agent.parse_and_validate_action("SEARCH_USER(query=alice)").unwrap();
+        assert!(matches!(
+            action,
+            Action::Social(SocialAction::SearchUser { ref query }) if query == "alice"
+        ));
+    }
+
+    #[test]
+    fn test_parse_social_mute() {
+        let agent = make_test_agent();
+        let action = agent.parse_and_validate_action("MUTE(user_id=spammer)").unwrap();
+        assert!(matches!(
+            action,
+            Action::Social(SocialAction::Mute { ref user_id }) if user_id == "spammer"
+        ));
+    }
+
+    #[test]
+    fn test_parse_social_mute_bare() {
+        let agent = make_test_agent();
+        let action = agent.parse_and_validate_action("MUTE(bad-actor)").unwrap();
+        assert!(matches!(
+            action,
+            Action::Social(SocialAction::Mute { ref user_id }) if user_id == "bad-actor"
+        ));
+    }
+
+    #[test]
+    fn test_parse_social_do_nothing() {
+        let agent = make_test_agent();
+        let action = agent.parse_and_validate_action("DO_NOTHING()").unwrap();
+        assert!(matches!(action, Action::Social(SocialAction::DoNothing)));
+    }
+
+    #[test]
+    fn test_social_memory_importance_create_post() {
+        let mut agent = make_test_agent();
+        agent.memory.clear();
+        agent.store_action_in_memory(&Action::Social(SocialAction::CreatePost {
+            content: "hello".to_string(),
+        }));
+        let recent = agent.memory.get_recent(1);
+        assert_eq!(recent.len(), 1);
+        assert!((recent[0].importance - 0.85).abs() < f32::EPSILON);
+        assert!(recent[0].content.contains("Posted:"));
+    }
+
+    #[test]
+    fn test_social_memory_importance_like_post() {
+        let mut agent = make_test_agent();
+        agent.memory.clear();
+        agent.store_action_in_memory(&Action::Social(SocialAction::Like {
+            target_kind: TargetKind::Post,
+            target_id: "p1".to_string(),
+        }));
+        let recent = agent.memory.get_recent(1);
+        assert!((recent[0].importance - 0.30).abs() < f32::EPSILON);
+        assert!(recent[0].content.contains("post"));
+    }
+
+    #[test]
+    fn test_social_memory_importance_like_comment() {
+        let mut agent = make_test_agent();
+        agent.memory.clear();
+        agent.store_action_in_memory(&Action::Social(SocialAction::Like {
+            target_kind: TargetKind::Comment,
+            target_id: "c1".to_string(),
+        }));
+        let recent = agent.memory.get_recent(1);
+        assert!((recent[0].importance - 0.30).abs() < f32::EPSILON);
+        assert!(recent[0].content.contains("comment"));
+    }
+
+    #[test]
+    fn test_social_memory_importance_follow() {
+        let mut agent = make_test_agent();
+        agent.memory.clear();
+        agent.store_action_in_memory(&Action::Social(SocialAction::Follow {
+            user_id: "u1".to_string(),
+        }));
+        let recent = agent.memory.get_recent(1);
+        assert!((recent[0].importance - 0.75).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_social_memory_importance_do_nothing() {
+        let mut agent = make_test_agent();
+        agent.memory.clear();
+        agent.store_action_in_memory(&Action::Social(SocialAction::DoNothing));
+        let recent = agent.memory.get_recent(1);
+        assert!((recent[0].importance - 0.05).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_parse_social_trend_uppercase() {
+        let agent = make_test_agent();
+        let action = agent.parse_and_validate_action("TREND()").unwrap();
+        assert!(matches!(action, Action::Social(SocialAction::Trend)));
+    }
+
+    #[test]
+    fn test_parse_social_trend_lowercase() {
+        // Also accept lowercase "trend" per ACTION_TYPE_MAP
+        let agent = make_test_agent();
+        let action = agent.parse_and_validate_action("trend()").unwrap();
+        assert!(matches!(action, Action::Social(SocialAction::Trend)));
+    }
+
+    #[test]
+    fn test_social_action_display_trend_in_agent() {
+        let action = Action::Social(SocialAction::Trend);
+        assert_eq!(action.to_string(), "Social: Performed trend operation");
+    }
+
+    #[test]
+    fn test_social_memory_importance_trend() {
+        let mut agent = make_test_agent();
+        agent.memory.clear();
+        agent.store_action_in_memory(&Action::Social(SocialAction::Trend));
+        let recent = agent.memory.get_recent(1);
+        assert_eq!(recent.len(), 1);
+        // Trend is a browse/discovery op — same band as SearchPosts (0.25)
+        assert!((recent[0].importance - 0.25).abs() < f32::EPSILON);
+        assert!(recent[0].content.contains("trend"));
+    }
+
+    #[test]
+    fn test_parse_social_trend_apply_no_panic() {
+        // Verify Trend routes through apply without panic (generic social event path)
+        use crate::sim::WorldState;
+        let mut world = WorldState::new();
+        let agent_id = uuid::Uuid::new_v4();
+        let ts = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        world.apply_at(agent_id, Action::Social(SocialAction::Trend), ts);
+        assert_eq!(world.events.len(), 1);
+    }
+
+    #[test]
+    fn test_unknown_social_action_returns_error() {
+        let agent = make_test_agent();
+        let result = agent.parse_and_validate_action("TOTALLY_UNKNOWN(something)");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Unknown action type"));
+    }
+
+    #[test]
+    fn test_generic_actions_unaltered_after_social_extension() {
+        // Regression guard: all 5 original generic variants still parse correctly.
+        let agent = make_test_agent();
+        assert!(matches!(
+            agent.parse_and_validate_action("Speak(hello)").unwrap(),
+            Action::Speak(ref s) if s == "hello"
+        ));
+        assert!(matches!(
+            agent.parse_and_validate_action("Move(forest)").unwrap(),
+            Action::Move(ref s) if s == "forest"
+        ));
+        assert!(matches!(
+            agent.parse_and_validate_action("Interact(door)").unwrap(),
+            Action::Interact(ref s) if s == "door"
+        ));
+        assert!(matches!(
+            agent.parse_and_validate_action("Observe(sky)").unwrap(),
+            Action::Observe(ref s) if s == "sky"
+        ));
+        assert!(matches!(
+            agent.parse_and_validate_action("Think(plan)").unwrap(),
+            Action::Think(ref s) if s == "plan"
+        ));
     }
 }

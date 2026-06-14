@@ -17,11 +17,12 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 2
-cycles_total: 2
-ledger: parity 1/50 units verified + GAP-1/GAP-2 resolved [x]   # U-015 [x]; valid_at + vec-sim enablers done (unlock U-017/U-021/U-024)
-symbols: 8/1087 [x] + ~16 [≠] of 1087 mapped   # S-190 + S-G1-001..006 + S-G2-001 [x]
-gaps_open: GAP-OQ3-EMBED [!] (embedding generation: shimmy has no /v1/embeddings — add to shimmy OR teri EmbeddingClient vs provider); GAP-U015-1 [!] (chunk large docs in build() after U-013 text_processor lands)
+cycles_this_session: 3
+cycles_total: 3
+ledger: parity 1/50 units verified + GAP-1/GAP-2/GAP-ACTION-TAXONOMY resolved [x]   # U-015 [x]; valid_at+vec-sim+social-Action-taxonomy enablers done
+symbols: ~28/1087 [x] + ~18 [≠] of 1087 mapped   # +S-TAX-001..019,021 [x] (social Action taxonomy); S-TAX-020 REFRESH [≠]
+gaps_open: GAP-OQ3-EMBED [!] (embedding generation: shimmy has no /v1/embeddings); GAP-U015-1 [!] (build() large-doc chunking after U-013); GAP-SOCIAL-WORLDSTATE [!] (rich social-world-state timeline/posts/engagement deferred to U-022/028/029/030)
+action_taxonomy: Action::Social(SocialAction) — 12 OASIS types (Trend included; Like/Dislike carry TargetKind{Post,Comment}); REFRESH [≠] (FILTERED_ACTIONS). READY for U-022/028/029/030.
 # TRUE BASELINE CORRECTION: DISCOVER baseline.md claimed 142 tests GREEN on c894de8 — FALSE-GREEN.
 #   c894de8 (PR #4 merge) was a BAD MERGE: duplicated api_key field (config.rs) + dead from_env/dup
 #   block (main.rs) => did NOT compile. Cycle 1 repaired both to clean fix-branch (d433f95) versions.
