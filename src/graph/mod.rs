@@ -53,10 +53,19 @@ pub enum RelationKind {
 pub struct Relation {
     pub kind: RelationKind,
     pub weight: f32,
+    /// Temporal validity window, mapping onto Zep/MiroFish `valid_at`/`invalid_at` fields.
+    ///
+    /// - `None` — static/always-valid (no temporal constraint)
+    /// - `Some((start, None))` — valid since `start` unix timestamp, still current
+    /// - `Some((start, Some(end)))` — expired window [start, end)
+    ///
+    /// Both timestamps are seconds since Unix epoch (u64).
+    #[serde(default)]
+    pub valid_at: Option<(u64, Option<u64>)>,
 }
 
 impl Relation {
-    /// Creates a new relation with validated weight.
+    /// Creates a new relation with validated weight and no temporal constraint.
     ///
     /// # Errors
     /// Returns an error if weight is not in the range [0.0, 1.0].
@@ -64,8 +73,70 @@ impl Relation {
         if !(0.0..=1.0).contains(&weight) {
             return Err(TeriError::Graph(format!("Weight must be between 0 and 1, got: {weight}")));
         }
-        Ok(Self { kind, weight })
+        Ok(Self { kind, weight, valid_at: None })
     }
+
+    /// Creates a new relation with a validated weight and an explicit temporal validity window.
+    ///
+    /// `valid_at` semantics:
+    /// - `None` — always valid
+    /// - `Some((start, None))` — valid from `start` unix seconds, open-ended (still current)
+    /// - `Some((start, Some(end)))` — valid in window `[start, end)`; expired after `end`
+    ///
+    /// # Errors
+    /// Returns an error if weight is not in the range [0.0, 1.0].
+    pub fn with_validity(
+        kind: RelationKind,
+        weight: f32,
+        valid_at: Option<(u64, Option<u64>)>,
+    ) -> Result<Self> {
+        if !(0.0..=1.0).contains(&weight) {
+            return Err(TeriError::Graph(format!("Weight must be between 0 and 1, got: {weight}")));
+        }
+        Ok(Self { kind, weight, valid_at })
+    }
+
+    /// Returns `true` if this relation is considered active at unix timestamp `t` (seconds).
+    ///
+    /// Rules:
+    /// - `valid_at = None` → always active
+    /// - `valid_at = Some((start, None))` → active if `t >= start`
+    /// - `valid_at = Some((start, Some(end)))` → active if `start <= t < end`
+    pub fn is_active_at(&self, t: u64) -> bool {
+        match self.valid_at {
+            None => true,
+            Some((start, None)) => t >= start,
+            Some((start, Some(end))) => t >= start && t < end,
+        }
+    }
+}
+
+/// An edge represented as (from_entity_id, to_entity_id, relation).
+pub type EdgeTriple = (Uuid, Uuid, Relation);
+
+/// Parses an optional temporal validity window from an LLM-produced JSON relation object.
+///
+/// Accepted shapes (all optional; returns `None` if none present):
+/// - `{"valid_from": <u64>, "valid_until": <u64>}` — both present → `Some((start, Some(end)))`
+/// - `{"valid_from": <u64>}` only → `Some((start, None))`
+/// - `{"valid_at": [<u64>, <u64|null>]}` — array form → parsed accordingly
+///
+/// Any parse failure (bad type, out-of-range) silently falls back to `None` (never errors).
+fn parse_valid_at_from_json(item: &Value) -> Option<(u64, Option<u64>)> {
+    // Array form: "valid_at": [start, end_or_null]
+    if let Some(arr) = item.get("valid_at").and_then(Value::as_array) {
+        let start = arr.first().and_then(Value::as_u64)?;
+        let end = arr.get(1).and_then(|v| if v.is_null() { None } else { v.as_u64() });
+        return Some((start, end));
+    }
+
+    // Object form: "valid_from" / "valid_until"
+    if let Some(start) = item.get("valid_from").and_then(Value::as_u64) {
+        let end = item.get("valid_until").and_then(Value::as_u64);
+        return Some((start, end));
+    }
+
+    None
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,7 +373,7 @@ impl KnowledgeGraph {
                     _ => continue,
                 };
 
-                graph.add_relation(from_idx, to_idx, Relation { kind, weight });
+                graph.add_relation(from_idx, to_idx, Relation { kind, weight, valid_at: None });
             }
         }
         // A non-array relation response is tolerated as empty — no relations added.
@@ -434,7 +505,7 @@ impl KnowledgeGraph {
     }
 
     /// Helper method to get all edges from the graph as (from_id, to_id, relation).
-    fn get_all_edges(&self) -> Vec<(Uuid, Uuid, Relation)> {
+    fn get_all_edges(&self) -> Vec<EdgeTriple> {
         self.inner
             .edge_references()
             .map(|edge| {
@@ -578,7 +649,12 @@ Document text:
                 )));
             }
 
-            relations.push((from_idx, to_idx, Relation { kind, weight: weight as f32 }));
+            // Optionally parse valid_at / valid_from / valid_until from LLM JSON (default None).
+            // Accepts: {"valid_from": <u64>, "valid_until": <u64>} or
+            //          {"valid_at": [<u64>, <u64|null>]}
+            let valid_at = parse_valid_at_from_json(item);
+
+            relations.push((from_idx, to_idx, Relation { kind, weight: weight as f32, valid_at }));
         }
 
         Ok(relations)
@@ -604,6 +680,30 @@ Document text:
     #[doc(hidden)]
     pub fn get_index(&self) -> &HashMap<String, NodeIndex> {
         &self.index
+    }
+
+    /// Returns all edges (from_id, to_id, relation) partitioned into (active, historical)
+    /// at the given unix timestamp `t` (seconds).
+    ///
+    /// Active: `relation.is_active_at(t)` is true.
+    /// Historical: `relation.is_active_at(t)` is false.
+    ///
+    /// This powers the `panorama_search` active-vs-historical classification that MiroFish/Zep
+    /// uses via `valid_at`/`invalid_at` fields.
+    pub fn partition_edges_at(&self, t: u64) -> (Vec<EdgeTriple>, Vec<EdgeTriple>) {
+        let mut active = Vec::new();
+        let mut historical = Vec::new();
+        for edge in self.inner.edge_references() {
+            let from_entity = &self.inner[edge.source()];
+            let to_entity = &self.inner[edge.target()];
+            let rel = edge.weight().clone();
+            if rel.is_active_at(t) {
+                active.push((from_entity.id, to_entity.id, rel));
+            } else {
+                historical.push((from_entity.id, to_entity.id, rel));
+            }
+        }
+        (active, historical)
     }
 }
 
@@ -661,7 +761,7 @@ mod tests {
         let alice_idx = graph.add_entity(alice).expect("Failed to add entity");
         let bob_idx = graph.add_entity(bob).expect("Failed to add entity");
 
-        let relation = Relation { kind: RelationKind::RelatedTo, weight: 0.8 };
+        let relation = Relation { kind: RelationKind::RelatedTo, weight: 0.8, valid_at: None };
 
         graph.add_relation(alice_idx, bob_idx, relation);
         assert_eq!(graph.relation_count(), 1);
@@ -962,6 +1062,156 @@ mod tests {
         let result = Relation::new(RelationKind::RelatedTo, -0.1);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("between 0 and 1"));
+    }
+
+    // ===== Relation.valid_at / temporal validity tests =====
+
+    #[test]
+    fn test_relation_is_active_at_none_always_true() {
+        let rel = Relation::new(RelationKind::RelatedTo, 0.5).expect("valid weight");
+        assert_eq!(rel.valid_at, None);
+        // None = always active regardless of timestamp
+        assert!(rel.is_active_at(0));
+        assert!(rel.is_active_at(u64::MAX));
+        assert!(rel.is_active_at(1_700_000_000));
+    }
+
+    #[test]
+    fn test_relation_is_active_at_open_ended() {
+        // valid since t=1000, still current (no end)
+        let rel = Relation::with_validity(RelationKind::Causes, 0.7, Some((1000, None)))
+            .expect("valid weight");
+        assert!(!rel.is_active_at(999));  // before start → inactive
+        assert!(rel.is_active_at(1000)); // at start → active
+        assert!(rel.is_active_at(9999)); // well after start → active
+    }
+
+    #[test]
+    fn test_relation_is_active_at_closed_window() {
+        // valid [1000, 2000)
+        let rel = Relation::with_validity(RelationKind::WorksFor, 0.9, Some((1000, Some(2000))))
+            .expect("valid weight");
+        assert!(!rel.is_active_at(999));  // before window
+        assert!(rel.is_active_at(1000)); // start (inclusive)
+        assert!(rel.is_active_at(1500)); // inside
+        assert!(!rel.is_active_at(2000)); // end (exclusive) → expired
+        assert!(!rel.is_active_at(9999)); // long after
+    }
+
+    #[test]
+    fn test_relation_with_validity_weight_validation() {
+        // Weight validation still applies in with_validity
+        let ok = Relation::with_validity(RelationKind::Other, 1.0, None);
+        assert!(ok.is_ok());
+
+        let err = Relation::with_validity(RelationKind::Other, 1.5, Some((0, None)));
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("between 0 and 1"));
+    }
+
+    #[test]
+    fn test_relation_serde_roundtrip_with_valid_at() {
+        // New shape WITH valid_at: serializes and deserializes correctly
+        let rel = Relation::with_validity(
+            RelationKind::RelatedTo,
+            0.8,
+            Some((1_700_000_000, Some(1_800_000_000))),
+        )
+        .expect("valid weight");
+
+        let json = serde_json::to_string(&rel).expect("serialize");
+        let back: Relation = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.valid_at, Some((1_700_000_000, Some(1_800_000_000))));
+        assert!((back.weight - 0.8).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_relation_serde_backward_compat_no_valid_at_field() {
+        // OLD-shape JSON (from before valid_at was added) must deserialize with valid_at=None
+        let old_json = r#"{"kind":"RelatedTo","weight":0.5}"#;
+        let rel: Relation = serde_json::from_str(old_json).expect("backward-compat deserialize");
+        assert_eq!(rel.valid_at, None, "missing valid_at field must default to None");
+        assert_eq!(rel.kind, RelationKind::RelatedTo);
+        assert!((rel.weight - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_knowledge_graph_serde_roundtrip_with_valid_at() {
+        // Full graph roundtrip: old-shape (no valid_at) relations survive JSON/bincode deserialization.
+        let mut graph = KnowledgeGraph::new();
+        let alice = Entity { id: Uuid::new_v4(), name: "Alice".to_string(), kind: EntityKind::Person };
+        let bob = Entity { id: Uuid::new_v4(), name: "Bob".to_string(), kind: EntityKind::Person };
+        let alice_idx = graph.add_entity(alice.clone()).expect("add Alice");
+        let bob_idx = graph.add_entity(bob.clone()).expect("add Bob");
+
+        // Relation with temporal window
+        let rel = Relation::with_validity(RelationKind::WorksFor, 0.9, Some((1000, Some(2000))))
+            .expect("valid");
+        graph.add_relation(alice_idx, bob_idx, rel);
+
+        // JSON roundtrip
+        let json = graph.serialize_to_json().expect("serialize");
+        let g2 = KnowledgeGraph::deserialize_from_json(&json).expect("deserialize");
+        let edges = g2.get_all_edges();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].2.valid_at, Some((1000, Some(2000))));
+
+        // Bincode roundtrip
+        let bytes = graph.serialize_to_bincode().expect("bincode serialize");
+        let g3 = KnowledgeGraph::deserialize_from_bincode(&bytes).expect("bincode deserialize");
+        let edges3 = g3.get_all_edges();
+        assert_eq!(edges3[0].2.valid_at, Some((1000, Some(2000))));
+    }
+
+    #[test]
+    fn test_partition_edges_at() {
+        let mut graph = KnowledgeGraph::new();
+        let a = graph.add_entity(Entity { id: Uuid::new_v4(), name: "A".to_string(), kind: EntityKind::Concept }).expect("A");
+        let b = graph.add_entity(Entity { id: Uuid::new_v4(), name: "B".to_string(), kind: EntityKind::Concept }).expect("B");
+        let c = graph.add_entity(Entity { id: Uuid::new_v4(), name: "C".to_string(), kind: EntityKind::Concept }).expect("C");
+
+        // Active edge: always-valid
+        graph.add_relation(a, b, Relation::new(RelationKind::RelatedTo, 0.5).expect("r1"));
+        // Historical edge: expired window [100, 200)
+        graph.add_relation(a, c, Relation::with_validity(RelationKind::Causes, 0.5, Some((100, Some(200)))).expect("r2"));
+
+        let t = 500u64; // after expiry
+        let (active, historical) = graph.partition_edges_at(t);
+        assert_eq!(active.len(), 1);
+        assert_eq!(historical.len(), 1);
+        // The expired relation is historical
+        assert!(!historical[0].2.is_active_at(t));
+    }
+
+    #[test]
+    fn test_parse_valid_at_from_json_array_form() {
+        // valid_at: [start, end]
+        let item = serde_json::json!({"valid_at": [1000u64, 2000u64]});
+        let result = super::parse_valid_at_from_json(&item);
+        assert_eq!(result, Some((1000, Some(2000))));
+
+        // valid_at: [start, null]
+        let item2 = serde_json::json!({"valid_at": [1000u64, null]});
+        let result2 = super::parse_valid_at_from_json(&item2);
+        assert_eq!(result2, Some((1000, None)));
+    }
+
+    #[test]
+    fn test_parse_valid_at_from_json_object_form() {
+        // valid_from + valid_until
+        let item = serde_json::json!({"valid_from": 500u64, "valid_until": 1500u64});
+        let result = super::parse_valid_at_from_json(&item);
+        assert_eq!(result, Some((500, Some(1500))));
+
+        // valid_from only (open-ended)
+        let item2 = serde_json::json!({"valid_from": 500u64});
+        let result2 = super::parse_valid_at_from_json(&item2);
+        assert_eq!(result2, Some((500, None)));
+
+        // neither field → None
+        let item3 = serde_json::json!({"kind": "RelatedTo"});
+        let result3 = super::parse_valid_at_from_json(&item3);
+        assert_eq!(result3, None);
     }
 
     #[test]

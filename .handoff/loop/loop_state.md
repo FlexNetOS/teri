@@ -17,10 +17,11 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 1
-cycles_total: 1
-ledger: parity 1/50 units verified   # U-015 [x] (KnowledgeGraph::build 2-pass extraction)
-symbols: 1/1087 [x] + ~16 [≠] (U-015 Zep-SaaS-N/A) of 1087 mapped   # S-190 [x]; S-181-197 resolved
+cycles_this_session: 2
+cycles_total: 2
+ledger: parity 1/50 units verified + GAP-1/GAP-2 resolved [x]   # U-015 [x]; valid_at + vec-sim enablers done (unlock U-017/U-021/U-024)
+symbols: 8/1087 [x] + ~16 [≠] of 1087 mapped   # S-190 + S-G1-001..006 + S-G2-001 [x]
+gaps_open: GAP-OQ3-EMBED [!] (embedding generation: shimmy has no /v1/embeddings — add to shimmy OR teri EmbeddingClient vs provider); GAP-U015-1 [!] (chunk large docs in build() after U-013 text_processor lands)
 # TRUE BASELINE CORRECTION: DISCOVER baseline.md claimed 142 tests GREEN on c894de8 — FALSE-GREEN.
 #   c894de8 (PR #4 merge) was a BAD MERGE: duplicated api_key field (config.rs) + dead from_env/dup
 #   block (main.rs) => did NOT compile. Cycle 1 repaired both to clean fix-branch (d433f95) versions.

@@ -1372,3 +1372,27 @@
 ## SWEEP-4 — `backend/scripts/test_profile_format.py`
 
 - [ ] S-1087 · `unit:SWEEP-4` · `fn` · `test_profile_format` · DEFERRED — test utility only; not part of production surface · `backend/scripts/test_profile_format.py:1`
+
+
+---
+
+## GAP-1 / OQ-2 — Relation temporal validity (cycle-2 additions, src/graph/mod.rs)
+
+- [x] S-G1-001 · `unit:GAP-1` · `field` · `Relation.valid_at` · temporal window `Option<(u64, Option<u64>)>`; `#[serde(default)]` for backward-compat · `src/graph/mod.rs` → `teri::graph::Relation.valid_at` · PARITY-VERIFIED 2026-06-14: serde backward-compat proven (`test_relation_serde_backward_compat_no_valid_at_field`: old `{"kind":"RelatedTo","weight":0.5}` → `valid_at=None`)
+- [x] S-G1-002 · `unit:GAP-1` · `fn` · `Relation::with_validity` · constructor with explicit valid_at; same weight validation as `::new` · `src/graph/mod.rs` → `teri::graph::Relation::with_validity` · PARITY-VERIFIED 2026-06-14: weight-validation parity with `::new` (`test_relation_with_validity_weight_validation`)
+- [x] S-G1-003 · `unit:GAP-1` · `fn` · `Relation::is_active_at` · returns bool; handles None/open-ended/closed window cases · `src/graph/mod.rs` → `teri::graph::Relation::is_active_at` · PARITY-VERIFIED 2026-06-14: all 3 branches (None/open/half-open `[start,end)`) reproduce Zep active-vs-historical contract
+- [x] S-G1-004 · `unit:GAP-1` · `fn` · `KnowledgeGraph::partition_edges_at` · splits edges into (active, historical) at timestamp t; powers panorama_search classification · `src/graph/mod.rs` → `teri::graph::KnowledgeGraph::partition_edges_at` · PARITY-VERIFIED 2026-06-14: maps onto `panorama_search` active/historical split (`test_partition_edges_at`)
+- [x] S-G1-005 · `unit:GAP-1` · `fn` · `parse_valid_at_from_json` · free fn; parses valid_at/valid_from/valid_until from LLM JSON; array and object forms; graceful None on missing · `src/graph/mod.rs` → `teri::graph::parse_valid_at_from_json` · PARITY-VERIFIED 2026-06-14: array+object forms + graceful-None (`test_parse_valid_at_from_json_array_form`/`_object_form`)
+- [x] S-G1-006 · `unit:GAP-1` · `type` · `EdgeTriple` · type alias `(Uuid, Uuid, Relation)` for clippy complexity · `src/graph/mod.rs` → `teri::graph::EdgeTriple` · PARITY-VERIFIED 2026-06-14: type alias exercised via `partition_edges_at`/`get_all_edges` return shape
+
+---
+
+## GAP-2 / OQ-3 — query_vec_similarity cosine search (cycle-2 additions, src/memory/mod.rs)
+
+- [x] S-G2-001 · `unit:GAP-2` · `fn` · `MemoryStore::query_vec_similarity` · async cosine-similarity search over stored vec entries; spawn_blocking redb scan; dimension-mismatch skip; zero-norm skip; top_k sort · `src/memory/mod.rs` → `teri::memory::MemoryStore::query_vec_similarity` · PARITY-VERIFIED 2026-06-14: cosine math proven genuine (magnitude-normalized, not dot — independent differential: wrong-direction high-magnitude vector loses to aligned one); 6 branches tested (empty→Ok([]), ranking, top_k limiting, top_k≥avail→all, dim-mismatch skip, identical→sim≈1.0); reproduces SEARCH half of Zep insight_forge/quick_search ranked-results contract
+
+---
+
+## GAP-OQ3-EMBED — Embedding generation (blocked, substrate decision needed)
+
+- [!] S-EMBED-001 · `unit:GAP-OQ3-EMBED` · BLOCKED · Embedding generation (text → vector) has no backend. shimmy has no /v1/embeddings route. Decision: add /v1/embeddings to shimmy OR add EmbeddingClient trait in teri. Do NOT implement a fake/random embedder.
