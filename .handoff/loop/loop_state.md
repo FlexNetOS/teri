@@ -17,9 +17,9 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 4
-cycles_total: 4
-ledger: parity 3/50 units verified [x] (U-006, U-008, U-015) + GAP-1/2/6/ACTION-TAXONOMY resolved   # LLM adapter now PROVEN superset (think+fence strip, retry recovery)
+cycles_this_session: 5
+cycles_total: 5
+ledger: parity 4/50 units verified [x] (U-006, U-008, U-013, U-015) + GAP-1/2/6/U015-1/ACTION-TAXONOMY resolved   # text_processor (split_text/preprocess/stats) + build() chunking; 263 green
 symbols: ~28/1087 [x] + ~18 [≠] of 1087 mapped   # +S-TAX-001..019,021 [x] (social Action taxonomy); S-TAX-020 REFRESH [≠]
 gaps_open: GAP-OQ3-EMBED [!] (embedding generation: shimmy has no /v1/embeddings); GAP-U015-1 [!] (build() large-doc chunking after U-013); GAP-SOCIAL-WORLDSTATE [!] (rich social-world-state timeline/posts/engagement deferred to U-022/028/029/030)
 action_taxonomy: Action::Social(SocialAction) — 12 OASIS types (Trend included; Like/Dislike carry TargetKind{Post,Comment}); REFRESH [≠] (FILTERED_ACTIONS). READY for U-022/028/029/030.

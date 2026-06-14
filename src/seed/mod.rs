@@ -1,3 +1,5 @@
+pub mod text_processor;
+
 use crate::error::{Result, TeriError};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};

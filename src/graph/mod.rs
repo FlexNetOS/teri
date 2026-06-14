@@ -1,5 +1,6 @@
 use crate::error::{Result, TeriError};
 use crate::llm::LlmClient;
+use crate::seed::text_processor;
 use crate::seed::SeedDocument;
 use petgraph::graph::{Graph, NodeIndex};
 use petgraph::visit::EdgeRef;
@@ -294,89 +295,142 @@ impl KnowledgeGraph {
 
     /// Builds a knowledge graph from a seed document using a two-pass LLM extraction pipeline.
     ///
-    /// Pass 1: entity extraction — prompt the LLM, parse the JSON response, add each entity
-    /// to the graph (duplicate names are skipped rather than faulted — resilience matches
-    /// MiroFish's tolerant contract).
+    /// # Large-document chunking (GAP-U015-1)
     ///
-    /// Pass 2: relation extraction — prompt the LLM with the extracted entity list, parse
-    /// the JSON response, resolve entity names to NodeIndex values, add each relation (relations
-    /// that reference an unknown entity name are skipped, not faulted).
+    /// MiroFish splits large documents before LLM processing to avoid context overflow.
+    /// Teri replicates this: documents whose `raw_text` exceeds `CHUNK_SIZE` characters are
+    /// split into overlapping chunks via [`crate::seed::text_processor::split_text`] (defaults:
+    /// 500-char windows, 50-char overlap).  Pass 1 (entity extraction) is run **per chunk**;
+    /// entities from all chunks are merged into a single deduplicated set.  Pass 2 (relation
+    /// extraction) is then run over each chunk separately, with relations merged into the graph
+    /// (unknown-entity refs remain skipped, as before).
     ///
-    /// Empty extraction (LLM returns no entities) yields a valid empty graph, not an error.
+    /// **Small-doc invariant**: documents with ≤ `CHUNK_SIZE` chars produce exactly one chunk
+    /// (the whole text), so the pipeline is identical to the pre-chunking behaviour — all 5
+    /// existing build tests continue to pass unchanged.
+    ///
+    /// # Pass details
+    ///
+    /// Pass 1: entity extraction — prompt the LLM per chunk, parse JSON responses, merge
+    /// extracted entities into the graph (duplicate names are skipped — MiroFish resilience
+    /// contract).
+    ///
+    /// Pass 2: relation extraction — prompt the LLM with the full deduplicated entity list
+    /// per chunk; parse JSON responses; resolve entity names to NodeIndex values; add each
+    /// relation (relations that reference an unknown entity name are skipped, not faulted).
+    ///
+    /// Empty extraction (LLM returns no entities across all chunks) yields a valid empty graph,
+    /// not an error.
     ///
     /// LLM errors and JSON parse errors are propagated as `TeriError`.
     pub async fn build<L: LlmClient>(doc: &SeedDocument, llm: &L) -> Result<Self> {
+        /// Chunk size threshold (characters).  Documents ≤ this size use a single chunk,
+        /// preserving exact parity with the pre-chunking build() contract.
+        const CHUNK_SIZE: usize = 500;
+        const CHUNK_OVERLAP: usize = 50;
+
         let mut graph = KnowledgeGraph::new();
 
-        // ---- Pass 1: entity extraction ----
-        let entity_prompt = Self::entity_extraction_prompt(doc);
-        let entity_json = llm.complete(&entity_prompt).await?;
+        // Split the document text into chunks.
+        // `split_text` returns a single-element vec for text ≤ CHUNK_SIZE, so the small-doc
+        // path is structurally identical to the original single-pass behaviour.
+        let chunks = text_processor::split_text(&doc.raw_text, CHUNK_SIZE, CHUNK_OVERLAP);
 
-        let entities = Self::parse_entities_json(&entity_json)?;
+        // If the document is completely blank, `split_text` returns an empty vec.
+        // Treat this the same as an empty extraction (valid empty graph).
+        if chunks.is_empty() {
+            return Ok(graph);
+        }
 
-        // Add entities; skip duplicates (MiroFish resilience contract).
-        for entity in &entities {
-            if !graph.index.contains_key(&entity.name) {
-                graph.add_entity(entity.clone())?;
+        // ---- Pass 1: entity extraction — one LLM call per chunk, merge results ----
+        for chunk_text in &chunks {
+            // Build a per-chunk pseudo-document so we can reuse the existing prompt helper.
+            // Metadata is shared from the original document.
+            let chunk_doc = SeedDocument {
+                id: doc.id,
+                raw_text: chunk_text.clone(),
+                metadata: doc.metadata.clone(),
+                created_at: doc.created_at,
+            };
+
+            let entity_prompt = Self::entity_extraction_prompt(&chunk_doc);
+            let entity_json = llm.complete(&entity_prompt).await?;
+            let entities = Self::parse_entities_json(&entity_json)?;
+
+            // Merge: skip duplicates (MiroFish resilience contract, now cross-chunk).
+            for entity in &entities {
+                if !graph.index.contains_key(&entity.name) {
+                    graph.add_entity(entity.clone())?;
+                }
             }
         }
 
-        // If no entities were extracted, return a valid empty graph (not an error).
+        // If no entities were extracted across all chunks, return a valid empty graph.
         if graph.entity_count() == 0 {
             return Ok(graph);
         }
 
-        // ---- Pass 2: relation extraction ----
-        // Collect the entities actually in the graph (post-dedup) for the prompt.
+        // ---- Pass 2: relation extraction — one LLM call per chunk, merge results ----
+        // Collect the deduplicated entity set (post-merge from Pass 1).
         let graph_entities: Vec<Entity> = graph.get_all_entities().into_iter().cloned().collect();
-        let relation_prompt = Self::relation_extraction_prompt(doc, &graph_entities);
-        let relation_json = llm.complete(&relation_prompt).await?;
 
-        // Parse relations, skipping any that reference an unknown entity name.
-        let value: Value = serde_json::from_str(&relation_json)
-            .map_err(|e| TeriError::Graph(format!("Invalid relation JSON from LLM: {e}")))?;
+        for chunk_text in &chunks {
+            let chunk_doc = SeedDocument {
+                id: doc.id,
+                raw_text: chunk_text.clone(),
+                metadata: doc.metadata.clone(),
+                created_at: doc.created_at,
+            };
 
-        if let Some(arr) = value.as_array() {
-            for item in arr {
-                let from_name = match item.get("from").and_then(Value::as_str) {
-                    Some(n) => n,
-                    None => continue, // skip malformed item
-                };
-                let to_name = match item.get("to").and_then(Value::as_str) {
-                    Some(n) => n,
-                    None => continue, // skip malformed item
-                };
+            let relation_prompt = Self::relation_extraction_prompt(&chunk_doc, &graph_entities);
+            let relation_json = llm.complete(&relation_prompt).await?;
 
-                // Skip relations referencing entities not in the graph.
-                let from_idx = match graph.index.get(from_name).copied() {
-                    Some(idx) => idx,
-                    None => continue,
-                };
-                let to_idx = match graph.index.get(to_name).copied() {
-                    Some(idx) => idx,
-                    None => continue,
-                };
+            // Parse relations; skip any referencing an unknown entity name.
+            let value: Value = serde_json::from_str(&relation_json)
+                .map_err(|e| TeriError::Graph(format!("Invalid relation JSON from LLM: {e}")))?;
 
-                let kind_str = item.get("kind").and_then(Value::as_str).unwrap_or("Other");
-                let kind = match kind_str {
-                    "WorksFor" => RelationKind::WorksFor,
-                    "LocatedIn" => RelationKind::LocatedIn,
-                    "RelatedTo" => RelationKind::RelatedTo,
-                    "Causes" => RelationKind::Causes,
-                    "Affects" => RelationKind::Affects,
-                    _ => RelationKind::Other,
-                };
+            if let Some(arr) = value.as_array() {
+                for item in arr {
+                    let from_name = match item.get("from").and_then(Value::as_str) {
+                        Some(n) => n,
+                        None => continue, // skip malformed item
+                    };
+                    let to_name = match item.get("to").and_then(Value::as_str) {
+                        Some(n) => n,
+                        None => continue, // skip malformed item
+                    };
 
-                let weight = match item.get("weight").and_then(Value::as_f64) {
-                    Some(w) if (0.0..=1.0).contains(&w) => w as f32,
-                    // Skip relations with missing or out-of-range weight.
-                    _ => continue,
-                };
+                    // Skip relations referencing entities not in the graph.
+                    let from_idx = match graph.index.get(from_name).copied() {
+                        Some(idx) => idx,
+                        None => continue,
+                    };
+                    let to_idx = match graph.index.get(to_name).copied() {
+                        Some(idx) => idx,
+                        None => continue,
+                    };
 
-                graph.add_relation(from_idx, to_idx, Relation { kind, weight, valid_at: None });
+                    let kind_str = item.get("kind").and_then(Value::as_str).unwrap_or("Other");
+                    let kind = match kind_str {
+                        "WorksFor" => RelationKind::WorksFor,
+                        "LocatedIn" => RelationKind::LocatedIn,
+                        "RelatedTo" => RelationKind::RelatedTo,
+                        "Causes" => RelationKind::Causes,
+                        "Affects" => RelationKind::Affects,
+                        _ => RelationKind::Other,
+                    };
+
+                    let weight = match item.get("weight").and_then(Value::as_f64) {
+                        Some(w) if (0.0..=1.0).contains(&w) => w as f32,
+                        // Skip relations with missing or out-of-range weight.
+                        _ => continue,
+                    };
+
+                    graph.add_relation(from_idx, to_idx, Relation { kind, weight, valid_at: None });
+                }
             }
+            // A non-array relation response is tolerated as empty — no relations added.
         }
-        // A non-array relation response is tolerated as empty — no relations added.
 
         Ok(graph)
     }
@@ -1519,6 +1573,123 @@ mod tests {
         ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
             Err(TeriError::Llm("Streaming not implemented in mock".to_string()))
         }
+    }
+
+    // ===== Multi-chunk mock LLM that returns different entities per chunk =====
+
+    /// A mock LLM that tracks how many times it has been called for entity extraction
+    /// and returns a different entity on each call — proving that entities from ALL chunks
+    /// are merged into the final graph.
+    struct ChunkCountingLlmClient {
+        /// All entity-extraction responses, indexed by call order (wraps around).
+        entity_responses: Vec<String>,
+        /// Single relation response (same for all chunks — tests the merge, not relations).
+        relation_response: String,
+        /// Shared call counter (using `std::sync::Mutex` to satisfy `&self` bound on `complete`).
+        entity_call_count: std::sync::Mutex<usize>,
+    }
+
+    impl ChunkCountingLlmClient {
+        fn new(entity_responses: Vec<&str>, relation_response: &str) -> Self {
+            Self {
+                entity_responses: entity_responses.iter().map(|s| s.to_string()).collect(),
+                relation_response: relation_response.to_string(),
+                entity_call_count: std::sync::Mutex::new(0),
+            }
+        }
+
+        fn entity_call_count(&self) -> usize {
+            *self.entity_call_count.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for ChunkCountingLlmClient {
+        async fn complete(&self, prompt: &str) -> Result<String> {
+            if prompt.contains("Extract named entities") {
+                let mut count = self.entity_call_count.lock().unwrap();
+                let idx = *count % self.entity_responses.len();
+                *count += 1;
+                Ok(self.entity_responses[idx].clone())
+            } else if prompt.contains("extract relations") {
+                Ok(self.relation_response.clone())
+            } else {
+                Err(TeriError::Llm("Unexpected prompt for chunk-counting mock".to_string()))
+            }
+        }
+
+        async fn complete_json<T: serde::de::DeserializeOwned>(&self, prompt: &str) -> Result<T> {
+            let response = self.complete(prompt).await?;
+            serde_json::from_str(&response)
+                .map_err(|e| TeriError::Llm(format!("JSON parsing error: {}", e)))
+        }
+
+        async fn stream(
+            &self,
+            _prompt: &str,
+        ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            Err(TeriError::Llm("Streaming not implemented in chunk-counting mock".to_string()))
+        }
+    }
+
+    /// build() with a large multi-chunk document must:
+    /// 1. Call the LLM more than once for entity extraction (proving chunking happened).
+    /// 2. Merge entities from ALL chunks into the graph (deduped).
+    /// 3. Produce a graph that contains entities from chunk 1 AND chunk 2 (distinct names).
+    #[tokio::test]
+    async fn test_build_large_doc_multi_chunk_merge() {
+        // Build a document that is clearly > 500 chars so it gets split into at least 2 chunks.
+        // Pad with unique filler so the chunks are distinct.
+        let chunk1_filler = "Alpha ".repeat(50); // ~300 chars, first chunk territory
+        let chunk2_filler = "Beta ".repeat(50);  // ~300 chars, second chunk territory
+        // Use ". " as sentence boundary separator to encourage clean splits.
+        let large_text = format!(
+            "{}. Context for Alice and her team at Sunrise Corp. {}. Context for Bob and his division at Sunset Inc.",
+            chunk1_filler, chunk2_filler
+        );
+        assert!(
+            large_text.chars().count() > 500,
+            "test pre-condition: document must exceed chunk threshold"
+        );
+
+        // Entity responses: chunk 1 returns Alice/Sunrise Corp, chunk 2 returns Bob/Sunset Inc.
+        // (The counting mock cycles through responses in order.)
+        let entity_resp_chunk1 = r#"[
+            {"name": "Alice", "kind": "Person"},
+            {"name": "Sunrise Corp", "kind": "Organization"}
+        ]"#;
+        let entity_resp_chunk2 = r#"[
+            {"name": "Bob", "kind": "Person"},
+            {"name": "Sunset Inc", "kind": "Organization"}
+        ]"#;
+
+        let mock_llm = ChunkCountingLlmClient::new(
+            vec![entity_resp_chunk1, entity_resp_chunk2],
+            "[]", // no relations needed for this test
+        );
+
+        let doc = SeedDocument {
+            id: uuid::Uuid::new_v4(),
+            raw_text: large_text,
+            metadata: HashMap::new(),
+            created_at: Utc::now(),
+        };
+
+        let graph = KnowledgeGraph::build(&doc, &mock_llm).await.expect("multi-chunk build");
+
+        // Chunking happened — entity extraction was called more than once.
+        let call_count = mock_llm.entity_call_count();
+        assert!(
+            call_count > 1,
+            "expected entity extraction to be called >1 time (chunking), got {call_count}"
+        );
+
+        // All 4 entities (2 per chunk) should be present in the merged graph.
+        assert!(graph.get_entity("Alice").is_some(), "Alice must be in merged graph");
+        assert!(graph.get_entity("Sunrise Corp").is_some(), "Sunrise Corp must be in merged graph");
+        assert!(graph.get_entity("Bob").is_some(), "Bob must be in merged graph");
+        assert!(graph.get_entity("Sunset Inc").is_some(), "Sunset Inc must be in merged graph");
+        assert_eq!(graph.entity_count(), 4, "4 unique entities, none dropped");
     }
 
     // ===== Entity/Relation Extraction Tests =====
