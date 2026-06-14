@@ -115,16 +115,16 @@
 
 ## U-009 — `backend/app/utils/file_parser.py`
 
-- [ ] S-060 · `unit:U-009` · `fn` · `_read_text_with_fallback` · multi-encoding detection: chardet→charset-normalizer→latin-1 · `file_parser.py:11`
-- [ ] S-061 · `unit:U-009` · `type` · `FileParser` · static file extraction class · `file_parser.py:61`
-- [ ] S-062 · `unit:U-009` · `field` · `FileParser.SUPPORTED_EXTENSIONS` · set of supported extensions · `file_parser.py:64`
-- [ ] S-063 · `unit:U-009` · `method` · `FileParser.is_supported` · checks filename against ALLOWED_EXTENSIONS · `file_parser.py:67`
-- [ ] S-064 · `unit:U-009` · `method` · `FileParser.extract_text` · dispatch to pdf/md/txt extractor · `file_parser.py:81`
-- [ ] S-065 · `unit:U-009` · `method` · `FileParser._extract_from_pdf` · PyMuPDF, silently skips failed pages · `file_parser.py:111`
-- [ ] S-066 · `unit:U-009` · `method` · `FileParser._extract_from_md` · markdown text extraction · `file_parser.py:128`
-- [ ] S-067 · `unit:U-009` · `method` · `FileParser._extract_from_txt` · text file extraction · `file_parser.py:133`
-- [ ] S-068 · `unit:U-009` · `method` · `FileParser.extract_from_multiple` · concatenates texts from multiple files · `file_parser.py:138`
-- [ ] S-069 · `unit:U-009` · `fn` · `split_text_into_chunks` · character-count split with overlap · `file_parser.py:161`
+- [x] S-060 · `unit:U-009` · `fn` · `_read_text_with_fallback` · multi-encoding detection: chardet→charset-normalizer→latin-1 · `file_parser.py:11` · **rust-target:** `SeedIngestor::read_text_with_fallback` at `src/seed/mod.rs`; strategy: UTF-8 → GBK (encoding_rs) → Windows-1252 (never fails); tested: GBK bytes→correct chars, Latin-1 bytes→correct chars, UTF-8 passthrough, end-to-end `from_file` for both encodings.
+- [x] S-061 · `unit:U-009` · `type` · `FileParser` · static file extraction class · `file_parser.py:61` · **rust-target:** `SeedIngestor` at `src/seed/mod.rs`
+- [≠] S-062 · `unit:U-009` · `field` · `FileParser.SUPPORTED_EXTENSIONS` · set of supported extensions · `file_parser.py:64` · **rust-target:** `SUPPORTED_EXTENSIONS` const at `src/seed/mod.rs`; **`- [≠]` json superset (no-downgrade):** teri's set `{txt,md,markdown,pdf,json}` is a SUPERSET of MiroFish `Config.ALLOWED_EXTENSIONS={pdf,md,txt,markdown}` (config.py:41) — identical for the 4 shared exts, ADDS json because teri genuinely ingests json (`read_json`); nothing MiroFish accepts is rejected. Verified cycle-6. (nit: code comment says "mirrors" — should say "mirrors+extends")
+- [≠] S-063 · `unit:U-009` · `method` · `FileParser.is_supported` · checks filename against ALLOWED_EXTENSIONS · `file_parser.py:67` · **rust-target:** `SeedIngestor::is_supported` at `src/seed/mod.rs`; tested: all known types true, unknowns false, case-insensitive. **`- [≠]` permissive-policy (no-downgrade):** `is_supported` is the caller-side gate (mirrors MiroFish `allowed_file`/`FileParser.is_supported`) while `from_file` stays PERMISSIVE (unknown ext → plain-text, vs MiroFish `extract_text` raising) — teri resilience; the gate still exists, hides no loss. Verified cycle-6.
+- [x] S-064 · `unit:U-009` · `method` · `FileParser.extract_text` · dispatch to pdf/md/txt extractor · `file_parser.py:81` · **rust-target:** `SeedIngestor::from_file` dispatch at `src/seed/mod.rs`; all arms including md/markdown now explicit
+- [x] S-065 · `unit:U-009` · `method` · `FileParser._extract_from_pdf` · PyMuPDF, silently skips failed pages · `file_parser.py:111` · **rust-target:** `SeedIngestor::read_pdf` at `src/seed/mod.rs`; page-skip-on-error verified (parity-verifier cycle-5)
+- [x] S-066 · `unit:U-009` · `method` · `FileParser._extract_from_md` · markdown text extraction · `file_parser.py:128` · **rust-target:** `SeedIngestor::from_file` "md"|"markdown" arm → `read_plain_text` (encoding-fallback) at `src/seed/mod.rs`; tested: .md dispatch, .markdown dispatch
+- [x] S-067 · `unit:U-009` · `method` · `FileParser._extract_from_txt` · text file extraction · `file_parser.py:133` · **rust-target:** `SeedIngestor::read_plain_text` with `read_text_with_fallback` at `src/seed/mod.rs`; now handles non-UTF-8
+- [x] S-068 · `unit:U-009` · `method` · `FileParser.extract_from_multiple` · concatenates texts from multiple files · `file_parser.py:138` · **rust-target:** `SeedIngestor::from_files` at `src/seed/mod.rs`; in-order concat with `=== 文档 i: name ===` headers; per-file error tolerance; tested: order, headers, error tolerance
+- [ ] S-069 · `unit:U-009` · `fn` · `split_text_into_chunks` · character-count split with overlap · `file_parser.py:161` · distributed to U-013 (text_processor)
 
 ---
 

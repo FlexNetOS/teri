@@ -262,3 +262,47 @@ S-190 → `- [x]` (re-verified with chunking).
 ### Result
 
 **U-013 = PASS** (S-167/S-169/S-170/S-171 → `- [x]`, S-168 `- [≠]`). **GAP-U015-1 = RESOLVED** (S-190 → `- [x]`, no U-015 downgrade). Parity-ledger: U-013 `- [x]`, GAP-U015-1 RESOLVED in the U-015 row.
+
+---
+
+## 2026-06-14 · cycle-6 · U-009 · `FileParser` file-parsing gaps → `SeedIngestor` (encoding fallback, .md dispatch, is_supported, multi-file concat)
+
+**Verdict: PASS.** All S-060..S-068 contract behaviors differentially verified against MiroFish `file_parser.py` + `config.py`. Two `- [≠]` intentional divergences (both no-downgrade). No regression: **263→275 (+12)** tests green; clippy `--all-targets -D warnings` clean (independently re-confirmed by build-health). The +12 are the new encoding/dispatch/is_supported/multi-file tests in `src/seed/mod.rs:619-782`.
+
+**Method:** differential, not existence-check. GBK byte fixtures generated independently in Python (`"中文".encode("gbk")` → `[D6 D0 CE C4]`; `"你好世界"` → `[C4 E3 BA C3 CA C0 BD E7]`) and confirmed byte-exact to the Rust test fixtures. The `encoding_rs` decoder behavior was run directly via a throwaway `examples/gbk_probe.rs` (`cargo run --example`, removed after) — NOT inferred from the Python `gbk` codec (encoding_rs GBK is GB18030-family, so it had to be exercised directly).
+
+### S-060 — `read_text_with_fallback` (encoding fallback, HIGHEST RISK) = PASS
+
+Direct `encoding_rs` run (the load-bearing evidence):
+- **UTF-8 fast path:** `"Hello, 世界! résumé"` → `std::str::from_utf8` Ok → returned unchanged. ✓
+- **GBK round-trip PROVEN:** `GBK.decode([D6 D0 CE C4])` → `out="中文"`, **`had_errors=false`** → guard accepts. Correct Chinese characters, NOT mojibake, NOT a UTF-8 error. End-to-end `from_file` on a GBK `.txt` (`[C4 E3 BA C3 CA C0 BD E7]`) → `raw_text=="你好世界"`. ✓
+- **had_errors IS CHECKED (the flagged risk is closed):** `src/seed/mod.rs:167-170` does `let (cow,_,had_errors)=GBK.decode(bytes); if !had_errors { return cow.into_owned(); }`. Adversarial false-positive probe: Latin-1 `café` bytes `[63 61 66 E9]` through GBK → `out="caf␦"`, **`had_errors=true`** → guard REJECTS, falls through to Windows-1252 → `"café"`. So a Latin-1 file is NOT mis-decoded as GBK. The exact defect the gate was told to hunt for is **absent**. ✓
+- **Windows-1252 backstop never errors:** `[63 61 66 E9]` → `had_errors=false` (`0xE9→é`); lone `0x80` → `€`. Every byte maps; no `String::from_utf8_lossy` mojibake anywhere in the path (confirmed absent — strict `from_utf8` + two checked `encoding_rs` decoders only). ✓
+
+Parity vs MiroFish `_read_text_with_fallback` (file_parser.py:11-58): MiroFish is UTF-8 → charset_normalizer/chardet best-guess → UTF-8+replace. Rust is UTF-8 → GBK(checked) → Windows-1252(total). For the real-world cases that matter (valid UTF-8, valid GBK Chinese, valid Latin-1) both produce the correct decode; neither errors/panics. The deterministic Rust order is a sound, non-downgrading equivalent of MiroFish's heuristic detector — both honor the "never raise on a text file" contract.
+
+### S-064/S-066/S-067 — .md/.markdown dispatch → text reader = PASS
+
+`from_file` "md"|"markdown" arm (`src/seed/mod.rs:84`) routes to `read_plain_text` (with encoding fallback), matching MiroFish `_extract_from_md`/`_extract_from_txt` (both plain text via `_read_text_with_fallback`). Tested: `.md`→raw_text exact, `file_format=="md"`; `.markdown`→exact, `file_format=="markdown"`. ✓
+
+### S-062/S-063 — `is_supported` = PASS with TWO `- [≠]` (no behavior loss)
+
+- **`- [≠]` (a) permissive `from_file`** (task-described): unknown ext → plain-text read (teri resilience) vs MiroFish `extract_text` raising `ValueError`. `is_supported` is the caller-side API gate (mirrors MiroFish `allowed_file`/`FileParser.is_supported`), so the policy split hides no loss — the gate still exists, it's just decoupled from the reader.
+- **`- [≠]` (b) json superset** (adjudicated this cycle): MiroFish `Config.ALLOWED_EXTENSIONS={pdf,md,txt,markdown}` (config.py:41) and `FileParser.SUPPORTED_EXTENSIONS={.pdf,.md,.markdown,.txt}` — **no json** (MiroFish has no json reader). teri's set is `{txt,md,markdown,pdf,json}` — a **superset**: for the 4 shared extensions behavior is identical (nothing MiroFish accepts is rejected). teri ADDS json because teri genuinely ingests json (`read_json` at mod.rs:221-234, `test_json_file_format`/`test_integration_examples` pass). Declaring json supported is *consistent with teri's own capability* — it would be a bug to gate out a format teri ingests. Superset, no downgrade. Tested: all 5 known→true, unknowns (exe/zip/png/noext)→false, case-insensitive (`DOC.TXT`/`Report.MD`→true). ✓
+- **Nit (non-blocking, comment-only):** the doc at `src/seed/mod.rs:10-12` says the const "mirrors `Config.ALLOWED_EXTENSIONS`" — it actually mirrors teri's *superset* (adds json). No behavioral impact; suggest amending the comment to "mirrors+extends".
+
+### S-061/S-068 — `FileParser` type + `extract_from_multiple` multi-file concat = PASS
+
+Concat format byte-exact (orchestrator pre-confirmed; re-confirmed in code): `format!("=== 文档 {idx}: {filename} ===\n{text}")` joined `"\n\n"`, error line `"=== 文档 {idx}: {path} (提取失败: {e}) ==="` — identical to MiroFish `extract_from_multiple` (file_parser.py:138-158), including 1-based index and `Path::file_name` for the per-file name. **Per-file error tolerance proven:** a missing file in a 2-file batch → `from_files` returns `Ok`, good file's content present AND `提取失败` marker present (one bad file does NOT abort the batch — matches the Python `try/except` per-file). In-order header check (`pos1<pos2`) passes. ✓
+
+### S-065 — `_extract_from_pdf` page-skip = PASS (carried from cycle-5)
+
+`read_pdf` page-skip-on-error already parity-verified cycle-5; unaffected by this cycle's changes.
+
+### No-regression
+
+Full `cargo test` (all targets) = **275 passed, 0 failed** (was 263, +12). Seed module: 45/45. The pre-existing seed tests (PDF invalid→err, URL non-200→err, json/malformed-json, web extraction, basic metadata) all unaffected. clippy `--all-targets -D warnings` clean.
+
+### Result
+
+**U-009 = PASS.** S-060..S-068 → `- [x]` except S-062/S-063 → `- [≠]` (json superset + permissive policy, both no-downgrade). S-069 stays distributed to U-013 (already `- [x]`). The flagged GBK-Latin-1 false-positive risk is **closed**: `had_errors` is checked, GBK round-trip proven, no mojibake.

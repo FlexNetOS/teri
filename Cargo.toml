@@ -82,6 +82,7 @@ minijinja = "1"
 # File format support
 pdfium-render = "0.8"
 scraper = "0.19"
+encoding_rs = "0.8"
 
 [dev-dependencies]
 tokio-test = "0.4"
