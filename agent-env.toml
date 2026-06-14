@@ -1,0 +1,26 @@
+# agent-env.toml — teri's required secrets for envctl auto-injection.
+#
+# When launched via `envctl run -- teri ...`, envctl reads this file to determine
+# which secrets to inject from its vault. The keys listed in [secrets] must be provided
+# by the operator (or existing environment) and are available as injected env vars.
+#
+# Usage:
+#   # With envctl (preferred — secrets auto-injected):
+#   envctl run -- teri run --seed "market-analysis" --query "What's the S&P 500 trend?"
+#
+#   # Without envctl (manual key):
+#   export LLM_API_KEY=sk-...
+#   teri run --seed "..." --query "..."
+
+[secrets]
+LLM_API_KEY = { required = true, description = "API key for the LLM backend (OpenAI-compatible)" }
+
+[config]
+description = "All teri configuration is environment-driven; see LLM_* and SIM_* env vars in README.md"
+
+[toolchain]
+llm_backends = ["openai", "anthropic", "gemini"]
+inference_servers = ["shimmy (local)"]
+
+[fallback]
+message = "LLM_API_KEY not set. Use `envctl run -- teri ...` for auto-injection, or export LLM_API_KEY manually."
