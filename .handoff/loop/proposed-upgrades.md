@@ -41,6 +41,33 @@ boundary. Cross-harness ⇒ propose, never force-apply (scope law).
 3. **Reusable vendored-dependency exclusion helper script (`scripts/`).** Note it now; bundle it on the
    second hand-written recurrence of the exclude-glob list.
 
+## D. Interim `[≠]` re-audit under the tightened bar — QUEUED tracked task (cycles 8–9 find)
+
+**Why now:** the owner flagged (cycles 8–9) that `- [≠]` "noted as optional" was being used to skip
+portable features ("if you do not add it to the rust port, is it still optional?" — "a bad-behavior
+flag"). The `[≠]` bar has now been tightened across the harness (applied — see the change-history row):
+`[≠]` is legal ONLY for genuinely-inexpressible / non-contractual / strict-superset behaviors, never
+"the dest won't use it" for a feature with distinct observable output. The pre-DONE left-behind sweep
+already re-validates `[≠]`, but the owner asked for it now, so it is surfaced as its own tracked task
+rather than waiting for the DONE sweep.
+
+**Task (queued, NOT run here — this is a tracked backlog item):**
+- Re-challenge **every** existing `- [≠]` ledger row in this run (~18+ in `loop_state.md` symbols line +
+  the `- [≠]` rows in `merge-ledger.md`/`symbol-map.md`/`findings/parity.md`) under the precise bar.
+  For each: is it (a) inexpressible, (b) non-contractual/unobservable, or (c) strict-superset? If none of
+  those — it is a disguised portable-feature skip → reclassify to `extend-Y`/`port-fresh` and PORT it.
+- **Prioritize re-challenging:** the remaining **U-018-adjacent `[≠]`** (other OASIS profile fields/
+  serializers in the same area that the cycle-8 correction may not have swept) and the **Zep-mechanics
+  `[≠]`** — S-189 `build_graph_async`, S-193 `add_text_batches` (1s sleep), S-194 `_wait_for_episodes`
+  (poll/timeout) (findings/parity.md l34-37): confirm each is genuinely Zep-SaaS async-lifecycle
+  machinery with no in-process analogue (legitimate (a)/(b)), not a behavior teri's synchronous path
+  silently drops.
+- **Already confirmed legitimate under the new bar (do NOT re-port — sanity-check, not over-correction):**
+  retry **jitter** (b, parity.md l205), **REFRESH** in `FILTERED_ACTIONS` (b, parity.md l108/l157,
+  S-TAX-020), **`is_supported` json-superset** (c, parity.md l291).
+- **Owner action:** none required to *apply* (the bar tightening is applied + strengthen-only); this is a
+  queued cleanup task to run before DONE. Surface its result in the DONE left-behind sweep.
+
 ## C. Gate-adjacent note (already applied this iteration, owner awareness)
 
 F-G1 strengthened the baseline gate (executed-evidence + red-tip-fail-closed) and was **applied** because
