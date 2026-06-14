@@ -3,6 +3,8 @@
 **Date:** 2026-06-13  
 **Verdict:** GREEN-TO-START ✓
 
+> **⚠️ CORRECTION (2026-06-14, ITERATE cycle 1):** The "Teri Build ✓ PASS / 142 tests GREEN on develop @ c894de8" below was **FALSE-GREEN**. The actual `c894de8` (PR #4 merge into develop) is a **bad merge** that duplicated the `api_key` field in `src/config.rs` (lines 91–92) and left a dead `Config::from_env()` + duplicated block in `src/main.rs` — it does **not compile**. The DISCOVER build-health check did not actually compile the develop tip. Cycle 1 **repaired** config.rs/main.rs to the clean fix-branch (`d433f95`) versions; develop now compiles. **TRUE no-downgrade baseline = 156 tests green** (independently verified). Harness lesson for end-of-loop evolution-find: the DISCOVER baseline gate must actually `cargo build` the dest tip and fail-closed on a non-compiling tip.
+
 ## Health Matrix
 
 | Check | Result | Evidence |
