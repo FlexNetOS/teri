@@ -405,3 +405,66 @@ Full `cargo test` (all targets): **315 passed, 0 failed, 3 ignored** (was 310, +
 
 ### Symbols
 10 U-004 symbols → `- [x]` (S-026..S-035, incl. `build_rotating_writer` + the file layer). U-004 ledger → `- [x]`. get_logger / shortcuts / utf8 recorded as idiomatic-equivalent mappings, NOT gaps.
+
+---
+
+## 2026-06-14 · `[≠]` RE-AUDIT (owner-flagged, harness PR #34 tightened bar)
+
+Re-challenged every `- [≠]` row under the tightened test: `[≠]` legal ONLY as (a) inexpressible→really `[!]`, (b) non-contractual/unobservable, (c) strict-superset, or pure code-ORGANIZATION where the contract is fully ported elsewhere. Default-skeptical: each `[≠]` assumed a disguised feature-skip until proven. Source read at MiroFish `services/oasis_profile_generator.py`, `services/graph_builder.py`, `utils/retry.py`; teri read at `src/agent/mod.rs`, `src/graph/mod.rs`.
+
+### Verdict table — borderline rows
+
+| Row | Symbol | Verdict | Rule / Reason |
+|-----|--------|---------|---------------|
+| S-360 | `_fix_truncated_json` | **DISGUISED-SKIP → port-now** | Repairs truncated LLM JSON to SALVAGE a partial response before rule-based fallback. teri discards a salvageable LLM response on any parse error → quality/resilience DOWNGRADE with distinct observable output. Portable (brace/bracket/quote-closing string surgery). |
+| S-361 | `_try_fix_json` | **DISGUISED-SKIP → port-now** | Aggressive JSON repair: extract `{...}`, strip control chars, collapse whitespace, and field-level `bio`/`persona` regex salvage. Recovers content teri throws away. Distinct observable output. Portable. |
+| S-371 | `_normalize_gender` | **KEEP-[≠] (b) — but NARROWED scope: tie to OASIS export** | The 中文→en map (`男`→male, `女`→female, `机构`/`其他`→other, default→other) is REAL normalization, BUT its ONLY call site is `_save_reddit_json` (oasis_profile_generator.py:1177) — an OASIS file-EXPORT format concern. teri has no OASIS export path (S-369/S-372/S-373/S-344/S-345 all out of scope). With no export consumer there is no in-process contract today. **Legit keeper as (b) ONLY while OASIS export stays unported.** RE-FLAGGED: if/when OASIS Reddit/Twitter export is ported, `_normalize_gender` MUST port with it (it is contractual to that output) — recorded as a dependency, not a permanent divergence. |
+| S-355 | `_search_zep_for_entity` | **KEEP-[≠] (b)** | Zep-SaaS hybrid search (`self.zep_client.graph.search` scope=edges/nodes, rrf reranker, parallel ThreadPool, 30s timeout). Pure Zep-server-side machinery; no in-process analogue. The IN-PROCESS enrichment it feeds is the graph-traversal half (see S-356). |
+| S-356 | `_build_entity_context` | **DISGUISED-SKIP → port-now (enrichment narrowed in `generate_social`)** | `_build_entity_context` assembles entity attributes + `related_edges` (facts) + `related_nodes` (neighbor summaries) into the LLM prompt context for `generate_profile_from_entity`. teri's MAPPED method `generate_social` (agent/mod.rs:984) takes a FLAT `entity_summary: &str` and its prompt embeds ONLY name/type/summary — it NEVER enriches from the graph. The graph-traversal enrichment DOES exist in teri (`generate_entity_description`→`get_neighbors`, agent/mod.rs:926) but feeds the **Persona** path (`generate`, :886), NOT `generate_social`. So the social-profile path is NARROWED: it requires the caller to pre-supply context. The (b) part (Zep search) stays `[≠]`; the (in-process related_edges/related_nodes neighbor enrichment) is a dropped quality behavior on the social path → port. |
+| S-048 | `call_batch_with_retry` | **DISGUISED-SKIP → port-now (port to U-006)** | Not just "callers own batching": carries a REAL resilience contract — per-item retry via `call_with_retry`, partition into `(results, failures)` with per-failure `{index,item,error}`, and `continue_on_failure` (isolate a bad item vs abort the batch). Distinct observable behavior (partial-success result shape). No current teri consumer, but "when in doubt → port it"; belongs in U-006 retry utilities. |
+
+### Pending-dependency reclassifications (NOT divergences)
+
+| Row | Symbol | Reclassify → | Reason |
+|-----|--------|--------------|--------|
+| S-189 | `build_graph_async` | **pending-U-012** | Real async-task-with-progress FEATURE (spawns background task via `self.task_manager.create_task`, returns `task_id`, drives progress). TaskManager = U-012 (S-138..S-167, all `- [ ]`). Port when U-012 lands. |
+| S-192 | `set_ontology` | **pending-U-014** | Dynamic ontology (builds entity/edge Pydantic models from an ontology dict). Dynamic ontology IS in scope (OQ-5/GAP-3: EntityKind::Custom + ontology generator). OntologyGenerator = U-014 (S-172..S-176, all `- [ ]`). Port when U-014 lands. |
+
+### KEEP-[≠] — confirmed legit (Zep-SaaS-lifecycle / code-org / superset)
+
+- **S-191 `create_graph`** — KEEP (b): mints Zep `graph_id=mirofish_{uuid16}` + `self.client.graph.create()`. Pure Zep SaaS; teri's petgraph is in-process, no server graph to create.
+- **S-193 `add_text_batches` 1s sleep** — KEEP (b): rate-limit between Zep `graph.add_batch` POSTs. No in-process analogue (no remote API to throttle). The batching/progress contract itself rides on U-012/U-013, not here.
+- **S-194 `_wait_for_episodes` (poll processed=True every 3s, 600s timeout)** — KEEP (b): polls Zep SERVER-SIDE async episode processing. teri's LLM extraction is synchronous/awaitable in-process — nothing to poll.
+- **S-195 `_get_graph_info`** — KEEP (b/c): paginated Zep node/edge fetch → counts. teri exposes `entity_count()`/`relation_count()` directly (graph/mod.rs:517/521). Superset/equivalent.
+- **S-196 `get_graph_data`** — KEEP (b/c): paginated Zep read with Zep temporal fields (valid_at/invalid_at/expired_at/episodes). teri uses `serialize_to_json()`/`get_all_entities()`/`get_all_edges()`; Zep-specific temporal columns are server-side artifacts.
+- **S-197 `delete_graph`** — KEEP (b): `self.client.graph.delete()`. teri's KnowledgeGraph is dropped when out of scope; no remote graph to delete.
+- **S-181..S-188 `GraphInfo` dataclass + `GraphBuilderService` form** — KEEP code-org: Zep-result DTO + service wrapper; contract ported as methods on `KnowledgeGraph` (entity_count/relation_count/serialize_to_json, EntityKind enum). Same behavior, different form.
+- **S-045/S-046/S-047 `RetryableAPIClient` (+__init__/call_with_retry)** — KEEP code-org: per-adapter inline retry in `call_api` (llm.rs); same single-call retry contract, different form. (Distinct from S-048, which carries the EXTRA batch-partition contract.)
+- **S-062 `SUPPORTED_EXTENSIONS`** — KEEP (c) strict-superset: `{txt,md,markdown,pdf,json}` ⊇ MiroFish `{pdf,md,txt,markdown}`; adds json (genuinely ingested), rejects nothing MiroFish accepts.
+- **S-063 `is_supported`** — KEEP code-org/(c): caller-side gate preserved; `from_file` stays permissive (unknown→plain-text) = resilience, hides no loss.
+- **S-168 `extract_from_files`** — KEEP code-org: delegation plumbing; extraction ported in `SeedIngestor` (U-010).
+- **S-328 `OasisAgentProfile.name`** — KEEP code-org: reuses `Persona.name`, not duplicated.
+- **S-348/S-349/S-350/S-351 (MBTI/COUNTRIES/INDIVIDUAL/GROUP const arrays)** — KEEP code-org: inlined as rule-based match arms / free-LLM choice; values preserved.
+- **S-352 `__init__`** — KEEP code-org: `PersonaGenerator::new()` covers init; LLM passed per-call.
+- **S-357/S-358 `_is_individual_entity`/`_is_group_entity`** — KEEP code-org: classification inlined as match arms in rule-based fallback.
+- **S-362/S-363/S-364 (system/individual/group prompt builders)** — KEEP code-org: prompt logic folded into `generate_social`'s single template.
+- **S-366 `set_graph_id`** — KEEP (b): Zep graph_id not applicable; graph passed by ref.
+- **S-367 `generate_profiles_from_entities`** — KEEP code-org: batch loop is the orchestrator's (`AgentPool::spawn`) job. (NOTE: enrichment-per-entity contract is S-356's concern, addressed above.)
+- **S-368 `_print_generated_profile`** — KEEP (b): console/debug print, unobservable contract → tracing layer.
+- **S-369/S-370/S-372/S-373 (OASIS save_profiles / twitter_csv / reddit_json / save_profiles_to_json)** — KEEP code-org: OASIS file export out of scope (S-344). (Coupled to S-371 re-flag above.)
+- **retry jitter (S-043 note)** — KEEP (b): stochastic, no observable contract.
+- **S-TAX-020 REFRESH omission** — KEEP (b): in `FILTERED_ACTIONS={refresh,sign_up}` (run_parallel_simulation.py:611), filtered BEFORE reaching actions.jsonl/`to_episode_text`. Not a downgrade.
+
+### PORT-NOW list (exact source → target)
+
+1. **S-360 `_fix_truncated_json`** — oasis_profile_generator.py:583 → new helper in `src/agent/mod.rs` (e.g. `fix_truncated_json(&str)->String`), called in `generate_social` before `serde_json::from_str`.
+2. **S-361 `_try_fix_json`** — oasis_profile_generator.py:606 → `try_fix_json(...)->Option<Value>` in `src/agent/mod.rs`, attempted on parse failure in `generate_social` before rule-based fallback (field-level bio/persona salvage incl.).
+3. **S-356 (in-process enrichment half)** — `_build_entity_context` parts 1-3 (attributes + related_edges + related_nodes) → enrich `generate_social` to pull `KnowledgeGraph::get_neighbors` context (reuse/mirror `generate_entity_description`) instead of requiring a flat caller-supplied `entity_summary`. Zep-search half (S-355) stays `[≠]`.
+4. **S-048 `call_batch_with_retry`** — retry.py:195 → `src/llm.rs` (U-006 retry utilities): batch helper returning `(Vec<Ok>, Vec<Failure{index,item,error}>)` with `continue_on_failure`.
+
+### Symbol-map mutations applied (this re-audit)
+- S-360, S-361 → `- [ ]` (port-now); S-356, S-048 → `- [ ]` (port-now); each row note updated to DISGUISED-SKIP rationale. None marked `- [x]`.
+- S-189 → `- [ ]` pending-U-012; S-192 → `- [ ]` pending-U-014 (reclassified from `[≠]`).
+- S-371 retained `- [≠]` with an added re-flag (port-with-OASIS-export dependency).
+- S-355 retained `- [≠]` (Zep-SaaS-search half only).
+- All other `[≠]` rows: KEEP confirmed (table above), unchanged.

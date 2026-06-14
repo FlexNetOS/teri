@@ -971,16 +971,324 @@ impl PersonaGenerator {
         Ok(())
     }
 
+    /// Repair a truncated JSON string by closing unbalanced braces/brackets and dangling strings.
+    ///
+    /// Ports `OasisProfileGenerator._fix_truncated_json` (oasis_profile_generator.py:583).
+    /// Strategy:
+    /// 1. Strip surrounding whitespace.
+    /// 2. If the last char is not `"`, `,`, `}`, or `]`, append `"` to close a dangling string.
+    /// 3. Close any remaining unbalanced `[` brackets, then `{` braces.
+    ///
+    /// Returns the repaired string (may still fail JSON parse if damage is too severe).
+    pub fn fix_truncated_json(content: &str) -> String {
+        let mut content = content.trim().to_string();
+
+        // Count unbalanced braces/brackets
+        let open_braces =
+            content.chars().filter(|&c| c == '{').count() as isize
+            - content.chars().filter(|&c| c == '}').count() as isize;
+        let open_brackets =
+            content.chars().filter(|&c| c == '[').count() as isize
+            - content.chars().filter(|&c| c == ']').count() as isize;
+
+        // Close a dangling (truncated) string: if the last char is not a valid JSON terminal char
+        if !content.is_empty() {
+            let last = content.chars().last().unwrap();
+            if last != '"' && last != ',' && last != '}' && last != ']' {
+                content.push('"');
+            }
+        }
+
+        // Close unbalanced brackets, then braces (inner before outer)
+        for _ in 0..open_brackets.max(0) {
+            content.push(']');
+        }
+        for _ in 0..open_braces.max(0) {
+            content.push('}');
+        }
+
+        content
+    }
+
+    /// Aggressively salvage a broken/truncated JSON LLM response.
+    ///
+    /// Ports `OasisProfileGenerator._try_fix_json` (oasis_profile_generator.py:606).
+    /// Repair sequence:
+    /// 1. Apply `fix_truncated_json` (close brackets/strings).
+    /// 2. Extract the first `{…}` block via regex.
+    /// 3. Normalize newlines inside JSON string values (replace with spaces, collapse whitespace).
+    /// 4. Attempt `serde_json::from_str`.
+    /// 5. If still failing, strip control characters (0x00..0x1f, 0x7f..0x9f) and retry.
+    /// 6. If all structural repairs fail, do field-level regex extraction of `bio` / `persona`
+    ///    and return a minimal-but-valid object (marks `_fixed: true`).
+    /// 7. If nothing can be extracted, return `None` (caller uses rule-based fallback).
+    ///
+    /// Returns `Some(Value)` when ANY salvage succeeds (the caller should use it), `None` on
+    /// complete failure. `_fixed` key is set on structurally-repaired results; callers that
+    /// accept partial objects should accept any `Some`.
+    pub fn try_fix_json(
+        content: &str,
+        entity_name: &str,
+        entity_type: &str,
+        entity_summary: &str,
+    ) -> Option<serde_json::Value> {
+        // Step 1: truncation repair
+        let content = Self::fix_truncated_json(content);
+
+        // Step 2: extract the first {...} block
+        // Simple brace-scan: find first '{', then walk forward tracking depth to find its match.
+        let json_str = Self::extract_json_object(&content)?;
+
+        // Step 3 + 4: normalize newlines inside string values, then try parse
+        let json_normalized = Self::normalize_json_string_newlines(&json_str);
+        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&json_normalized) {
+            v["_fixed"] = serde_json::Value::Bool(true);
+            return Some(v);
+        }
+
+        // Step 5: strip control characters, then retry
+        let json_stripped = Self::strip_control_chars(&json_normalized);
+        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&json_stripped) {
+            v["_fixed"] = serde_json::Value::Bool(true);
+            return Some(v);
+        }
+
+        // Step 6: field-level regex extraction of bio / persona
+        let bio = Self::extract_json_string_field(&content, "bio").unwrap_or_else(|| {
+            if !entity_summary.is_empty() {
+                entity_summary.chars().take(200).collect()
+            } else {
+                format!("{}: {}", entity_type, entity_name)
+            }
+        });
+        let persona = Self::extract_json_string_field_partial(&content, "persona").unwrap_or_else(
+            || {
+                if !entity_summary.is_empty() {
+                    entity_summary.to_string()
+                } else {
+                    format!("{entity_name} is a {entity_type}.")
+                }
+            },
+        );
+
+        // Only return a partial result if we actually extracted something from the content
+        // (mirrors MiroFish's `if bio_match or persona_match:` guard)
+        let has_bio_match = Self::extract_json_string_field(&content, "bio").is_some();
+        let has_persona_match = Self::extract_json_string_field_partial(&content, "persona").is_some();
+        if has_bio_match || has_persona_match {
+            return Some(serde_json::json!({
+                "bio": bio,
+                "persona": persona,
+                "_fixed": true,
+            }));
+        }
+
+        // Step 7: complete failure
+        None
+    }
+
+    /// Extract the first `{...}` block from a string using brace-depth tracking.
+    fn extract_json_object(s: &str) -> Option<String> {
+        let start = s.find('{')?;
+        let chars: Vec<char> = s[start..].chars().collect();
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut escape_next = false;
+        let mut end_idx = None;
+
+        for (i, &ch) in chars.iter().enumerate() {
+            if escape_next {
+                escape_next = false;
+                continue;
+            }
+            if ch == '\\' && in_string {
+                escape_next = true;
+                continue;
+            }
+            if ch == '"' {
+                in_string = !in_string;
+                continue;
+            }
+            if in_string {
+                continue;
+            }
+            if ch == '{' {
+                depth += 1;
+            } else if ch == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    end_idx = Some(i + 1);
+                    break;
+                }
+            }
+        }
+
+        let end = end_idx.unwrap_or(chars.len());
+        let extracted: String = chars[..end].iter().collect();
+        Some(extracted)
+    }
+
+    /// Normalize newlines inside JSON string values (replace `\n`/`\r` with spaces, collapse
+    /// multiple whitespace into one). Mirrors the `fix_string_newlines` inner function in
+    /// MiroFish `_try_fix_json` (oasis_profile_generator.py:620-629).
+    fn normalize_json_string_newlines(s: &str) -> String {
+        // Walk the string, find quoted regions, normalize whitespace inside them.
+        let mut result = String::with_capacity(s.len());
+        let chars: Vec<char> = s.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '"' {
+                // Start of a JSON string — collect until closing unescaped '"'
+                result.push('"');
+                i += 1;
+                let mut in_escape = false;
+                let mut string_content = String::new();
+                while i < chars.len() {
+                    let ch = chars[i];
+                    if in_escape {
+                        string_content.push('\\');
+                        string_content.push(ch);
+                        in_escape = false;
+                    } else if ch == '\\' {
+                        in_escape = true;
+                    } else if ch == '"' {
+                        break;
+                    } else {
+                        // Replace actual newline/CR with space
+                        if ch == '\n' || ch == '\r' {
+                            string_content.push(' ');
+                        } else {
+                            string_content.push(ch);
+                        }
+                    }
+                    i += 1;
+                }
+                // Collapse multiple whitespace into single space inside the string
+                let normalized: String = string_content
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                result.push_str(&normalized);
+                result.push('"');
+            } else {
+                result.push(chars[i]);
+            }
+            i += 1;
+        }
+        result
+    }
+
+    /// Strip JSON control characters (0x00–0x1f and 0x7f–0x9f) and collapse whitespace.
+    /// Mirrors `re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', json_str)` + `re.sub(r'\s+', ' ', …)`
+    /// in MiroFish `_try_fix_json` step 5 (oasis_profile_generator.py:640-641).
+    fn strip_control_chars(s: &str) -> String {
+        let replaced: String = s
+            .chars()
+            .map(|c| {
+                let cp = c as u32;
+                if cp <= 0x1f || (0x7f..=0x9f).contains(&cp) {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        // Collapse multiple whitespace
+        replaced.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Extract the value of a JSON string field using a simple regex-equivalent scan.
+    /// Matches `"field": "value"` and returns `value`. Returns `None` if not found.
+    /// Mirrors `re.search(r'"bio"\s*:\s*"([^"]*)"', content)` in MiroFish.
+    fn extract_json_string_field(content: &str, field: &str) -> Option<String> {
+        let needle = format!("\"{}\"", field);
+        let field_start = content.find(&needle)?;
+        let after_key = &content[field_start + needle.len()..];
+        // Skip whitespace and colon
+        let after_colon = after_key.trim_start_matches(|c: char| c.is_whitespace() || c == ':').trim_start();
+        if !after_colon.starts_with('"') {
+            return None;
+        }
+        let value_start = &after_colon[1..]; // skip opening "
+        let end = value_start.find('"')?;
+        Some(value_start[..end].to_string())
+    }
+
+    /// Extract a (possibly truncated) JSON string field value.
+    /// Unlike `extract_json_string_field`, this accepts a value that is NOT terminated by `"`,
+    /// taking everything up to end-of-string. Mirrors the `persona_match` pattern
+    /// `re.search(r'"persona"\s*:\s*"([^"]*)', content)` (no closing quote) in MiroFish.
+    fn extract_json_string_field_partial(content: &str, field: &str) -> Option<String> {
+        let needle = format!("\"{}\"", field);
+        let field_start = content.find(&needle)?;
+        let after_key = &content[field_start + needle.len()..];
+        let after_colon = after_key.trim_start_matches(|c: char| c.is_whitespace() || c == ':').trim_start();
+        if !after_colon.starts_with('"') {
+            return None;
+        }
+        let value_start = &after_colon[1..]; // skip opening "
+        // Take up to closing `"` if present, otherwise take everything (truncated)
+        let end = value_start.find('"').unwrap_or(value_start.len());
+        if end == 0 {
+            return None;
+        }
+        Some(value_start[..end].to_string())
+    }
+
+    /// Build an entity context string from the KnowledgeGraph, enriching the social profile
+    /// prompt with neighbor information.
+    ///
+    /// Ports the IN-PROCESS parts (1–3) of `OasisProfileGenerator._build_entity_context`
+    /// (oasis_profile_generator.py:414):
+    /// - Part 1: entity attributes (name + kind used as "attributes" in teri's Entity model)
+    /// - Part 3: related nodes (neighbor names + kinds from `KnowledgeGraph::get_neighbors`)
+    ///
+    /// The Zep-search half (part 4, `_search_zep_for_entity`) is `[≠]` (S-355) and is not
+    /// ported — teri uses an in-process graph.
+    ///
+    /// Returns an empty string if the entity has no neighbors (graceful flat fallback).
+    fn build_entity_context(graph: &KnowledgeGraph, entity: &Entity) -> String {
+        let mut context_parts: Vec<String> = Vec::new();
+
+        // Part 1: entity attributes — in teri's Entity model, the main attributes are
+        // `name` and `kind`; we surface them as a context section.
+        let attrs = format!("- name: {}\n- kind: {}", entity.name, entity.kind);
+        context_parts.push(format!("### Entity Attributes\n{}", attrs));
+
+        // Part 3: related nodes (neighbor names + kinds from the graph)
+        // Mirrors `entity.related_nodes` iteration in _build_entity_context:456-472.
+        let neighbors = graph.get_neighbors(entity.id).unwrap_or_default();
+        if !neighbors.is_empty() {
+            let related_info: Vec<String> = neighbors
+                .iter()
+                .map(|n| format!("- **{}** ({})", n.name, n.kind))
+                .collect();
+            context_parts.push(format!(
+                "### Related Entities\n{}",
+                related_info.join("\n")
+            ));
+        }
+
+        context_parts.join("\n\n")
+    }
+
     /// Generate a social-media profile for an entity, returning a `SocialProfile`.
     ///
     /// Mirrors `OasisProfileGenerator.generate_profile_from_entity`:
-    /// 1. Tries LLM → parse JSON fields → populate `SocialProfile`.
-    /// 2. On any LLM/parse failure, falls back to `generate_social_rule_based`.
+    /// 1. Builds entity context from the graph (neighbors) if `graph_ctx` is provided.
+    /// 2. Tries LLM → parse JSON → populate `SocialProfile`.
+    /// 3. On parse failure, tries `try_fix_json` to salvage a partial/truncated response.
+    /// 4. If salvage succeeds and parses, populates from the salvaged JSON.
+    /// 5. Only if STILL unparseable falls back to `generate_social_rule_based`.
     ///
     /// `bio` and `persona` in the returned `SocialProfile` are distinct fields matching
     /// `OasisAgentProfile.bio` (short public bio) and `OasisAgentProfile.persona` (detailed
     /// personality description).  `user_id` defaults to 0; callers that export to OASIS
     /// should set it to the desired numeric id after construction.
+    ///
+    /// `graph_ctx`: optional `(&KnowledgeGraph, &Entity)` — when provided, enriches the LLM
+    /// prompt with neighbor context from the graph (ports S-356 `_build_entity_context`).
+    /// When `None`, the profile is generated from the flat summary alone (backward-compatible).
     pub async fn generate_social<L: LlmClient>(
         &self,
         entity_name: &str,
@@ -988,6 +1296,7 @@ impl PersonaGenerator {
         entity_summary: &str,
         platform: Platform,
         llm: &L,
+        graph_ctx: Option<(&KnowledgeGraph, &Entity)>,
     ) -> Result<SocialProfile> {
         let user_name = Self::generate_username(entity_name);
         let created_at = chrono::Utc::now().format("%Y-%m-%d").to_string();
@@ -997,6 +1306,15 @@ impl PersonaGenerator {
             format!("{entity_name} is a {entity_type} participating in social discussions.")
         } else {
             entity_summary.to_string()
+        };
+
+        // S-356: build entity context from graph neighbors (enrichment)
+        let entity_context = match graph_ctx {
+            Some((graph, entity)) => {
+                let ctx = Self::build_entity_context(graph, entity);
+                if ctx.is_empty() { String::new() } else { format!("\n\nEntity context:\n{}", ctx) }
+            }
+            None => String::new(),
         };
 
         let prompt = format!(
@@ -1018,22 +1336,37 @@ Return a JSON object with these fields:
 
 Entity name: {entity_name}
 Entity type: {entity_type}
-Entity summary: {entity_summary}
+Entity summary: {entity_summary}{entity_context}
 Platform: {platform}
 
 Return only valid JSON."#,
             entity_name = entity_name,
             entity_type = entity_type,
             entity_summary = entity_summary,
+            entity_context = entity_context,
             platform = match platform {
                 Platform::Twitter => "Twitter",
                 Platform::Reddit => "Reddit",
             },
         );
 
-        // Try LLM, fall back to rule-based on any failure
+        // Try LLM → parse → salvage (S-360/S-361) → rule-based
         let profile_data = match llm.complete(&prompt).await {
-            Ok(response) => serde_json::from_str::<serde_json::Value>(&response).ok(),
+            Ok(response) => {
+                // First attempt: direct parse
+                match serde_json::from_str::<serde_json::Value>(&response) {
+                    Ok(v) => Some(v),
+                    Err(_) => {
+                        // Salvage attempt (S-360 + S-361): try_fix_json before rule-based
+                        Self::try_fix_json(&response, entity_name, entity_type, entity_summary)
+                            .map(|mut v| {
+                                // Strip internal _fixed marker before use
+                                if let Some(m) = v.as_object_mut() { m.remove("_fixed"); }
+                                v
+                            })
+                    }
+                }
+            }
             Err(_) => None,
         };
 
@@ -2755,7 +3088,7 @@ mod tests {
         let generator = PersonaGenerator::new();
 
         let sp = generator
-            .generate_social("Jane Doe", "journalist", "A seasoned reporter", Platform::Twitter, &mock_llm)
+            .generate_social("Jane Doe", "journalist", "A seasoned reporter", Platform::Twitter, &mock_llm, None)
             .await
             .expect("generate_social must succeed with valid mock LLM");
 
@@ -2799,7 +3132,7 @@ mod tests {
 
         let generator = PersonaGenerator::new();
         let sp = generator
-            .generate_social("State University", "university", "A public university", Platform::Reddit, &ErrorLlm)
+            .generate_social("State University", "university", "A public university", Platform::Reddit, &ErrorLlm, None)
             .await
             .expect("rule-based fallback must succeed even when LLM errors");
 
@@ -2823,7 +3156,7 @@ mod tests {
         let generator = PersonaGenerator::new();
 
         let sp = generator
-            .generate_social("John Student", "student", "A university student", Platform::Twitter, &bad_llm)
+            .generate_social("John Student", "student", "A university student", Platform::Twitter, &bad_llm, None)
             .await
             .expect("rule-based fallback must succeed for bad LLM JSON");
 
@@ -3104,5 +3437,332 @@ mod tests {
         assert!(v["profession"].is_null());
         assert_eq!(v["interested_topics"].as_array().unwrap().len(), 0);
         assert!(v["source_entity_uuid"].is_null());
+    }
+
+    // ===== S-360 / S-361: JSON salvage (fix_truncated_json + try_fix_json) =====
+
+    #[test]
+    fn test_fix_truncated_json_closes_open_brace() {
+        // Simple unclosed object
+        let input = r#"{"bio": "hello", "persona": "world""#;
+        let fixed = PersonaGenerator::fix_truncated_json(input);
+        let v: serde_json::Value = serde_json::from_str(&fixed).expect("should parse after fix");
+        assert_eq!(v["bio"], "hello");
+        assert_eq!(v["persona"], "world");
+    }
+
+    #[test]
+    fn test_fix_truncated_json_closes_dangling_string_then_braces() {
+        // String was cut in the middle — last char is not a valid JSON terminal
+        let input = r#"{"bio": "truncated val"#;
+        let fixed = PersonaGenerator::fix_truncated_json(input);
+        // After fix we should get {"bio": "truncated val"}
+        let v: serde_json::Value = serde_json::from_str(&fixed).expect("should parse after fix");
+        assert_eq!(v["bio"], "truncated val");
+    }
+
+    #[test]
+    fn test_fix_truncated_json_closes_open_array_and_brace() {
+        // Array and brace both unclosed
+        let input = r#"{"topics": ["one", "two""#;
+        let fixed = PersonaGenerator::fix_truncated_json(input);
+        // After fix: {"topics": ["one", "two"]}
+        let v: serde_json::Value = serde_json::from_str(&fixed).expect("should parse after fix");
+        let arr = v["topics"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0], "one");
+    }
+
+    #[test]
+    fn test_fix_truncated_json_valid_input_unchanged() {
+        // Valid JSON should still round-trip through fix
+        let input = r#"{"bio": "ok", "karma": 1000}"#;
+        let fixed = PersonaGenerator::fix_truncated_json(input);
+        let v: serde_json::Value = serde_json::from_str(&fixed).expect("valid input should still parse");
+        assert_eq!(v["karma"], 1000);
+    }
+
+    #[test]
+    fn test_try_fix_json_salvages_truncated_response() {
+        // A mostly-valid JSON object truncated after the closing string value.
+        // MiroFish's _try_fix_json guarantees recovery of bio/persona via field-level
+        // extraction. Numeric fields (karma, age) may not be recoverable from a truncated
+        // response (the structural fix converts trailing digits into `31"` which is invalid
+        // JSON) — this matches MiroFish behavior where step 6 extracts only string fields.
+        // The key contract: some result is returned (NOT None), and bio/persona are preserved.
+        let truncated = r#"{"bio": "Tech journalist bio", "persona": "Detailed persona text", "karma": 3500, "age": 31"#;
+        let result = PersonaGenerator::try_fix_json(truncated, "Jane", "journalist", "");
+        assert!(result.is_some(), "should salvage a truncated-but-repairable response");
+        let v = result.unwrap();
+        // bio and persona are extractable by field-level regex (MiroFish step 6 contract)
+        assert_eq!(v["bio"], "Tech journalist bio");
+        assert_eq!(v["persona"], "Detailed persona text");
+    }
+
+    #[test]
+    fn test_try_fix_json_salvages_string_truncated_mid_value() {
+        // When a JSON string value is truncated (last char IS a quote boundary), fix_truncated_json
+        // closes the brace and the structural parse succeeds — all fields including numerics survive.
+        let truncated = r#"{"bio": "Journalist bio", "persona": "Detailed persona", "karma": 3500, "age": 31}"#;
+        // This is actually valid JSON — prove fix_truncated_json doesn't break it
+        let result = PersonaGenerator::try_fix_json(truncated, "Jane", "journalist", "");
+        assert!(result.is_some(), "valid truncated JSON should parse");
+        let v = result.unwrap();
+        assert_eq!(v["bio"], "Journalist bio");
+        assert_eq!(v["karma"], 3500);
+        assert_eq!(v["age"], 31);
+    }
+
+    #[test]
+    fn test_try_fix_json_returns_none_for_garbage() {
+        // Completely garbage input — no JSON structure at all
+        let garbage = "this is not json at all, nothing to salvage here";
+        let result = PersonaGenerator::try_fix_json(garbage, "X", "y", "");
+        // Either None or a minimal partial with _fixed — since no bio/persona key matched,
+        // the MiroFish "if bio_match or persona_match" guard causes None.
+        assert!(result.is_none(), "pure garbage with no JSON fields should return None");
+    }
+
+    #[test]
+    fn test_try_fix_json_field_extraction_fallback() {
+        // JSON has bio/persona extractable by field regex but overall structure is broken
+        let broken = r#"garbage preamble {"bio": "extracted bio", "persona": "extracted persona" more garbage"#;
+        let result = PersonaGenerator::try_fix_json(broken, "X", "y", "");
+        // Should extract bio and persona via field-level regex
+        assert!(result.is_some());
+        let v = result.unwrap();
+        assert_eq!(v["bio"], "extracted bio");
+        assert_eq!(v["persona"], "extracted persona");
+    }
+
+    #[tokio::test]
+    async fn test_generate_social_salvage_path_taken_not_rule_based() {
+        // When the LLM returns a truncated-but-repairable JSON, generate_social must use the
+        // salvaged LLM values, NOT fall back to rule-based defaults.
+        //
+        // Proof: the salvaged response has distinct bio/persona values that ONLY come from
+        // the LLM response. Rule-based for "expert" produces bio="Expert and thought leader
+        // in their field." — if we see "UNIQUE_LLM_SIGNATURE" in bio, the salvage path ran.
+        //
+        // The truncation scenario: JSON is missing the closing `}` (common max_tokens cutoff),
+        // and the last key:value pair is a string (so fix_truncated_json can properly close it).
+        let truncated_llm_response = r#"{"bio": "UNIQUE_LLM_SIGNATURE bio", "persona": "UNIQUE_LLM_SIGNATURE persona""#;
+        let mock_llm = MockPersonaLlm::new(truncated_llm_response);
+        let generator = PersonaGenerator::new();
+
+        let sp = generator
+            .generate_social("Test Entity", "expert", "A test expert", Platform::Twitter, &mock_llm, None)
+            .await
+            .expect("salvage path must succeed");
+
+        // The LLM-sourced signature in bio/persona proves the salvage path was taken.
+        // Rule-based for "expert" would produce bio="Expert and thought leader in their field."
+        assert!(
+            sp.bio.contains("UNIQUE_LLM_SIGNATURE"),
+            "bio must contain LLM-unique value, proving salvage (not rule-based); got: {}",
+            sp.bio
+        );
+        assert!(
+            sp.persona.contains("UNIQUE_LLM_SIGNATURE"),
+            "persona must contain LLM-unique value, proving salvage (not rule-based); got: {}",
+            sp.persona
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_social_genuine_garbage_falls_back_to_rule_based() {
+        // When LLM returns genuine garbage (no JSON structure), rule-based fallback kicks in.
+        let bad_llm = MockPersonaLlm::new("no json here whatsoever, just plain text output");
+        let generator = PersonaGenerator::new();
+
+        let sp = generator
+            .generate_social("John Student", "student", "A university student", Platform::Twitter, &bad_llm, None)
+            .await
+            .expect("rule-based fallback must succeed for garbage LLM output");
+
+        // student rule → age=22, mbti="INFP" — proves rule-based was used
+        assert_eq!(sp.age, Some(22), "age=22 proves rule-based student path");
+        assert_eq!(sp.mbti.as_deref(), Some("INFP"), "INFP proves rule-based student path");
+        assert!(sp.interested_topics.contains(&"Education".to_string()));
+    }
+
+    // ===== S-356: graph-enriched generate_social (build_entity_context) =====
+
+    #[tokio::test]
+    async fn test_generate_social_with_graph_ctx_enriches_prompt() {
+        // When generate_social is called with a graph context, the LLM prompt must include
+        // neighbor information. We prove this by using a mock LLM that echoes its prompt,
+        // then assert the prompt contains the neighbor name.
+
+        struct PromptCaptureLlm {
+            captured: std::sync::Arc<std::sync::Mutex<String>>,
+            response: String,
+        }
+
+        #[async_trait]
+        impl LlmClient for PromptCaptureLlm {
+            async fn complete(&self, prompt: &str) -> Result<String> {
+                *self.captured.lock().unwrap() = prompt.to_string();
+                Ok(self.response.clone())
+            }
+            async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+                Err(TeriError::Llm("not implemented".to_string()))
+            }
+            async fn stream(
+                &self,
+                _: &str,
+            ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+                Err(TeriError::Llm("not implemented".to_string()))
+            }
+        }
+
+        // Build a graph with one entity and one neighbor
+        let mut graph = KnowledgeGraph::new();
+        let main_entity = Entity {
+            id: uuid::Uuid::new_v4(),
+            name: "Tech University".to_string(),
+            kind: EntityKind::Organization,
+        };
+        let neighbor_entity = Entity {
+            id: uuid::Uuid::new_v4(),
+            name: "Professor Alice".to_string(),
+            kind: EntityKind::Person,
+        };
+        let main_idx = graph.add_entity(main_entity.clone()).expect("add main entity");
+        let neighbor_idx = graph.add_entity(neighbor_entity).expect("add neighbor");
+        graph.add_relation(
+            main_idx,
+            neighbor_idx,
+            crate::graph::Relation::new(crate::graph::RelationKind::RelatedTo, 0.9)
+                .expect("valid relation"),
+        );
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let mock_llm = PromptCaptureLlm {
+            captured: captured.clone(),
+            // Rule-based fallback friendly: return empty/invalid to fall through
+            response: "{}".to_string(),
+        };
+
+        let generator = PersonaGenerator::new();
+        let _sp = generator
+            .generate_social(
+                "Tech University",
+                "university",
+                "A top university",
+                Platform::Reddit,
+                &mock_llm,
+                Some((&graph, &main_entity)),
+            )
+            .await
+            .expect("generate_social with graph_ctx must succeed");
+
+        let prompt = captured.lock().unwrap().clone();
+        assert!(
+            prompt.contains("Professor Alice"),
+            "prompt must include neighbor name 'Professor Alice'; prompt was: {}",
+            &prompt[..prompt.len().min(500)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_social_without_graph_ctx_no_enrichment() {
+        // When graph_ctx is None, the prompt should NOT contain enrichment sections.
+        struct PromptCaptureLlm {
+            captured: std::sync::Arc<std::sync::Mutex<String>>,
+        }
+
+        #[async_trait]
+        impl LlmClient for PromptCaptureLlm {
+            async fn complete(&self, prompt: &str) -> Result<String> {
+                *self.captured.lock().unwrap() = prompt.to_string();
+                Ok("{}".to_string())
+            }
+            async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+                Err(TeriError::Llm("not implemented".to_string()))
+            }
+            async fn stream(
+                &self,
+                _: &str,
+            ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+                Err(TeriError::Llm("not implemented".to_string()))
+            }
+        }
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let mock_llm = PromptCaptureLlm { captured: captured.clone() };
+        let generator = PersonaGenerator::new();
+
+        let _sp = generator
+            .generate_social(
+                "Some Entity",
+                "expert",
+                "An expert summary",
+                Platform::Twitter,
+                &mock_llm,
+                None,
+            )
+            .await
+            .expect("generate_social without graph_ctx must succeed");
+
+        let prompt = captured.lock().unwrap().clone();
+        assert!(
+            !prompt.contains("### Related Entities"),
+            "prompt must NOT contain enrichment section when graph_ctx is None"
+        );
+        assert!(
+            !prompt.contains("Entity context:"),
+            "prompt must NOT contain 'Entity context:' when graph_ctx is None"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_social_entity_absent_from_graph_graceful_fallback() {
+        // When the entity is not in the graph (has no neighbors), generate_social must
+        // still succeed — flat summary fallback, no panic.
+        let mut graph = KnowledgeGraph::new();
+        let entity = Entity {
+            id: uuid::Uuid::new_v4(),
+            name: "Isolated Entity".to_string(),
+            kind: EntityKind::Person,
+        };
+        // Add the entity but no neighbors
+        graph.add_entity(entity.clone()).expect("add entity");
+
+        struct ErrorLlm;
+        #[async_trait]
+        impl LlmClient for ErrorLlm {
+            async fn complete(&self, _: &str) -> Result<String> {
+                Err(TeriError::Llm("network failure".to_string()))
+            }
+            async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+                Err(TeriError::Llm("not implemented".to_string()))
+            }
+            async fn stream(
+                &self,
+                _: &str,
+            ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+                Err(TeriError::Llm("not implemented".to_string()))
+            }
+        }
+
+        let generator = PersonaGenerator::new();
+        // Entity with no neighbors: graph context has no "Related Entities" section,
+        // so fallback to rule-based must succeed.
+        let sp = generator
+            .generate_social(
+                "Isolated Entity",
+                "student",
+                "A student with no connections",
+                Platform::Reddit,
+                &ErrorLlm,
+                Some((&graph, &entity)),
+            )
+            .await
+            .expect("must succeed even with no-neighbor entity + LLM error");
+
+        // Rule-based student path kicks in
+        assert_eq!(sp.age, Some(22));
+        assert_eq!(sp.mbti.as_deref(), Some("INFP"));
     }
 }

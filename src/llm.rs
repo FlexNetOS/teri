@@ -73,6 +73,124 @@ pub fn strip_json_fence(content: &str) -> String {
 // Maximum backoff delay (seconds) — matches MiroFish retry.py:59 `min(delay, max_delay)`
 const MAX_BACKOFF_SECS: u64 = 30;
 
+// ============================================================================
+// Batch retry helper (MiroFish parity — retry.py:195 `call_batch_with_retry`)
+// ============================================================================
+
+/// A single batch-item failure: the index in the original ops slice, and the
+/// error returned after all per-item retries were exhausted.
+///
+/// Matches MiroFish retry.py:228 `{"index": idx, "error": str(e)}`.
+/// The Python version also stores `"item"` (the input), but closures in Rust
+/// are consumed on call — the index is sufficient for callers to recover the
+/// input from their own slice, which preserves all information.
+#[derive(Debug)]
+pub struct BatchFailure {
+    /// Zero-based index of the failed operation in the input slice.
+    pub index: usize,
+    /// The error returned after all retries for this item were exhausted.
+    pub error: TeriError,
+}
+
+/// Outcome of [`call_batch_with_retry`].
+///
+/// Mirrors MiroFish `(results, failures)` return tuple (retry.py:195):
+/// - `results`: one `Ok(T)` per item that eventually succeeded.
+/// - `failures`: one `BatchFailure` per item that was exhausted after all retries.
+///
+/// When `continue_on_failure` is `true` (the default), `results` + `failures`
+/// together account for every input operation.  When `false`, the function
+/// aborts at the first permanent failure and returns `Err(TeriError)` instead
+/// of a `BatchResult`.
+#[derive(Debug)]
+pub struct BatchResult<T> {
+    /// Successful results, in input order.
+    pub results: Vec<T>,
+    /// Per-item failures for items that exhausted all retries.
+    pub failures: Vec<BatchFailure>,
+}
+
+/// Run `ops` as a batch, retrying each failing operation individually with
+/// exponential back-off.
+///
+/// # Contract (MiroFish retry.py:195 `call_batch_with_retry`)
+///
+/// For each operation `ops[i]`:
+/// 1. Attempt the operation; on `Err` retry with backoff up to `max_retries`
+///    times (identical to the per-adapter `call_api` retry loop).
+/// 2. If it succeeds, push the result to `BatchResult::results`.
+/// 3. If it exhausts all retries:
+///    - When `continue_on_failure == true` (default in MiroFish): record a
+///      `BatchFailure { index, error }` in `BatchResult::failures` and
+///      continue to the next operation.
+///    - When `continue_on_failure == false`: abort immediately and return
+///      `Err(error)` (mirrors `raise` at retry.py:234).
+///
+/// # Closure contract
+/// Each element of `ops` is a `Fn() -> Fut` factory so the helper can
+/// re-invoke it on every retry attempt.  Pass `|| async { your_call() }`.
+///
+/// # Back-off
+/// Delay = `2^attempt` seconds, clamped to `MAX_BACKOFF_SECS` (30 s).
+/// No jitter — intentional divergence (`[≠]`) matching the rest of teri's
+/// retry contract.
+///
+/// # Returns
+/// `Ok(BatchResult<T>)` — always, even when some items failed, as long as
+/// `continue_on_failure` is `true`.
+/// `Err(TeriError)` — only when `continue_on_failure` is `false` AND an
+/// operation exhausts its retries.
+pub async fn call_batch_with_retry<T, F, Fut>(
+    ops: Vec<F>,
+    max_retries: u32,
+    continue_on_failure: bool,
+) -> Result<BatchResult<T>>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut results: Vec<T> = Vec::new();
+    let mut failures: Vec<BatchFailure> = Vec::new();
+
+    for (idx, op) in ops.iter().enumerate() {
+        // Per-item retry loop — mirrors RetryableAPIClient.call_with_retry
+        // (retry.py:149): attempt max_retries+1 times, exponential backoff
+        // between attempts, raise on final exhaustion.
+        let mut retries: u32 = 0;
+        let item_result = loop {
+            match op().await {
+                Ok(val) => break Ok(val),
+                Err(e) => {
+                    if retries >= max_retries {
+                        // All retries exhausted for this item (retry.py:178)
+                        break Err(e);
+                    }
+                    retries += 1;
+                    let delay = (2_u64.pow(retries)).min(MAX_BACKOFF_SECS);
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                    // Loop continues: op() is called again on next iteration
+                }
+            }
+        };
+
+        match item_result {
+            Ok(val) => results.push(val),
+            Err(e) => {
+                if continue_on_failure {
+                    // Record failure but continue processing remaining items
+                    // (retry.py:227-232: append to failures, do NOT raise)
+                    failures.push(BatchFailure { index: idx, error: e });
+                } else {
+                    // Abort entire batch — retry.py:234 `raise`
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    Ok(BatchResult { results, failures })
+}
+
 /// Core LLM client trait - completely provider-agnostic.
 /// This trait makes NO assumptions about the underlying provider.
 #[async_trait]
@@ -1141,6 +1259,113 @@ data: [DONE]\n",
         }
         assert_eq!(output, "Hello Claude");
         mock.assert();
+    }
+
+    // =========================================================================
+    // S-048 — call_batch_with_retry (MiroFish retry.py:195)
+    // =========================================================================
+
+    // Type alias to avoid repetitive complex trait-object types in test bodies.
+    type BoxOp = Box<
+        dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u32>> + Send>>
+            + Send
+            + Sync,
+    >;
+
+    fn ok_op(v: u32) -> BoxOp {
+        Box::new(move || Box::pin(async move { Ok(v) }))
+    }
+
+    fn err_op(msg: &'static str) -> BoxOp {
+        Box::new(move || {
+            Box::pin(async move { Err(TeriError::Llm(msg.to_string())) })
+        })
+    }
+
+    /// All ops succeed → results contains every value in input order; no failures.
+    #[tokio::test]
+    async fn test_batch_all_succeed() {
+        let ops: Vec<BoxOp> = vec![ok_op(1), ok_op(2), ok_op(3)];
+        let batch = call_batch_with_retry(ops, 0, true).await.unwrap();
+        assert_eq!(batch.results, vec![1, 2, 3]);
+        assert!(batch.failures.is_empty());
+    }
+
+    /// Empty ops slice → empty BatchResult; no panic, no error.
+    #[tokio::test]
+    async fn test_batch_empty() {
+        let ops: Vec<BoxOp> = vec![];
+        let batch = call_batch_with_retry(ops, 3, true).await.unwrap();
+        assert!(batch.results.is_empty());
+        assert!(batch.failures.is_empty());
+    }
+
+    /// One op always fails; continue_on_failure=true → other ops succeed,
+    /// failure is recorded with the correct index.
+    /// Matches retry.py:226-232: failures.append({index, item, error}).
+    #[tokio::test]
+    async fn test_batch_one_fails_continue_true() {
+        let ops: Vec<BoxOp> = vec![
+            ok_op(10),
+            err_op("permanent failure"), // index 1 — always fails after retries
+            ok_op(30),
+        ];
+        // max_retries=0: no retries, immediate failure recording
+        let batch = call_batch_with_retry(ops, 0, true).await.unwrap();
+        assert_eq!(batch.results, vec![10, 30], "succeeded items must be present");
+        assert_eq!(batch.failures.len(), 1, "exactly one failure");
+        assert_eq!(batch.failures[0].index, 1, "failure index must be 1");
+        assert!(
+            batch.failures[0].error.to_string().contains("permanent failure"),
+            "failure must carry the error"
+        );
+    }
+
+    /// One op always fails; continue_on_failure=false → batch aborts with Err,
+    /// no BatchResult returned.
+    /// Matches retry.py:233-234: `if not continue_on_failure: raise`.
+    #[tokio::test]
+    async fn test_batch_one_fails_continue_false() {
+        let ops: Vec<BoxOp> = vec![
+            ok_op(10),
+            err_op("abort trigger"), // index 1 — permanent failure
+            ok_op(30),               // should never run
+        ];
+        let result = call_batch_with_retry(ops, 0, false).await;
+        assert!(result.is_err(), "batch must abort with Err when continue_on_failure=false");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("abort trigger"), "error must propagate: {err_msg}");
+    }
+
+    /// An op that fails-then-succeeds recovers via retry and lands in results.
+    /// Uses AtomicUsize to make the closure stateful without capturing a
+    /// non-Send local (same technique as test_openai_retry_recovers_after_503).
+    #[tokio::test]
+    async fn test_batch_fail_then_succeed_via_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+        CALL_COUNT.store(0, Ordering::SeqCst);
+
+        // Op: fails on attempt 0 (call #0), succeeds on attempt 1 (call #1)
+        let ops: Vec<BoxOp> = vec![Box::new(|| {
+            Box::pin(async {
+                let attempt = CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    Err(TeriError::Llm("transient".to_string()))
+                } else {
+                    Ok(42u32)
+                }
+            })
+        })];
+        // max_retries=1 → up to 2 total attempts; op recovers on attempt 1
+        let batch = call_batch_with_retry(ops, 1, true).await.unwrap();
+        assert_eq!(batch.results, vec![42], "must recover on retry");
+        assert!(batch.failures.is_empty(), "no permanent failures");
+        assert_eq!(
+            CALL_COUNT.load(Ordering::SeqCst),
+            2,
+            "must have been called exactly twice"
+        );
     }
 
     #[tokio::test]
