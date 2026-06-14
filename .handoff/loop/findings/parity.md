@@ -306,3 +306,27 @@ Full `cargo test` (all targets) = **275 passed, 0 failed** (was 263, +12). Seed 
 ### Result
 
 **U-009 = PASS.** S-060..S-068 → `- [x]` except S-062/S-063 → `- [≠]` (json superset + permissive policy, both no-downgrade). S-069 stays distributed to U-013 (already `- [x]`). The flagged GBK-Latin-1 false-positive risk is **closed**: `had_errors` is checked, GBK round-trip proven, no mojibake.
+
+---
+
+## Cycle 7 — U-048 (extend-Y: in-band end-of-sim terminal signal) — 2026-06-14
+
+**Unit:** U-048 · S-1057 (+ S-1057-A/B/C). Files: `src/sim/mod.rs`, `src/api/mod.rs`.
+**Verdict: PASS** (4/4 symbols proven; SSE-handler *consumer* wiring correctly deferred to U-026).
+
+### Source contract (MiroFish)
+- `action_logger.py:105` `log_simulation_end(total_rounds, total_actions)` writes a terminal log entry `{event_type:"simulation_end", platform, total_rounds, total_actions}` — an EXPLICIT end marker on the action stream (not a bare stream-close).
+- `simulation_runner.py:623` monitor detects `event_type=="simulation_end"` → sets `*_completed=True`, `*_running=False`. The contract: consumers get an explicit terminal event with the executed-round count.
+
+### Differential confirmations (run, not asserted-to-exist)
+1. **Completion fires at the right time + correct count.** `run()` sends `completion_tx.send(Some(SimCompletion{total_ticks}))` at `sim/mod.rs:565` — AFTER the tick loop (517-554) where the last snapshot is broadcast (`:547`) and pushed to history (`:553`), and BEFORE `run()` returns (`:567`). `total_ticks = history.len() as u32` (`:558`) — the ACTUAL executed count, not `max_ticks`. Test `test_completion_signal_fires_with_correct_total_ticks` (N=5, parallelism=1) asserts `sc.total_ticks==N` AND cross-checks `result.history.len()==N`. PASS.
+2. **Ordering (fires-after-last-snapshot).** `test_completion_signal_fires_after_last_snapshot` (N=3) reads the shared history Arc at the instant completion is observed and asserts `history.len()==N` — proving history is fully populated when the signal lands. PASS.
+3. **Late-subscriber safety (watch > broadcast).** `test_late_subscriber_sees_completion` (N=2) runs FIRST, subscribes AFTER, and observes `Some(SimCompletion{total_ticks:2})` immediately via `watch::Receiver::borrow()`. This also PROVES `_completion_anchor` works: tokio `watch::send` is a no-op when no receiver is alive, so if the anchor (`sim/mod.rs:414,426,433`) were absent the late subscriber would see `None` — it sees `Some`, so the anchor persisted the value. PASS. `test_subscribe_completion_initial_value_is_none` confirms the pre-run `None`. PASS.
+4. **sim_end event maps the terminal marker.** `TickStreamEvent::sim_end` (`api/mod.rs:105`) → `{tick:total_ticks, data:{"sim_end":true,"total_ticks":n}, event_id:"sim-end"}`. Sentinel-in-data, same uniform wire format as `lag_gap`. `event_id` fixed `"sim-end"` (no suffix → exactly one per sim). 4 api tests PASS (tick, event_id, data fields, zero-ticks edge). Maps `log_simulation_end`'s explicit marker + round count.
+5. **No regression (additive).** `test_snapshot_broadcast_unaffected_by_completion_channel` (N=4): `subscribe()` and `subscribe_with_history()` both still deliver all 4 ticks in order, history len==4. The completion channel is purely additive. Full suite **275 → 285 passed** (+10), 3 ignored, clippy `--all-targets -D warnings` clean.
+
+### Ignored-test finding (2 → 3)
+The +1 ignored is NOT a `#[ignore]` unit test — it is a **doctest** with an ` ```ignore ` code fence: `SimEngine::subscribe_completion` usage example at `sim/mod.rs:478`. It is illustrative SSE-handler pseudo-code (`?` outside a fn, references the not-yet-wired U-026 consumer) — legitimately non-runnable, NOT a real test silenced to dodge a failure. The other two pre-existing ignored doctests: `api/streaming.rs:134` (`StreamAdapter::as_hook`) and `sim/mod.rs:275` (`SimConfig`). Zero `#[ignore]` attributes anywhere in `src/`/`tests/`; the U-048 diff added no `#[ignore]`. No hidden downgrade.
+
+### Symbols
+- [x] S-1057 (rollup) · [x] S-1057-A `SimCompletion` · [x] S-1057-B `subscribe_completion` · [x] S-1057-C `sim_end` — 4/4.

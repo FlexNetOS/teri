@@ -1309,9 +1309,12 @@
 
 ---
 
-## U-048 — Runtime: Report Streaming Contract
+## U-048 — Runtime: Report Streaming Contract / in-band sim_end terminal signal (extend-Y)
 
-- [ ] S-1057 · `unit:U-048` · `const` · `REPORT_STREAMING_CONTRACT` · report sections generated one at a time (serial); each section appended to JSON on disk as completed; client polls /sections and /section/<n> to see partial progress; SSE log streams via /agent-log/stream + /console-log/stream · `report_agent.py:2100`
+- [x] S-1057 · `unit:U-048` · `const` · `REPORT_STREAMING_CONTRACT` · report sections generated one at a time (serial); each section appended to JSON on disk as completed; client polls /sections and /section/<n> to see partial progress; SSE log streams via /agent-log/stream + /console-log/stream · `report_agent.py:2100` · Rust: `src/api/mod.rs::TickStreamEvent::sim_end` + `src/sim/mod.rs::SimCompletion` + `src/sim/mod.rs::SimEngine::subscribe_completion` (extend-Y: additive completion channel on SimEngine; sim_end TickStreamEvent constructor; SSE wiring deferred to U-026)
+- [x] S-1057-A · `unit:U-048` · `struct` · `SimCompletion` · terminal signal payload emitted by SimEngine::run() after the last snapshot; mirrors MiroFish action_logger.log_simulation_end (~line 105) / simulation_runner monitor (~line 623) · `simulation_runner.py:623` · Rust: `src/sim/mod.rs::SimCompletion` (`total_ticks: u32`, Serialize/Deserialize/Clone/PartialEq)
+- [x] S-1057-B · `unit:U-048` · `method` · `SimEngine::subscribe_completion` · returns watch::Receiver<Option<SimCompletion>>; watch chosen so late subscribers (after run() returns) always observe the terminal Some(...) without a race; _completion_anchor keeps the channel alive so send() in run() always persists · `simulation_runner.py:623` · Rust: `src/sim/mod.rs::SimEngine::subscribe_completion`
+- [x] S-1057-C · `unit:U-048` · `method` · `TickStreamEvent::sim_end` · constructor for the in-band SSE terminal frame: tick=total_ticks, data={"sim_end":true,"total_ticks":n}, event_id="sim-end"; mirrors lag_gap's sentinel-in-data encoding so SSE wire format stays uniform · `action_logger.py:105` · Rust: `src/api/mod.rs::TickStreamEvent::sim_end`
 
 ---
 

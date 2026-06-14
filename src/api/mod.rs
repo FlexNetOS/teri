@@ -86,6 +86,29 @@ impl TickStreamEvent {
             event_id: format!("gap-{}", missed_ticks),
         }
     }
+
+    /// Create the terminal end-of-simulation event.
+    ///
+    /// This is the in-band signal that a stream consumer receives as the final event on the
+    /// SSE stream, mirroring MiroFish `action_logger.log_simulation_end` (~line 105) which
+    /// emits a `simulation_end` marker that `simulation_runner.py` (~line 623) monitors to
+    /// mark the sim completed.
+    ///
+    /// Design: encoded like `lag_gap` — a sentinel value in `data` rather than a new struct
+    /// field, so the SSE wire format stays uniform (`{ tick, data, event_id }` always).
+    /// The `event_id` is the fixed string `"sim-end"` (no count suffix: there is exactly one
+    /// per simulation). `tick` is set to `total_ticks` so consumers know the final tick index.
+    ///
+    /// # Usage
+    /// The SSE handler (U-026) awaits `SimEngine::subscribe_completion()`, then emits this
+    /// event as the final SSE frame before closing the connection.
+    pub fn sim_end(total_ticks: u32) -> Self {
+        Self {
+            tick: total_ticks,
+            data: serde_json::json!({ "sim_end": true, "total_ticks": total_ticks }),
+            event_id: "sim-end".to_string(),
+        }
+    }
 }
 
 /// Configuration for streaming backpressure handling.
@@ -188,5 +211,33 @@ mod tests {
         assert_eq!(event.event_id, "gap-42");
         assert_eq!(event.data["missed_ticks"], 42);
         assert_eq!(event.data["gap"], true);
+    }
+
+    #[test]
+    fn test_tick_stream_event_sim_end_tick() {
+        let event = TickStreamEvent::sim_end(10);
+        assert_eq!(event.tick, 10, "tick must equal total_ticks");
+    }
+
+    #[test]
+    fn test_tick_stream_event_sim_end_event_id() {
+        let event = TickStreamEvent::sim_end(10);
+        assert_eq!(event.event_id, "sim-end", "event_id must be the fixed sentinel string");
+    }
+
+    #[test]
+    fn test_tick_stream_event_sim_end_data_fields() {
+        let event = TickStreamEvent::sim_end(7);
+        assert_eq!(event.data["sim_end"], true, "data.sim_end must be true");
+        assert_eq!(event.data["total_ticks"], 7, "data.total_ticks must match arg");
+    }
+
+    #[test]
+    fn test_tick_stream_event_sim_end_zero_ticks() {
+        // Edge: sim that ran 0 ticks (config.max_ticks == 0)
+        let event = TickStreamEvent::sim_end(0);
+        assert_eq!(event.tick, 0);
+        assert_eq!(event.data["total_ticks"], 0);
+        assert_eq!(event.event_id, "sim-end");
     }
 }

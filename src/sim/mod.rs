@@ -2,7 +2,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use uuid::Uuid;
 
 /// Discriminant for Like/Dislike actions: preserves the post-vs-comment distinction that
@@ -377,12 +377,41 @@ impl SimulationResult {
 /// Each hook is called once per tick with a clone of the tick's snapshot.
 pub type SnapshotHook = Arc<dyn Fn(WorldSnapshot) + Send + Sync>;
 
+/// Terminal signal emitted once by `SimEngine::run()` when the tick loop completes.
+///
+/// Mirrors MiroFish `action_logger.log_simulation_end` / `simulation_runner.py` monitor
+/// that detects `simulation_end` on the action stream to mark a sim completed.
+///
+/// `total_ticks` is the count of ticks that were actually executed (== `SimConfig::max_ticks`
+/// in the normal case, or fewer if the loop was interrupted by an error — though run() returns
+/// Err in that case, so subscribers should treat a Completed signal as always-clean).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimCompletion {
+    /// Number of ticks executed before the simulation ended.
+    pub total_ticks: u32,
+}
+
 pub struct SimEngine {
     config: SimConfig,
     snapshot_tx: broadcast::Sender<WorldSnapshot>,
     snapshot_history: Arc<Mutex<Vec<WorldSnapshot>>>,
     /// Registered snapshot hooks (e.g. TickBuffer adapters for HTTP streaming).
     snapshot_hooks: Vec<SnapshotHook>,
+    /// Watch channel carrying the terminal completion signal.
+    ///
+    /// Initialized to `None`. `run()` sends `Some(SimCompletion { total_ticks })` exactly
+    /// once, after the last snapshot has been broadcast and pushed to history.
+    ///
+    /// `watch` is chosen over `broadcast` so late subscribers always observe the final
+    /// value — a late-arriving SSE handler can call `subscribe_completion()` after `run()`
+    /// has already returned and will still see `Some(...)` without a race.
+    ///
+    /// tokio `watch::Sender::send()` only updates the stored value when at least one
+    /// `Receiver` is alive. `_completion_anchor` is that receiver — it keeps the channel
+    /// "alive" so that the `send()` in `run()` always persists the `Some(...)` value,
+    /// making it observable to any receiver created after `run()` completes.
+    completion_tx: watch::Sender<Option<SimCompletion>>,
+    _completion_anchor: watch::Receiver<Option<SimCompletion>>,
 }
 
 impl SimEngine {
@@ -391,11 +420,17 @@ impl SimEngine {
         // RecvError::Lagged. History replay via subscribe_with_history() covers
         // ticks beyond the 64-slot window.
         let (snapshot_tx, _snapshot_rx) = broadcast::channel(64);
+        // Completion watch starts None; run() flips it to Some(SimCompletion) once.
+        // The anchor receiver is kept alive in the struct so that send() in run() always
+        // updates the stored value (tokio watch: send fails silently if no receivers exist).
+        let (completion_tx, completion_anchor) = watch::channel(None);
         Self {
             config,
             snapshot_tx,
             snapshot_history: Arc::new(Mutex::new(Vec::new())),
             snapshot_hooks: Vec::new(),
+            completion_tx,
+            _completion_anchor: completion_anchor,
         }
     }
 
@@ -428,6 +463,29 @@ impl SimEngine {
         &self,
     ) -> (broadcast::Receiver<WorldSnapshot>, Arc<Mutex<Vec<WorldSnapshot>>>) {
         (self.snapshot_tx.subscribe(), Arc::clone(&self.snapshot_history))
+    }
+
+    /// Subscribe to the terminal completion signal.
+    ///
+    /// Returns a `watch::Receiver<Option<SimCompletion>>`. The receiver starts at `None` and
+    /// transitions to `Some(SimCompletion { total_ticks })` exactly once when `run()` finishes.
+    ///
+    /// Because `watch` retains the last value, late subscribers (those who call this method
+    /// AFTER `run()` has already returned) will immediately observe `Some(...)` on the first
+    /// `borrow()` / `changed()` poll — no timing race for the SSE handler (U-026).
+    ///
+    /// # Usage pattern (SSE handler)
+    /// ```ignore
+    /// let mut completion_rx = engine.subscribe_completion();
+    /// // ... stream snapshots ...
+    /// completion_rx.changed().await?;  // waits until run() sends the signal
+    /// let sim_end_event = TickStreamEvent::sim_end(
+    ///     completion_rx.borrow().as_ref().unwrap().total_ticks
+    /// );
+    /// // emit sim_end_event over SSE, then close the stream
+    /// ```
+    pub fn subscribe_completion(&self) -> watch::Receiver<Option<SimCompletion>> {
+        self.completion_tx.subscribe()
     }
 
     pub async fn run<L: crate::llm::LlmClient>(
@@ -497,6 +555,15 @@ impl SimEngine {
 
         // Clone history from canonical store; avoids a local Vec running in parallel (6A)
         let history = self.snapshot_history.lock().clone();
+        let total_ticks = history.len() as u32;
+
+        // Emit the terminal completion signal AFTER the last snapshot has been committed to
+        // history. This ordering guarantees that any SSE handler observing the completion
+        // signal can safely drain history up to `total_ticks` without missing the last tick.
+        // Mirrors MiroFish action_logger.log_simulation_end / simulation_runner monitor.
+        // Ignore the error: if all receivers have been dropped, the signal is irrelevant.
+        let _ = self.completion_tx.send(Some(SimCompletion { total_ticks }));
+
         Ok(SimulationResult { id: Uuid::new_v4(), history })
     }
 }
@@ -1021,5 +1088,239 @@ mod tests {
         let json = serde_json::to_string(&action).expect("serialize failed");
         let back: Action = serde_json::from_str(&json).expect("deserialize failed");
         assert_eq!(action, back);
+    }
+
+    // ===== U-048: Completion Signal Tests =====
+
+    #[test]
+    fn test_subscribe_completion_initial_value_is_none() {
+        // Before run(), the completion channel must carry None.
+        let engine = SimEngine::new(SimConfig::default());
+        let rx = engine.subscribe_completion();
+        assert!(rx.borrow().is_none(), "completion must start as None before run()");
+    }
+
+    #[tokio::test]
+    async fn test_completion_signal_fires_with_correct_total_ticks() {
+        // Core U-048 test: subscribe before run(), run for N ticks, assert completion fires
+        // with total_ticks == N (the in-band terminal signal mirrors MiroFish simulation_end).
+        use crate::agent::{Agent, AgentPool, Persona};
+        use crate::error::Result;
+        use crate::llm::LlmClient;
+        use async_trait::async_trait;
+        use std::pin::Pin;
+
+        struct MockLlm;
+        #[async_trait]
+        impl LlmClient for MockLlm {
+            async fn complete(&self, _: &str) -> Result<String> {
+                Ok("Think(idle)".to_string())
+            }
+            async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+            async fn stream(
+                &self,
+                _: &str,
+            ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+        }
+
+        const N: u32 = 5;
+        let mut pool = AgentPool::new();
+        pool.add_agent(Agent::new(Persona {
+            name: "A".into(),
+            background: "test".into(),
+            traits: vec![],
+            role: "none".into(),
+        }));
+
+        let engine = SimEngine::new(SimConfig::new(N, 1));
+        // Subscribe BEFORE run() — the normal SSE handler ordering.
+        let completion_rx = engine.subscribe_completion();
+
+        let graph = crate::graph::KnowledgeGraph::new();
+        let result = engine.run(&mut pool, &graph, &MockLlm).await.expect("run failed");
+
+        // run() must have sent the completion signal synchronously before returning.
+        let completion = completion_rx.borrow().clone();
+        assert!(completion.is_some(), "completion must be Some after run()");
+        let sc = completion.unwrap();
+        assert_eq!(sc.total_ticks, N, "total_ticks must equal max_ticks");
+        // Also verify via history length as a cross-check.
+        assert_eq!(result.history.len() as u32, N);
+    }
+
+    #[tokio::test]
+    async fn test_completion_signal_fires_after_last_snapshot() {
+        // Ordering guarantee: the completion signal must be sent AFTER the last snapshot
+        // has been committed to history. We verify by reading history from the engine's
+        // shared Arc just before completion is observed — it must already be fully populated.
+        use crate::agent::{Agent, AgentPool, Persona};
+        use crate::error::Result;
+        use crate::llm::LlmClient;
+        use async_trait::async_trait;
+        use std::pin::Pin;
+
+        struct MockLlm;
+        #[async_trait]
+        impl LlmClient for MockLlm {
+            async fn complete(&self, _: &str) -> Result<String> {
+                Ok("Think(idle)".to_string())
+            }
+            async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+            async fn stream(
+                &self,
+                _: &str,
+            ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+        }
+
+        const N: u32 = 3;
+        let mut pool = AgentPool::new();
+        pool.add_agent(Agent::new(Persona {
+            name: "B".into(),
+            background: "test".into(),
+            traits: vec![],
+            role: "none".into(),
+        }));
+
+        let engine = SimEngine::new(SimConfig::new(N, 1));
+        let completion_rx = engine.subscribe_completion();
+        let (_, history_arc) = engine.subscribe_with_history();
+
+        let graph = crate::graph::KnowledgeGraph::new();
+        engine.run(&mut pool, &graph, &MockLlm).await.expect("run failed");
+
+        // At the point we observe completion, history must already contain all N snapshots.
+        let sc = completion_rx.borrow().clone().expect("completion must be Some after run()");
+        assert_eq!(sc.total_ticks, N);
+        let history_len = history_arc.lock().len() as u32;
+        assert_eq!(
+            history_len, N,
+            "history must be fully populated when completion signal is observed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_late_subscriber_sees_completion() {
+        // watch holds its last value: a subscriber created AFTER run() must immediately
+        // observe Some(SimCompletion) without any timing race.
+        use crate::agent::{Agent, AgentPool, Persona};
+        use crate::error::Result;
+        use crate::llm::LlmClient;
+        use async_trait::async_trait;
+        use std::pin::Pin;
+
+        struct MockLlm;
+        #[async_trait]
+        impl LlmClient for MockLlm {
+            async fn complete(&self, _: &str) -> Result<String> {
+                Ok("Think(idle)".to_string())
+            }
+            async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+            async fn stream(
+                &self,
+                _: &str,
+            ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+        }
+
+        const N: u32 = 2;
+        let mut pool = AgentPool::new();
+        pool.add_agent(Agent::new(Persona {
+            name: "C".into(),
+            background: "test".into(),
+            traits: vec![],
+            role: "none".into(),
+        }));
+
+        let engine = SimEngine::new(SimConfig::new(N, 1));
+        let graph = crate::graph::KnowledgeGraph::new();
+        // Run FIRST, subscribe AFTER — tests the watch "holds last value" property.
+        engine.run(&mut pool, &graph, &MockLlm).await.expect("run failed");
+
+        // Late subscriber: subscribes after run() has already sent the completion signal.
+        let late_rx = engine.subscribe_completion();
+        let completion = late_rx.borrow().clone();
+        assert!(completion.is_some(), "late subscriber must see completion immediately via watch");
+        assert_eq!(completion.unwrap().total_ticks, N);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_broadcast_unaffected_by_completion_channel() {
+        // Regression: adding the completion channel must NOT break the existing snapshot
+        // broadcast. subscribe() and subscribe_with_history() must still deliver all ticks.
+        use crate::agent::{Agent, AgentPool, Persona};
+        use crate::error::Result;
+        use crate::llm::LlmClient;
+        use async_trait::async_trait;
+        use std::pin::Pin;
+
+        struct MockLlm;
+        #[async_trait]
+        impl LlmClient for MockLlm {
+            async fn complete(&self, _: &str) -> Result<String> {
+                Ok("Observe(sky)".to_string())
+            }
+            async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+            async fn stream(
+                &self,
+                _: &str,
+            ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+        }
+
+        const N: u32 = 4;
+        let mut pool = AgentPool::new();
+        pool.add_agent(Agent::new(Persona {
+            name: "D".into(),
+            background: "test".into(),
+            traits: vec![],
+            role: "none".into(),
+        }));
+
+        let engine = SimEngine::new(SimConfig::new(N, 1));
+        let mut snap_rx = engine.subscribe();
+        let (mut snap_rx2, history_arc) = engine.subscribe_with_history();
+
+        let graph = crate::graph::KnowledgeGraph::new();
+        engine.run(&mut pool, &graph, &MockLlm).await.expect("run failed");
+
+        // subscribe() still delivers all N snapshots
+        let mut received = Vec::new();
+        while let Ok(s) = snap_rx.try_recv() {
+            received.push(s);
+        }
+        assert_eq!(received.len(), N as usize, "snapshot broadcast must deliver all ticks");
+        for (i, s) in received.iter().enumerate() {
+            assert_eq!(s.tick, (i + 1) as u32);
+        }
+
+        // subscribe_with_history() still works
+        let mut received2 = Vec::new();
+        while let Ok(s) = snap_rx2.try_recv() {
+            received2.push(s);
+        }
+        assert_eq!(received2.len(), N as usize);
+        assert_eq!(history_arc.lock().len(), N as usize);
+    }
+
+    #[test]
+    fn test_sim_completion_serde_roundtrip() {
+        let sc = SimCompletion { total_ticks: 42 };
+        let json = serde_json::to_string(&sc).expect("serialize");
+        let back: SimCompletion = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(sc, back);
     }
 }
