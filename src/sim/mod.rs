@@ -776,6 +776,7 @@ mod tests {
                 background: "Test agent".to_string(),
                 traits: vec!["test".to_string()],
                 role: "tester".to_string(),
+                social: None,
             };
             pool.add_agent(Agent::new(persona));
         }
@@ -834,6 +835,7 @@ mod tests {
                 background: format!("Test agent {}", i),
                 traits: vec!["curious".to_string()],
                 role: "explorer".to_string(),
+                social: None,
             };
             pool.add_agent(Agent::new(persona));
         }
@@ -910,6 +912,7 @@ mod tests {
                 background: "test".into(),
                 traits: vec!["test".into()],
                 role: "observer".into(),
+                social: None,
             }));
         }
 
@@ -1134,6 +1137,7 @@ mod tests {
             background: "test".into(),
             traits: vec![],
             role: "none".into(),
+            social: None,
         }));
 
         let engine = SimEngine::new(SimConfig::new(N, 1));
@@ -1187,6 +1191,7 @@ mod tests {
             background: "test".into(),
             traits: vec![],
             role: "none".into(),
+            social: None,
         }));
 
         let engine = SimEngine::new(SimConfig::new(N, 1));
@@ -1240,6 +1245,7 @@ mod tests {
             background: "test".into(),
             traits: vec![],
             role: "none".into(),
+            social: None,
         }));
 
         let engine = SimEngine::new(SimConfig::new(N, 1));
@@ -1288,6 +1294,7 @@ mod tests {
             background: "test".into(),
             traits: vec![],
             role: "none".into(),
+            social: None,
         }));
 
         let engine = SimEngine::new(SimConfig::new(N, 1));

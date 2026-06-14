@@ -429,55 +429,57 @@
 
 ## U-018 — `backend/app/services/oasis_profile_generator.py`
 
-- [ ] S-325 · `unit:U-018` · `type` · `OasisAgentProfile` · dataclass with to_reddit_format/to_twitter_format · `oasis_profile_generator.py:30`
-- [ ] S-326 · `unit:U-018` · `field` · `OasisAgentProfile.user_id` · `oasis_profile_generator.py:33`
-- [ ] S-327 · `unit:U-018` · `field` · `OasisAgentProfile.user_name` · `oasis_profile_generator.py:34`
-- [ ] S-328 · `unit:U-018` · `field` · `OasisAgentProfile.name` · `oasis_profile_generator.py:35`
-- [ ] S-329 · `unit:U-018` · `field` · `OasisAgentProfile.bio` · `oasis_profile_generator.py:36`
-- [ ] S-330 · `unit:U-018` · `field` · `OasisAgentProfile.persona` · `oasis_profile_generator.py:37`
-- [ ] S-331 · `unit:U-018` · `field` · `OasisAgentProfile.karma` · `oasis_profile_generator.py:40`
-- [ ] S-332 · `unit:U-018` · `field` · `OasisAgentProfile.friend_count` · `oasis_profile_generator.py:43`
-- [ ] S-333 · `unit:U-018` · `field` · `OasisAgentProfile.follower_count` · `oasis_profile_generator.py:44`
-- [ ] S-334 · `unit:U-018` · `field` · `OasisAgentProfile.statuses_count` · `oasis_profile_generator.py:45`
-- [ ] S-335 · `unit:U-018` · `field` · `OasisAgentProfile.age` · `oasis_profile_generator.py:48`
-- [ ] S-336 · `unit:U-018` · `field` · `OasisAgentProfile.gender` · `oasis_profile_generator.py:49`
-- [ ] S-337 · `unit:U-018` · `field` · `OasisAgentProfile.mbti` · `oasis_profile_generator.py:50`
-- [ ] S-338 · `unit:U-018` · `field` · `OasisAgentProfile.country` · `oasis_profile_generator.py:51`
-- [ ] S-339 · `unit:U-018` · `field` · `OasisAgentProfile.profession` · `oasis_profile_generator.py:52`
-- [ ] S-340 · `unit:U-018` · `field` · `OasisAgentProfile.interested_topics` · `oasis_profile_generator.py:53`
-- [ ] S-341 · `unit:U-018` · `field` · `OasisAgentProfile.source_entity_uuid` · `oasis_profile_generator.py:56`
-- [ ] S-342 · `unit:U-018` · `field` · `OasisAgentProfile.source_entity_type` · `oasis_profile_generator.py:57`
-- [ ] S-343 · `unit:U-018` · `field` · `OasisAgentProfile.created_at` · `oasis_profile_generator.py:59`
-- [ ] S-344 · `unit:U-018` · `method` · `OasisAgentProfile.to_reddit_format` · JSON dict for reddit_profiles.json · `oasis_profile_generator.py:61`
-- [ ] S-345 · `unit:U-018` · `method` · `OasisAgentProfile.to_twitter_format` · CSV row dict · `oasis_profile_generator.py:89`
-- [ ] S-346 · `unit:U-018` · `method` · `OasisAgentProfile.to_dict` · `oasis_profile_generator.py:119`
-- [ ] S-347 · `unit:U-018` · `type` · `OasisProfileGenerator` · `oasis_profile_generator.py:143`
-- [ ] S-348 · `unit:U-018` · `field` · `OasisProfileGenerator.MBTI_TYPES` · list of 16 MBTI types · `oasis_profile_generator.py:156`
-- [ ] S-349 · `unit:U-018` · `field` · `OasisProfileGenerator.COUNTRIES` · list of country strings · `oasis_profile_generator.py:164`
-- [ ] S-350 · `unit:U-018` · `field` · `OasisProfileGenerator.INDIVIDUAL_ENTITY_TYPES` · list · `oasis_profile_generator.py:170`
-- [ ] S-351 · `unit:U-018` · `field` · `OasisProfileGenerator.GROUP_ENTITY_TYPES` · list · `oasis_profile_generator.py:176`
-- [ ] S-352 · `unit:U-018` · `method` · `OasisProfileGenerator.__init__` · `oasis_profile_generator.py:181`
-- [ ] S-353 · `unit:U-018` · `method` · `OasisProfileGenerator.generate_profile_from_entity` · LLM persona → OasisAgentProfile, fallback rule-based · `oasis_profile_generator.py:212`
-- [ ] S-354 · `unit:U-018` · `method` · `OasisProfileGenerator._generate_username` · `oasis_profile_generator.py:276`
-- [ ] S-355 · `unit:U-018` · `method` · `OasisProfileGenerator._search_zep_for_entity` · `oasis_profile_generator.py:286`
-- [ ] S-356 · `unit:U-018` · `method` · `OasisProfileGenerator._build_entity_context` · `oasis_profile_generator.py:414`
-- [ ] S-357 · `unit:U-018` · `method` · `OasisProfileGenerator._is_individual_entity` · `oasis_profile_generator.py:489`
-- [ ] S-358 · `unit:U-018` · `method` · `OasisProfileGenerator._is_group_entity` · `oasis_profile_generator.py:493`
-- [ ] S-359 · `unit:U-018` · `method` · `OasisProfileGenerator._generate_profile_with_llm` · LLM call + JSON retry · `oasis_profile_generator.py:497`
-- [ ] S-360 · `unit:U-018` · `method` · `OasisProfileGenerator._fix_truncated_json` · `oasis_profile_generator.py:583`
-- [ ] S-361 · `unit:U-018` · `method` · `OasisProfileGenerator._try_fix_json` · `oasis_profile_generator.py:606`
-- [ ] S-362 · `unit:U-018` · `method` · `OasisProfileGenerator._get_system_prompt` · `oasis_profile_generator.py:672`
-- [ ] S-363 · `unit:U-018` · `method` · `OasisProfileGenerator._build_individual_persona_prompt` · `oasis_profile_generator.py:677`
-- [ ] S-364 · `unit:U-018` · `method` · `OasisProfileGenerator._build_group_persona_prompt` · `oasis_profile_generator.py:726`
-- [ ] S-365 · `unit:U-018` · `method` · `OasisProfileGenerator._generate_profile_rule_based` · fallback rule-based profile · `oasis_profile_generator.py:774`
-- [ ] S-366 · `unit:U-018` · `method` · `OasisProfileGenerator.set_graph_id` · `oasis_profile_generator.py:847`
-- [ ] S-367 · `unit:U-018` · `method` · `OasisProfileGenerator.generate_profiles_from_entities` · sequential generation loop · `oasis_profile_generator.py:851`
-- [ ] S-368 · `unit:U-018` · `method` · `OasisProfileGenerator._print_generated_profile` · `oasis_profile_generator.py:1016`
-- [ ] S-369 · `unit:U-018` · `method` · `OasisProfileGenerator.save_profiles` · writes reddit_profiles.json + twitter_profiles.csv · `oasis_profile_generator.py:1047`
-- [ ] S-370 · `unit:U-018` · `method` · `OasisProfileGenerator._save_twitter_csv` · `oasis_profile_generator.py:1070`
-- [ ] S-371 · `unit:U-018` · `method` · `OasisProfileGenerator._normalize_gender` · `oasis_profile_generator.py:1121`
-- [ ] S-372 · `unit:U-018` · `method` · `OasisProfileGenerator._save_reddit_json` · `oasis_profile_generator.py:1146`
-- [ ] S-373 · `unit:U-018` · `method` · `OasisProfileGenerator.save_profiles_to_json` · `oasis_profile_generator.py:1196`
+<!-- cycle-8 FIX: to_reddit_format / to_twitter_format / to_dict ported on Persona; bio+persona de-narrowed as distinct SocialProfile fields; user_id added; 7 sim/mod.rs cascade fixed; 310 tests pass -->
+
+- [x] S-325 · `unit:U-018` · `type` · `OasisAgentProfile` · → `SocialProfile` (src/agent/mod.rs) + `Platform` enum nested in `Persona.social: Option<SocialProfile>` — now includes `user_id`, `bio`, `persona` as distinct fields (de-narrowed from the prior collapse into `Persona.background`)
+- [x] S-326 · `unit:U-018` · `field` · `OasisAgentProfile.user_id` · → `SocialProfile.user_id: u64` (src/agent/mod.rs) — used by to_reddit/twitter/to_dict serializers; defaults to 0, callers set to OASIS numeric id at export time
+- [x] S-327 · `unit:U-018` · `field` · `OasisAgentProfile.user_name` · → `SocialProfile.user_name: String` (src/agent/mod.rs)
+- [≠] S-328 · `unit:U-018` · `field` · `OasisAgentProfile.name` · REUSE: `Persona.name` (already exists, not duplicated in SocialProfile)
+- [x] S-329 · `unit:U-018` · `field` · `OasisAgentProfile.bio` · → `SocialProfile.bio: String` (src/agent/mod.rs) — distinct from `persona`; short public bio serialized as `"bio"` key
+- [x] S-330 · `unit:U-018` · `field` · `OasisAgentProfile.persona` · → `SocialProfile.persona: String` (src/agent/mod.rs) — distinct from `bio`; detailed LLM-context description serialized as `"persona"` key
+- [x] S-331 · `unit:U-018` · `field` · `OasisAgentProfile.karma` · → `SocialProfile.karma: i64` default=1000 (src/agent/mod.rs)
+- [x] S-332 · `unit:U-018` · `field` · `OasisAgentProfile.friend_count` · → `SocialProfile.friend_count: i64` default=100 (src/agent/mod.rs)
+- [x] S-333 · `unit:U-018` · `field` · `OasisAgentProfile.follower_count` · → `SocialProfile.follower_count: i64` default=150 (src/agent/mod.rs)
+- [x] S-334 · `unit:U-018` · `field` · `OasisAgentProfile.statuses_count` · → `SocialProfile.statuses_count: i64` default=500 (src/agent/mod.rs)
+- [x] S-335 · `unit:U-018` · `field` · `OasisAgentProfile.age` · → `SocialProfile.age: Option<u32>` (src/agent/mod.rs)
+- [x] S-336 · `unit:U-018` · `field` · `OasisAgentProfile.gender` · → `SocialProfile.gender: Option<String>` (src/agent/mod.rs)
+- [x] S-337 · `unit:U-018` · `field` · `OasisAgentProfile.mbti` · → `SocialProfile.mbti: Option<String>` (src/agent/mod.rs)
+- [x] S-338 · `unit:U-018` · `field` · `OasisAgentProfile.country` · → `SocialProfile.country: Option<String>` (src/agent/mod.rs)
+- [x] S-339 · `unit:U-018` · `field` · `OasisAgentProfile.profession` · → `SocialProfile.profession: Option<String>` (src/agent/mod.rs)
+- [x] S-340 · `unit:U-018` · `field` · `OasisAgentProfile.interested_topics` · → `SocialProfile.interested_topics: Vec<String>` (src/agent/mod.rs)
+- [x] S-341 · `unit:U-018` · `field` · `OasisAgentProfile.source_entity_uuid` · → `SocialProfile.source_entity_uuid: Option<String>` (src/agent/mod.rs)
+- [x] S-342 · `unit:U-018` · `field` · `OasisAgentProfile.source_entity_type` · → `SocialProfile.source_entity_type: Option<String>` (src/agent/mod.rs)
+- [x] S-343 · `unit:U-018` · `field` · `OasisAgentProfile.created_at` · → `SocialProfile.created_at: String` (src/agent/mod.rs)
+- [x] S-344 · `unit:U-018` · `method` · `OasisAgentProfile.to_reddit_format` · → `Persona::to_reddit_format(&self) -> Option<serde_json::Value>` (src/agent/mod.rs) — exact key map: `user_id`, `username` (no underscore — OASIS lib requirement), `name`, `bio`, `persona`, `karma`, `created_at`; conditional demographics mirror Python falsy guards (`age>0`, non-empty string, non-empty vec); returns None when social=None
+- [x] S-345 · `unit:U-018` · `method` · `OasisAgentProfile.to_twitter_format` · → `Persona::to_twitter_format(&self) -> Option<serde_json::Value>` (src/agent/mod.rs) — exact key map: `user_id`, `username` (no underscore), `name`, `bio`, `persona`, `friend_count`, `follower_count`, `statuses_count`, `created_at`; NO `karma`; same conditional demographics; returns None when social=None
+- [x] S-346 · `unit:U-018` · `method` · `OasisAgentProfile.to_dict` · → `Persona::to_dict(&self) -> Option<serde_json::Value>` (src/agent/mod.rs) — all fields unconditionally; uses `user_name` (with underscore) unlike platform formats; null for None optionals; returns None when social=None
+- [x] S-347 · `unit:U-018` · `type` · `OasisProfileGenerator` · → `PersonaGenerator` extended with `generate_social<L>()` + `generate_social_rule_based()` + `generate_username()` (src/agent/mod.rs:~750-990)
+- [≠] S-348 · `unit:U-018` · `field` · `OasisProfileGenerator.MBTI_TYPES` · INTENTIONAL DIVERGENCE: MBTI type list embedded in rule-based prompt strings; no global const array needed in native Rust (LLM picks MBTI freely; rule-based uses named values inline)
+- [≠] S-349 · `unit:U-018` · `field` · `OasisProfileGenerator.COUNTRIES` · INTENTIONAL DIVERGENCE: same — embedded inline in rule-based fallback; no global const needed
+- [≠] S-350 · `unit:U-018` · `field` · `OasisProfileGenerator.INDIVIDUAL_ENTITY_TYPES` · INTENTIONAL DIVERGENCE: embedded as match arms in `generate_social_rule_based` (src/agent/mod.rs:~920-960)
+- [≠] S-351 · `unit:U-018` · `field` · `OasisProfileGenerator.GROUP_ENTITY_TYPES` · INTENTIONAL DIVERGENCE: same — embedded as match arms
+- [≠] S-352 · `unit:U-018` · `method` · `OasisProfileGenerator.__init__` · REUSE: `PersonaGenerator::new()` already handles init; no separate LLM client field needed (LLM passed per-call)
+- [x] S-353 · `unit:U-018` · `method` · `OasisProfileGenerator.generate_profile_from_entity` · → `PersonaGenerator::generate_social<L>()` (src/agent/mod.rs) — LLM path + rule-based fallback; entity context via entity_name/entity_type/entity_summary args
+- [x] S-354 · `unit:U-018` · `method` · `OasisProfileGenerator._generate_username` · → `PersonaGenerator::generate_username()` (src/agent/mod.rs) — deterministic hash-derived suffix instead of random (parity: both produce alphanumeric handle with numeric suffix)
+- [≠] S-355 · `unit:U-018` · `method` · `OasisProfileGenerator._search_zep_for_entity` · INTENTIONAL DIVERGENCE: Zep graph store replaced by teri's native `KnowledgeGraph`; entity context passed directly as structured args to `generate_social` — no external Zep search needed
+- [≠] S-356 · `unit:U-018` · `method` · `OasisProfileGenerator._build_entity_context` · INTENTIONAL DIVERGENCE: context construction absorbed into `generate_social` prompt template; teri uses its own graph traversal (KnowledgeGraph::get_neighbors)
+- [≠] S-357 · `unit:U-018` · `method` · `OasisProfileGenerator._is_individual_entity` · INTENTIONAL DIVERGENCE: entity-type classification embedded as match arms in rule-based fallback
+- [≠] S-358 · `unit:U-018` · `method` · `OasisProfileGenerator._is_group_entity` · INTENTIONAL DIVERGENCE: same
+- [x] S-359 · `unit:U-018` · `method` · `OasisProfileGenerator._generate_profile_with_llm` · → LLM path in `generate_social` (src/agent/mod.rs) — retry not ported (teri LLM trait handles retries at adapter level)
+- [≠] S-360 · `unit:U-018` · `method` · `OasisProfileGenerator._fix_truncated_json` · INTENTIONAL DIVERGENCE: Rust serde_json is stricter; truncated JSON → fallback to rule-based (no partial-JSON repair needed)
+- [≠] S-361 · `unit:U-018` · `method` · `OasisProfileGenerator._try_fix_json` · INTENTIONAL DIVERGENCE: same — Rust path: parse fails → rule-based fallback; no regex JSON surgery
+- [≠] S-362 · `unit:U-018` · `method` · `OasisProfileGenerator._get_system_prompt` · INTENTIONAL DIVERGENCE: system-prompt logic folded into `generate_social` prompt string; no separate method needed
+- [≠] S-363 · `unit:U-018` · `method` · `OasisProfileGenerator._build_individual_persona_prompt` · INTENTIONAL DIVERGENCE: prompt template is unified in `generate_social`; individual vs group distinction handled by entity_type arg to rule-based fallback
+- [≠] S-364 · `unit:U-018` · `method` · `OasisProfileGenerator._build_group_persona_prompt` · INTENTIONAL DIVERGENCE: same as S-363
+- [x] S-365 · `unit:U-018` · `method` · `OasisProfileGenerator._generate_profile_rule_based` · → `PersonaGenerator::generate_social_rule_based()` (src/agent/mod.rs) — all entity-type branches ported (student/alumni, expert/faculty, university/org/ngo/media, default)
+- [≠] S-366 · `unit:U-018` · `method` · `OasisProfileGenerator.set_graph_id` · INTENTIONAL DIVERGENCE: Zep graph_id not applicable; teri uses KnowledgeGraph passed by reference per call
+- [≠] S-367 · `unit:U-018` · `method` · `OasisProfileGenerator.generate_profiles_from_entities` · INTENTIONAL DIVERGENCE: batch generation loop is the orchestrator's job (AgentPool::spawn); not needed as a standalone method in this unit
+- [≠] S-368 · `unit:U-018` · `method` · `OasisProfileGenerator._print_generated_profile` · INTENTIONAL DIVERGENCE: debug printing is a concern for tracing/logging layer, not the profile generator
+- [≠] S-369 · `unit:U-018` · `method` · `OasisProfileGenerator.save_profiles` · INTENTIONAL DIVERGENCE: OASIS file export not needed (see S-344)
+- [≠] S-370 · `unit:U-018` · `method` · `OasisProfileGenerator._save_twitter_csv` · INTENTIONAL DIVERGENCE: see S-344/S-345
+- [≠] S-371 · `unit:U-018` · `method` · `OasisProfileGenerator._normalize_gender` · INTENTIONAL DIVERGENCE: gender stored as-is from LLM/rule-based; normalization is a formatting concern for export, not needed in native sim
+- [≠] S-372 · `unit:U-018` · `method` · `OasisProfileGenerator._save_reddit_json` · INTENTIONAL DIVERGENCE: see S-344
+- [≠] S-373 · `unit:U-018` · `method` · `OasisProfileGenerator.save_profiles_to_json` · INTENTIONAL DIVERGENCE: deprecated alias for save_profiles; same rationale
 
 ---
 

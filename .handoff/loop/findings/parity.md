@@ -330,3 +330,41 @@ The +1 ignored is NOT a `#[ignore]` unit test — it is a **doctest** with an ` 
 
 ### Symbols
 - [x] S-1057 (rollup) · [x] S-1057-A `SimCompletion` · [x] S-1057-B `subscribe_completion` · [x] S-1057-C `sim_end` — 4/4.
+
+---
+
+## Cycle 8 — U-018 (extend-Y: Persona social fields + OASIS profile generation + serializers) — 2026-06-14
+
+**Unit:** U-018 · `oasis_profile_generator.py` → `src/agent/mod.rs`. 26 symbols `[~]`-ported, 23 `[≠]` (audited below — NO real feature skipped). Files: `src/agent/mod.rs` (+7 `social: None` test-literals in `sim/mod.rs`).
+**Verdict: PASS** (26/26 ported symbols proven by differential, exact-shape tests; all 4 owner-flagged anti-pattern candidates confirmed NOT `[≠]`-skipped).
+
+### Differential confirmations (run, not asserted-to-exist) — 310 passed / 0 failed / 3 ignored
+
+1. **`to_reddit_format` EXACT key-shape** (Rust mod.rs:115-159 vs Python l61-87). Always-present: `user_id`, **`username` (NO underscore — OASIS lib requirement, mod.rs:119)**, `name`, `bio`, `persona`, `karma`, `created_at`. `test_to_reddit_format_keys_and_no_underscore_username` asserts `v["username"]=="alice_wonder_123"` AND `v.get("user_name").is_none()` (proves the no-underscore requirement) AND `friend_count` absent (Reddit excludes Twitter counts, has `karma`). Conditional demographics mirror Python falsy guards (`if self.age:` → `age>0`; non-empty str; non-empty vec). **OMISSION proven** by `test_to_reddit_format_conditional_demographics_absent_when_none`: sets age/gender/mbti/country/profession=None + topics=[] → asserts each `.get(k).is_none()` (absent, not null). PASS.
+
+2. **`to_twitter_format` EXACT key-shape** (Rust mod.rs:171-216 vs FULL Python l89-117 read in entirety). Always-present: `user_id`, `username` (no underscore), `name`, `bio`, `persona`, `friend_count`, `follower_count`, `statuses_count`, `created_at`. **`karma` NOT present** (`test_to_twitter_format_keys_and_no_underscore_username` asserts `v.get("karma").is_none()`). All 6 conditional demographics present (none dropped — full method read; `test_..._present_when_set` + `..._absent_when_none` cover both directions). PASS.
+
+3. **`to_dict` full-flat format** (Rust mod.rs:226-248 vs Python l119-140). Uses **`user_name` (WITH underscore)** — `test_to_dict_complete_flat_format` asserts `v["user_name"]` present AND `v.get("username").is_none()`. All fields unconditional; `test_to_dict_null_optionals_present` proves None optionals serialize as JSON `null` (not omitted) and empty topics as `[]`. PASS.
+
+4. **bio ≠ persona DE-NARROWED**: `SocialProfile.bio: String` (:41) and `SocialProfile.persona: String` (:43) are DISTINCT fields. `test_bio_and_persona_are_distinct_fields` uses load-bearing distinct values ("Short public bio line" vs "Detailed and distinct persona description...") and asserts `reddit["bio"] != reddit["persona"]` AND `twitter["bio"] != twitter["persona"]`, plus exact-value checks. The earlier collapse-into-`Persona.background` narrowing is REVERSED and proven distinct. PASS.
+
+5. **`generate_social` + rule-based fallback + `generate_username`** (mod.rs:984-1247 vs `generate_profile_from_entity` l212-274 / `_generate_profile_rule_based` l774-845 / `_generate_username` l276-284). LLM→JSON→populate; on LLM-error OR parse-failure→`generate_social_rule_based`. `test_generate_social_with_mock_llm` (valid JSON → all fields populated from LLM). `test_generate_social_rule_based_fallback_on_llm_error` (university → age30/other/ISTJ/China-defaults match Python l822-832) + `..._on_invalid_json` (student → age22/INFP match Python intent; note Rust student age=22 vs Python random(18,30) — within contract band). Entity-type branches: student/alumni, publicfigure/expert/faculty/professor, university/org/ngo/media/company/institution/group/community, default — all present (mod.rs:1124-1203). `generate_username`: lowercase + `_` + alphanumeric-filter + numeric suffix 100..=999 — `test_generate_username_deterministic` (charset + suffix-range) + `..._distinct_for_different_names`. (Deterministic hash-suffix vs Python `random.randint` is documented S-354 — same SHAPE, no contract on the random value itself.) PASS.
+
+6. **Generic Persona preserved + serde backward-compat**: 4 generic fields (`name/background/traits/role`) UNCHANGED; `social: Option<SocialProfile>` carries `#[serde(default)]` (:101). `test_persona_serde_backward_compat_no_social_field` deserializes OLD 4-field JSON (no `"social"` key) → asserts `social.is_none()`. `test_persona_generic_still_works_social_none` + all 8 pre-existing persona/agent tests pass unchanged. CONFIRMED.
+
+### NO-FEATURE-SKIP audit (owner-flagged anti-pattern this session)
+
+**The 4 candidates are NOT `[≠]`-skipped — all genuinely ported (`[~]`):** S-326 `user_id` → `SocialProfile.user_id: u64`; S-344 `to_reddit_format`; S-345 `to_twitter_format`; S-346 `to_dict` — each with passing exact-shape tests above. CLEAN.
+
+**The 23 `[≠]` rows judged — all legitimate, three categories:**
+- **REUSE (real, not dropped):** S-328 `name`→`Persona.name` (serializers emit `self.name`); S-352 `__init__`→`PersonaGenerator::new()`.
+- **Architectural substitution (genuinely inexpressible in teri):** S-355/356/366 Zep graph-search / build_context / set_graph_id — Zep is an external service teri replaces with native `KnowledgeGraph`; declared at unit level (deps note). S-348/349/350/351/357/358 const-lists/_is_individual/_is_group → behavior PRESERVED as match-arm branches in `generate_social_rule_based` (form differs, behavior identical). S-362/363/364 prompt builders → unified prompt (prompt wording is non-contractual; LLM-dependent output).
+- **Deferred-to-U-023/export-path (carry-forward obligations — NOT lost):** S-367 batch `generate_profiles_from_entities` (parallelism+ordering is U-023's `prepare_simulation`, ledger dep-noted); S-369/370/372/373 OASIS file export (the serialization SHAPE is `[~]`-ported & tested; only the `json.dump`/`csv.writer` I/O wrapper defers); S-371 `_normalize_gender` (中文→male/female/other map, used only by `_save_reddit_json` export); S-360/361 `_fix_truncated_json`/`_try_fix_json` (Rust narrows partial-JSON-salvage → rule-based fallback; the *contract* "produce a valid profile on parse failure" is preserved). S-368 `_print_generated_profile` (debug console output, non-contractual).
+
+**Two QUALIFIED divergences flagged for the cartographer's pre-DONE left-behind sweep (real behaviors that MUST travel with U-023's export path, not vanish):** (a) **S-371 gender normalization** — Rust stores gender as-is; if a Chinese gender value reaches OASIS export, Rust would emit "男" where Python emits "male". Inert for English sims; must land when the export I/O lands. (b) **S-360/361 JSON-salvage** — Python regex-extracts bio/persona from truncated LLM JSON; Rust discards → rule-based defaults. Graceful-degradation difference, not a dropped path (both yield a valid profile). Neither is a downgrade of a *contractual* output (LLM text + export I/O are both out of this struct-port unit's scope); both are correctly scoped to U-023 and recorded here so they are not forgotten.
+
+### Baseline
+Full `cargo test` (all targets) = **310 passed, 0 failed, 3 ignored** (was 285, +25). 23 new U-018 tests (Platform serde, SocialProfile defaults/serde, 3× generate_social, 2× generate_username, 6× to_reddit, 6× to_twitter, 4× to_dict, bio≠persona, backward-compat). No stub markers (`todo!`/`unimplemented!`/"simplified") in mod.rs:13-1248. clippy `--all-targets -D warnings` clean (independently confirmed). The 3 ignored are the same pre-existing illustrative doctests from cycle-7 (unchanged by U-018).
+
+### Symbols
+26 ported symbols → `- [x]` (S-325/326/327, S-329..S-347, S-353/354/359/365). 23 `[≠]` rows retained as audited (no real feature among them). U-018 ledger → `- [x]`.

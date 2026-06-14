@@ -10,12 +10,242 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+/// Social media platform a `SocialProfile` belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Platform {
+    Twitter,
+    Reddit,
+}
+
+/// Social-media–specific profile data for a simulated agent.
+///
+/// Holds the fields that map directly to `OasisAgentProfile` fields.  `SocialProfile.bio`
+/// and `SocialProfile.persona` are DISTINCT (matching MiroFish source): `bio` is the short
+/// public user bio; `persona` is the long, detailed personality description.  Both are
+/// serialized under those exact keys in `to_reddit_format` / `to_twitter_format`.
+///
+/// `user_id` matches `OasisAgentProfile.user_id` (the OASIS numeric id used as the
+/// key in exported JSON/CSV; distinct from `Agent.id: Uuid` which is the native sim id).
+///
+/// Defaults match MiroFish `OasisAgentProfile` defaults:
+///   karma=1000, friend_count=100, follower_count=150, statuses_count=500.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocialProfile {
+    /// OASIS numeric user id (matches `OasisAgentProfile.user_id`).
+    pub user_id: u64,
+    /// Social-platform handle (e.g. `alice_wonder_42`); serialized as `"username"` (no
+    /// underscore) per OASIS library requirement — see `to_reddit_format`/`to_twitter_format`.
+    pub user_name: String,
+    /// Short public bio displayed on the profile page (distinct from `persona`).
+    pub bio: String,
+    /// Detailed personality description used in LLM system prompts (distinct from `bio`).
+    pub persona: String,
+    /// Which platform this profile targets.
+    pub platform: Platform,
+    /// Reddit-style karma score (default 1000).
+    #[serde(default = "SocialProfile::default_karma")]
+    pub karma: i64,
+    /// Number of accounts this agent follows (default 100).
+    #[serde(default = "SocialProfile::default_friend_count")]
+    pub friend_count: i64,
+    /// Number of followers (default 150).
+    #[serde(default = "SocialProfile::default_follower_count")]
+    pub follower_count: i64,
+    /// Accounts this agent follows — kept as alias for `friend_count` in the Twitter model.
+    #[serde(default = "SocialProfile::default_friend_count")]
+    pub following_count: i64,
+    /// Number of posts / status updates (default 500).
+    #[serde(default = "SocialProfile::default_statuses_count")]
+    pub statuses_count: i64,
+    pub age: Option<u32>,
+    pub gender: Option<String>,
+    pub mbti: Option<String>,
+    pub country: Option<String>,
+    pub profession: Option<String>,
+    #[serde(default)]
+    pub interested_topics: Vec<String>,
+    /// Freeform description of how this agent posts (tone, frequency, style).
+    pub posting_style: Option<String>,
+    /// UUID of the source entity this profile was derived from.
+    pub source_entity_uuid: Option<String>,
+    /// Entity-type label from the source graph (e.g. `"student"`, `"university"`).
+    pub source_entity_type: Option<String>,
+    /// ISO-8601 date string of profile creation (e.g. `"2026-06-14"`).
+    pub created_at: String,
+}
+
+impl SocialProfile {
+    fn default_karma() -> i64 {
+        1000
+    }
+    fn default_friend_count() -> i64 {
+        100
+    }
+    fn default_follower_count() -> i64 {
+        150
+    }
+    fn default_statuses_count() -> i64 {
+        500
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Persona {
     pub name: String,
     pub background: String,
     pub traits: Vec<String>,
     pub role: String,
+    /// Optional social-media profile overlay.  Generic personas keep `None`.
+    /// The `#[serde(default)]` ensures old 4-field JSON deserializes without error.
+    #[serde(default)]
+    pub social: Option<SocialProfile>,
+}
+
+impl Persona {
+    /// Serialize to Reddit-platform OASIS format.
+    ///
+    /// Mirrors `OasisAgentProfile.to_reddit_format` exactly:
+    /// - Always-present keys: `user_id`, `username` (OASIS library requires no underscore),
+    ///   `name`, `bio`, `persona`, `karma`, `created_at`.
+    /// - Conditionally present (only when `Some`/non-empty): `age`, `gender`, `mbti`,
+    ///   `country`, `profession`, `interested_topics`.
+    ///
+    /// Returns `None` when `self.social` is `None`.
+    pub fn to_reddit_format(&self) -> Option<serde_json::Value> {
+        let social = self.social.as_ref()?;
+        let mut profile = serde_json::json!({
+            "user_id": social.user_id,
+            "username": social.user_name,  // OASIS library requires "username" (no underscore)
+            "name": self.name,
+            "bio": social.bio,
+            "persona": social.persona,
+            "karma": social.karma,
+            "created_at": social.created_at,
+        });
+
+        // Conditional demographics — mirror Python's `if self.age:` guards exactly.
+        // In Python, 0 / "" / [] are all falsy, so we omit on None AND on 0 for age.
+        if let Some(age) = social.age
+            && age > 0
+        {
+            profile["age"] = serde_json::Value::from(age);
+        }
+        if let Some(ref gender) = social.gender
+            && !gender.is_empty()
+        {
+            profile["gender"] = serde_json::Value::from(gender.as_str());
+        }
+        if let Some(ref mbti) = social.mbti
+            && !mbti.is_empty()
+        {
+            profile["mbti"] = serde_json::Value::from(mbti.as_str());
+        }
+        if let Some(ref country) = social.country
+            && !country.is_empty()
+        {
+            profile["country"] = serde_json::Value::from(country.as_str());
+        }
+        if let Some(ref profession) = social.profession
+            && !profession.is_empty()
+        {
+            profile["profession"] = serde_json::Value::from(profession.as_str());
+        }
+        if !social.interested_topics.is_empty() {
+            profile["interested_topics"] = serde_json::Value::from(social.interested_topics.clone());
+        }
+
+        Some(profile)
+    }
+
+    /// Serialize to Twitter-platform OASIS format.
+    ///
+    /// Mirrors `OasisAgentProfile.to_twitter_format` exactly:
+    /// - Always-present keys: `user_id`, `username` (no underscore), `name`, `bio`,
+    ///   `persona`, `friend_count`, `follower_count`, `statuses_count`, `created_at`.
+    /// - Conditionally present (same falsy-guard as Python): `age`, `gender`, `mbti`,
+    ///   `country`, `profession`, `interested_topics`.
+    /// - Note: `karma` is NOT included (Reddit-only field).
+    ///
+    /// Returns `None` when `self.social` is `None`.
+    pub fn to_twitter_format(&self) -> Option<serde_json::Value> {
+        let social = self.social.as_ref()?;
+        let mut profile = serde_json::json!({
+            "user_id": social.user_id,
+            "username": social.user_name,  // OASIS library requires "username" (no underscore)
+            "name": self.name,
+            "bio": social.bio,
+            "persona": social.persona,
+            "friend_count": social.friend_count,
+            "follower_count": social.follower_count,
+            "statuses_count": social.statuses_count,
+            "created_at": social.created_at,
+        });
+
+        // Conditional demographics — identical falsy-guard semantics as to_reddit_format.
+        if let Some(age) = social.age
+            && age > 0
+        {
+            profile["age"] = serde_json::Value::from(age);
+        }
+        if let Some(ref gender) = social.gender
+            && !gender.is_empty()
+        {
+            profile["gender"] = serde_json::Value::from(gender.as_str());
+        }
+        if let Some(ref mbti) = social.mbti
+            && !mbti.is_empty()
+        {
+            profile["mbti"] = serde_json::Value::from(mbti.as_str());
+        }
+        if let Some(ref country) = social.country
+            && !country.is_empty()
+        {
+            profile["country"] = serde_json::Value::from(country.as_str());
+        }
+        if let Some(ref profession) = social.profession
+            && !profession.is_empty()
+        {
+            profile["profession"] = serde_json::Value::from(profession.as_str());
+        }
+        if !social.interested_topics.is_empty() {
+            profile["interested_topics"] = serde_json::Value::from(social.interested_topics.clone());
+        }
+
+        Some(profile)
+    }
+
+    /// Serialize to the complete flat dict format.
+    ///
+    /// Mirrors `OasisAgentProfile.to_dict` exactly: all fields unconditionally, with
+    /// `null` for `Option`s that are `None` and `[]` for empty `interested_topics`.
+    /// Uses `user_name` (with underscore) for the full-dict key — distinct from the
+    /// `"username"` (no underscore) used in platform-specific formats.
+    ///
+    /// Returns `None` when `self.social` is `None`.
+    pub fn to_dict(&self) -> Option<serde_json::Value> {
+        let social = self.social.as_ref()?;
+        Some(serde_json::json!({
+            "user_id": social.user_id,
+            "user_name": social.user_name,
+            "name": self.name,
+            "bio": social.bio,
+            "persona": social.persona,
+            "karma": social.karma,
+            "friend_count": social.friend_count,
+            "follower_count": social.follower_count,
+            "statuses_count": social.statuses_count,
+            "age": social.age,
+            "gender": social.gender,
+            "mbti": social.mbti,
+            "country": social.country,
+            "profession": social.profession,
+            "interested_topics": social.interested_topics,
+            "source_entity_uuid": social.source_entity_uuid,
+            "source_entity_type": social.source_entity_type,
+            "created_at": social.created_at,
+        }))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -740,6 +970,281 @@ impl PersonaGenerator {
 
         Ok(())
     }
+
+    /// Generate a social-media profile for an entity, returning a `SocialProfile`.
+    ///
+    /// Mirrors `OasisProfileGenerator.generate_profile_from_entity`:
+    /// 1. Tries LLM → parse JSON fields → populate `SocialProfile`.
+    /// 2. On any LLM/parse failure, falls back to `generate_social_rule_based`.
+    ///
+    /// `bio` and `persona` in the returned `SocialProfile` are distinct fields matching
+    /// `OasisAgentProfile.bio` (short public bio) and `OasisAgentProfile.persona` (detailed
+    /// personality description).  `user_id` defaults to 0; callers that export to OASIS
+    /// should set it to the desired numeric id after construction.
+    pub async fn generate_social<L: LlmClient>(
+        &self,
+        entity_name: &str,
+        entity_type: &str,
+        entity_summary: &str,
+        platform: Platform,
+        llm: &L,
+    ) -> Result<SocialProfile> {
+        let user_name = Self::generate_username(entity_name);
+        let created_at = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+        let default_bio = format!("{}: {}", entity_type, entity_name);
+        let default_persona = if entity_summary.is_empty() {
+            format!("{entity_name} is a {entity_type} participating in social discussions.")
+        } else {
+            entity_summary.to_string()
+        };
+
+        let prompt = format!(
+            r#"Generate a social media profile for a simulated agent based on the following entity.
+Return a JSON object with these fields:
+- bio: short public bio string (200 chars, displayed on profile page)
+- persona: detailed personality description string (used in LLM system prompt)
+- karma: integer (Reddit score, default 1000)
+- friend_count: integer (accounts followed, default 100)
+- follower_count: integer (followers, default 150)
+- statuses_count: integer (posts made, default 500)
+- age: integer or null
+- gender: "male", "female", or "other" (null if unknown)
+- mbti: MBTI type string or null (e.g. "INTJ")
+- country: country name string or null
+- profession: profession string or null
+- interested_topics: array of strings
+- posting_style: short description of posting tone and frequency
+
+Entity name: {entity_name}
+Entity type: {entity_type}
+Entity summary: {entity_summary}
+Platform: {platform}
+
+Return only valid JSON."#,
+            entity_name = entity_name,
+            entity_type = entity_type,
+            entity_summary = entity_summary,
+            platform = match platform {
+                Platform::Twitter => "Twitter",
+                Platform::Reddit => "Reddit",
+            },
+        );
+
+        // Try LLM, fall back to rule-based on any failure
+        let profile_data = match llm.complete(&prompt).await {
+            Ok(response) => serde_json::from_str::<serde_json::Value>(&response).ok(),
+            Err(_) => None,
+        };
+
+        if let Some(data) = profile_data {
+            let bio = data["bio"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&default_bio)
+                .to_string();
+            let persona = data["persona"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&default_persona)
+                .to_string();
+            let karma = data["karma"].as_i64().unwrap_or(1000);
+            let friend_count = data["friend_count"].as_i64().unwrap_or(100);
+            let follower_count = data["follower_count"].as_i64().unwrap_or(150);
+            let following_count = friend_count; // Twitter model: following ≈ friend_count
+            let statuses_count = data["statuses_count"].as_i64().unwrap_or(500);
+            let age = data["age"].as_u64().map(|v| v as u32);
+            let gender = data["gender"].as_str().map(|s| s.to_string());
+            let mbti = data["mbti"].as_str().map(|s| s.to_string());
+            let country = data["country"].as_str().map(|s| s.to_string());
+            let profession = data["profession"].as_str().map(|s| s.to_string());
+            let interested_topics = data["interested_topics"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let posting_style = data["posting_style"].as_str().map(|s| s.to_string());
+
+            Ok(SocialProfile {
+                user_id: 0,
+                user_name,
+                bio,
+                persona,
+                platform,
+                karma,
+                friend_count,
+                follower_count,
+                following_count,
+                statuses_count,
+                age,
+                gender,
+                mbti,
+                country,
+                profession,
+                interested_topics,
+                posting_style,
+                source_entity_uuid: None,
+                source_entity_type: Some(entity_type.to_string()),
+                created_at,
+            })
+        } else {
+            // Rule-based fallback — mirrors _generate_profile_rule_based
+            Ok(Self::generate_social_rule_based(
+                entity_name,
+                entity_type,
+                entity_summary,
+                platform,
+                &user_name,
+                &created_at,
+            ))
+        }
+    }
+
+    /// Rule-based fallback for social profile generation.
+    ///
+    /// Mirrors `OasisProfileGenerator._generate_profile_rule_based`: assigns sensible
+    /// defaults keyed by entity type (individual vs group/institution).
+    /// `bio` and `persona` are populated distinctly — `bio` is a short tagline and
+    /// `persona` is the longer entity summary or a default description.
+    fn generate_social_rule_based(
+        entity_name: &str,
+        entity_type: &str,
+        entity_summary: &str,
+        platform: Platform,
+        user_name: &str,
+        created_at: &str,
+    ) -> SocialProfile {
+        let entity_type_lower = entity_type.to_lowercase();
+
+        // Individual entity types → personal profile defaults
+        let (bio, persona, age, gender, mbti, country, profession, interested_topics, posting_style) =
+            if matches!(
+                entity_type_lower.as_str(),
+                "student" | "alumni"
+            ) {
+                (
+                    format!("{} with interests in academics and social issues.", entity_type),
+                    if entity_summary.is_empty() {
+                        format!("{entity_name} is a {etl} who is actively engaged in academic and social discussions. They enjoy sharing perspectives and connecting with peers.", etl = entity_type.to_lowercase())
+                    } else {
+                        entity_summary.to_string()
+                    },
+                    Some(22u32),
+                    Some("other".to_string()),
+                    Some("INFP".to_string()),
+                    Some("US".to_string()),
+                    Some("Student".to_string()),
+                    vec!["Education".to_string(), "Social Issues".to_string(), "Technology".to_string()],
+                    Some("Casual, frequent posts on campus life and social topics".to_string()),
+                )
+            } else if matches!(
+                entity_type_lower.as_str(),
+                "publicfigure" | "expert" | "faculty" | "professor"
+            ) {
+                (
+                    "Expert and thought leader in their field.".to_string(),
+                    if entity_summary.is_empty() {
+                        format!("{entity_name} is a recognized {etl} who shares insights and opinions on important matters. They are known for their expertise and influence in public discourse.", etl = entity_type.to_lowercase())
+                    } else {
+                        entity_summary.to_string()
+                    },
+                    Some(45u32),
+                    Some("other".to_string()),
+                    Some("INTJ".to_string()),
+                    Some("US".to_string()),
+                    Some("Expert".to_string()),
+                    vec!["Politics".to_string(), "Economics".to_string(), "Culture & Society".to_string()],
+                    Some("Thoughtful, infrequent posts with expert analysis".to_string()),
+                )
+            } else if matches!(
+                entity_type_lower.as_str(),
+                "university" | "governmentagency" | "organization" | "ngo" | "mediaoutlet" | "company" | "institution" | "group" | "community"
+            ) {
+                // Group/institution entity types → institutional account defaults
+                (
+                    format!("Official account of {}.", entity_name),
+                    if entity_summary.is_empty() {
+                        format!("{entity_name} is an institutional entity that communicates official positions, announcements, and engages with stakeholders on relevant matters.")
+                    } else {
+                        entity_summary.to_string()
+                    },
+                    Some(30u32),
+                    Some("other".to_string()),
+                    Some("ISTJ".to_string()),
+                    Some("China".to_string()),
+                    Some(entity_type.to_string()),
+                    vec!["Public Policy".to_string(), "Community".to_string(), "Official Announcements".to_string()],
+                    Some(format!("Official account for {entity_name}. Professional, measured tone.")),
+                )
+            } else {
+                // Default: generic participant
+                (
+                    if entity_summary.is_empty() {
+                        format!("{}: {}", entity_type, entity_name)
+                    } else {
+                        entity_summary.chars().take(150).collect()
+                    },
+                    if entity_summary.is_empty() {
+                        format!("{entity_name} is a {etl} participating in social discussions.", etl = entity_type.to_lowercase())
+                    } else {
+                        entity_summary.to_string()
+                    },
+                    Some(30u32),
+                    Some("other".to_string()),
+                    Some("ISTJ".to_string()),
+                    Some("US".to_string()),
+                    Some(entity_type.to_string()),
+                    vec!["General".to_string(), "Social Issues".to_string()],
+                    Some("Occasional posts on general topics".to_string()),
+                )
+            };
+
+        SocialProfile {
+            user_id: 0,
+            user_name: user_name.to_string(),
+            bio,
+            persona,
+            platform,
+            karma: 1000,
+            friend_count: 100,
+            follower_count: 150,
+            following_count: 100,
+            statuses_count: 500,
+            age,
+            gender,
+            mbti,
+            country,
+            profession,
+            interested_topics,
+            posting_style,
+            source_entity_uuid: None,
+            source_entity_type: Some(entity_type.to_string()),
+            created_at: created_at.to_string(),
+        }
+    }
+
+    /// Generate a URL-safe username from an entity name.
+    ///
+    /// Mirrors `OasisProfileGenerator._generate_username`: lowercase, underscores,
+    /// alphanumeric only, plus a 3-digit numeric suffix to avoid collisions.
+    pub fn generate_username(name: &str) -> String {
+        let base: String = name
+            .to_lowercase()
+            .replace(' ', "_")
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        // Use a stable hash-derived suffix so the output is deterministic in tests.
+        // Simple djb2-style fold over the name bytes.
+        let hash: u32 = name
+            .bytes()
+            .fold(5381u32, |acc, b| acc.wrapping_mul(33).wrapping_add(b as u32));
+        let suffix = 100 + (hash % 900); // 100..=999
+        format!("{base}_{suffix}")
+    }
 }
 
 impl Default for PersonaGenerator {
@@ -947,6 +1452,7 @@ mod tests {
             background: "A curious researcher".to_string(),
             traits: vec!["analytical".to_string(), "creative".to_string()],
             role: "Analyst".to_string(),
+            social: None,
         };
 
         let agent = Agent::new(persona.clone());
@@ -961,6 +1467,7 @@ mod tests {
             background: "A curious researcher".to_string(),
             traits: vec!["analytical".to_string()],
             role: "Analyst".to_string(),
+            social: None,
         };
 
         let mut agent = Agent::new(persona);
@@ -978,6 +1485,7 @@ mod tests {
             background: "A curious researcher".to_string(),
             traits: vec!["analytical".to_string()],
             role: "Analyst".to_string(),
+            social: None,
         };
 
         let agent = Agent::new(persona);
@@ -995,6 +1503,7 @@ mod tests {
             background: "A curious researcher".to_string(),
             traits: vec!["analytical".to_string()],
             role: "Analyst".to_string(),
+            social: None,
         };
 
         let mut agent = Agent::new(persona);
@@ -1053,6 +1562,7 @@ mod tests {
             background: "Valid background".to_string(),
             traits: vec!["valid".to_string()],
             role: "Valid role".to_string(),
+            social: None,
         };
         assert!(generator.validate_persona(&invalid_persona).is_err());
 
@@ -1062,6 +1572,7 @@ mod tests {
             background: "".to_string(),
             traits: vec!["valid".to_string()],
             role: "Valid role".to_string(),
+            social: None,
         };
         assert!(generator.validate_persona(&invalid_persona).is_err());
 
@@ -1071,6 +1582,7 @@ mod tests {
             background: "Valid background".to_string(),
             traits: (0..11).map(|i| format!("trait_{}", i)).collect(), // 11 traits
             role: "Valid role".to_string(),
+            social: None,
         };
         assert!(generator.validate_persona(&invalid_persona).is_err());
 
@@ -1080,6 +1592,7 @@ mod tests {
             background: "Valid background".to_string(),
             traits: vec!["trait1".to_string(), "trait2".to_string()],
             role: "Valid role".to_string(),
+            social: None,
         };
         assert!(generator.validate_persona(&valid_persona).is_ok());
     }
@@ -1315,6 +1828,7 @@ mod tests {
             background: "Test background".to_string(),
             traits: vec!["test".to_string()],
             role: "Tester".to_string(),
+            social: None,
         };
         let agent = Agent::new(persona);
 
@@ -1329,6 +1843,7 @@ mod tests {
             background: "Test background".to_string(),
             traits: vec!["test".to_string()],
             role: "Tester".to_string(),
+            social: None,
         };
         let agent = Agent::new(persona);
 
@@ -1343,6 +1858,7 @@ mod tests {
             background: "Test background".to_string(),
             traits: vec!["test".to_string()],
             role: "Tester".to_string(),
+            social: None,
         };
         let agent = Agent::new(persona);
 
@@ -1357,6 +1873,7 @@ mod tests {
             background: "Test background".to_string(),
             traits: vec!["test".to_string()],
             role: "Tester".to_string(),
+            social: None,
         };
         let agent = Agent::new(persona);
 
@@ -1371,6 +1888,7 @@ mod tests {
             background: "Test background".to_string(),
             traits: vec!["test".to_string()],
             role: "Tester".to_string(),
+            social: None,
         };
         let agent = Agent::new(persona);
 
@@ -1385,6 +1903,7 @@ mod tests {
             background: "Test background".to_string(),
             traits: vec!["test".to_string()],
             role: "Tester".to_string(),
+            social: None,
         };
         let agent = Agent::new(persona);
 
@@ -1399,6 +1918,7 @@ mod tests {
             background: "Test background".to_string(),
             traits: vec!["test".to_string()],
             role: "Tester".to_string(),
+            social: None,
         };
         let agent = Agent::new(persona);
 
@@ -1414,6 +1934,7 @@ mod tests {
             background: "Test background".to_string(),
             traits: vec!["test".to_string()],
             role: "Tester".to_string(),
+            social: None,
         };
         let agent = Agent::new(persona);
 
@@ -1429,6 +1950,7 @@ mod tests {
             background: "Test background".to_string(),
             traits: vec!["test".to_string()],
             role: "Tester".to_string(),
+            social: None,
         };
         let agent = Agent::new(persona);
 
@@ -1468,6 +1990,7 @@ mod tests {
             background: "A curious researcher".to_string(),
             traits: vec!["analytical".to_string(), "creative".to_string()],
             role: "Analyst".to_string(),
+            social: None,
         };
         let agent = Agent::new(persona);
 
@@ -1524,6 +2047,7 @@ mod tests {
             background: "A test agent".to_string(),
             traits: vec!["test".to_string()],
             role: "Tester".to_string(),
+            social: None,
         };
         let mut agent = Agent::new(persona);
 
@@ -1575,6 +2099,7 @@ mod tests {
             background: "A test agent".to_string(),
             traits: vec!["test".to_string()],
             role: "Tester".to_string(),
+            social: None,
         };
         let mut agent = Agent::new(persona);
         let world = WorldState::new();
@@ -1596,6 +2121,7 @@ mod tests {
             background: "A strategic thinker".to_string(),
             traits: vec!["strategic".to_string()],
             role: "Planner".to_string(),
+            social: None,
         };
         let mut agent = Agent::new(persona);
         let world = WorldState::new();
@@ -1623,6 +2149,7 @@ mod tests {
             background: "A careful observer".to_string(),
             traits: vec!["observant".to_string()],
             role: "Scout".to_string(),
+            social: None,
         };
         let mut agent = Agent::new(persona.clone());
 
@@ -1672,6 +2199,7 @@ mod tests {
             background: "A social media agent".to_string(),
             traits: vec!["engaged".to_string()],
             role: "Poster".to_string(),
+            social: None,
         })
     }
 
@@ -2024,5 +2552,557 @@ mod tests {
             agent.parse_and_validate_action("Think(plan)").unwrap(),
             Action::Think(ref s) if s == "plan"
         ));
+    }
+
+    // ===== U-018 SocialProfile / Platform Tests =====
+
+    #[test]
+    fn test_platform_serde_roundtrip() {
+        // Platform enum serializes to lowercase string and deserializes back.
+        let tw = Platform::Twitter;
+        let rd = Platform::Reddit;
+
+        let tw_json = serde_json::to_string(&tw).unwrap();
+        let rd_json = serde_json::to_string(&rd).unwrap();
+        assert_eq!(tw_json, "\"twitter\"");
+        assert_eq!(rd_json, "\"reddit\"");
+
+        let tw2: Platform = serde_json::from_str(&tw_json).unwrap();
+        let rd2: Platform = serde_json::from_str(&rd_json).unwrap();
+        assert_eq!(tw2, Platform::Twitter);
+        assert_eq!(rd2, Platform::Reddit);
+    }
+
+    #[test]
+    fn test_platform_eq() {
+        assert_eq!(Platform::Twitter, Platform::Twitter);
+        assert_eq!(Platform::Reddit, Platform::Reddit);
+        assert_ne!(Platform::Twitter, Platform::Reddit);
+    }
+
+    #[test]
+    fn test_social_profile_defaults() {
+        // Default numeric values match MiroFish OasisAgentProfile defaults.
+        let profile = SocialProfile {
+            user_id: 0,
+            user_name: "test_123".to_string(),
+            bio: "".to_string(),
+            persona: "".to_string(),
+            platform: Platform::Reddit,
+            karma: SocialProfile::default_karma(),
+            friend_count: SocialProfile::default_friend_count(),
+            follower_count: SocialProfile::default_follower_count(),
+            following_count: SocialProfile::default_friend_count(),
+            statuses_count: SocialProfile::default_statuses_count(),
+            age: None,
+            gender: None,
+            mbti: None,
+            country: None,
+            profession: None,
+            interested_topics: vec![],
+            posting_style: None,
+            source_entity_uuid: None,
+            source_entity_type: None,
+            created_at: "2026-06-14".to_string(),
+        };
+        assert_eq!(profile.karma, 1000);
+        assert_eq!(profile.friend_count, 100);
+        assert_eq!(profile.follower_count, 150);
+        assert_eq!(profile.statuses_count, 500);
+    }
+
+    #[test]
+    fn test_social_profile_serde_roundtrip() {
+        let profile = SocialProfile {
+            user_id: 7,
+            user_name: "alice_wonder_42".to_string(),
+            bio: "Tech journalist covering AI".to_string(),
+            persona: "Alice is a seasoned tech journalist with strong opinions on AI ethics.".to_string(),
+            platform: Platform::Twitter,
+            karma: 2500,
+            friend_count: 200,
+            follower_count: 300,
+            following_count: 200,
+            statuses_count: 1000,
+            age: Some(28),
+            gender: Some("female".to_string()),
+            mbti: Some("ENFP".to_string()),
+            country: Some("US".to_string()),
+            profession: Some("Journalist".to_string()),
+            interested_topics: vec!["Tech".to_string(), "Politics".to_string()],
+            posting_style: Some("Frequent, opinionated".to_string()),
+            source_entity_uuid: Some("abc-123".to_string()),
+            source_entity_type: Some("journalist".to_string()),
+            created_at: "2026-06-14".to_string(),
+        };
+        let json = serde_json::to_string(&profile).unwrap();
+        let decoded: SocialProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.user_name, profile.user_name);
+        assert_eq!(decoded.platform, Platform::Twitter);
+        assert_eq!(decoded.karma, 2500);
+        assert_eq!(decoded.age, Some(28));
+        assert_eq!(decoded.mbti.as_deref(), Some("ENFP"));
+    }
+
+    #[test]
+    fn test_persona_generic_still_works_social_none() {
+        // Generic Persona (social=None) construction and field access — no regression.
+        let persona = Persona {
+            name: "Alice".to_string(),
+            background: "A curious researcher".to_string(),
+            traits: vec!["analytical".to_string()],
+            role: "Analyst".to_string(),
+            social: None,
+        };
+        assert_eq!(persona.name, "Alice");
+        assert!(persona.social.is_none());
+    }
+
+    #[test]
+    fn test_persona_serde_backward_compat_no_social_field() {
+        // Old 4-field Persona JSON (no "social" key) must deserialize to social=None.
+        let old_json = r#"{
+            "name": "Bob",
+            "background": "A veteran explorer",
+            "traits": ["brave", "resourceful"],
+            "role": "Scout"
+        }"#;
+        let persona: Persona = serde_json::from_str(old_json).unwrap();
+        assert_eq!(persona.name, "Bob");
+        assert_eq!(persona.role, "Scout");
+        assert!(persona.social.is_none(), "old JSON without 'social' must deserialize to None");
+    }
+
+    #[test]
+    fn test_persona_serde_with_social_field() {
+        // Persona with social field roundtrips correctly.
+        let persona = Persona {
+            name: "Carol".to_string(),
+            background: "A social media analyst".to_string(),
+            traits: vec!["curious".to_string()],
+            role: "Analyst".to_string(),
+            social: Some(SocialProfile {
+                user_id: 5,
+                user_name: "carol_analyst_500".to_string(),
+                bio: "Data analyst and social media researcher".to_string(),
+                persona: "Carol focuses on social dynamics in online communities, bringing analytical rigor.".to_string(),
+                platform: Platform::Reddit,
+                karma: 1000,
+                friend_count: 100,
+                follower_count: 150,
+                following_count: 100,
+                statuses_count: 500,
+                age: Some(34),
+                gender: Some("female".to_string()),
+                mbti: None,
+                country: None,
+                profession: Some("Analyst".to_string()),
+                interested_topics: vec!["Data Science".to_string()],
+                posting_style: None,
+                source_entity_uuid: None,
+                source_entity_type: Some("expert".to_string()),
+                created_at: "2026-06-14".to_string(),
+            }),
+        };
+        let json = serde_json::to_string(&persona).unwrap();
+        let decoded: Persona = serde_json::from_str(&json).unwrap();
+        assert!(decoded.social.is_some());
+        let sp = decoded.social.unwrap();
+        assert_eq!(sp.user_name, "carol_analyst_500");
+        assert_eq!(sp.platform, Platform::Reddit);
+        assert_eq!(sp.karma, 1000);
+    }
+
+    #[test]
+    fn test_generate_username_deterministic() {
+        // Same name → same output (hash-derived suffix, no randomness).
+        let u1 = PersonaGenerator::generate_username("Alice Wonder");
+        let u2 = PersonaGenerator::generate_username("Alice Wonder");
+        assert_eq!(u1, u2);
+        // Username is lowercase, alphanumeric + underscore only.
+        assert!(u1.chars().all(|c| c.is_alphanumeric() || c == '_'));
+        // Suffix is in 100..=999 range.
+        let parts: Vec<&str> = u1.rsplitn(2, '_').collect();
+        let suffix: u32 = parts[0].parse().expect("suffix must be numeric");
+        assert!((100..=999).contains(&suffix));
+    }
+
+    #[test]
+    fn test_generate_username_distinct_for_different_names() {
+        let u1 = PersonaGenerator::generate_username("Alice");
+        let u2 = PersonaGenerator::generate_username("Bob");
+        // Different names should produce different usernames (different suffixes / bases).
+        assert_ne!(u1, u2);
+    }
+
+    #[tokio::test]
+    async fn test_generate_social_with_mock_llm() {
+        // Mock LLM returns valid JSON — SocialProfile is populated from it.
+        let mock_json = r#"{
+            "karma": 3500,
+            "friend_count": 250,
+            "follower_count": 800,
+            "statuses_count": 1200,
+            "age": 31,
+            "gender": "female",
+            "mbti": "ENFP",
+            "country": "Canada",
+            "profession": "Journalist",
+            "interested_topics": ["Politics", "Media"],
+            "posting_style": "Frequent, opinionated commentary"
+        }"#;
+        let mock_llm = MockPersonaLlm::new(mock_json);
+        let generator = PersonaGenerator::new();
+
+        let sp = generator
+            .generate_social("Jane Doe", "journalist", "A seasoned reporter", Platform::Twitter, &mock_llm)
+            .await
+            .expect("generate_social must succeed with valid mock LLM");
+
+        assert_eq!(sp.platform, Platform::Twitter);
+        assert_eq!(sp.karma, 3500);
+        assert_eq!(sp.friend_count, 250);
+        assert_eq!(sp.follower_count, 800);
+        assert_eq!(sp.statuses_count, 1200);
+        assert_eq!(sp.age, Some(31));
+        assert_eq!(sp.gender.as_deref(), Some("female"));
+        assert_eq!(sp.mbti.as_deref(), Some("ENFP"));
+        assert_eq!(sp.country.as_deref(), Some("Canada"));
+        assert_eq!(sp.profession.as_deref(), Some("Journalist"));
+        assert!(sp.interested_topics.contains(&"Politics".to_string()));
+        assert!(sp.posting_style.is_some());
+        // username is derived from entity name deterministically
+        assert!(!sp.user_name.is_empty());
+        // source_entity_type set from entity_type argument
+        assert_eq!(sp.source_entity_type.as_deref(), Some("journalist"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_social_rule_based_fallback_on_llm_error() {
+        // When LLM returns an error, generate_social falls back to rule-based.
+        struct ErrorLlm;
+        #[async_trait]
+        impl LlmClient for ErrorLlm {
+            async fn complete(&self, _: &str) -> Result<String> {
+                Err(TeriError::Llm("network failure".to_string()))
+            }
+            async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+                Err(TeriError::Llm("not implemented".to_string()))
+            }
+            async fn stream(
+                &self,
+                _: &str,
+            ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+                Err(TeriError::Llm("not implemented".to_string()))
+            }
+        }
+
+        let generator = PersonaGenerator::new();
+        let sp = generator
+            .generate_social("State University", "university", "A public university", Platform::Reddit, &ErrorLlm)
+            .await
+            .expect("rule-based fallback must succeed even when LLM errors");
+
+        assert_eq!(sp.platform, Platform::Reddit);
+        // Defaults match MiroFish values
+        assert_eq!(sp.karma, 1000);
+        assert_eq!(sp.friend_count, 100);
+        assert_eq!(sp.follower_count, 150);
+        assert_eq!(sp.statuses_count, 500);
+        // Rule-based for 'university' entity type sets age=30, gender="other", mbti="ISTJ"
+        assert_eq!(sp.age, Some(30));
+        assert_eq!(sp.gender.as_deref(), Some("other"));
+        assert_eq!(sp.mbti.as_deref(), Some("ISTJ"));
+        assert!(!sp.interested_topics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_generate_social_rule_based_fallback_on_invalid_json() {
+        // When LLM returns non-JSON, rule-based fallback kicks in.
+        let bad_llm = MockPersonaLlm::new("this is not json at all");
+        let generator = PersonaGenerator::new();
+
+        let sp = generator
+            .generate_social("John Student", "student", "A university student", Platform::Twitter, &bad_llm)
+            .await
+            .expect("rule-based fallback must succeed for bad LLM JSON");
+
+        // student rule → age=22, gender="other", mbti="INFP"
+        assert_eq!(sp.age, Some(22));
+        assert_eq!(sp.mbti.as_deref(), Some("INFP"));
+        assert!(sp.interested_topics.contains(&"Education".to_string()));
+    }
+
+    #[test]
+    fn test_social_profile_defaults_serde_defaults() {
+        // Partial JSON (missing numeric fields) deserializes using serde defaults.
+        let partial_json = r#"{
+            "user_id": 1,
+            "user_name": "handle_123",
+            "bio": "A short bio",
+            "persona": "Detailed personality description",
+            "platform": "reddit",
+            "created_at": "2026-06-14"
+        }"#;
+        let sp: SocialProfile = serde_json::from_str(partial_json).unwrap();
+        assert_eq!(sp.karma, 1000);
+        assert_eq!(sp.friend_count, 100);
+        assert_eq!(sp.follower_count, 150);
+        assert_eq!(sp.statuses_count, 500);
+        assert!(sp.interested_topics.is_empty());
+    }
+
+    // ===== U-018 Fix: to_reddit_format / to_twitter_format / to_dict / bio+persona distinct =====
+
+    /// Build a fully-populated Persona with SocialProfile for serialization tests.
+    fn make_social_persona() -> Persona {
+        Persona {
+            name: "Alice Wonder".to_string(),
+            background: "Generic background text".to_string(),
+            traits: vec!["curious".to_string()],
+            role: "Researcher".to_string(),
+            social: Some(SocialProfile {
+                user_id: 42,
+                user_name: "alice_wonder_123".to_string(),
+                bio: "Short public bio line".to_string(),
+                persona: "Detailed and distinct persona description for LLM context".to_string(),
+                platform: Platform::Reddit,
+                karma: 2500,
+                friend_count: 80,
+                follower_count: 200,
+                following_count: 80,
+                statuses_count: 350,
+                age: Some(28),
+                gender: Some("female".to_string()),
+                mbti: Some("INFJ".to_string()),
+                country: Some("US".to_string()),
+                profession: Some("Scientist".to_string()),
+                interested_topics: vec!["Science".to_string(), "Ethics".to_string()],
+                posting_style: None,
+                source_entity_uuid: None,
+                source_entity_type: Some("person".to_string()),
+                created_at: "2026-06-14".to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn test_to_reddit_format_keys_and_no_underscore_username() {
+        // to_reddit_format must use "username" (no underscore) — OASIS library requirement.
+        // Keys: user_id, username, name, bio, persona, karma, created_at.
+        let p = make_social_persona();
+        let v = p.to_reddit_format().expect("should produce Some");
+
+        assert_eq!(v["user_id"], 42u64, "user_id must be present");
+        assert_eq!(v["username"], "alice_wonder_123", "key must be 'username' (no underscore)");
+        assert!(v.get("user_name").is_none(), "must NOT have 'user_name' with underscore");
+        assert_eq!(v["name"], "Alice Wonder");
+        assert_eq!(v["bio"], "Short public bio line");
+        assert_eq!(v["persona"], "Detailed and distinct persona description for LLM context");
+        assert_eq!(v["karma"], 2500i64);
+        assert_eq!(v["created_at"], "2026-06-14");
+        // No friend_count / follower_count / statuses_count (Reddit-only excludes Twitter fields)
+        assert!(v.get("friend_count").is_none());
+    }
+
+    #[test]
+    fn test_to_reddit_format_conditional_demographics_present_when_set() {
+        // When age/gender/mbti/country/profession/interested_topics are set, they appear.
+        let p = make_social_persona();
+        let v = p.to_reddit_format().unwrap();
+
+        assert_eq!(v["age"], 28u32);
+        assert_eq!(v["gender"], "female");
+        assert_eq!(v["mbti"], "INFJ");
+        assert_eq!(v["country"], "US");
+        assert_eq!(v["profession"], "Scientist");
+        let topics = v["interested_topics"].as_array().unwrap();
+        assert_eq!(topics.len(), 2);
+        assert_eq!(topics[0], "Science");
+    }
+
+    #[test]
+    fn test_to_reddit_format_conditional_demographics_absent_when_none() {
+        // When optional fields are None / empty, they must NOT appear in the output.
+        let mut p = make_social_persona();
+        if let Some(ref mut s) = p.social {
+            s.age = None;
+            s.gender = None;
+            s.mbti = None;
+            s.country = None;
+            s.profession = None;
+            s.interested_topics = vec![];
+        }
+        let v = p.to_reddit_format().unwrap();
+
+        assert!(v.get("age").is_none(), "age must be absent when None");
+        assert!(v.get("gender").is_none(), "gender must be absent when None");
+        assert!(v.get("mbti").is_none(), "mbti must be absent when None");
+        assert!(v.get("country").is_none(), "country must be absent when None");
+        assert!(v.get("profession").is_none(), "profession must be absent when None");
+        assert!(v.get("interested_topics").is_none(), "interested_topics must be absent when empty");
+    }
+
+    #[test]
+    fn test_to_reddit_format_returns_none_when_no_social() {
+        let p = Persona {
+            name: "NoSocial".to_string(),
+            background: "bg".to_string(),
+            traits: vec![],
+            role: "none".to_string(),
+            social: None,
+        };
+        assert!(p.to_reddit_format().is_none());
+    }
+
+    #[test]
+    fn test_to_twitter_format_keys_and_no_underscore_username() {
+        // to_twitter_format: username (no underscore), friend_count, follower_count,
+        // statuses_count, NO karma.
+        let p = make_social_persona();
+        let v = p.to_twitter_format().expect("should produce Some");
+
+        assert_eq!(v["user_id"], 42u64);
+        assert_eq!(v["username"], "alice_wonder_123", "key must be 'username' (no underscore)");
+        assert!(v.get("user_name").is_none(), "must NOT have 'user_name' with underscore");
+        assert_eq!(v["name"], "Alice Wonder");
+        assert_eq!(v["bio"], "Short public bio line");
+        assert_eq!(v["persona"], "Detailed and distinct persona description for LLM context");
+        assert_eq!(v["friend_count"], 80i64);
+        assert_eq!(v["follower_count"], 200i64);
+        assert_eq!(v["statuses_count"], 350i64);
+        assert_eq!(v["created_at"], "2026-06-14");
+        // karma is NOT present in twitter format
+        assert!(v.get("karma").is_none(), "karma must NOT appear in twitter format");
+    }
+
+    #[test]
+    fn test_to_twitter_format_conditional_demographics_present_when_set() {
+        let p = make_social_persona();
+        let v = p.to_twitter_format().unwrap();
+
+        assert_eq!(v["age"], 28u32);
+        assert_eq!(v["gender"], "female");
+        assert_eq!(v["mbti"], "INFJ");
+        assert_eq!(v["country"], "US");
+        assert_eq!(v["profession"], "Scientist");
+        let topics = v["interested_topics"].as_array().unwrap();
+        assert_eq!(topics.len(), 2);
+    }
+
+    #[test]
+    fn test_to_twitter_format_conditional_demographics_absent_when_none() {
+        let mut p = make_social_persona();
+        if let Some(ref mut s) = p.social {
+            s.age = None;
+            s.gender = None;
+            s.mbti = None;
+            s.country = None;
+            s.profession = None;
+            s.interested_topics = vec![];
+        }
+        let v = p.to_twitter_format().unwrap();
+
+        assert!(v.get("age").is_none());
+        assert!(v.get("gender").is_none());
+        assert!(v.get("mbti").is_none());
+        assert!(v.get("country").is_none());
+        assert!(v.get("profession").is_none());
+        assert!(v.get("interested_topics").is_none());
+    }
+
+    #[test]
+    fn test_to_twitter_format_returns_none_when_no_social() {
+        let p = Persona {
+            name: "NoSocial".to_string(),
+            background: "bg".to_string(),
+            traits: vec![],
+            role: "none".to_string(),
+            social: None,
+        };
+        assert!(p.to_twitter_format().is_none());
+    }
+
+    #[test]
+    fn test_bio_and_persona_are_distinct_fields() {
+        // bio and persona must appear as separate, distinct values in the output.
+        // This proves the de-narrowing — collapsing both into Persona.background was wrong.
+        let p = make_social_persona();
+        let reddit = p.to_reddit_format().unwrap();
+        let twitter = p.to_twitter_format().unwrap();
+
+        // bio != persona (they have different values in make_social_persona)
+        assert_ne!(reddit["bio"], reddit["persona"], "bio and persona must be distinct in reddit format");
+        assert_ne!(twitter["bio"], twitter["persona"], "bio and persona must be distinct in twitter format");
+
+        // Both appear with their correct distinct values
+        assert_eq!(reddit["bio"], "Short public bio line");
+        assert_eq!(reddit["persona"], "Detailed and distinct persona description for LLM context");
+        assert_eq!(twitter["bio"], "Short public bio line");
+        assert_eq!(twitter["persona"], "Detailed and distinct persona description for LLM context");
+    }
+
+    #[test]
+    fn test_to_dict_complete_flat_format() {
+        // to_dict must include all fields, with "user_name" (underscore), no optional omission.
+        let p = make_social_persona();
+        let v = p.to_dict().expect("should produce Some");
+
+        assert_eq!(v["user_id"], 42u64);
+        // to_dict uses "user_name" (with underscore) — the full flat format
+        assert_eq!(v["user_name"], "alice_wonder_123");
+        assert!(v.get("username").is_none(), "to_dict must NOT have 'username' (no underscore)");
+        assert_eq!(v["name"], "Alice Wonder");
+        assert_eq!(v["bio"], "Short public bio line");
+        assert_eq!(v["persona"], "Detailed and distinct persona description for LLM context");
+        assert_eq!(v["karma"], 2500i64);
+        assert_eq!(v["friend_count"], 80i64);
+        assert_eq!(v["follower_count"], 200i64);
+        assert_eq!(v["statuses_count"], 350i64);
+        assert_eq!(v["age"], 28u32);
+        assert_eq!(v["gender"], "female");
+        assert_eq!(v["mbti"], "INFJ");
+        assert_eq!(v["country"], "US");
+        assert_eq!(v["profession"], "Scientist");
+        assert_eq!(v["created_at"], "2026-06-14");
+        // source fields present
+        assert_eq!(v["source_entity_type"], "person");
+    }
+
+    #[test]
+    fn test_to_dict_returns_none_when_no_social() {
+        let p = Persona {
+            name: "NoSocial".to_string(),
+            background: "bg".to_string(),
+            traits: vec![],
+            role: "none".to_string(),
+            social: None,
+        };
+        assert!(p.to_dict().is_none());
+    }
+
+    #[test]
+    fn test_to_dict_null_optionals_present() {
+        // to_dict includes null for None optionals (unconditional, unlike platform formats).
+        let mut p = make_social_persona();
+        if let Some(ref mut s) = p.social {
+            s.age = None;
+            s.gender = None;
+            s.mbti = None;
+            s.country = None;
+            s.profession = None;
+            s.interested_topics = vec![];
+            s.source_entity_uuid = None;
+        }
+        let v = p.to_dict().unwrap();
+
+        // All fields present, but as null / empty array
+        assert!(v["age"].is_null(), "age must be null when None in to_dict");
+        assert!(v["gender"].is_null());
+        assert!(v["mbti"].is_null());
+        assert!(v["country"].is_null());
+        assert!(v["profession"].is_null());
+        assert_eq!(v["interested_topics"].as_array().unwrap().len(), 0);
+        assert!(v["source_entity_uuid"].is_null());
     }
 }
