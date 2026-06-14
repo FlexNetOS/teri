@@ -90,4 +90,15 @@ Status legend: `pending` (not started).
 - [!] GAP-3 · `EntityKind::Custom(String)` dynamic kinds · blocks U-014 ontology generator · OQ-5
 - [!] GAP-4 · per-platform action-validity matrix · blocks U-028/U-029 · Decision-2
 - [!] GAP-5 · action-arg enrichment (post/user/comment) · informs U-030 · Decision-2
-- [!] GAP-6 · `<think>...</think>` strip in OpenAiAdapter · blocks U-008 parity · Decision-3
+- [!] GAP-6 · `<think>...</think>` strip in OpenAiAdapter · blocks U-008 parity · Decision-3 → **RESOLVED cycle-4** (strip_think + strip_json_fence, all 3 adapters)
+
+---
+
+## Cycle-4 verification reclassifications (AUTHORITATIVE over the reuse-Y rows above)
+The differential gate (reuse is never trusted) refuted the reuse-Y class for every backend unit checked — findings in `findings/reuse-verify-{llm,seed,infra}.md`:
+- [x] U-006 · reuse-Y→**extend-Y DONE** · retry recovery+cap+no-spurious tested, MAX_BACKOFF_SECS clamp; jitter `- [≠]`.
+- [x] U-008 · reuse-Y→**extend-Y DONE** · `strip_think`+`strip_json_fence` across all 3 adapters; teri LLM = proven superset; GAP-6 resolved.
+- [~] U-009 · reuse-Y→**extend-Y (pending)** · add encoding-fallback (GBK/Latin-1) + `.md` dispatch + `is_supported` gate + multi-file concat. ← file_parser.py.
+- [~] U-013 · reuse-Y→**port-fresh (pending)** · teri has NO text chunking → new `src/seed/text_processor.rs` (`split_text` 500/50 + `preprocess` + `stats`). **Unblocks GAP-U015-1.** ← text_processor.py.
+- [≠] U-004 · reuse-Y→**intentional-divergence** · teri logs to stdout by design (operators redirect; MiroFish itself does at simulation_runner.py:427); rotating-file appender omitted (owner-optional `tracing-appender` add).
+- [~] U-048 (JSONL action-log streaming) · reuse-Y→**extend-Y (pending)** · 3/4 behaviors confirmed (ordering, no-loss/catch-up, backpressure); add in-band end-of-sim terminal signal to stream subscribers (`StreamEvent::sim_end` at sim/mod.rs:496 + api/mod.rs:82). ← action_logger.py:105.

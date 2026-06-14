@@ -83,12 +83,12 @@
 
 ## U-006 — `backend/app/utils/retry.py`
 
-- [ ] S-043 · `unit:U-006` · `fn` · `retry_with_backoff` · decorator for sync fns; exponential backoff · `retry.py:15`
-- [ ] S-044 · `unit:U-006` · `fn` · `retry_with_backoff_async` · decorator for async fns · `retry.py:80`
-- [ ] S-045 · `unit:U-006` · `type` · `RetryableAPIClient` · class wrapping retry logic · `retry.py:132`
-- [ ] S-046 · `unit:U-006` · `method` · `RetryableAPIClient.__init__` · `retry.py:137`
-- [ ] S-047 · `unit:U-006` · `method` · `RetryableAPIClient.call_with_retry` · single call with retry · `retry.py:149`
-- [ ] S-048 · `unit:U-006` · `method` · `RetryableAPIClient.call_batch_with_retry` · batch calls with retry · `retry.py:195`
+- [~] S-043 · `unit:U-006` · `fn` · `retry_with_backoff` · decorator for sync fns; exponential backoff · `retry.py:15` · **rust-target:** `OpenAiAdapter::call_api` / `AnthropicAdapter::call_api` / `GeminiAdapter::call_api` inline retry loop at `src/llm.rs`; max_delay clamp added (MAX_BACKOFF_SECS=30 matches retry.py:59 `min(delay,max_delay)`, applied at llm.rs:140/151/356/367/554/565 — VERIFIED); jitter omitted (`- [≠]` — stochastic retry.py:61, no observable contract — ACCEPTED divergence); tested: exhaustion→Err+hit-count (test_openai_retry_exhausted_returns_err, _hits_cap), no-spurious-retry-on-success (test_openai_retry_no_retry_on_success). **STILL `- [~]`: recovery path (retry-THEN-succeed) untested. Porter claimed httpmock 0.7 can't do 503-THEN-200 — REFUTED by parity-verifier cycle-4: a static-atomic stateful matcher DOES work. EXACT TECHNIQUE for porter:** add module-scope `static C: AtomicUsize = AtomicUsize::new(0);` then mount a 503 mock with `.matches(\|_req\| C.fetch_add(1, SeqCst) == 0)` (matches only request #1) PLUS a plain 200 mock (no extra matcher) on the same path; httpmock's `find_mock` returns the first match, so req#1→503 (counter→1), req#2→200 (503 stops matching); assert resp == recovered body, `mock_503.assert_hits(1)`, `mock_200.assert_hits(1)`. (`when.matches` is `fn(&HttpMockRequest)->bool` — non-capturing, so a `static` counter is required, NOT a closure-captured local. ~2s runtime = real 2^1 backoff sleep; same order as existing retry tests. Probe run green in cycle-4 then removed.)
+- [~] S-044 · `unit:U-006` · `fn` · `retry_with_backoff_async` · decorator for async fns · `retry.py:80` · **rust-target:** same inline async retry in all three `call_api` impls; async via tokio::time::sleep; behavior identical to S-043 — same recovery-path gap and same recovery-test technique applies (see S-043)
+- [≠] S-045 · `unit:U-006` · `type` · `RetryableAPIClient` · class wrapping retry logic · `retry.py:132` · intentional-divergence: no standalone type; retry is encapsulated per-adapter in `call_api`; same contract, different form
+- [≠] S-046 · `unit:U-006` · `method` · `RetryableAPIClient.__init__` · `retry.py:137` · intentional-divergence: see S-045
+- [≠] S-047 · `unit:U-006` · `method` · `RetryableAPIClient.call_with_retry` · single call with retry · `retry.py:149` · intentional-divergence: see S-045
+- [≠] S-048 · `unit:U-006` · `method` · `RetryableAPIClient.call_batch_with_retry` · batch calls with retry · `retry.py:195` · intentional-divergence: no batch retry API in teri (teri's callers own batching)
 
 ---
 
@@ -106,10 +106,10 @@
 
 ## U-008 — `backend/app/utils/llm_client.py:LLMClient`
 
-- [ ] S-056 · `unit:U-008` · `type` · `LLMClient` · OpenAI-compatible LLM wrapper · `llm_client.py:14`
-- [ ] S-057 · `unit:U-008` · `method` · `LLMClient.__init__` · reads LLM_API_KEY/BASE_URL/MODEL_NAME from Config · `llm_client.py:17`
-- [ ] S-058 · `unit:U-008` · `method` · `LLMClient.chat` · calls chat.completions.create, strips `<think>` tags · `llm_client.py:35`
-- [ ] S-059 · `unit:U-008` · `method` · `LLMClient.chat_json` · calls chat with json_object format, strips markdown fences, parses JSON · `llm_client.py:70`
+- [x] S-056 · `unit:U-008` · `type` · `LLMClient` · OpenAI-compatible LLM wrapper · `llm_client.py:14` · **rust-target:** `LlmClient` trait + `OpenAiAdapter` / `AnthropicAdapter` / `GeminiAdapter` at `src/llm.rs`; provider-agnostic trait covering chat, chat_json, stream
+- [x] S-057 · `unit:U-008` · `method` · `LLMClient.__init__` · reads LLM_API_KEY/BASE_URL/MODEL_NAME from Config · `llm_client.py:17` · **rust-target:** `OpenAiAdapter::new(&LlmConfig)` / `AnthropicAdapter::new` / `GeminiAdapter::new` at `src/llm.rs`; validated via `LlmConfig::validate()` in config.rs
+- [x] S-058 · `unit:U-008` · `method` · `LLMClient.chat` · calls chat.completions.create, strips `<think>` tags · `llm_client.py:35` · **rust-target:** `LlmClient::complete` on all 3 adapters at `src/llm.rs`; `strip_think` helper (manual scan, no regex dep) applied to raw content; tested: single block, multi-block, no block, multiline, whitespace trim — all 3 adapters covered
+- [x] S-059 · `unit:U-008` · `method` · `LLMClient.chat_json` · calls chat with json_object format, strips markdown fences, parses JSON · `llm_client.py:70` · **rust-target:** `LlmClient::complete_json` on all 3 adapters at `src/llm.rs`; `strip_think` then `strip_json_fence` (handles ```json\n…\n``` and bare ```…```) before serde_json::from_str; parse-fail → TeriError::Llm (matches MiroFish ValueError); tested: plain JSON, ```json fenced, bare ``` fenced, think+fence combined — all 3 adapters covered
 
 ---
 
