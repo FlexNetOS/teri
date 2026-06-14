@@ -29,7 +29,11 @@ action_taxonomy: Action::Social(SocialAction) — 12 OASIS types (Trend included
 #   TRUE no-downgrade baseline going forward = 156 tests green (verified). Cargo.toml has a worktree-only
 #   [workspace] build-aid (teri is a meta-root member; review before develop->main promotion).
 merge: 0/50 merged+reverified-in-Y (target==dest, so "merge" == landed-in-teri + teri-not-regressed)
-classes: port-fresh=17 extend-Y=6 reuse-Y=18 map-onto-substrate=13   # locked by architect 2026-06-14 (SWEEP-4 = [≠] dropped)
+classes: port-fresh=17 extend-Y=6 reuse-Y=18 map-onto-substrate=13   # architect's ORIGINAL (provisional, harness PR #33)
+# CYCLE-4 RECLASSIFICATION (differential gate, authoritative): the 6 backend reuse-Y units were ALL refuted —
+#   U-006/U-008 -> extend-Y DONE [x]; U-009 -> extend-Y (pending); U-013 -> port-fresh (pending, unblocks GAP-U015-1);
+#   U-004 -> [≠] console-by-design; U-048 -> extend-Y (pending sim_end). 9 Vue reuse-Y units BLOCKED on the axum API.
+# status: cycle 4 done — LLM adapter (U-006+U-008) PROVEN superset, GAP-6 resolved, 242 green.
 # OQ resolutions (all no-downgrade): OQ-1 dual-platform=BOTH (MultiPlatformRunner + 2 SimEngine tokio::join!);
 #   OQ-2 Relation.valid_at temporal window; OQ-3 query_vec_similarity via shimmy embeddings;
 #   OQ-4 Vue frontend IN SCOPE, kept + re-pointed at teri axum API (not WASM);

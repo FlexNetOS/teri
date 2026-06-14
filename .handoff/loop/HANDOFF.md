@@ -3,9 +3,10 @@
 **Resume signal for the autonomous /loop.** Read this + `loop_state.md`, then continue at ITERATE.
 
 ## Where we are
-- **Phase:** ITERATE in progress. **3 cycles done** (through loop iteration 3). Next = reuse-Y verify-only quick-wins.
-- **Done so far:** U-015 (build 2-pass extraction) `[x]`; GAP-1 Relation.valid_at + GAP-2 query_vec_similarity `[x]`; GAP-ACTION-TAXONOMY (Action::Social — 12 OASIS types incl Trend + TargetKind{Post,Comment}) `[x]`. teri **220 tests green**. ~28/1087 symbols `[x]`.
-- **Harness upgrades merged:** harness_hub PR #30 (venv-exclude+AST fallback, drop-resilience), #31 (build-health EXECUTES baseline + fail-closed on red tip; relay-noise return-integrity), #32 (porter prove-before-collapse/omit discriminant rule).
+- **Phase:** ITERATE in progress. **4 cycles done** (through loop iteration 4). Next = the extend-Y/port-fresh ports surfaced by the reuse-Y differential verification.
+- **Done so far (parity-verified `[x]`):** U-015 (build extraction); GAP-1 Relation.valid_at; GAP-2 query_vec_similarity; GAP-ACTION-TAXONOMY (Action::Social 12 OASIS types); **U-006 retry (recovery-proven) + U-008 chat/chat_json — teri LLM adapter is now a PROVEN superset (GAP-6 resolved: `<think>`+JSON-fence strip, all 3 adapters)**. teri **242 tests green**. ~36/1087 symbols `[x]`.
+- **Reuse-Y reality check (cycle 4):** the differential gate refuted reuse-Y for ALL 6 backend units → small ports, not free wins. Reclassified: U-006/U-008 `[x]` DONE; **U-009 extend-Y** (encoding-fallback + `.md` + `is_supported` + multi-file), **U-013 port-fresh** (teri has NO text chunking → new `src/seed/text_processor.rs`, `split_text` 500/50 — **unblocks GAP-U015-1**), **U-004 `[≠]`** (console-by-design), **U-048 extend-Y** (add in-band `sim_end` stream signal). 9 Vue reuse-Y units are BLOCKED on the teri axum API (defer until U-025/026/027 exist).
+- **Harness upgrades merged:** harness_hub PR #30, #31, #32, **#33** (reuse-Y is now PROVISIONAL — budget as differential-verify+probable-small-port, not free win).
 - **⚠️ develop tip was BROKEN:** `c894de8` (PR #4 merge) was a bad merge (dup `api_key` in config.rs + dead `from_env`/dup block in main.rs) — did NOT compile. **Repaired on `port/mirofish` (commit 9836238)** by restoring the clean fix-branch versions, but **NOT yet PR'd to develop** — develop's tip is still broken until this lands. Consider a clean repair-only hotfix PR (without the Cargo.toml `[workspace]` worktree-aid) to unbreak develop.
 - **Branch:** `port/mirofish` off `develop@c894de8` in worktree `/home/drdave/Desktop/meta/.worktrees/mirofish-port/teri`. Commits: 9836238 (repair) · 064655c (U-015) · 4cdfd0d (valid_at+vec_sim).
 - **Cargo.toml `[workspace]`** = worktree-only build aid (teri is a meta-root member); strip before develop→main promote.
@@ -27,11 +28,14 @@
 - Each unit differentially parity-verified vs MiroFish (or, for map-onto, behavioral equivalence of the mapped teri path). Never stub, never drop a branch, never fake a `- [x]`.
 
 ## Next ITERATE units
-1. **reuse-Y verify-only quick-wins (NEXT — 18 units, fast ledger advance).** teri already provides these fully; per the merge-ledger they need DIFFERENTIAL VERIFICATION vs MiroFish (NOT a fresh port) — if teri's existing symbol matches the source contract → mark `- [x]` (verify-only); if it diverges → reclassify `extend-Y` and port the missing behavior. Candidates from target-architecture.md/merge-ledger.md: the LLM-adapter units (U-008 `LlmClient` superset — but note `<think>` strip GAP-6 may make it extend-Y), seed ingestor, persistent-memory units, sim-tick-loop reuse, the streaming infra. Batch several per cycle (they're quick). Use the opus parity-verifier per unit (reuse is never trusted).
-2. **extend-Y units** (6): agent social-persona fields, graph episodic wiring, report ReACT, etc.
-3. **U-013 text_processor** (chunking) → then extend `build()` for large-doc chunking (resolves GAP-U015-1).
-4. **GAP-OQ3-EMBED decision** — embedding-generation substrate (add `/v1/embeddings` to shimmy via Airframe, OR a teri `EmbeddingClient` vs an OpenAI-compatible provider).
-5. **port-fresh** (17, the heavy surface): HTTP/axum API routes (U-025/026/027, 59 routes), simulation lifecycle manager (U-023), community platform adapters + the social-sim that consumes the Action taxonomy (U-022/028/029/030, resolves GAP-SOCIAL-WORLDSTATE), IPC/interview (U-020), simulation config generator (U-019), ontology generator (U-014, OQ-5), Vue frontend re-pointed at teri's axum API (OQ-4).
+1. **Small extend-Y/port-fresh completions surfaced by cycle-4 (NEXT):**
+   - **U-013 (port-fresh)** — new `src/seed/text_processor.rs`: `split_text(chunk_size=500, overlap=50, UTF-8-safe char windows + sentence-boundary backtrack)` + `preprocess_text` (CRLF→LF, collapse blank runs, trim) + `get_text_stats`. ← text_processor.py / file_parser.py:161-202. **Then resolve GAP-U015-1**: extend `build()` (graph/mod.rs:237) to split→extract-per-chunk→merge for large docs.
+   - **U-009 (extend-Y)** — `SeedIngestor`: add multi-encoding fallback (UTF-8→GBK/Latin-1), `.md`/`.markdown` dispatch, `is_supported` ext gate, multi-file concat. ← file_parser.py.
+   - **U-048 (extend-Y)** — add in-band end-of-sim terminal signal to stream subscribers (`StreamEvent::sim_end` at sim/mod.rs:496 + api/mod.rs:82). ← action_logger.py:105.
+2. **extend-Y units** (6): U-001 AppConfig, U-002 serve_cmd, U-018 Persona social fields, U-024 ReportAgent ReACT, U-036 i18n, U-041 SimulationRunView, U-049 graceful shutdown.
+3. **GAP-OQ3-EMBED decision** — embedding-generation substrate (add `/v1/embeddings` to shimmy via Airframe, OR a teri `EmbeddingClient` vs an OpenAI-compatible provider).
+4. **port-fresh** (the heavy surface): HTTP/axum API routes (U-025/026/027, 59 routes — unblocks the 9 Vue reuse-Y units), simulation lifecycle manager (U-023), community platform adapters + social-sim consuming the Action taxonomy (U-022/028/029/030, resolves GAP-SOCIAL-WORLDSTATE), IPC/interview (U-020), config generator (U-019), ontology (U-014, OQ-5), Vue re-pointed at teri's axum API (OQ-4).
+5. **Vue reuse-Y verify (9 units, BLOCKED until the axum API exists)** — U-035/037/038/039/040/042/043/044 + SWEEP-1: verify the kept-Vue shapes against teri's API once routes land.
 
 ## Open gaps (flagged `- [!]`, no silent drop)
 - **GAP-OQ3-EMBED** — embedding generation substrate (shimmy `/v1/embeddings` absent).
