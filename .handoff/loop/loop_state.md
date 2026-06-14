@@ -33,6 +33,7 @@ classes: port-fresh=17 extend-Y=6 reuse-Y=18 map-onto-substrate=13   # locked by
 #   LLM_API_KEY; Zep/OASIS-path units are map-onto-substrate (verified as behavioral equivalence of the
 #   mapped teri path, not by running MiroFish's Zep/OASIS path which needs external creds).
 last_item: (none — DISCOVER complete)
-status: DISCOVER COMPLETE — ledger+symbol-map+research+architect+merge-ledger+cross-repo-refs+baseline all present; ready for ITERATE
+status: DISCOVER COMPLETE + evolution-find applied (harness_hub PR #30 merged, 7b54beb: venv-exclude+AST fallback, DISCOVER drop-resilience, incremental-DISCOVER-commit, port-in-place target==dest, per-unit source-runnable). Ready for ITERATE.
+loop_iteration: 1 (DISCOVER+eval) done; next = 2 (ITERATE porting cycles)
 last_update: 2026-06-14T12:30:00Z
 next_iterate: U-015 (wire KnowledgeGraph::build) -> OQ-2/OQ-3 (Relation.valid_at + query_vec_similarity) -> Action enum social variants (unlocks U-022/028/029/030)
