@@ -39,7 +39,8 @@ classes: port-fresh=17 extend-Y=6 reuse-Y=18 map-onto-substrate=13   # locked by
 #   LLM_API_KEY; Zep/OASIS-path units are map-onto-substrate (verified as behavioral equivalence of the
 #   mapped teri path, not by running MiroFish's Zep/OASIS path which needs external creds).
 last_item: (none — DISCOVER complete)
-status: DISCOVER COMPLETE + evolution-find applied (harness_hub PR #30 merged, 7b54beb: venv-exclude+AST fallback, DISCOVER drop-resilience, incremental-DISCOVER-commit, port-in-place target==dest, per-unit source-runnable). Ready for ITERATE.
-loop_iteration: 1 (DISCOVER+eval) done; next = 2 (ITERATE porting cycles)
+status: HAND OFF at cycle budget (2 ITERATE cycles done this session). U-015 + GAP-1 + GAP-2 [x], 171 green. develop tip repair staged (9836238, not yet PR'd). evolution-find iter-2 applied (harness_hub PR #31 merged, 4fb5f71: build-health-auditor EXECUTES baseline + fail-closed on red tip; relay-noise return-integrity rule).
+loop_iteration: 2 (ITERATE c1-c2 + eval) done; next = 3 (ITERATE c3 = Action social variants)
+next_iterate: Action enum social variants (sim Action + agent parser + WorldState::apply) — unlocks U-022/028/029/030
 last_update: 2026-06-14T12:30:00Z
 next_iterate: U-015 (wire KnowledgeGraph::build) -> OQ-2/OQ-3 (Relation.valid_at + query_vec_similarity) -> Action enum social variants (unlocks U-022/028/029/030)

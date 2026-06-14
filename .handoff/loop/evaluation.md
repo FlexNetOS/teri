@@ -1,70 +1,71 @@
-# Run evaluation — rust-port (MiroFish → teri), DISCOVER, iteration 1
+# Run evaluation — rust-port (MiroFish → teri), ITERATE cycles 1–2 (iteration 2)
 
-**Evaluated:** 2026-06-14 by evolution-steward (`/harness:harness-evolution find`)
+**Evaluated:** 2026-06-14 by evolution-steward (`/harness:harness-evolution find`, LIGHTWEIGHT — HAND OFF, not DONE)
 **Run:** port-and-merge, **target==dest==teri** (Python Flask/OASIS → existing Rust app)
-**Phase reached:** DISCOVER COMPLETE (ledger 50 units / 1087 symbols; architect+merge-ledger+research+
-cross-repo-refs+baseline+y-regression all present). 0 ITERATE cycles yet.
-**Source artifacts read:** loop_state.md, parity-ledger.md(45), symbol-map.md(40), merge-ledger.md,
-research.md(40), baseline.md, findings/y-regression.md, worktree git log.
+**Phase reached:** ITERATE cycles 1–2 done (U-015 verified; GAP-1 valid_at + GAP-2 vec-sim enablers verified). 1/50 units verified.
+**Source artifacts read:** loop_state.md, baseline.md (CORRECTION block), findings/parity.md (U-015 + cycle-2 verdicts), parity-ledger.md, merge-ledger.md. Commits on port/mirofish: 9836238 (repair), 064655c (U-015), 4cdfd0d (valid_at+vec_sim).
 
 ## Scorecard
 
-### Friction (wasted cycles / retries / guesses)
-- **HIGH — architect agent died mid-stream (socket close) at 402s / 29 tool-uses having written NOTHING
-  to disk.** A re-spawn that wrote each deliverable incrementally and returned <400 words succeeded.
-  Whole-phase strand from one connection drop. (F1)
-- **HIGH — a PRIOR DISCOVER session was interrupted and left UNCOMMITTED** (parity-ledger harvest dated
-  2026-06-13; the single DISCOVER commit `897ba5d` is 2026-06-14). Partial deliverables on disk but no
-  loop_state/symbol-map/architect/HANDOFF → not resumable via the documented RESUME path; effectively
-  re-done. Phase 1 commits ONCE (step 7), so any mid-DISCOVER drop strands everything. (F2)
-- **MED — operator had to hand-annotate the target==dest collapse** in loop_state (lines 8-18) and the
-  merge-ledger header, because the SKILL assumes rust_target ≠ dest_repo. The merge step/ledger partly
-  duplicate the port step/parity-ledger with no documented handling. (F3)
-- **MED — the cartographer had to manually scope out MiroFish's bundled `.venv`** and manually fall back
-  to the Python `ast` module: symbol-map.md line 7 records "`git kb code index` not used (indexer not
-  configured for this source tree)" and line 10 records "venv/node_modules/dist EXCLUDED". Both were
-  ad-hoc operator judgment the skill does not prescribe. (F4)
+### What worked (the no-downgrade machinery held)
+- **The no-downgrade gate CAUGHT the false-green** — not at DISCOVER (where it should have), but the
+  ITERATE-cycle-1 porter could not build c894de8, which surfaced the bad PR-#4 merge. The harness
+  failed *closed* in the end: the bad tip blocked work rather than letting a regression through. Repair
+  landed (9836238); TRUE baseline re-established at 156 green, then 171 by cycle 2.
+- **The parity gate did real differential work, not existence-checking.** Cycle-2's cosine check ran an
+  *independent* magnitude-vs-direction differential (query `[1,1,0]` vs P=`[10,0,0]` high-magnitude-wrong
+  vs Q aligned) to prove genuine cosine, not raw dot (parity.md Claim B). Serde backward-compat was
+  pinned (old JSON without `valid_at` deserializes). GAP-OQ3-EMBED was honestly left `- [!]` with a
+  grep-proof that no fake/random embedder exists — no fake-pass. This is the gate behaving exactly as
+  designed.
+- **No silent drops.** Every U-015 symbol (17/17) covered `- [x]`/`- [≠]` or distributed-with-citation to
+  U-012/U-013; chunking adjudicated to U-013 as `- [!]`, not dropped.
 
-### Gate quality
-- No parity/merge gate ran yet (0 ITERATE cycles), so no missed-defect / false-block evidence at the
-  parity grain. **One gate DID fire at DISCOVER and was too coarse:** the whole-source source-runnable
-  precondition (SKILL Phase 1 step 6) is binary "source can't be executed → NEEDS-HUMAN, stop." MiroFish
-  is **partly** runnable (local utils/models run; Zep-Cloud/OASIS paths need external creds and are
-  map-onto-substrate, verified by behavioral equivalence of the mapped teri path — loop_state 32-34,
-  research 13-22). A literal reading of the binary gate would have **false-halted DISCOVER**. The
-  operator correctly classified per-path instead — undocumented. (F5) — this is **recurrence 2** of the
-  already-applied "DISCOVER source-runnable precondition" lesson (CLAUDE.md change row v1.7.1).
-- The DONE/parity/symbol gates themselves remain sound; nothing here weakens them. The venv-exclude and
-  per-unit-runnable refinements only **tighten** coverage accuracy (more real source covered, fewer
-  false halts) — strengthen-only, no-downgrade intact.
+### Friction / gaps (fix targets)
+- **HIGH (gate-quality) — FALSE-GREEN DISCOVER BASELINE (F-G1).** `baseline.md` asserted "Teri Build ✓
+  PASS / 142 tests GREEN on develop @ c894de8" (line 14) but c894de8 (PR #4 merge) does **not compile**
+  (duplicated `api_key` field in config.rs; dead `Config::from_env()` + dup block in main.rs — CORRECTION
+  block line 6; loop_state 25-29; parity.md 14). The DISCOVER build-health gate emitted a GREEN verdict
+  it had not executed against the real dest tip. The loop's entire reference baseline was a phantom for
+  iterations 0–1; only the cycle-1 porter's build failure exposed it. A gate that reports green it did
+  not run is the highest-value upgrade target this iteration.
+- **MED (return-integrity) — CROSS-LOOP RELAY HIJACKED A SUB-AGENT'S RETURN (F-G2).** A concurrent
+  envctl/forge-loop weave/relay heartbeat ("relay:resumed", a DriftSummary in a *different* worktree)
+  reached the cycle-2 porter mid-run; the porter returned an ACK of *that* message instead of its
+  work-summary. The work was correct on disk, so the orchestrator recovered by verifying via git — but it
+  could not trust the return. Sub-agents have no rule to ignore foreign relay/weave/notification noise and
+  to always return their own work-summary. Sibling of the iter-1 drop-resilience class (continuity noise
+  interfering with an agent's deliverable).
+- **LOW (port-in-place build friction) — WORKTREE [workspace] ARTIFACT (F-G3).** Building a teri worktree
+  nested under `meta/.worktrees` required adding `[workspace]` to teri/Cargo.toml (teri is a meta-root
+  member; cargo walks up and rejects the worktree as a non-member). Harmless to teri's standalone CI but a
+  structural artifact that MUST be stripped before develop→main promotion (loop_state 28-29). The
+  port-in-place (target==dest, dest is a meta-workspace member) setup has no documented worktree-build
+  recipe → operator hand-added it.
 
 ### Coverage
-- Strong. 50 units / 1087 symbols harvested from REAL source only; venv correctly excluded (manually).
-  6 cross-cutting GAP rows flagged `[!]` (no silent drop); SWEEP-4 dropped as `[≠]` intentional. The
-  risk was the inverse of "left behind" — a naive harvest would have **over**-covered (15k+ venv .py
-  files inventoried as source). Default exclusion makes that accuracy automatic, not operator-dependent.
+- Intact. 1/50 units verified + 2 cross-cutting enablers (GAP-1/GAP-2) resolved, both unlocking named
+  downstream units (U-017/U-021/U-024) that remain `- [ ]`. Nothing capped or silently deferred;
+  GAP-OQ3-EMBED and GAP-U015-1 carried forward `- [!]` with owners.
 
 ### Human walls
-- No genuine NEEDS-HUMAN wall hit. The one place the harness *would* have walled (binary source-runnable
-  gate) was an **avoidable false wall** — closed by the F5 per-unit refinement.
+- One genuine, correctly-handled stop: the non-compiling dest tip. That is *exactly* where the loop
+  should fail-closed. The defect is that it should have been caught at DISCOVER (by an executed baseline
+  build) rather than one full iteration later at the cycle-1 porter.
 
 ## Lessons mined (see LESSONS.md rows)
-1. **F4 venv/vendored-dependency default-exclude + non-git-kb AST fallback** (accuracy) → inventory skill,
-   symbol-map ref, cartographer. APPLIED.
-2. **F1 large/multi-file-deliverable agents need drop-resilience** (incremental disk writes + bounded
-   pointer-summary return) → architect/cartographer/researcher defs + orchestrator agent-spawn contract.
-   APPLIED.
-3. **F2 incremental DISCOVER commits + a DISCOVER-progress checkpoint** so an interrupted DISCOVER resumes
-   cold → SKILL Phase 1. APPLIED.
-4. **F3 target==dest port-in-place configuration** (merge collapses to landed-in-dest + dest-not-regressed)
-   → SKILL Phase 0/1 + merge-ledger ref. APPLIED.
-5. **F5 per-unit/per-path source-runnable classification** (locally-differentiable vs external-service →
-   substrate-path), not a whole-source binary gate → SKILL step 6. **Gate-adjacent: prose clarification
-   APPLIED; the NEEDS-HUMAN-trigger wording change PROPOSED** for owner sign-off (fail-closed). Recurrence 2.
+1. **F-G1 false-green baseline** → build-health-auditor (executed-evidence baseline) + SKILL Phase 1 step 6
+   (fail-closed on a red dest tip). **APPLIED — strictly STRENGTHENING the no-downgrade baseline gate.**
+2. **F-G2 cross-loop relay-noise hijack** → porter agent def + orchestrator agent-spawn contract
+   (ignore foreign relay/weave/notification; always return your work-summary). **APPLIED.** Recurrence 2 of
+   the continuity-noise class.
+3. **F-G3 port-in-place worktree [workspace] build recipe** → merge-ledger §Port-in-place +
+   loop_state note (worktree-only, strip-before-promote). **PROPOSED** (promotion-adjacent; touches the
+   develop→main promotion step) — see proposed-upgrades.md.
 
 ## No-downgrade attestation
-Every applied edit only **strengthens** accuracy/coverage or adds resilience. None loosens a parity,
-symbol, merge, or DONE condition. The F5 refinement keeps the hard NEEDS-HUMAN trigger for any unit that
-genuinely requires running the source and has no runnable path; it only removes the false-halt on
-external-service paths that are verified via the substrate. Strengthen-only, scope law honored
-(rust-port harness only).
+The baseline-gate edit only **strengthens**: it converts "confirm it builds" into "paste the executed
+`cargo build` + `cargo test` evidence with real counts, and FAIL-CLOSED (NEEDS-HUMAN / recorded repair
+task) on a non-compiling dest tip — never emit GREEN you did not run." No parity, symbol, merge, or DONE
+condition is loosened. The relay-noise rule adds a return-integrity requirement; it relaxes nothing. F-G3
+is proposed, not applied, because it is promotion-adjacent. Scope law honored (rust-port harness only).
