@@ -81,6 +81,15 @@ pub struct PredictionReport {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub id: Uuid,
+    pub sender: String,
+    pub content: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub agent_id: Option<Uuid>,
+}
+
 pub struct ReportAgent;
 
 impl ReportAgent {
@@ -487,5 +496,106 @@ mod tests {
         let final_report = last_report.unwrap();
         assert_eq!(final_report.raw_query, "What happened?");
         assert!(!final_report.summary.is_empty());
+    }
+
+    #[test]
+    fn test_chat_message_creation() {
+        let msg = ChatMessage {
+            id: Uuid::new_v4(),
+            sender: "user".to_string(),
+            content: "Hello, agent!".to_string(),
+            timestamp: chrono::Utc::now(),
+            agent_id: None,
+        };
+
+        assert_eq!(msg.sender, "user");
+        assert_eq!(msg.content, "Hello, agent!");
+        assert!(msg.agent_id.is_none());
+    }
+
+    #[test]
+    fn test_chat_message_with_agent_id() {
+        let agent_id = Uuid::new_v4();
+        let msg = ChatMessage {
+            id: Uuid::new_v4(),
+            sender: "Alice".to_string(),
+            content: "I understand your question.".to_string(),
+            timestamp: chrono::Utc::now(),
+            agent_id: Some(agent_id),
+        };
+
+        assert_eq!(msg.sender, "Alice");
+        assert_eq!(msg.agent_id, Some(agent_id));
+    }
+
+    #[test]
+    fn test_chat_message_serialization() {
+        let agent_id = Uuid::new_v4();
+        let msg = ChatMessage {
+            id: Uuid::new_v4(),
+            sender: "Bob".to_string(),
+            content: "Test message".to_string(),
+            timestamp: chrono::Utc::now(),
+            agent_id: Some(agent_id),
+        };
+
+        let json = serde_json::to_string(&msg).expect("Serialization failed");
+        assert!(json.contains("\"sender\":\"Bob\""));
+        assert!(json.contains("\"content\":\"Test message\""));
+    }
+
+    #[test]
+    fn test_chat_message_deserialization() {
+        let agent_id = Uuid::new_v4();
+        let json = serde_json::json!({
+            "id": Uuid::new_v4().to_string(),
+            "sender": "Charlie",
+            "content": "Deserialized message",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "agent_id": agent_id.to_string(),
+        });
+
+        let msg: ChatMessage = serde_json::from_value(json).expect("Deserialization failed");
+        assert_eq!(msg.sender, "Charlie");
+        assert_eq!(msg.content, "Deserialized message");
+        assert_eq!(msg.agent_id, Some(agent_id));
+    }
+
+    #[test]
+    fn test_chat_message_round_trip() {
+        let original = ChatMessage {
+            id: Uuid::new_v4(),
+            sender: "user".to_string(),
+            content: "Round trip test message".to_string(),
+            timestamp: chrono::Utc::now(),
+            agent_id: Some(Uuid::new_v4()),
+        };
+
+        let json = serde_json::to_string(&original).expect("Serialization failed");
+        let deserialized: ChatMessage =
+            serde_json::from_str(&json).expect("Deserialization failed");
+
+        assert_eq!(original.sender, deserialized.sender);
+        assert_eq!(original.content, deserialized.content);
+        assert_eq!(original.agent_id, deserialized.agent_id);
+    }
+
+    #[test]
+    fn test_chat_message_without_agent_id_round_trip() {
+        let original = ChatMessage {
+            id: Uuid::new_v4(),
+            sender: "system".to_string(),
+            content: "System message".to_string(),
+            timestamp: chrono::Utc::now(),
+            agent_id: None,
+        };
+
+        let json = serde_json::to_string(&original).expect("Serialization failed");
+        let deserialized: ChatMessage =
+            serde_json::from_str(&json).expect("Deserialization failed");
+
+        assert_eq!(original.sender, deserialized.sender);
+        assert_eq!(original.content, deserialized.content);
+        assert!(deserialized.agent_id.is_none());
     }
 }
