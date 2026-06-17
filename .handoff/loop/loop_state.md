@@ -17,7 +17,24 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 1   # RESUMED 2026-06-17 (7th resume, reset 0); c1=U-016 complete (ZepEntityReader→KnowledgeGraph adapter)
+cycles_this_session: 1   # RESUMED 2026-06-17 (8th resume, reset 0); c1=U-018 OASIS export layer (DECISION-10, un-[≠]'d wrongly-skipped symbols)
+cycles_total: 25
+# CYCLE1 (8th resume) 2026-06-17: U-018 OASIS profile EXPORT layer — opus PASS (6/6). DECISION-10 (architect):
+#   dependency-confirmation for U-023 surfaced a NO-DOWNGRADE issue — S-367/369/370/371/372/373 were [≠]'d as
+#   "OASIS export not needed"/"orchestrator does it", but U-023 prepare_simulation CALLS generate_profiles_from_entities
+#   + saves reddit_profiles.json/twitter_profiles.csv, get_profiles READS them, and teri's i18n keys (loadedReddit/
+#   TwitterProfiles) already reference them → CONTRACTUAL (API serves them). Un-[≠]'d + ported. New src/services/
+#   oasis_profile_export.rs: generate_profiles_from_entities (sequential, reuses PersonaGenerator::generate_social;
+#   realtime-save-after-each via to_reddit/twitter_format serializers — MATCHES MiroFish inner closure), save_profiles,
+#   save_reddit_json (DEDICATED writer, NOT to_reddit_format — forces OASIS defaults age=30/gender-always/mbti=ISTJ/
+#   country=中国/bio[:150]char/karma=1000; key-order byte-identical via preserve_order), save_twitter_csv (header
+#   [user_id,name,username,user_char,description], user_id=row-idx, user_char="{bio} {persona}"), normalize_gender
+#   (男→male/女→female/机构,其他→other), save_profiles_to_json alias. S-368 stays [≠] (stdout debug print; realtime
+#   BEHAVIOR ported). csv crate added. opus found CSV terminator CRLF(py) vs LF(rust) — adjudicated NON-CONTRACTUAL
+#   (read path universal-newlines normalizes; observable parsed rows identical); doc-comment corrected. ADDITIVE-only
+#   (no edit to verified SocialProfile/PersonaGenerator/serializers). 36 new tests, teri 749 green, clippy clean.
+#   >>> This was a NO-DOWNGRADE CORRECTION (owner rule): the wrongly-[≠]'d export symbols are now ported. NEXT: U-023
+#   sub-cycles B (state types) / C (manager+FS+getters) / D (prepare_simulation 4-stage async, parallel via JoinSet).
 cycles_total: 24
 # CYCLE1 (7th resume) 2026-06-17: U-016 COMPLETE — ZepEntityReader→KnowledgeGraph adapter (S-214..S-222) — opus
 #   FAIL→fix→PASS (DECISION-9, map-onto-substrate). src/services/entity_reader.rs: KnowledgeGraphEntityReader<'a>{

@@ -84,6 +84,9 @@ minijinja = "1"
 # Regex (used by OntologyGenerator._to_pascal_case — S-173)
 regex = "1"
 
+# CSV writing (OASIS twitter_profiles.csv export — S-370)
+csv = "1"
+
 # File format support
 pdfium-render = "0.8"
 scraper = "0.19"

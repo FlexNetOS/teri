@@ -617,3 +617,121 @@ impl<'a> KnowledgeGraphEntityReader<'a> {
 4. **`filter_defined_entities`** ports the `{Entity,Node}`-skip verbatim (always-pass in teri — typed entities — NOT a `[≠]`, a PORT with an unreachable branch); type-match against EntityKind Display (lowercase built-ins / Custom verbatim — same divergence DECISION-8 accepted); enrich via **`get_neighbor_relations`** (O(degree), provably the same set as MiroFish's O(n·e) `all_edges` scan — efficiency upgrade); `total_count=entity_count`, `filtered_count=kept`.
 5. **Retry vs error-contract split:** `_call_with_retry` is **`[≠]` non-contractual** (no in-process I/O can transiently fail; no observable difference) — NOT ported. The `except→None` (`get_entity_with_context`, incl. bad/unknown uuid) and `except→[]` (`get_node_edges`) fallbacks ARE observable contracts and **ARE PORTED**.
 6. **Blast radius:** verified `Entity`/`Relation`/`EntityKind`/`RelationKind` **UNCHANGED** (rejected extending `Entity` with `summary` — no data to fill it); ONE additive `KnowledgeGraph::get_entity_by_id(Uuid)->Option<&Entity>` recommended (reads existing `index_by_id`, zero blast radius), or an in-reader id-map if no graph edit is wanted. Parity gate: differential on the kept-EntityNode set, entity_types, related_edges/nodes context, total/filtered counts, and the None/[] error paths; each `[≠]` is Zep-server/SDK-inexpressible with a verified consumer-side graceful fallback — never a portable-feature skip.
+
+---
+
+## DECISION-10 — U-018 OASIS profile-export layer un-`[≠]`'d + ported (S-367,S-369,S-370,S-371,S-372,S-373); U-023 sub-cycle order
+
+**Trigger:** scoping U-023 `SimulationManager.prepare_simulation` surfaced a NO-DOWNGRADE violation. Stage 2 of `prepare_simulation` calls `OasisProfileGenerator.generate_profiles_from_entities(...)` then **saves `reddit_profiles.json` + `twitter_profiles.csv`**; `get_profiles(sim_id, platform)` READS those files; the U-026 HTTP API `GET /<id>/profiles` SERVES them. teri ALSO already ships i18n keys (en+zh, `src/i18n/locales/{en,zh}.json:657/659`) `loadedRedditProfiles`/`loadedTwitterProfiles` that name those exact files. These were `[≠]`'d in symbol-map (S-367/S-369/S-370/S-371/S-372/S-373) as "batch is orchestrator's job" / "OASIS file export not needed". Per the owner NO-DOWNGRADE rule and the `[≠]` bar, a feature with a **distinct observable output** (a JSON file, a CSV file, a List[profile] returned to a discrete caller) is PORTED, not `[≠]`-skipped. (Direct precedent: U-018 `to_reddit_format`/`to_twitter_format`/`to_dict` were already un-`[≠]`'d and ported for exactly this reason — and that skip had also hidden a bio+persona field collapse.)
+
+### §1 — Profile DATA-FLOW ruling: the files ARE contractual (CONFIRMED, agree with the prior)
+
+**RULING: the profile data flows through FILES in teri, matching MiroFish.** `reddit_profiles.json` + `twitter_profiles.csv` are **CONTRACTUAL observable outputs** that MUST be produced. Evidence (all three independently sufficient, jointly decisive):
+1. **The U-026 API serves them** — `GET /<id>/profiles` returns the parsed file contents; the file shape IS the API response contract (an external observable). Skipping the files would force the API to fabricate a different in-process shape → an observable divergence on a public HTTP route.
+2. **`get_profiles(sim_id, platform)` READS the files** (`simulation_manager.py` ~L481-495) — the read side is the documented contract; a reader with nothing to read is a downgrade.
+3. **teri's own i18n keys already anticipate them** — `loadedRedditProfiles`("Loaded {count} profiles from reddit_profiles.json") / `loadedTwitterProfiles`(twitter_profiles.csv) exist in BOTH locales. teri's UI/log layer already expects to announce loading from these exact filenames. The keys are present-and-emittable; the files must exist for the message to be true.
+
+**The native-SimEngine objection is REFUTED, not accepted.** The locked substrate decision (OASIS Python subprocess → teri native `src/sim/` SimEngine) changes only *who consumes the profiles to drive the simulation* (MiroFish: the OASIS subprocess reads the files; teri: the SimEngine reads in-process). It does **NOT** remove the file contract, because the API + `get_profiles` + the i18n keys consume the files **regardless of what the sim engine consumes**. The file outputs are an export/persistence contract on the *manager*, orthogonal to the engine's input path. teri SimEngine MAY additionally take the `Vec<SocialProfile>` in-process (efficiency, no re-parse) — that is a strict-superset additive convenience and does not relieve the obligation to write the files. **Files: contractual. In-process Vec to the engine: additive, allowed, does not replace the files.**
+
+`save_profiles_to_json` (S-373) is the deprecated alias delegating to `save_profiles` — it emits the SAME `reddit_profiles.json`. It is the same observable output; port it as a thin delegating alias (it costs ~3 lines and keeps the public surface faithful), OR fold callers onto `save_profiles` if no caller uses the alias — see §3 verdict.
+
+### §2 — Per-symbol PORT-vs-`[≠]` verdict table (S-367..S-373)
+
+| Symbol | Method | Verdict | Owner-rule justification |
+|---|---|---|---|
+| **S-367** | `generate_profiles_from_entities` | **PORT (un-`[≠]`)** | U-023 calls it as a **discrete method** producing a `List[OasisAgentProfile]` that is then file-saved AND fed to config-gen. The `[≠]` rationale "AgentPool::spawn does it" was wrong: the **parallel orchestration** (ThreadPoolExecutor / `parallel_count`) is the caller's concern, but the **method itself** — sequential-or-parallel loop over `generate_profile_from_entity`, per-profile fallback on error, progress_callback `(current,total,msg)`, realtime-save hook, returns ordered `Vec` — is a real observable unit `prepare_simulation` invokes. Port a real `generate_profiles_from_entities` returning `Vec<SocialProfile>`. See §3 for signature. |
+| **S-368** | `_print_generated_profile` | **STAYS `[≠]` (legitimate)** | Console pretty-print of a profile (`【简介】`/`【详细人设】`/`【基本属性】` blocks) to stdout. Non-contractual: no caller reads stdout; it is a human-tracing convenience, not an observable output any consumer (API/get_profiles/SimEngine) depends on. teri's tracing/logging layer covers progress via `progress_callback` + the i18n `progress.profileGenerated` key (already SWEEP-ported). Genuinely a debug-print → legal `[≠]`. (If a future trace contract names this exact format, re-flag — for now non-contractual.) |
+| **S-369** | `save_profiles(profiles, file_path, platform)` | **PORT (un-`[≠]`)** | The platform-dispatch writer (`platform=="twitter"`→CSV else→JSON). Produces the contractual files (§1). Was `[≠]`'d "not needed" — refuted by API+get_profiles+i18n. PORT. |
+| **S-370** | `_save_twitter_csv` | **PORT (un-`[≠]`)** | Produces `twitter_profiles.csv` — a contractual file with a **specific OASIS column contract** the API serves. NOTE the writer is NOT just `to_twitter_format` dumped: header is exactly `['user_id','name','username','user_char','description']`; `user_id` is the **CSV row index** (0-based, NOT `profile.user_id`); `user_char = bio` or `"{bio} {persona}"` when persona≠bio, with `\n`/`\r`→space; `description = bio` with `\n`/`\r`→space. This column shape is the OASIS contract — must port the writer, cannot substitute the serializer. PORT. |
+| **S-371** | `_normalize_gender` | **PORT — its re-flag FIRES** | The 中文→en map (`男`→male,`女`→female,`机构`/`其他`→other, en passthrough, default→other). Symbol-map S-371 explicitly re-flagged it: "if OASIS Reddit/Twitter export is ever ported, MUST port WITH it (contractual to that output)." We are now porting `_save_reddit_json` (its only call site) → **the dependency fires; PORT it.** It is contractual to the reddit JSON `gender` field. |
+| **S-372** | `_save_reddit_json` | **PORT (un-`[≠]`)** | Produces `reddit_profiles.json`. **Critical: this writer is NOT `to_reddit_format`.** It FORCES OASIS-mandatory defaults that `to_reddit_format` conditionally omits: `user_id` = `profile.user_id ?? row_idx`; `bio` = `bio[:150]` (truncate to 150 chars) or `"{name}"` fallback; `persona` = `persona` or `"{name} is a participant in social discussions."`; `karma` = `karma or 1000`; **`age` = `age or 30`**, **`gender` = `_normalize_gender(gender)`** (always present), **`mbti` = `mbti or "ISTJ"`**, **`country` = `country or "中国"`** — these four are UNCONDITIONAL with hard defaults (OASIS `agent_graph.get_agent()` requires them), whereas `to_reddit_format` omits them when falsy. Optional `profession`/`interested_topics` only when truthy. The `user_id` field is load-bearing (OASIS matches `initial_posts.poster_agent_id`). **Must port the dedicated writer** — reusing `to_reddit_format` would drop the mandatory-default contract = a downgrade. PORT. |
+| **S-373** | `save_profiles_to_json` | **PORT as thin alias (un-`[≠]`)** | Deprecated alias: logs a deprecation warning then delegates to `save_profiles(...)`. Same observable output (`reddit_profiles.json`). Port as a ~3-line delegating fn (emit the deprecation log via `tracing::warn!`, call `save_profiles`) to keep the public surface faithful. If the left-behind sweep confirms NO caller (U-023 uses `save_profiles` directly), the porter MAY record it as a `[≠]` "deprecated-alias, zero callers, superseded by save_profiles" — but **default to porting the alias**; the per-symbol cost is trivial and it removes any doubt. |
+
+**Net:** S-367, S-369, S-370, S-371, S-372 → **PORT** (un-`[≠]`). S-373 → **PORT (thin alias)**, downgradeable to a documented zero-caller `[≠]` only if the sweep proves no caller. S-368 → **legitimately STAYS `[≠]`** (non-contractual stdout debug-print; progress is carried by `progress_callback` + the already-ported `progress.profileGenerated` i18n key).
+
+### §3 — Where the ported export layer lives + signatures
+
+**Module: NEW `src/services/oasis_profile_export.rs`** (a new file in the existing `src/services/` module tree; add `pub mod oasis_profile_export;` to `src/services/mod.rs`). Rationale: this is a **service/persistence** concern (FS writers + a batch orchestrator over the generator), not a method on `PersonaGenerator` (which owns single-profile *generation*, not multi-profile *export*). Keeping it out of `src/agent/mod.rs` means **zero edits to the parity-verified `SocialProfile` / `PersonaGenerator` / serializer surface** — the export layer CONSUMES them additively. This also mirrors MiroFish's own split (generator vs the save_* methods live on the same class there, but in Rust the borrow/ownership story is cleaner with a free-function service module that takes `&[SocialProfile]`).
+
+**Reuse (additive only — NO change to verified types):** `SocialProfile` (all fields present incl. `user_id,user_name,bio,persona,karma,age,gender,mbti,country,profession,interested_topics,created_at`); `Persona::to_reddit_format`/`to_twitter_format`/`to_dict` (already verified — used by `realtime` JSON path where MiroFish uses `to_reddit_format`); `agent::generate_username(name)`; the single-profile `PersonaGenerator::generate_social<L>(...)`; `EntityNode::get_entity_type()`.
+
+Signatures (the porter's contract):
+
+```rust
+// src/services/oasis_profile_export.rs
+use crate::agent::{PersonaGenerator, SocialProfile};
+use crate::services::entity_reader::EntityNode;
+
+/// Output platform for the OASIS export (selects file format).
+pub enum OutputPlatform { Reddit, Twitter }
+
+/// Batch-generate profiles from filtered entities (S-367).
+/// Sequential or bounded-parallel loop over generate_social; per-entity fallback
+/// profile on generation error (mirrors MiroFish's try/except → fallback OasisAgentProfile);
+/// progress_callback invoked (current, total, message) after each; optional realtime
+/// file write after each completion. Returns profiles in ENTITY ORDER (Vec index == idx).
+///
+/// `parallel_count` mapping (MiroFish ThreadPoolExecutor): see §4 — caller (prepare_simulation)
+/// chooses sequential (parallel_count<=1) vs tokio JoinSet (parallel_count>1). The realtime-save
+/// + ordered-result + per-error-fallback semantics are identical either way.
+pub async fn generate_profiles_from_entities<L: crate::llm::LlmClient>(
+    generator: &PersonaGenerator,
+    llm: &L,
+    entities: &[EntityNode],
+    graph: Option<&crate::graph::KnowledgeGraph>,   // for build_entity_context enrichment
+    use_llm: bool,
+    parallel_count: usize,
+    realtime_output: Option<(&std::path::Path, OutputPlatform)>,  // realtime save hook
+    progress_callback: &mut dyn FnMut(i64, i64, String),
+) -> Vec<SocialProfile>;
+
+/// Platform-dispatch writer (S-369): twitter→CSV else→JSON.
+pub fn save_profiles(profiles: &[SocialProfile], file_path: &std::path::Path, platform: OutputPlatform) -> std::io::Result<()>;
+
+/// Reddit JSON writer (S-372) — FORCES OASIS-mandatory defaults (NOT to_reddit_format):
+///   user_id = profile.user_id (fallback row idx); bio = bio[:150] or "{name}";
+///   persona = persona or "{name} is a participant in social discussions.";
+///   karma = karma|1000; age = age|30; gender = normalize_gender(gender) [ALWAYS];
+///   mbti = mbti|"ISTJ"; country = country|"中国"; optional profession/interested_topics if truthy.
+fn save_reddit_json(profiles: &[SocialProfile], file_path: &std::path::Path) -> std::io::Result<()>;
+
+/// Twitter CSV writer (S-370) — header ['user_id','name','username','user_char','description'];
+///   user_id = ROW INDEX (0-based, not profile.user_id);
+///   user_char = bio, or "{bio} {persona}" when persona != bio, with \n/\r -> space;
+///   description = bio with \n/\r -> space. Force .csv extension (replace .json).
+fn save_twitter_csv(profiles: &[SocialProfile], file_path: &std::path::Path) -> std::io::Result<()>;
+
+/// 中文/en gender normalization to OASIS {male,female,other} (S-371).
+///   None/"" -> "other"; 男->male, 女->female, 机构/其他/other->other; male/female passthrough; default other.
+fn normalize_gender(gender: Option<&str>) -> &'static str;
+```
+
+- **`save_profiles_realtime`** (S-368-adjacent inner closure) is NOT a separate public symbol — it is the `realtime_output: Option<...>` hook inside `generate_profiles_from_entities`: after each profile completes, if `Some`, re-serialize all completed-so-far profiles and overwrite the file (reddit→`to_reddit_format` JSON array; twitter→`to_twitter_format` CSV). Mirror MiroFish's "write the full current set each time" semantics + its `except → log warning, continue` (a realtime-write failure must NOT abort the batch — `tracing::warn!` and proceed).
+- **`save_profiles_to_json`** (S-373) → optional thin alias `pub fn save_profiles_to_json(...) { warn!("deprecated…"); save_profiles(...) }` per §2.
+- **Error model:** writers return `std::io::Result<()>` (idiomatic; `prepare_simulation` maps to `TeriError`); the realtime-hook swallows-and-logs (matches MiroFish). Per CLAUDE.md prefer `TeriError` variants over `anyhow` at the manager boundary — the export layer surfaces `io::Result` and the caller wraps.
+
+### §4 — U-023 decomposition + sub-cycle ORDER
+
+The export layer (§3) is a **hard dependency of `prepare_simulation` stage 2** — it must land BEFORE the stage that calls it. Recommended order (4 cycles):
+
+1. **Cycle A — EXPORT LAYER (re-opens U-018).** Port S-367/S-369/S-370/S-371/S-372 (+S-373 alias) into `src/services/oasis_profile_export.rs` per §3. Un-`[≠]` those symbol-map rows (flip to `[ ]`→port→`[x]`); S-371's re-flag fires here; S-368 documented as legitimately-staying-`[≠]`. **Differential parity gate:** golden-compare the `reddit_profiles.json` bytes (field set incl. forced defaults, `bio[:150]`, `user_id`), the `twitter_profiles.csv` (header + the `user_char`/`description`/row-index columns), `normalize_gender` over {男,女,机构,其他,male,female,"",None,garbage}, and the batch `Vec` ordering + per-error fallback. This cycle is self-contained and verifiable WITHOUT the manager. **Do this first.**
+2. **Cycle B — U-023(a): state types.** `SimulationStatus` + `PlatformType` enums; `SimulationState` struct + `to_dict`/`to_simple_dict` serializers (serde). FS-persistence-shape only; no behavior yet.
+3. **Cycle C — U-023(b): manager skeleton + FS persistence + getters.** `SimulationManager` struct; `_get_simulation_dir`/`_save_simulation_state`/`_load_simulation_state`; `create_simulation`; and the getters `get_simulation`/`list_simulations`/**`get_profiles`** (reads the files Cycle A writes)/`get_simulation_config`/`get_run_instructions`. `get_profiles` parity now provable because Cycle A produces the files it reads.
+4. **Cycle D — U-023(c): `prepare_simulation` 4-stage async task.** Wire stage 1 (`filter_defined_entities`, already ported S-356/U-016 reader) → stage 2 (`generate_profiles_from_entities` + `save_profiles` for BOTH platforms, from Cycle A) → stage 3 (`generate_config`, U-019) → stage 4 (state READY). Async via `tokio::spawn`; FS-state-machine PENDING→PREPARING→READY/FAILED; `parallel_profile_count>1` → `tokio::JoinSet`/`join` inside `generate_profiles_from_entities` (the parallel variant is THIS caller's concern, exactly as the `[≠]` rationale anticipated — but now it drives a real ported method, not a missing one).
+
+**Order rationale:** Cycle A (export) is a leaf with no manager dependency and is the stage-2 dependency, so it lands first and is independently gated. B before C (types before the struct that holds them). C before D (`prepare_simulation` writes state via C's `_save_simulation_state` and its stage-2 output is read back by C's `get_profiles`). Estimate 4 cycles; Cycle A may split into A1 (writers+normalize_gender) / A2 (batch generator) if the batch async/parallel mapping proves heavy.
+
+### §5 — Blast-radius flag
+
+- **ADDITIVE ONLY. Zero edits to parity-verified types.** `SocialProfile`, `Persona::{to_reddit_format,to_twitter_format,to_dict}`, `PersonaGenerator::generate_social`, `agent::generate_username`, `EntityNode::get_entity_type` are all **CONSUMED, not modified**. The export layer is a new file (`src/services/oasis_profile_export.rs`) + one `pub mod` line in `src/services/mod.rs`. No existing signature changes; no existing caller affected.
+- The `to_reddit_format`/`to_twitter_format` serializers are reused **only on the realtime-save path** (where MiroFish uses them). The FINAL `save_reddit_json`/`save_twitter_csv` writers are dedicated (forced-defaults / OASIS column contract) and do NOT route through the serializers — this is faithful to MiroFish (its realtime closure uses `to_*_format`; its `save_*` methods build their own dicts).
+- Symbol-map edits required (Cycle A): flip S-367/S-369/S-370/S-371/S-372/S-373 from `[≠]` toward port; annotate each with "un-`[≠]`'d DECISION-10 (contractual file/return output)". Keep S-368 `[≠]` with the updated non-contractual-stdout note. merge-ledger U-018 row stays `extend-Y` (the export layer extends the U-018 surface in teri).
+
+### DECISION-10 — 6-line actionable summary
+
+1. **Files ARE contractual** — `reddit_profiles.json` + `twitter_profiles.csv` are served by the U-026 API, read by `get_profiles`, and named by teri's existing i18n keys; the native SimEngine substrate does NOT remove the file contract (engine input is orthogonal to the export/persistence contract). The data flows through files in teri, matching MiroFish.
+2. **Un-`[≠]` and PORT S-367, S-369, S-370, S-371, S-372, S-373**; **keep S-368 `[≠]`** (non-contractual stdout debug-print, progress carried by the already-ported `progress_callback`/`progress.profileGenerated` key).
+3. **S-371's re-flag FIRES** (`_normalize_gender` ports because its only caller `_save_reddit_json` is now ported); **`_save_reddit_json` is NOT `to_reddit_format`** — it forces OASIS-mandatory defaults (age=30, normalized gender ALWAYS, mbti=ISTJ, country=中国, bio[:150], user_id-or-rowidx), so port the dedicated writer.
+4. **New module `src/services/oasis_profile_export.rs`** (free-fn service): `generate_profiles_from_entities` (async, ordered Vec, per-error fallback, progress_callback, realtime hook), `save_profiles` (dispatch), `save_reddit_json`/`save_twitter_csv` (dedicated writers — twitter header `['user_id','name','username','user_char','description']`, user_id=row-index), `normalize_gender` — all reusing `SocialProfile` + the verified serializers.
+5. **Sub-cycle order: A (export layer, re-opens U-018, gated standalone) → B (state types) → C (manager + FS persistence + getters incl. get_profiles) → D (prepare_simulation 4-stage async task, parallel via JoinSet).** Export-layer FIRST because it is stage-2's dependency and is independently verifiable.
+6. **Blast radius: additive only** — new file + one `pub mod` line; zero edits to the parity-verified `SocialProfile`/`PersonaGenerator`/serializers; the dedicated writers do NOT route through `to_*_format` (faithful to MiroFish's own realtime-vs-save split). Parity gate: golden-byte-compare both files, `normalize_gender` map, batch ordering + fallback.
