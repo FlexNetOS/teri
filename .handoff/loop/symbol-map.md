@@ -799,19 +799,19 @@
 - [x] S-665 · `unit:U-023` · `field` · `SimulationState.error` · `simulation_manager.py:76` → `SimulationState::error`
 - [x] S-666 · `unit:U-023` · `method` · `SimulationState.to_dict` · `simulation_manager.py:78` → `SimulationState::to_dict` (17 keys, insertion order, status as string, error null/string)
 - [x] S-667 · `unit:U-023` · `method` · `SimulationState.to_simple_dict` · `simulation_manager.py:100` → `SimulationState::to_simple_dict` (9 keys, insertion order)
-- [ ] S-668 · `unit:U-023` · `type` · `SimulationManager` · FS-backed manager (not singleton) · `simulation_manager.py:115`
-- [ ] S-669 · `unit:U-023` · `field` · `SimulationManager.SIMULATION_DATA_DIR` · `simulation_manager.py:127`
-- [ ] S-670 · `unit:U-023` · `method` · `SimulationManager.__init__` · `simulation_manager.py:132`
-- [ ] S-671 · `unit:U-023` · `method` · `SimulationManager._get_simulation_dir` · `simulation_manager.py:139`
-- [ ] S-672 · `unit:U-023` · `method` · `SimulationManager._save_simulation_state` · `simulation_manager.py:145`
-- [ ] S-673 · `unit:U-023` · `method` · `SimulationManager._load_simulation_state` · `simulation_manager.py:157`
-- [ ] S-674 · `unit:U-023` · `method` · `SimulationManager.create_simulation` · uuid sim_id, creates FS dir · `simulation_manager.py:194`
-- [ ] S-675 · `unit:U-023` · `method` · `SimulationManager.prepare_simulation` · 4-stage async: entities→profiles→config→READY · `simulation_manager.py:230`
-- [ ] S-676 · `unit:U-023` · `method` · `SimulationManager.get_simulation` · `simulation_manager.py:459`
-- [ ] S-677 · `unit:U-023` · `method` · `SimulationManager.list_simulations` · `simulation_manager.py:463`
-- [ ] S-678 · `unit:U-023` · `method` · `SimulationManager.get_profiles` · reads JSON/CSV · `simulation_manager.py:481`
-- [ ] S-679 · `unit:U-023` · `method` · `SimulationManager.get_simulation_config` · reads JSON · `simulation_manager.py:496`
-- [ ] S-680 · `unit:U-023` · `method` · `SimulationManager.get_run_instructions` · `simulation_manager.py:507`
+- [x] S-668 · `unit:U-023` · `type` · `SimulationManager` · FS-backed manager (not singleton) · `simulation_manager.py:115` → `SimulationManager` struct with `Mutex<HashMap<String,SimulationState>>` cache + `sim_data_dir: PathBuf`; `new(path)` + `from_config(Config)` constructors; sub-cycle (c) 2026-06-17
+- [x] S-669 · `unit:U-023` · `field` · `SimulationManager.SIMULATION_DATA_DIR` · `simulation_manager.py:127` → `SimulationManager::sim_data_dir`; uses `config.oasis_simulation_data_dir` (env `OASIS_SIMULATION_DATA_DIR`, default `"./uploads/simulations"`) — teri's equivalent of Python's module-relative `../../uploads/simulations`
+- [x] S-670 · `unit:U-023` · `method` · `SimulationManager.__init__` · `simulation_manager.py:132` → `SimulationManager::new` + `SimulationManager::from_config`; creates dir lazily on first use (matching Python's per-call `os.makedirs`); initializes empty Mutex-guarded HashMap cache
+- [x] S-671 · `unit:U-023` · `method` · `SimulationManager._get_simulation_dir` · `simulation_manager.py:139` → `SimulationManager::get_simulation_dir`; creates `{sim_data_dir}/{simulation_id}/` via `create_dir_all` then returns PathBuf
+- [x] S-672 · `unit:U-023` · `method` · `SimulationManager._save_simulation_state` · `simulation_manager.py:145` → `SimulationManager::save_simulation_state`; bumps `state.updated_at` FIRST, then writes `state.json` (pretty JSON, 2-space indent, UTF-8 raw matching `ensure_ascii=False`), then updates Mutex cache — order faithful to Python L150-155
+- [x] S-673 · `unit:U-023` · `method` · `SimulationManager._load_simulation_state` · `simulation_manager.py:157` → `SimulationManager::load_simulation_state`; cache-first; file missing→None; per-field `.get(key,default)` tolerance faithful to Python L171-189; invalid status string→Err (Python `SimulationStatus(str)` raises ValueError); caches on load
+- [x] S-674 · `unit:U-023` · `method` · `SimulationManager.create_simulation` · uuid sim_id, creates FS dir · `simulation_manager.py:194` → `SimulationManager::create_simulation`; id = `"sim_"` + 12 lowercase hex chars (`uuid::Uuid::new_v4().simple().to_string()[..12]`); saves state.json via `save_simulation_state`; returns SimulationState
+- [ ] S-675 · `unit:U-023` · `method` · `SimulationManager.prepare_simulation` · 4-stage async: entities→profiles→config→READY · `simulation_manager.py:230` → NOT YET PORTED (sub-cycle d)
+- [x] S-676 · `unit:U-023` · `method` · `SimulationManager.get_simulation` · `simulation_manager.py:459` → `SimulationManager::get_simulation`; thin delegation to `load_simulation_state`
+- [x] S-677 · `unit:U-023` · `method` · `SimulationManager.list_simulations` · `simulation_manager.py:463` → `SimulationManager::list_simulations`; skips hidden (`.`-prefix) and non-dir entries; filters by project_id when `Some`; returns empty vec if sim_data_dir absent (matching Python's `os.path.exists` guard); unspecified order (matching Python's `os.listdir`)
+- [x] S-678 · `unit:U-023` · `method` · `SimulationManager.get_profiles` · reads JSON/CSV · `simulation_manager.py:481` → `SimulationManager::get_profiles`; missing state→Err (Python `raise ValueError`); missing file→`Ok(vec![])` (NOT Err); file present→`Ok(Vec<Value>)`. Raise-vs-empty distinction faithfully preserved. `platform` arg selects `{platform}_profiles.json`.
+- [x] S-679 · `unit:U-023` · `method` · `SimulationManager.get_simulation_config` · reads JSON · `simulation_manager.py:496` → `SimulationManager::get_simulation_config`; file missing→`Ok(None)`; file present→`Ok(Some(Value))`
+- [x] S-680 · `unit:U-023` · `method` · `SimulationManager.get_run_instructions` · `simulation_manager.py:507` → `SimulationManager::get_run_instructions` PARTIAL — returns `RunInstructions{simulation_dir, config_file, substrate_note}`. [≠]-substrate: `scripts_dir`, `commands` (Python OASIS subprocess invocations), and `instructions` (conda activate steps) are genuinely INEXPRESSIBLE in teri's substrate (teri has no `scripts/run_*.py` and no conda env; it runs SimEngine in-process). This is NOT "won't use" — the strings cannot be faithfully constructed. Structural fields (paths) ported; command strings omitted with `substrate_note` directing callers to `SimEngine::run`.
 
 ---
 

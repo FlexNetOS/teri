@@ -1,11 +1,23 @@
-//! Simulation state types — port of `backend/app/services/simulation_manager.py` L25-112.
+//! Simulation state types and manager — port of `backend/app/services/simulation_manager.py`.
 //!
-//! This module contains ONLY the state types (sub-cycle b):
+//! Sub-cycle (b) — state types (L25-112):
 //! - [`SimulationStatus`] — 8-variant enum (L25-34)
 //! - [`PlatformType`]     — 2-variant enum (L37-40)
 //! - [`SimulationState`]  — 17-field dataclass with `to_dict` / `to_simple_dict` (L43-112)
 //!
-//! The `SimulationManager` class (L115+) is ported in sub-cycles c/d.
+//! Sub-cycle (c) — `SimulationManager` struct + FS persistence + getters (L115-529):
+//! - [`SimulationManager`]         — struct with Mutex-guarded cache + FS root (S-668/S-669/S-670)
+//! - `_get_simulation_dir`         — S-671
+//! - `_save_simulation_state`      — S-672
+//! - `_load_simulation_state`      — S-673
+//! - `create_simulation`           — S-674
+//! - `get_simulation`              — S-676
+//! - `list_simulations`            — S-677
+//! - `get_profiles`                — S-678
+//! - `get_simulation_config`       — S-679
+//! - `get_run_instructions`        — S-680 (partial: see substrate note below)
+//!
+//! Sub-cycle (d) — `prepare_simulation` (L230-458, S-675) — NOT YET PORTED.
 //!
 //! # Ledger corrections
 //! The parity-ledger summary was wrong on two counts; the SOURCE is authoritative:
@@ -13,11 +25,17 @@
 //!   PAUSED, STOPPED, COMPLETED, FAILED.
 //! - `PlatformType` has **2** variants (not 3): TWITTER, REDDIT only (no BOTH).
 //!
-//! # Symbols: S-636..S-667
+//! # Symbols: S-636..S-680 (excluding S-675)
+
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, Map};
+use uuid::Uuid;
 
+use crate::error::{Result, TeriError};
 use crate::models::project::python_isoformat_local;
 
 // ---------------------------------------------------------------------------
@@ -648,5 +666,1039 @@ mod tests {
         assert!(obj["created_at"].is_string());
         assert!(obj["updated_at"].is_string());
         assert_eq!(obj["error"], Value::Null);
+    }
+}
+
+// =============================================================================
+// SimulationManager — sub-cycle (c)
+// =============================================================================
+//
+// Port of `SimulationManager` class (`simulation_manager.py` L115-529).
+//
+// ## Interior-mutability choice (S-670)
+//
+// Python's methods take `self` (not explicit mutation) but mutate `self._simulations`
+// dict in-place.  In Rust, callers (including the axum API layer) hold `Arc<SimulationManager>`
+// and call methods via `&self`.  We therefore wrap the cache in `Mutex<HashMap>` for interior
+// mutability — this is the idiomatic teri/axum pattern for shared state (consistent with how
+// `AppState` holds other services as `Arc<T>` with interior Mutex).
+//
+// ## SIMULATION_DATA_DIR convention (S-669)
+//
+// Python computes `SIMULATION_DATA_DIR` relative to the module file
+// (`../../uploads/simulations` from `services/`).  In teri this is the
+// `oasis_simulation_data_dir` config field (env `OASIS_SIMULATION_DATA_DIR`,
+// default `"./uploads/simulations"`).  The `from_config` constructor takes that
+// value; `new(path)` is provided for tests (matching the `ProjectManager` pattern).
+//
+// ## get_run_instructions substrate note (S-680) [≠]
+//
+// The Python `get_run_instructions` returns command strings that run MiroFish's
+// OASIS Python subprocess scripts:
+//   `python {scripts_dir}/run_twitter_simulation.py --config {config_path}`
+//   `conda activate MiroFish`  etc.
+//
+// teri has NO `scripts/run_*_simulation.py` and no conda env — it runs the
+// SimEngine in-process (substrate decision, locked by the port architect).
+// Fabricating these Python-script command strings would produce commands that
+// CANNOT run in teri's substrate, which is a worse downgrade than admitting
+// the gap.  This is a genuine [≠]-substrate case (NOT "won't use" — the strings
+// are inexpressible in teri's runtime).
+//
+// The structural fields that ARE expressible (simulation_dir, config_file) are
+// ported faithfully.  The commands/instructions strings are omitted with a clear
+// key and note indicating teri's native invocation path.
+
+// ---------------------------------------------------------------------------
+// RunInstructions
+// ---------------------------------------------------------------------------
+
+/// Return value of [`SimulationManager::get_run_instructions`].
+///
+/// Structural fields from Python are ported; the OASIS Python-script command strings
+/// are not expressible in teri's substrate (see module-level note) and are replaced
+/// with a teri-native indicator.
+///
+/// S-680
+#[derive(Debug, Clone)]
+pub struct RunInstructions {
+    /// Absolute path to the simulation's data directory.
+    ///
+    /// Port of Python `"simulation_dir"` key.
+    pub simulation_dir: PathBuf,
+
+    /// Path to `simulation_config.json` inside the simulation directory.
+    ///
+    /// Port of Python `"config_file"` key.
+    pub config_file: PathBuf,
+
+    /// [≠]-substrate: the Python source also returns `scripts_dir` (pointing to
+    /// MiroFish's `backend/scripts/`) and `commands` dict (Python subprocess invocations
+    /// for `run_twitter_simulation.py`, `run_reddit_simulation.py`,
+    /// `run_parallel_simulation.py`) plus `instructions` string (conda activate steps).
+    /// These are genuinely inexpressible in teri's substrate: teri uses the native
+    /// in-process `SimEngine` (no Python scripts, no conda env), so fabricating
+    /// those path strings would produce commands that cannot run.  Callers should
+    /// invoke `SimEngine::run` instead of shelling out to Python.
+    pub substrate_note: &'static str,
+}
+
+// ---------------------------------------------------------------------------
+// SimulationManager
+// ---------------------------------------------------------------------------
+
+/// Filesystem-backed simulation manager.
+///
+/// Port of `SimulationManager` (`simulation_manager.py:115-529`, sub-cycles c/d).
+///
+/// Holds an in-memory cache (`_simulations` in Python) guarded by a `Mutex` for
+/// interior mutability so callers can hold `Arc<SimulationManager>` and call methods
+/// via `&self` (matching the axum `AppState` sharing pattern).
+///
+/// # Symbols
+/// S-668 (type), S-669 (SIMULATION_DATA_DIR / `sim_data_dir` field),
+/// S-670 (`__init__` / `new`/`from_config`), S-671..S-680 (methods).
+pub struct SimulationManager {
+    /// S-669: equivalent of Python's `SIMULATION_DATA_DIR` class variable.
+    /// In Python: `os.path.join(os.path.dirname(__file__), '../../uploads/simulations')`.
+    /// In teri: `config.oasis_simulation_data_dir` (env `OASIS_SIMULATION_DATA_DIR`,
+    /// default `"./uploads/simulations"`).
+    sim_data_dir: PathBuf,
+
+    /// S-670: `self._simulations` — in-memory cache of loaded states.
+    /// Python mutates this freely from `self`; Rust uses `Mutex` for interior mutability.
+    cache: Mutex<HashMap<String, SimulationState>>,
+}
+
+impl SimulationManager {
+    // -----------------------------------------------------------------------
+    // Constructors (S-670)
+    // -----------------------------------------------------------------------
+
+    /// Create a `SimulationManager` pointed at an explicit directory.
+    /// Used in tests; production callers use `from_config`.
+    ///
+    /// Faithfully implements Python's `os.makedirs(self.SIMULATION_DATA_DIR, exist_ok=True)`
+    /// (the directory is created lazily on first use in each method, matching Python's
+    /// per-call `_get_simulation_dir` → `os.makedirs`).
+    pub fn new(sim_data_dir: impl Into<PathBuf>) -> Self {
+        SimulationManager {
+            sim_data_dir: sim_data_dir.into(),
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Create a `SimulationManager` from teri's `Config`.
+    ///
+    /// Uses `config.oasis_simulation_data_dir` (env `OASIS_SIMULATION_DATA_DIR`,
+    /// default `"./uploads/simulations"`) — the teri equivalent of Python's
+    /// `SIMULATION_DATA_DIR = os.path.join(dirname(__file__), '../../uploads/simulations')`.
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        SimulationManager::new(Path::new(&config.oasis_simulation_data_dir).to_path_buf())
+    }
+
+    // -----------------------------------------------------------------------
+    // _get_simulation_dir (S-671)
+    // -----------------------------------------------------------------------
+
+    /// Return the path to `{sim_data_dir}/{simulation_id}`, creating it if absent.
+    ///
+    /// Port of `_get_simulation_dir` (`simulation_manager.py:139-143`).
+    ///
+    /// Python: `sim_dir = os.path.join(SIMULATION_DATA_DIR, simulation_id); os.makedirs(sim_dir, exist_ok=True); return sim_dir`
+    fn get_simulation_dir(&self, simulation_id: &str) -> Result<PathBuf> {
+        let sim_dir = self.sim_data_dir.join(simulation_id);
+        std::fs::create_dir_all(&sim_dir)?;
+        Ok(sim_dir)
+    }
+
+    // -----------------------------------------------------------------------
+    // _save_simulation_state (S-672)
+    // -----------------------------------------------------------------------
+
+    /// Bump `state.updated_at`, write `{sim_dir}/state.json`, update cache.
+    ///
+    /// Port of `_save_simulation_state` (`simulation_manager.py:145-155`).
+    ///
+    /// Python order (faithfully matched):
+    ///   1. `state.updated_at = datetime.now().isoformat()`
+    ///   2. `json.dump(state.to_dict(), f, ensure_ascii=False, indent=2)`
+    ///   3. `self._simulations[state.simulation_id] = state`
+    ///
+    /// `ensure_ascii=False` + `indent=2` is matched by `serde_json::to_string_pretty`
+    /// which does NOT escape non-ASCII (UTF-8 raw), with 2-space indentation.
+    fn save_simulation_state(&self, state: &mut SimulationState) -> Result<()> {
+        // Step 1: bump updated_at (Python `datetime.now().isoformat()`)
+        state.updated_at = python_isoformat_local();
+
+        // Step 2: write state.json
+        let sim_dir = self.get_simulation_dir(&state.simulation_id)?;
+        let state_file = sim_dir.join("state.json");
+        // serde_json::to_string_pretty: 2-space indent, no ASCII escaping of non-ASCII chars.
+        let json = serde_json::to_string_pretty(&state.to_dict())?;
+        std::fs::write(&state_file, json.as_bytes())?;
+
+        // Step 3: update cache
+        let mut cache = self.cache.lock().expect("simulation_manager cache lock poisoned");
+        cache.insert(state.simulation_id.clone(), state.clone());
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // _load_simulation_state (S-673)
+    // -----------------------------------------------------------------------
+
+    /// Cache-first load of simulation state.
+    ///
+    /// Port of `_load_simulation_state` (`simulation_manager.py:157-192`).
+    ///
+    /// Behavior (faithfully matched):
+    ///   1. Return cached state if present (Python `if simulation_id in self._simulations`)
+    ///   2. Check `{sim_dir}/state.json` exists — if not, return `None`
+    ///      (Python `if not os.path.exists(state_file): return None`)
+    ///   3. Parse JSON with `.get(key, default)` tolerance for every field
+    ///   4. Invalid status string → `Err` (Python `SimulationStatus(str)` raises `ValueError`)
+    ///   5. Cache and return
+    ///
+    /// Field defaults (matching Python L171-189 exactly):
+    ///   project_id        → `""`
+    ///   graph_id          → `""`
+    ///   enable_twitter    → `true`
+    ///   enable_reddit     → `true`
+    ///   status            → `"created"` (string default, then parsed)
+    ///   entities_count    → `0`
+    ///   profiles_count    → `0`
+    ///   entity_types      → `[]`
+    ///   config_generated  → `false`
+    ///   config_reasoning  → `""`
+    ///   current_round     → `0`
+    ///   twitter_status    → `"not_started"`
+    ///   reddit_status     → `"not_started"`
+    ///   created_at        → `datetime.now().isoformat()` (i.e. a fresh local timestamp)
+    ///   updated_at        → `datetime.now().isoformat()`
+    ///   error             → `None`
+    fn load_simulation_state(&self, simulation_id: &str) -> Result<Option<SimulationState>> {
+        // Step 1: cache-first
+        {
+            let cache = self.cache.lock().expect("simulation_manager cache lock poisoned");
+            if let Some(state) = cache.get(simulation_id) {
+                return Ok(Some(state.clone()));
+            }
+        }
+
+        // Step 2: check FS (note: _get_simulation_dir creates the dir, so we check the file)
+        let sim_dir = self.get_simulation_dir(simulation_id)?;
+        let state_file = sim_dir.join("state.json");
+
+        if !state_file.exists() {
+            return Ok(None);
+        }
+
+        // Step 3: parse JSON
+        let raw = std::fs::read_to_string(&state_file)?;
+        let data: Value = serde_json::from_str(&raw)?;
+
+        let obj = data.as_object().ok_or_else(|| {
+            TeriError::Sim(format!("state.json for {simulation_id} is not a JSON object"))
+        })?;
+
+        let now = python_isoformat_local();
+
+        let project_id = obj.get("project_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let graph_id = obj.get("graph_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let enable_twitter = obj.get("enable_twitter")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        let enable_reddit = obj.get("enable_reddit")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        // Step 4: status — Python `SimulationStatus(data.get("status", "created"))`.
+        // An invalid string raises ValueError in Python; we return Err here (faithful).
+        let status_str = obj.get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("created");
+        let status: SimulationStatus = serde_json::from_value(Value::String(status_str.to_string()))
+            .map_err(|_| TeriError::Sim(format!(
+                "invalid SimulationStatus {status_str:?} in {simulation_id}/state.json \
+                 (Python SimulationStatus(str) raises ValueError on unknown value)"
+            )))?;
+
+        let entities_count = obj.get("entities_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+
+        let profiles_count = obj.get("profiles_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+
+        let entity_types: Vec<String> = obj.get("entity_types")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let config_generated = obj.get("config_generated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let config_reasoning = obj.get("config_reasoning")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let current_round = obj.get("current_round")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+
+        let twitter_status = obj.get("twitter_status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("not_started")
+            .to_string();
+
+        let reddit_status = obj.get("reddit_status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("not_started")
+            .to_string();
+
+        // Python: `data.get("created_at", datetime.now().isoformat())`
+        let created_at = obj.get("created_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&now)
+            .to_string();
+
+        // Python: `data.get("updated_at", datetime.now().isoformat())`
+        let updated_at = obj.get("updated_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&now)
+            .to_string();
+
+        // Python: `data.get("error")` — None if key absent or value is null
+        let error = obj.get("error")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        let state = SimulationState {
+            simulation_id: simulation_id.to_string(),
+            project_id,
+            graph_id,
+            enable_twitter,
+            enable_reddit,
+            status,
+            entities_count,
+            profiles_count,
+            entity_types,
+            config_generated,
+            config_reasoning,
+            current_round,
+            twitter_status,
+            reddit_status,
+            created_at,
+            updated_at,
+            error,
+        };
+
+        // Step 5: cache + return
+        let mut cache = self.cache.lock().expect("simulation_manager cache lock poisoned");
+        cache.insert(simulation_id.to_string(), state.clone());
+
+        Ok(Some(state))
+    }
+
+    // -----------------------------------------------------------------------
+    // create_simulation (S-674)
+    // -----------------------------------------------------------------------
+
+    /// Create a new simulation, persist its initial state, and return it.
+    ///
+    /// Port of `create_simulation` (`simulation_manager.py:194-228`).
+    ///
+    /// `simulation_id` format: `"sim_"` + first 12 hex chars of a random UUID v4.
+    /// This matches Python `f"sim_{uuid.uuid4().hex[:12]}"` exactly.
+    ///
+    /// Python defaults: `enable_twitter=True`, `enable_reddit=True`.
+    pub fn create_simulation(
+        &self,
+        project_id: &str,
+        graph_id: &str,
+        enable_twitter: bool,
+        enable_reddit: bool,
+    ) -> Result<SimulationState> {
+        // sim_id = f"sim_{uuid.uuid4().hex[:12]}"  (12 lowercase hex chars, no hyphens)
+        let hex = Uuid::new_v4().simple().to_string(); // 32 hex chars, no hyphens
+        let simulation_id = format!("sim_{}", &hex[..12]);
+
+        let mut state = SimulationState {
+            simulation_id,
+            project_id: project_id.to_string(),
+            graph_id: graph_id.to_string(),
+            enable_twitter,
+            enable_reddit,
+            status: SimulationStatus::Created,
+            entities_count: 0,
+            profiles_count: 0,
+            entity_types: Vec::new(),
+            config_generated: false,
+            config_reasoning: String::new(),
+            current_round: 0,
+            twitter_status: "not_started".to_string(),
+            reddit_status: "not_started".to_string(),
+            created_at: python_isoformat_local(),
+            updated_at: python_isoformat_local(),
+            error: None,
+        };
+
+        self.save_simulation_state(&mut state)?;
+
+        tracing::info!(
+            simulation_id = %state.simulation_id,
+            project_id = %project_id,
+            graph_id = %graph_id,
+            "created simulation"
+        );
+
+        Ok(state)
+    }
+
+    // -----------------------------------------------------------------------
+    // get_simulation (S-676)
+    // -----------------------------------------------------------------------
+
+    /// Return the current state of a simulation, or `None` if it does not exist.
+    ///
+    /// Port of `get_simulation` (`simulation_manager.py:459-461`).
+    /// Thin delegation to `_load_simulation_state`.
+    pub fn get_simulation(&self, simulation_id: &str) -> Result<Option<SimulationState>> {
+        self.load_simulation_state(simulation_id)
+    }
+
+    // -----------------------------------------------------------------------
+    // list_simulations (S-677)
+    // -----------------------------------------------------------------------
+
+    /// List all simulations, optionally filtered by `project_id`.
+    ///
+    /// Port of `list_simulations` (`simulation_manager.py:463-479`).
+    ///
+    /// Skip logic (faithful):
+    ///   - skip entries whose name starts with `'.'` (e.g. `.DS_Store`, `.gitkeep`)
+    ///   - skip non-directory entries
+    ///   - skip entries for which `_load_simulation_state` returns `None`
+    ///     (Python: `if sim_id.startswith('.') or not os.path.isdir(sim_path): continue`)
+    ///
+    /// Ordering: Python `os.listdir` order is FS-dependent and unspecified.
+    /// This method returns results in `read_dir` order (also FS-dependent and unspecified).
+    /// No sort is applied — matching Python's contract (no sort, no stated order).
+    ///
+    /// If `sim_data_dir` does not exist, returns an empty list (matches Python's
+    /// `if os.path.exists(self.SIMULATION_DATA_DIR): ...` guard).
+    pub fn list_simulations(&self, project_id: Option<&str>) -> Result<Vec<SimulationState>> {
+        if !self.sim_data_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut simulations = Vec::new();
+
+        for entry in std::fs::read_dir(&self.sim_data_dir)? {
+            let entry = entry?;
+            let entry_name = entry.file_name();
+            let sim_id = entry_name.to_string_lossy();
+
+            // Skip hidden entries (Python: `if sim_id.startswith('.')`)
+            if sim_id.starts_with('.') {
+                continue;
+            }
+
+            // Skip non-directory entries (Python: `not os.path.isdir(sim_path)`)
+            if !entry.path().is_dir() {
+                continue;
+            }
+
+            if let Some(state) = self.load_simulation_state(sim_id.as_ref())? {
+                // Filter by project_id if provided
+                if project_id.is_some_and(|pid| state.project_id != pid) {
+                    continue;
+                }
+                simulations.push(state);
+            }
+        }
+
+        Ok(simulations)
+    }
+
+    // -----------------------------------------------------------------------
+    // get_profiles (S-678)
+    // -----------------------------------------------------------------------
+
+    /// Return the agent profiles for a simulation (from `{platform}_profiles.json`).
+    ///
+    /// Port of `get_profiles` (`simulation_manager.py:481-494`).
+    ///
+    /// Behavior:
+    ///   - State missing  → `Err` (Python `raise ValueError(f"模拟不存在: {simulation_id}")`)
+    ///   - State present, profile JSON file missing → `Ok(Vec::new())` (empty array — NOT Err)
+    ///   - State present, profile JSON file present → `Ok(parsed array)`
+    ///
+    /// The raise-vs-empty distinction is load-bearing: callers must distinguish
+    /// "simulation not found" (hard error) from "profiles not yet generated" (empty list).
+    ///
+    /// `platform` default in Python: `"reddit"`. Callers must pass it explicitly in Rust.
+    pub fn get_profiles(
+        &self,
+        simulation_id: &str,
+        platform: &str,
+    ) -> Result<Vec<Value>> {
+        // Missing state → Err (Python `raise ValueError`)
+        let state = self.load_simulation_state(simulation_id)?;
+        if state.is_none() {
+            return Err(TeriError::Sim(format!(
+                "simulation not found: {simulation_id} \
+                 (Python raises ValueError here — missing state is hard error)"
+            )));
+        }
+
+        // Profile file missing → [] (Python `if not os.path.exists(profile_path): return []`)
+        let sim_dir = self.get_simulation_dir(simulation_id)?;
+        let profile_path = sim_dir.join(format!("{platform}_profiles.json"));
+
+        if !profile_path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let raw = std::fs::read_to_string(&profile_path)?;
+        let parsed: Vec<Value> = serde_json::from_str(&raw)?;
+        Ok(parsed)
+    }
+
+    // -----------------------------------------------------------------------
+    // get_simulation_config (S-679)
+    // -----------------------------------------------------------------------
+
+    /// Return the simulation config JSON, or `None` if not yet generated.
+    ///
+    /// Port of `get_simulation_config` (`simulation_manager.py:496-505`).
+    ///
+    /// Config file missing → `Ok(None)` (NOT an error — matches Python `return None`).
+    /// File present → `Ok(Some(parsed JSON value))`.
+    pub fn get_simulation_config(&self, simulation_id: &str) -> Result<Option<Value>> {
+        let sim_dir = self.get_simulation_dir(simulation_id)?;
+        let config_path = sim_dir.join("simulation_config.json");
+
+        if !config_path.exists() {
+            return Ok(None);
+        }
+
+        let raw = std::fs::read_to_string(&config_path)?;
+        let parsed: Value = serde_json::from_str(&raw)?;
+        Ok(Some(parsed))
+    }
+
+    // -----------------------------------------------------------------------
+    // get_run_instructions (S-680) — partial port with [≠]-substrate gap
+    // -----------------------------------------------------------------------
+
+    /// Return the structural run-instructions for a simulation.
+    ///
+    /// Port of `get_run_instructions` (`simulation_manager.py:507-529`).
+    ///
+    /// ## Substrate divergence [≠] (NOT a skip — genuinely inexpressible)
+    ///
+    /// Python returns a dict with:
+    ///   - `simulation_dir` (path)  ← ported
+    ///   - `config_file` (path)     ← ported
+    ///   - `scripts_dir` (path to MiroFish's `backend/scripts/`)  ← [≠]
+    ///   - `commands` dict with `python {scripts_dir}/run_twitter_simulation.py --config ...`  ← [≠]
+    ///   - `instructions` string with `conda activate MiroFish; python ...`  ← [≠]
+    ///
+    /// The `scripts_dir`, `commands`, and `instructions` fields describe running
+    /// MiroFish's Python OASIS subprocess scripts under a conda environment.
+    /// teri has NO these scripts and no conda env — it runs the SimEngine in-process
+    /// (port-architect decision, locked).  Fabricating those Python-script paths
+    /// would produce commands that CANNOT execute in teri's substrate.
+    ///
+    /// This is a genuine [≠]-substrate case: the commands are **inexpressible** in
+    /// teri's runtime, not merely "unused" or "unwanted".  The `substrate_note`
+    /// field on `RunInstructions` explains the gap and directs callers to
+    /// `SimEngine::run` (teri's native invocation).
+    pub fn get_run_instructions(&self, simulation_id: &str) -> Result<RunInstructions> {
+        let sim_dir = self.get_simulation_dir(simulation_id)?;
+        let config_file = sim_dir.join("simulation_config.json");
+
+        Ok(RunInstructions {
+            simulation_dir: sim_dir,
+            config_file,
+            // [≠]-substrate: MiroFish Python OASIS subprocess commands cannot run in teri.
+            // teri uses SimEngine::run in-process.  See module-level substrate note.
+            substrate_note: "OASIS Python subprocess commands (run_twitter_simulation.py, \
+                             run_reddit_simulation.py, run_parallel_simulation.py, conda activate) \
+                             are inexpressible in teri's substrate. \
+                             Use SimEngine::run() instead.",
+        })
+    }
+}
+
+// =============================================================================
+// Tests — SimulationManager (sub-cycle c)
+// =============================================================================
+
+#[cfg(test)]
+mod manager_tests {
+    use super::*;
+    use std::env;
+
+    /// Helper: create a temp dir rooted in std::env::temp_dir() (no /tmp hardcode).
+    fn temp_sim_dir(suffix: &str) -> PathBuf {
+        let mut p = env::temp_dir();
+        p.push(format!("teri_test_simulations_{}_{suffix}", std::process::id()));
+        p
+    }
+
+    // -----------------------------------------------------------------------
+    // create_simulation — id format, state.json written
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn create_simulation_id_format() {
+        let dir = temp_sim_dir("id_format");
+        let mgr = SimulationManager::new(&dir);
+
+        let state = mgr.create_simulation("proj-1", "graph-1", true, true).unwrap();
+
+        // id must be "sim_" + exactly 12 lowercase hex chars
+        assert!(
+            state.simulation_id.starts_with("sim_"),
+            "sim id must start with 'sim_': {}",
+            state.simulation_id
+        );
+        let hex_part = &state.simulation_id["sim_".len()..];
+        assert_eq!(hex_part.len(), 12, "hex suffix must be exactly 12 chars: {}", state.simulation_id);
+        // Valid hex chars are 0-9 and a-f (all lowercase). Digits are neither
+        // uppercase nor lowercase — so we check: is_ascii_digit OR is_ascii_lowercase.
+        assert!(
+            hex_part.chars().all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f')),
+            "hex suffix must be lowercase hex (0-9, a-f): {}",
+            hex_part
+        );
+
+        // state.json must exist on FS
+        let state_json = dir.join(&state.simulation_id).join("state.json");
+        assert!(state_json.exists(), "state.json must be written: {:?}", state_json);
+    }
+
+    #[test]
+    fn create_simulation_fields() {
+        let dir = temp_sim_dir("fields");
+        let mgr = SimulationManager::new(&dir);
+
+        let state = mgr.create_simulation("proj-abc", "graph-xyz", false, true).unwrap();
+
+        assert_eq!(state.project_id, "proj-abc");
+        assert_eq!(state.graph_id, "graph-xyz");
+        assert!(!state.enable_twitter);
+        assert!(state.enable_reddit);
+        assert_eq!(state.status, SimulationStatus::Created);
+        assert_eq!(state.entities_count, 0);
+        assert!(state.error.is_none());
+    }
+
+    #[test]
+    fn create_simulation_state_json_readable() {
+        // Written state.json must be valid UTF-8 pretty JSON with 2-space indent.
+        let dir = temp_sim_dir("json_readable");
+        let mgr = SimulationManager::new(&dir);
+
+        let state = mgr.create_simulation("p", "g", true, true).unwrap();
+
+        let state_json_path = dir.join(&state.simulation_id).join("state.json");
+        let raw = std::fs::read_to_string(&state_json_path).unwrap();
+
+        // Must parse as JSON object
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let obj = parsed.as_object().unwrap();
+        assert_eq!(obj["simulation_id"].as_str().unwrap(), state.simulation_id);
+        assert_eq!(obj["status"].as_str().unwrap(), "created");
+
+        // 2-space indent (pretty-printed): second line should start with "  "
+        let second_line = raw.lines().nth(1).unwrap_or("");
+        assert!(second_line.starts_with("  "), "state.json must be 2-space indented");
+    }
+
+    // -----------------------------------------------------------------------
+    // _save_simulation_state — updated_at bumped, cache updated
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn save_bumps_updated_at_before_write() {
+        let dir = temp_sim_dir("save_bump");
+        let mgr = SimulationManager::new(&dir);
+
+        let mut state = mgr.create_simulation("p", "g", true, true).unwrap();
+        let created_updated_at = state.updated_at.clone();
+
+        // Force a small delay to ensure the timestamp changes
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Mutate something and save
+        state.status = SimulationStatus::Preparing;
+        mgr.save_simulation_state(&mut state).unwrap();
+
+        // updated_at must have been bumped BEFORE the write
+        assert_ne!(
+            state.updated_at, created_updated_at,
+            "updated_at must be bumped on save"
+        );
+
+        // What's on disk must match the bumped timestamp
+        let state_json_path = dir.join(&state.simulation_id).join("state.json");
+        let raw = std::fs::read_to_string(&state_json_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            parsed["updated_at"].as_str().unwrap(),
+            state.updated_at,
+            "persisted updated_at must match the mutated state"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // _load_simulation_state — cache-first, missing→None
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn load_missing_returns_none() {
+        let dir = temp_sim_dir("load_missing");
+        let mgr = SimulationManager::new(&dir);
+
+        let result = mgr.load_simulation_state("sim_doesnotexist").unwrap();
+        assert!(result.is_none(), "missing sim should return None");
+    }
+
+    #[test]
+    fn load_cache_first_returns_cached_value() {
+        let dir = temp_sim_dir("cache_first");
+        let mgr = SimulationManager::new(&dir);
+
+        let state = mgr.create_simulation("proj", "graph", true, true).unwrap();
+        let sim_id = state.simulation_id.clone();
+
+        // Directly mutate the cache to a different value
+        {
+            let mut cache = mgr.cache.lock().unwrap();
+            let cached = cache.get_mut(&sim_id).unwrap();
+            cached.status = SimulationStatus::Running; // not on disk
+        }
+
+        // load must return cached version (Running), not the FS version (Created)
+        let loaded = mgr.load_simulation_state(&sim_id).unwrap().unwrap();
+        assert_eq!(
+            loaded.status,
+            SimulationStatus::Running,
+            "cache-first: should return cached Running, not FS Created"
+        );
+    }
+
+    #[test]
+    fn load_from_disk_after_cache_cleared() {
+        let dir = temp_sim_dir("load_disk");
+        let mgr = SimulationManager::new(&dir);
+
+        let state = mgr.create_simulation("proj-d", "graph-d", true, false).unwrap();
+        let sim_id = state.simulation_id.clone();
+
+        // Clear the cache to force disk read
+        {
+            let mut cache = mgr.cache.lock().unwrap();
+            cache.clear();
+        }
+
+        let loaded = mgr.load_simulation_state(&sim_id).unwrap().unwrap();
+        assert_eq!(loaded.simulation_id, sim_id);
+        assert_eq!(loaded.project_id, "proj-d");
+        assert!(!loaded.enable_reddit);
+        assert_eq!(loaded.status, SimulationStatus::Created);
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-trip: create → load
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn create_get_round_trip() {
+        let dir = temp_sim_dir("round_trip");
+        let mgr = SimulationManager::new(&dir);
+
+        let created = mgr.create_simulation("proj-rt", "graph-rt", true, true).unwrap();
+        let sim_id = created.simulation_id.clone();
+
+        let loaded = mgr.get_simulation(&sim_id).unwrap().unwrap();
+
+        assert_eq!(loaded.simulation_id, created.simulation_id);
+        assert_eq!(loaded.project_id, created.project_id);
+        assert_eq!(loaded.graph_id, created.graph_id);
+        assert_eq!(loaded.status, SimulationStatus::Created);
+        assert_eq!(loaded.enable_twitter, created.enable_twitter);
+        assert_eq!(loaded.enable_reddit, created.enable_reddit);
+    }
+
+    // -----------------------------------------------------------------------
+    // list_simulations — skip hidden, skip non-dirs, filter by project_id
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn list_simulations_skips_hidden_entries() {
+        let dir = temp_sim_dir("list_hidden");
+        let mgr = SimulationManager::new(&dir);
+
+        // Create a real simulation
+        let state = mgr.create_simulation("proj-h", "g", true, true).unwrap();
+
+        // Create a hidden directory (should be skipped)
+        let hidden = dir.join(".DS_Store");
+        std::fs::create_dir_all(&hidden).unwrap();
+        // Write a fake state.json in there too
+        std::fs::write(
+            hidden.join("state.json"),
+            r#"{"project_id":"proj-h","status":"created"}"#
+        ).unwrap();
+
+        // Create a file (not a dir) — should be skipped
+        let not_a_dir = dir.join("readme.txt");
+        std::fs::write(&not_a_dir, "not a dir").unwrap();
+
+        let list = mgr.list_simulations(None).unwrap();
+        // Only the real simulation should appear
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].simulation_id, state.simulation_id);
+    }
+
+    #[test]
+    fn list_simulations_filters_by_project_id() {
+        let dir = temp_sim_dir("list_filter");
+        let mgr = SimulationManager::new(&dir);
+
+        let s1 = mgr.create_simulation("proj-A", "g", true, true).unwrap();
+        let _s2 = mgr.create_simulation("proj-B", "g", true, true).unwrap();
+        let s3 = mgr.create_simulation("proj-A", "g", true, true).unwrap();
+
+        let list = mgr.list_simulations(Some("proj-A")).unwrap();
+        assert_eq!(list.len(), 2);
+        let ids: Vec<&str> = list.iter().map(|s| s.simulation_id.as_str()).collect();
+        assert!(ids.contains(&s1.simulation_id.as_str()));
+        assert!(ids.contains(&s3.simulation_id.as_str()));
+    }
+
+    #[test]
+    fn list_simulations_no_filter_returns_all() {
+        let dir = temp_sim_dir("list_all");
+        let mgr = SimulationManager::new(&dir);
+
+        mgr.create_simulation("proj-1", "g", true, true).unwrap();
+        mgr.create_simulation("proj-2", "g", true, true).unwrap();
+
+        let list = mgr.list_simulations(None).unwrap();
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn list_simulations_nonexistent_dir_returns_empty() {
+        // If sim_data_dir doesn't exist yet, list returns [] (not an error)
+        let dir = temp_sim_dir("list_nonexistent");
+        // Do NOT create the dir
+        let mgr = SimulationManager::new(&dir);
+        let list = mgr.list_simulations(None).unwrap();
+        assert!(list.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // get_profiles — missing state→Err, missing file→[], present→array
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_profiles_missing_state_returns_err() {
+        let dir = temp_sim_dir("profiles_no_state");
+        let mgr = SimulationManager::new(&dir);
+
+        // No simulation created
+        let result = mgr.get_profiles("sim_doesnotexist", "reddit");
+        assert!(
+            result.is_err(),
+            "missing state must return Err (Python raises ValueError)"
+        );
+    }
+
+    #[test]
+    fn get_profiles_missing_file_returns_empty_vec() {
+        let dir = temp_sim_dir("profiles_no_file");
+        let mgr = SimulationManager::new(&dir);
+
+        let state = mgr.create_simulation("p", "g", true, true).unwrap();
+
+        // No profiles file written — must return [] not Err
+        let profiles = mgr.get_profiles(&state.simulation_id, "reddit").unwrap();
+        assert!(profiles.is_empty(), "missing profiles file must return [], not Err");
+    }
+
+    #[test]
+    fn get_profiles_present_returns_array() {
+        let dir = temp_sim_dir("profiles_present");
+        let mgr = SimulationManager::new(&dir);
+
+        let state = mgr.create_simulation("p", "g", true, true).unwrap();
+
+        // Write a profiles JSON file
+        let profiles_json = r#"[{"username":"alice","bio":"test"},{"username":"bob","bio":"test2"}]"#;
+        let sim_dir = dir.join(&state.simulation_id);
+        std::fs::write(sim_dir.join("reddit_profiles.json"), profiles_json).unwrap();
+
+        let profiles = mgr.get_profiles(&state.simulation_id, "reddit").unwrap();
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0]["username"].as_str().unwrap(), "alice");
+    }
+
+    #[test]
+    fn get_profiles_platform_twitter_reads_twitter_file() {
+        let dir = temp_sim_dir("profiles_twitter");
+        let mgr = SimulationManager::new(&dir);
+
+        let state = mgr.create_simulation("p", "g", true, true).unwrap();
+
+        let sim_dir = dir.join(&state.simulation_id);
+        // Reddit file absent, twitter file present
+        std::fs::write(
+            sim_dir.join("twitter_profiles.json"),
+            r#"[{"username":"charlie"}]"#
+        ).unwrap();
+
+        // platform="reddit" → file absent → []
+        let reddit = mgr.get_profiles(&state.simulation_id, "reddit").unwrap();
+        assert!(reddit.is_empty());
+
+        // platform="twitter" → file present → 1 profile
+        let twitter = mgr.get_profiles(&state.simulation_id, "twitter").unwrap();
+        assert_eq!(twitter.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // get_simulation_config — missing→None, present→Some(Value)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_simulation_config_missing_returns_none() {
+        let dir = temp_sim_dir("config_missing");
+        let mgr = SimulationManager::new(&dir);
+
+        let state = mgr.create_simulation("p", "g", true, true).unwrap();
+
+        let cfg = mgr.get_simulation_config(&state.simulation_id).unwrap();
+        assert!(cfg.is_none(), "missing config file must return None, not Err");
+    }
+
+    #[test]
+    fn get_simulation_config_present_returns_some() {
+        let dir = temp_sim_dir("config_present");
+        let mgr = SimulationManager::new(&dir);
+
+        let state = mgr.create_simulation("p", "g", true, true).unwrap();
+
+        let config_json = r#"{"max_rounds":10,"agent_count":50}"#;
+        let sim_dir = dir.join(&state.simulation_id);
+        std::fs::write(sim_dir.join("simulation_config.json"), config_json).unwrap();
+
+        let cfg = mgr.get_simulation_config(&state.simulation_id).unwrap().unwrap();
+        assert_eq!(cfg["max_rounds"].as_i64().unwrap(), 10);
+        assert_eq!(cfg["agent_count"].as_i64().unwrap(), 50);
+    }
+
+    // -----------------------------------------------------------------------
+    // _load_simulation_state — invalid status → Err
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn load_invalid_status_returns_err() {
+        let dir = temp_sim_dir("invalid_status");
+        let mgr = SimulationManager::new(&dir);
+
+        let state = mgr.create_simulation("p", "g", true, true).unwrap();
+        let sim_id = state.simulation_id.clone();
+
+        // Corrupt the status in state.json
+        let state_json_path = dir.join(&sim_id).join("state.json");
+        let mut parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_json_path).unwrap()).unwrap();
+        parsed["status"] = serde_json::Value::String("bogus_status".to_string());
+        std::fs::write(&state_json_path, serde_json::to_string_pretty(&parsed).unwrap()).unwrap();
+
+        // Clear the cache to force FS read
+        mgr.cache.lock().unwrap().clear();
+
+        let result = mgr.load_simulation_state(&sim_id);
+        assert!(
+            result.is_err(),
+            "invalid status string must return Err (Python SimulationStatus('bogus') raises ValueError)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // get_run_instructions — structural fields present, substrate note present
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_run_instructions_structural_fields() {
+        let dir = temp_sim_dir("run_instructions");
+        let mgr = SimulationManager::new(&dir);
+
+        let state = mgr.create_simulation("p", "g", true, true).unwrap();
+
+        let instr = mgr.get_run_instructions(&state.simulation_id).unwrap();
+
+        assert!(
+            instr.simulation_dir.ends_with(&state.simulation_id),
+            "simulation_dir must point to sim dir: {:?}",
+            instr.simulation_dir
+        );
+        assert!(
+            instr.config_file.ends_with("simulation_config.json"),
+            "config_file must end with simulation_config.json: {:?}",
+            instr.config_file
+        );
+        assert!(
+            !instr.substrate_note.is_empty(),
+            "substrate_note must explain the [≠] gap"
+        );
+        assert!(
+            instr.substrate_note.contains("SimEngine"),
+            "substrate_note must direct caller to SimEngine: {}",
+            instr.substrate_note
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Unique sim IDs across multiple creates
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn create_simulation_ids_are_unique() {
+        let dir = temp_sim_dir("unique_ids");
+        let mgr = SimulationManager::new(&dir);
+
+        let ids: Vec<String> = (0..10)
+            .map(|_| mgr.create_simulation("p", "g", true, true).unwrap().simulation_id)
+            .collect();
+
+        let unique: std::collections::HashSet<&str> =
+            ids.iter().map(|s| s.as_str()).collect();
+        assert_eq!(unique.len(), ids.len(), "all simulation IDs must be unique");
     }
 }

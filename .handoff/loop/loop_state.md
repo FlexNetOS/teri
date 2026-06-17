@@ -17,8 +17,21 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 2   # RESUMED 2026-06-17 (8th resume, reset 0); c1=U-018 export layer; c2=U-023 sub-cycle(b) state types
-cycles_total: 26
+cycles_this_session: 3   # RESUMED 2026-06-17 (8th resume, reset 0); c1=U-018 export; c2=U-023(b) state types; c3=U-023(c) manager+FS+getters
+cycles_total: 27
+# CYCLE3 (8th resume) 2026-06-17: U-023 sub-cycle (c) SimulationManager + FS persistence + create_simulation +
+#   5 getters — opus PASS (12/12). src/services/simulation_manager.rs: SimulationManager{Mutex<HashMap> cache},
+#   from_config (config.oasis_simulation_data_dir, env OASIS_SIMULATION_DATA_DIR def ./uploads/simulations, mirrors
+#   ProjectManager); _get_simulation_dir/_save_simulation_state (bump updated_at→write state.json ensure_ascii=False
+#   2-space→cache)/_load_simulation_state (cache-first, missing→None, .get tolerance, invalid status→Err matching
+#   Python ValueError); create_simulation (sim_+12hex, CREATED); get_simulation/list_simulations (skip hidden+non-dir,
+#   project_id filter)/get_profiles (missing-state→Err, missing-file→[])/get_simulation_config (missing→None)/
+#   get_run_instructions. S-668..674,676..680 [x]; S-675 prepare_simulation [ ] (sub-cycle d). S-680 get_run_instructions
+#   [≠]-partial ADJUDICATED legit (commands reference run_*_simulation.py + conda — teri has neither, native SimEngine;
+#   emitting them = fabrication; expressible paths simulation_dir/config_file ported + substrate_note). >>> CARRY-FORWARD
+#   GATE logged on U-023 row: when U-026 API route lands, teri MUST emit NATIVE run-guidance (teri run/SimEngine::run),
+#   not just substrate_note, or the "how to run" contract downgrades. 21 new tests, teri 788 green, clippy clean.
+#   U-023 UNIT STAYS [~] (only sub-cycle d prepare_simulation S-675 remains).
 # CYCLE2 (8th resume) 2026-06-17: U-023 sub-cycle (b) state types — opus PASS (32/32, byte-identical). New
 #   src/services/simulation_manager.rs: SimulationStatus (8 variants created..failed, serde snake_case),
 #   PlatformType (2: twitter/reddit), SimulationState (17 fields + to_dict 17-key + to_simple_dict 9-key, status as

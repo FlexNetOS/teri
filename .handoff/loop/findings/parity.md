@@ -1299,3 +1299,48 @@ Both annotated on the U-023 row in `parity-ledger.md`.
 
 ### Rollup
 **VERDICT: PASS** for sub-cycle (b). 32/32 in-scope symbols (S-636..S-667) → `- [x]`. No `[≠]` claimed (nothing skipped). U-023 stays `- [ ]` at unit level — sub-cycles (c) `SimulationManager` and (d) `create_simulation`/`prepare_simulation`/`get_profiles`/`get_simulation_config` remain (S-668+ still `- [ ]`). Do NOT commit U-023 as done.
+
+---
+
+## 2026-06-17 · U-023 sub-cycle (c) · `SimulationManager` struct + FS persistence + getters (S-668..S-674, S-676..S-680)
+
+**Verdict: PASS** — differential parity verified for 12 symbols; S-680 ships as a legitimate `[≠]`-partial (adjudicated below). S-675 (`prepare_simulation`) confirmed out-of-scope, stays `- [ ]`.
+
+**Baseline:** `cargo test --lib services::simulation_manager` = **39 passed, 0 failed**. Build green per prompt (788 passed, clippy `--all-targets -D warnings` clean).
+
+**Type:** map-onto-substrate (the dir PATH is config-rooted vs Python's module-relative path) for S-668/669/670; literal-behavior parity for S-671..S-679; partial+`[≠]` for S-680.
+
+### Differential evidence (source `simulation_manager.py` ↔ Rust `src/services/simulation_manager.rs`)
+
+- **S-672 `_save_simulation_state`** (py L145-155 ↔ rs L830-846): order is **updated_at bumped FIRST** (py L150 `state.updated_at = datetime.now().isoformat()` → rs L832), **then write** (py L152-153 `json.dump(..., ensure_ascii=False, indent=2)` → rs L838 `to_string_pretty`), **then cache** (py L155 → rs L842-843). Order faithful. Serialization: Python `ensure_ascii=False, indent=2` emits raw UTF-8 + 2-space indent; differentially verified `json.dumps({'config_reasoning':'配置推理',...}, ensure_ascii=False, indent=2)` produces unescaped CJK + 2-space — `serde_json::to_string_pretty` produces the identical shape. Test `create_simulation_state_json_readable` asserts 2-space indent on disk.
+- **S-673 `_load_simulation_state`** (py L157-192 ↔ rs L881-1019): cache-first (py L159-160 ↔ rs L883-888); file-missing→None (py L165-166 ↔ rs L894-896); per-field `.get(key,default)` tolerance matches py L171-189 field-by-field (project_id "", graph_id "", enable_* true, counts 0, entity_types [], config_generated false, config_reasoning "", current_round 0, *_status "not_started", created_at/updated_at fresh-now, error None). **Invalid status string → Err** (py L177 `SimulationStatus(data.get("status","created"))` raises ValueError on unknown — differentially confirmed `SimulationStatus('bogus')` raises ValueError — rs L931-935 returns `TeriError::Sim`, NOT a silent default). Test `load_invalid_status_returns_err` proves it. `error` field: py `data.get("error")` returns None for absent/null and the string when present — rs `.and_then(as_str).map(to_string)` matches all three (differentially confirmed).
+- **S-674 `create_simulation`** (py L194-228 ↔ rs L1033-1074): id = `sim_` + 12 lowercase hex, no hyphens. Python `f"sim_{uuid.uuid4().hex[:12]}"` — differentially confirmed `uuid4().hex[:12]` = 12 chars, all in `0-9a-f`. Rust `Uuid::new_v4().simple().to_string()[..12]` = 32-hex-no-hyphen sliced to 12, lowercase. Test `create_simulation_id_format` asserts `sim_` prefix + 12 chars + lowercase-hex; `create_simulation_ids_are_unique` asserts uniqueness across 10. Status CREATED, saved. Faithful.
+- **S-676 `get_simulation`** (py L459-461 ↔ rs L1084-1086): thin delegation to load. Test `create_get_round_trip`.
+- **S-677 `list_simulations`** (py L463-479 ↔ rs L1108-1140): skips `'.'`-prefixed (py L471 ↔ rs L1121-1123) and non-dir entries (py L471 `not os.path.isdir` ↔ rs L1126-1128); project_id filter (py L476 ↔ rs L1132); **nonexistent dir → [] not Err** (py L467 `if os.path.exists(...)` guard ↔ rs L1109-1111 early `Ok(vec![])`). Tests `list_simulations_skips_hidden_entries` (hidden + non-dir both skipped), `_filters_by_project_id`, `_nonexistent_dir_returns_empty`. Order unspecified both sides (py `os.listdir` / rs `read_dir`) — faithful.
+- **S-678 `get_profiles`** — the raise-vs-empty distinction (py L481-494 ↔ rs L1159-1184): **missing STATE → Err** (py L484-485 `raise ValueError` ↔ rs L1166-1171); **missing FILE → Ok([])** (py L490-491 `return []` ↔ rs L1177-1179); present → parsed array; platform selects `{platform}_profiles.json` (py L488 ↔ rs L1175). Distinction is EXACT. Tests `get_profiles_missing_state_returns_err`, `_missing_file_returns_empty_vec`, `_present_returns_array`, `_platform_twitter_reads_twitter_file`.
+- **S-679 `get_simulation_config`** (py L496-505 ↔ rs L1196-1207): missing→None (py L501-502 ↔ rs L1200-1202), present→Some(parsed). Tests `_missing_returns_none`, `_present_returns_some`.
+- **S-668/669/670 `__init__`/SIMULATION_DATA_DIR**: Python roots at module-relative `../../uploads/simulations` (py L127-130); teri roots at `config.oasis_simulation_data_dir` (env `OASIS_SIMULATION_DATA_DIR`, default `./uploads/simulations`) following the ProjectManager pattern. The exact PATH differs (environment/rooting detail, config-driven) but is **not observably wrong**: the manager is self-consistent — it writes and reads the same configured dir, dir auto-created via `create_dir_all`, cache-first reads + FS writes preserved. In-memory cache mapped to `Mutex<HashMap>` (interior mutability for `Arc<SimulationManager>` axum sharing) — faithful map-onto of Python's `self._simulations` dict. Round-trip test `load_from_disk_after_cache_cleared` + `load_cache_first_returns_cached_value` prove cache semantics.
+
+### S-680 `get_run_instructions` — `[≠]` adjudication (owner no-downgrade rule applied)
+
+**Verdict: legitimate `[≠]`-partial — PASS.** NOT a disguised portable-feature skip.
+
+Ported faithfully (expressible): `simulation_dir`, `config_file` paths (py L514,516 ↔ rs `RunInstructions{simulation_dir, config_file}`).
+
+`[≠]`-omitted (genuinely inexpressible): `scripts_dir`, `commands{twitter,reddit,parallel}`, `instructions` (py L515,517-528). These are `python {scripts_dir}/run_twitter_simulation.py --config ...` + `conda activate MiroFish` strings.
+
+**Inexpressibility proven (not asserted):**
+- MiroFish's `run_*_simulation.py` scripts DO exist (`backend/scripts/run_{twitter,reddit,parallel}_simulation.py`, 26-61 KB each) and the commands reference them under conda. CONFIRMED they are real in source.
+- teri has NO such scripts and NO conda env. The runner scripts are ported as **native in-process Rust** (`SimEngine`, confirmed `src/sim/mod.rs:396` struct, `:493` `pub async fn run`) — tracked as separate units U-028/U-029/U-030 (`port-fresh`, all `- [ ]`). teri's runner = SimEngine, not a Python subprocess.
+- Therefore emitting `python /<nonexistent>/run_twitter_simulation.py` would be **fabrication of a command that cannot execute** in teri's substrate — strictly worse than admitting the gap. This meets the inexpressibility bar of the `[≠]` rule.
+
+**Consumer/contract check (the no-downgrade scrutiny):** `get_run_instructions` IS an observable API output — consumed at `backend/app/api/simulation.py:772` (`result["run_instructions"] = manager.get_run_instructions(...)`), served to the frontend on `GET /<sim_id>` ONLY when `status == READY`. So there IS a downstream consumer of the shape. HOWEVER:
+- The teri API route (U-026 `teri::api::simulation`) is **NOT YET PORTED** (`- [ ]`) — no teri consumer of `RunInstructions` exists yet (grep of `src/` for `RunInstructions`/`run_instructions` outside the manager file = zero hits).
+- `status == READY` is only reached after `prepare_simulation` (S-675, also unported, sub-cycle d) and the runner (U-022 `SimulationRunner`, `- [ ]`). The native-run contract teri would advertise does not exist as a stable shape yet.
+
+**Carry-forward gate (recorded, NOT an S-680 blocker):** when **U-026** is ported, the parity gate MUST verify teri emits *native run-guidance* (e.g., the `teri run`/`SimEngine::run` invocation) for the `run_instructions` API field — NOT merely the static `substrate_note` — so the frontend's "how to run a prepared simulation" contract is not downgraded. The literal Python script commands stay inexpressible, but the *guidance capability* must be re-expressed natively at the API boundary. Owner rule: the API contract requires SOME run-guidance shape. At the manager-method level (S-680) the `[≠]` is correct and complete; the obligation transfers to U-026.
+
+Test `get_run_instructions_structural_fields` asserts both path fields + non-empty substrate_note directing to SimEngine.
+
+### Rollup
+**VERDICT: PASS** for sub-cycle (c). 12/12 in-scope symbols verified: S-668..S-674, S-676..S-679 → `- [x]`; S-680 → `- [x]` (partial port w/ adjudicated `[≠]` on the script-command sub-fields, carry-forward gate on U-026). S-675 (`prepare_simulation`) stays `- [ ]` (sub-cycle d). U-023 stays `- [ ]` at unit level — only sub-cycle (d) remains. Do NOT commit U-023 as done.
