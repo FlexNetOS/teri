@@ -614,28 +614,28 @@
 
 ## U-021 — `backend/app/services/zep_graph_memory_updater.py`
 
-- [ ] S-493 · `unit:U-021` · `type` · `AgentActivity` · dataclass with to_episode_text + 12 action describers · `zep_graph_memory_updater.py:25`
-- [ ] S-494 · `unit:U-021` · `field` · `AgentActivity.platform` · `zep_graph_memory_updater.py:27`
-- [ ] S-495 · `unit:U-021` · `field` · `AgentActivity.agent_id` · `zep_graph_memory_updater.py:28`
-- [ ] S-496 · `unit:U-021` · `field` · `AgentActivity.agent_name` · `zep_graph_memory_updater.py:29`
-- [ ] S-497 · `unit:U-021` · `field` · `AgentActivity.action_type` · `zep_graph_memory_updater.py:30`
-- [ ] S-498 · `unit:U-021` · `field` · `AgentActivity.action_args` · `zep_graph_memory_updater.py:31`
-- [ ] S-499 · `unit:U-021` · `field` · `AgentActivity.round_num` · `zep_graph_memory_updater.py:32`
-- [ ] S-500 · `unit:U-021` · `field` · `AgentActivity.timestamp` · `zep_graph_memory_updater.py:33`
-- [ ] S-501 · `unit:U-021` · `method` · `AgentActivity.to_episode_text` · dispatches to 12 action describers · `zep_graph_memory_updater.py:35`
-- [ ] S-502 · `unit:U-021` · `method` · `AgentActivity._describe_create_post` · `zep_graph_memory_updater.py:64`
-- [ ] S-503 · `unit:U-021` · `method` · `AgentActivity._describe_like_post` · `zep_graph_memory_updater.py:70`
-- [ ] S-504 · `unit:U-021` · `method` · `AgentActivity._describe_dislike_post` · `zep_graph_memory_updater.py:83`
-- [ ] S-505 · `unit:U-021` · `method` · `AgentActivity._describe_repost` · `zep_graph_memory_updater.py:96`
-- [ ] S-506 · `unit:U-021` · `method` · `AgentActivity._describe_quote_post` · `zep_graph_memory_updater.py:109`
-- [ ] S-507 · `unit:U-021` · `method` · `AgentActivity._describe_follow` · `zep_graph_memory_updater.py:129`
-- [ ] S-508 · `unit:U-021` · `method` · `AgentActivity._describe_create_comment` · `zep_graph_memory_updater.py:137`
-- [ ] S-509 · `unit:U-021` · `method` · `AgentActivity._describe_like_comment` · `zep_graph_memory_updater.py:153`
-- [ ] S-510 · `unit:U-021` · `method` · `AgentActivity._describe_dislike_comment` · `zep_graph_memory_updater.py:166`
-- [ ] S-511 · `unit:U-021` · `method` · `AgentActivity._describe_search` · `zep_graph_memory_updater.py:179`
-- [ ] S-512 · `unit:U-021` · `method` · `AgentActivity._describe_search_user` · `zep_graph_memory_updater.py:184`
-- [ ] S-513 · `unit:U-021` · `method` · `AgentActivity._describe_mute` · `zep_graph_memory_updater.py:189`
-- [ ] S-514 · `unit:U-021` · `method` · `AgentActivity._describe_generic` · `zep_graph_memory_updater.py:197`
+- [x] S-493 · `unit:U-021` · `type` · `AgentActivity` · dataclass with to_episode_text + 12 action describers · `zep_graph_memory_updater.py:25`
+- [x] S-494 · `unit:U-021` · `field` · `AgentActivity.platform` · `zep_graph_memory_updater.py:27`
+- [x] S-495 · `unit:U-021` · `field` · `AgentActivity.agent_id` · `zep_graph_memory_updater.py:28`
+- [x] S-496 · `unit:U-021` · `field` · `AgentActivity.agent_name` · `zep_graph_memory_updater.py:29`
+- [x] S-497 · `unit:U-021` · `field` · `AgentActivity.action_type` · `zep_graph_memory_updater.py:30`
+- [x] S-498 · `unit:U-021` · `field` · `AgentActivity.action_args` · `zep_graph_memory_updater.py:31`
+- [x] S-499 · `unit:U-021` · `field` · `AgentActivity.round_num` · `zep_graph_memory_updater.py:32`
+- [x] S-500 · `unit:U-021` · `field` · `AgentActivity.timestamp` · `zep_graph_memory_updater.py:33`
+- [x] S-501 · `unit:U-021` · `method` · `AgentActivity.to_episode_text` · dispatches to 12 action describers · `zep_graph_memory_updater.py:35`
+- [x] S-502 · `unit:U-021` · `method` · `AgentActivity._describe_create_post` · `zep_graph_memory_updater.py:64`
+- [x] S-503 · `unit:U-021` · `method` · `AgentActivity._describe_like_post` · `zep_graph_memory_updater.py:70`
+- [x] S-504 · `unit:U-021` · `method` · `AgentActivity._describe_dislike_post` · `zep_graph_memory_updater.py:83`
+- [x] S-505 · `unit:U-021` · `method` · `AgentActivity._describe_repost` · `zep_graph_memory_updater.py:96`
+- [x] S-506 · `unit:U-021` · `method` · `AgentActivity._describe_quote_post` · `zep_graph_memory_updater.py:109`
+- [x] S-507 · `unit:U-021` · `method` · `AgentActivity._describe_follow` · `zep_graph_memory_updater.py:129`
+- [x] S-508 · `unit:U-021` · `method` · `AgentActivity._describe_create_comment` · `zep_graph_memory_updater.py:137`
+- [x] S-509 · `unit:U-021` · `method` · `AgentActivity._describe_like_comment` · `zep_graph_memory_updater.py:153`
+- [x] S-510 · `unit:U-021` · `method` · `AgentActivity._describe_dislike_comment` · `zep_graph_memory_updater.py:166`
+- [x] S-511 · `unit:U-021` · `method` · `AgentActivity._describe_search` · `zep_graph_memory_updater.py:179`
+- [x] S-512 · `unit:U-021` · `method` · `AgentActivity._describe_search_user` · `zep_graph_memory_updater.py:184`
+- [x] S-513 · `unit:U-021` · `method` · `AgentActivity._describe_mute` · `zep_graph_memory_updater.py:189`
+- [x] S-514 · `unit:U-021` · `method` · `AgentActivity._describe_generic` · `zep_graph_memory_updater.py:197`
 - [ ] S-515 · `unit:U-021` · `type` · `ZepGraphMemoryUpdater` · daemon-threaded queue flusher · `zep_graph_memory_updater.py:202`
 - [ ] S-516 · `unit:U-021` · `field` · `ZepGraphMemoryUpdater.BATCH_SIZE` · 5 · `zep_graph_memory_updater.py:217`
 - [ ] S-517 · `unit:U-021` · `field` · `ZepGraphMemoryUpdater.PLATFORM_DISPLAY_NAMES` · `zep_graph_memory_updater.py:220`

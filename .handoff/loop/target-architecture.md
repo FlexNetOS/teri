@@ -836,3 +836,35 @@ the same node/edge-dict shapes), built on `KnowledgeGraph::get_all_entities` (`g
 node/edge-dict shapes match what MiroFish's `fetch_all_*` feed consumers (already shown in U-016), (3) no teri
 consumer depends on the 2000-cap. On PASS: S-054/055 `[x]`, S-049/050/051/052/053 `[≠]` ⇒ **U-007 COMPLETE**,
 unblocking U-017/U-021.
+
+---
+
+## DECISION-13 — U-021 `zep_graph_memory_updater.py` (S-493..S-539) → 3 sub-cycles (map-onto-substrate: Zep graph.add → teri KnowledgeGraph)
+
+**Trigger:** newly-unblocked-by-U-007 unit, 554L/47 symbols — too large for one cycle. Decompose:
+
+- **sub-cycle (a) — `AgentActivity` + `to_episode_text` + 12 `_describe_*` (S-493..S-514).** PURE PORT (no substrate
+  decision). `AgentActivity` is a distinct loggable record (`action_type: String`, `action_args: serde_json::Map`,
+  + platform/agent_id/agent_name/round_num/timestamp) — faithful to MiroFish reading dicts from `actions.jsonl`; do
+  NOT couple it to teri's `SocialAction` enum (action_type is a dispatch string). `to_episode_text` dispatches on the
+  action_type string to 12 describers producing **byte-exact Chinese NL** ("{agent_name}: {description}"); unknown
+  action_type → `_describe_generic` ("执行了{action_type}操作"). `action_args.get("k", "")` → serde_json
+  `.get("k").and_then(Value::as_str).unwrap_or("")`. New module `src/services/graph_memory.rs`. Byte-exact differential
+  testable per describer (all the if/elif content+author combinations). **THIS CYCLE.**
+- **sub-cycle (b) — `ZepGraphMemoryUpdater` (S-515..S-53x).** The batching worker. **NEEDS THE SUBSTRATE DECISION
+  (architect when reached):** MiroFish `client.graph.add(graph_id, type="text", data=combined_text)` sends NL text to
+  Zep Cloud which runs ITS OWN server-side LLM extraction to add entities/edges. teri's in-process equivalent is the
+  **U-015 KnowledgeGraph LLM-extraction pipeline** (`build_with_progress`/extend) — so `_send_batch_activities` →
+  combined_text → teri graph extract-and-merge into the existing `KnowledgeGraph`. Threading model (Queue + daemon
+  worker + BATCH_SIZE=5 per-platform buffers + SEND_INTERVAL=0.5 + MAX_RETRIES=3) → tokio (mpsc channel + spawned
+  task, OR a simpler async accumulator). The retry on `client.graph.add` failure is `[≠]`-adjudicate (in-process
+  extraction failure modes differ from Zep-network). `start()`'s thread-spawn is a **U-050 site → use `with_locale`**.
+  The BATCH merge-as-one-text (combined_text = "\n".join) IS observable (affects extraction grouping) → port faithfully.
+- **sub-cycle (c) — `ZepGraphMemoryManager` (S-53x..S-539).** Class-level registry keyed by simulation_id
+  (create_updater/get_updater/stop_updater/stop_all/get_all_stats + `_stop_all_done` idempotency flag). Maps onto a
+  teri singleton/struct holding `Mutex<HashMap<String, ZepGraphMemoryUpdater>>`. **Feeds U-049** (`stop_all` is called
+  by register_cleanup) — record the carry-forward.
+
+**Owner-rule notes:** the platform display names {twitter:'世界1', reddit:'世界2'} (S-517) are console-display only →
+likely `[≠]` non-contractual (verify no consumer reads them). get_stats (S-538) IS observable (served via U-049/API) →
+port. DO_NOTHING skip in add_activity IS contractual (filters before queueing) → port.

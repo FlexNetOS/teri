@@ -17,7 +17,7 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 2   # RESUMED 2026-06-17 (9th resume, reset 0); baseline re-verified 788 green.
+cycles_this_session: 0   # RESUMED 2026-06-17 (10th resume, reset 0); baseline re-verified 797 green. Target: U-021 zep_graph_memory_updater (architect decomposition DECISION-13).
 # CYCLE2 (9th resume) 2026-06-17: U-007 zep_paging COMPLETE — opus PASS (DECISION-12, map-onto-substrate, NO new code).
 #   Whole module is Zep-Cloud network pagination; teri's in-process petgraph has no network/cursor/pages/I/O. S-054
 #   fetch_all_nodes / S-055 fetch_all_edges [x] map-onto (subsumed by U-016 KnowledgeGraphEntityReader::get_all_nodes/

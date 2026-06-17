@@ -1442,3 +1442,78 @@ This is NOT the owner's flagged bad pattern ("dest won't use it" rationalizing a
 
 ### Rollup
 **VERDICT: PASS (5/7 `[≠]`, 2/7 `[x]`).** S-054/S-055 → `- [x]` (map-onto). S-049/S-050/S-051/S-052/S-053 → `- [≠]` (all challenge-surviving: inexpressible network-cursor/retry artifacts; S-050 strict-superset). All S-049..S-055 are `[x]`/legal-`[≠]` → rollup rule satisfied ⇒ **U-007 COMPLETE**. No silent drop (full petgraph iteration), no narrowed branch, no disguised-skip `[≠]`. Orchestrator may flip U-007 ledger `- [x]` and commit.
+
+---
+
+## 2026-06-17 — U-021 sub-cycle (a) — `AgentActivity` + `to_episode_text` + 12 `_describe_*` (S-493..S-514)
+
+**Source:** `MiroFish/backend/app/services/zep_graph_memory_updater.py` L24-199
+**Rust:** `.worktrees/mirofish-port/teri/src/services/graph_memory.rs`
+**Kind:** PURE PORT (no substrate mapping). Bar = byte-exact Chinese NL output.
+
+### VERDICT: PASS — 22/22 symbols (S-493..S-514) all `[x]`. (U-021 unit stays `[~]`; sub-cycles b/c remain.)
+
+### Evidence — verified BY READING + BY RUNNING
+
+**By running:** `cargo test graph_memory` → **53 passed, 0 failed**. 52 of 53 use exact `assert_eq!`
+against the full expected `"Alice: <chinese>"` string; the single `assert!` is the prefix
+`starts_with("Alice: ")` test, which is additionally backed by an exact-equality full-format test.
+No weak (non-empty / length-only) assertion masquerading as parity evidence.
+
+**By reading — the byte-exact crux (strongest evidence):** extracted EVERY Chinese production
+literal from the source describer region (L64-199, docstrings stripped) and from the Rust impl block
+(pre-`mod tests`), normalised `{var}` placeholders to `{}`, and diffed the two sets:
+**41 PY literals == 41 RS literals, set-equal, byte-for-byte.** Zero PY-only (no dropped literal),
+zero RS-only (no drift). This covers every full-width `：`/`，`/`「」` and the colon-vs-no-colon crux.
+
+### Adversarial checklist — all refutation attempts FAILED to find a divergence
+
+1. **Struct fidelity (S-493..S-500):** 7 fields — `platform:String`, `agent_id:i64` (Py int),
+   `agent_name:String`, `action_type:String`, `action_args:Map<String,Value>` (Py Dict[str,Any]),
+   `round_num:i64` (Py int), `timestamp:String`. Types correct. `action_type` is a **plain dispatch
+   String** — the only `SocialAction` mention is the L38 doc-comment explicitly DISavowing the
+   coupling (`grep` = 1 hit, in a comment). NOT coupled to teri's enum. ✓
+
+2. **`to_episode_text` (S-501):** match covers exactly the 12 action_types, `_ => describe_generic`,
+   returns `format!("{}: {}", agent_name, description)` = `"{agent_name}: {description}"` — agent_name
+   prefix + ": ", no simulation prefix (source L61-62). ✓
+
+3. **12 describers (S-502..S-514) — byte-exact:**
+   - Key sets verified per describer: like/dislike_post read `post_content`+`post_author_name`;
+     repost reads `original_content`+`original_author_name`; quote_post reads original_content/
+     original_author_name + `quote_content` OR `content`; create_comment reads `content`+`post_content`
+     +`post_author_name`; like/dislike_comment read `comment_content`+`comment_author_name`;
+     follow/mute read `target_user_name`; search reads `query` OR `keyword`; search_user reads
+     `query` OR `username`. No wrong/missing key. ✓
+   - Ladder ORDER preserved: 4-way `both → content → author → neither` (like/dislike post+comment,
+     repost, quote-base); create_comment = outer-on-content then inner 4-way; quote_post appends
+     `，并评论道：「{quote_content}」` after the base. ✓
+   - **THE PUNCTUATION CRUX:** quote_post base = `…帖子「{content}」` (NO `：`, source L117 ↔ rust L189),
+     while like/dislike/repost = `…帖子：「{content}」` (WITH `：`). Byte-confirmed both directions:
+     quote-base has `帖子「` not `帖子：「`; like has `帖子：「`. ✓
+   - **`or`-fallbacks (the subtle Python-falsy edge):** quote_content OR content (L113), query OR
+     keyword (L181), query OR username (L186). Rust uses `arg(a)` → `if !is_empty() { a } else { arg(b) }`.
+     Python `a or b` returns `b` when `a` is empty-string OR absent. The Rust `is_empty()` check on
+     the `unwrap_or("")` result treats **both** the absent-key case AND the present-empty-string case
+     as fall-through. Confirmed by reading the helper `arg()` (`.get→as_str→unwrap_or("")`) AND by the
+     dedicated empty-string tests `test_quote_post_or_fallback_empty_quote_content_uses_content`,
+     `test_search_posts_empty_query_uses_keyword`, `test_search_user_empty_query_uses_username`
+     (each `{"query":""}` / `{"quote_content":""}` → asserts the fallback string). NOT an absence-only
+     check. ✓
+   - generic: `format!("执行了{}操作", self.action_type)` = `执行了{action_type}操作`. ✓
+
+4. **Tests assert the RIGHT thing (spot-checked the complex ones):** quote_post with comment append
+   (`引用了Carol的帖子「原文」，并评论道：「我的评论」`, L487), create_comment's 5 branches (L574-623,
+   all exact), and all 3 or-fallback empty-string tests — each is an exact `assert_eq!` against the
+   precise Chinese string. No weak expectation found.
+
+### Minor non-contractual note (NOT a divergence)
+The `arg()` helper returns `""` for a present-but-non-string JSON value (e.g. a number), whereas
+Python `dict.get` would return the raw value and the f-string would stringify it (`「5」`). Per the
+unit contract, `action_args` values are NL text strings deserialised from `actions.jsonl`; a numeric
+arg is not a contractual input here. Non-contractual edge, no parity impact.
+
+### Rollup
+**PASS:** all 22 symbols S-493..S-514 exercised and byte-exact (0 `[≠]` — pure port, nothing skipped).
+S-493..S-514 → `- [x]`. No silent drop, no narrowed/reordered ladder, no wrong key, no weakened test.
+U-021 unit ledger stays `- [~]` (sub-cycles b = `ZepGraphMemoryUpdater` L202+, c = manager remain).

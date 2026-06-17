@@ -5,6 +5,7 @@
 
 pub mod entity_reader;
 pub mod graph_builder;
+pub mod graph_memory;
 pub mod oasis_profile_export;
 pub mod ontology;
 pub mod simulation_config;
