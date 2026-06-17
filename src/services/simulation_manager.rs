@@ -17,7 +17,7 @@
 //! - `get_simulation_config`       — S-679
 //! - `get_run_instructions`        — S-680 (partial: see substrate note below)
 //!
-//! Sub-cycle (d) — `prepare_simulation` (L230-458, S-675) — NOT YET PORTED.
+//! Sub-cycle (d) — `prepare_simulation` (L230-458, S-675) — PORTED.
 //!
 //! # Ledger corrections
 //! The parity-ledger summary was wrong on two counts; the SOURCE is authoritative:
@@ -37,6 +37,50 @@ use uuid::Uuid;
 
 use crate::error::{Result, TeriError};
 use crate::models::project::python_isoformat_local;
+
+// ---------------------------------------------------------------------------
+// PrepareProgress — progress event emitted by `prepare_simulation` (S-675)
+// ---------------------------------------------------------------------------
+
+/// Progress update emitted by [`SimulationManager::prepare_simulation`].
+///
+/// Ports the kwargs of MiroFish's `progress_callback(stage, progress, message,
+/// current=, total=, item_name=)` (simulation_manager.py:273-327).
+///
+/// `item_name` in Python equals `message` at every callsite that passes it
+/// (L318-327: `item_name=msg` where `msg` is already the message string), so
+/// `item_name` is folded into `message` here — no second field needed.
+///
+/// This struct carries the FULL observable surface consumed by the U-026 SSE
+/// stream.  Dropping any field would downgrade the API contract.
+pub struct PrepareProgress<'a> {
+    /// Stage name: `"reading"` | `"generating_profiles"` | `"generating_config"`.
+    ///
+    /// Mirrors Python's first positional arg `stage` (e.g. `"reading"`, etc.).
+    pub stage: &'a str,
+
+    /// Overall stage progress in 0..=100 (integer percentage).
+    ///
+    /// Mirrors Python's second positional arg `progress` (e.g. `0`, `30`, `100`).
+    pub progress: i64,
+
+    /// Human-readable status message (i18n string).
+    ///
+    /// Mirrors Python's third positional arg `message` AND `item_name` kwarg
+    /// (they are identical at every callsite: L318-327 `item_name=msg`).
+    pub message: String,
+
+    /// Current item index (1-based within the stage), if applicable.
+    ///
+    /// Mirrors Python's `current=` kwarg.  `None` when the stage doesn't have
+    /// a meaningful current item (e.g. "reading"/0 where nothing is loaded yet).
+    pub current: Option<i64>,
+
+    /// Total item count for the stage, if applicable.
+    ///
+    /// Mirrors Python's `total=` kwarg.
+    pub total: Option<i64>,
+}
 
 // ---------------------------------------------------------------------------
 // SimulationStatus
@@ -1074,6 +1118,350 @@ impl SimulationManager {
     }
 
     // -----------------------------------------------------------------------
+    // prepare_simulation (S-675)
+    // -----------------------------------------------------------------------
+
+    /// Fully prepare a simulation: read entities → generate profiles → generate config.
+    ///
+    /// Port of `prepare_simulation` (`simulation_manager.py:230-458`).
+    ///
+    /// ## 4-stage pipeline (faithful to source)
+    ///
+    /// **Pre-load:** `load_simulation_state(simulation_id)` → `None` → `Err` with
+    ///   Chinese ValueError message `"模拟不存在: {simulation_id}"` (Python L263-264).
+    ///   Uses `TeriError::Sim` (maps Python's `ValueError` — the established pattern
+    ///   in this file for "business-logic precondition failure").
+    ///
+    /// **Exception wrapper:** stages 1-3 run under a try/except: on any error, sets
+    ///   `state.status = FAILED`, `state.error = e.to_string()`, saves state, returns `Err`
+    ///   (Python `except Exception as e: … state.status=FAILED; raise`).
+    ///
+    /// **Stage 1 ("reading"):** `KnowledgeGraphEntityReader::new(graph)` →
+    ///   `filter_defined_entities(defined_entity_types, enrich_with_edges=true)`.
+    ///   Sets `entities_count`/`entity_types`.  Zero entities → FAILED + **`Ok(state)`**
+    ///   (Python L298-302: `return state` — Ok return, NOT raise).
+    ///
+    /// **Stage 2 ("generating_profiles"):** realtime_output = Reddit > Twitter > None.
+    ///   Calls `generate_profiles_from_entities` with live `parallel_count` knob.
+    ///   Final saves: `enable_reddit` → reddit_profiles.json; `enable_twitter` →
+    ///   twitter_profiles.csv (two independent `if` branches, NOT elif — Python L361-374).
+    ///
+    /// **Stage 3 ("generating_config"):** `config_generator.generate_config(…).await`.
+    ///   Writes `simulation_config.json`; sets `config_generated=true`, `config_reasoning`.
+    ///
+    /// **Finish:** status=READY, save, `tracing::info!`, return `Ok(state)`.
+    ///
+    /// ## No `force_regenerate`
+    /// The source has NO stage-skipping flag — every run always executes all 3 stages.
+    ///
+    /// S-675
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prepare_simulation<L: crate::llm::LlmClient>(
+        &self,
+        simulation_id: &str,
+        simulation_requirement: &str,
+        document_text: &str,
+        defined_entity_types: Option<&[String]>,
+        use_llm_for_profiles: bool,
+        parallel_profile_count: usize,
+        llm: &L,
+        graph: &crate::graph::KnowledgeGraph,
+        persona_generator: &crate::agent::PersonaGenerator,
+        config_generator: &crate::services::simulation_config::SimulationConfigGenerator<L>,
+        mut progress_callback: Option<&mut dyn FnMut(PrepareProgress<'_>)>,
+    ) -> Result<SimulationState> {
+        use crate::i18n::{t, t_args};
+        use crate::services::entity_reader::KnowledgeGraphEntityReader;
+        use crate::services::oasis_profile_export::{
+            generate_profiles_from_entities, save_profiles, OutputPlatform,
+        };
+
+        // --- Pre-load: missing simulation → Err (Python L262-264: raise ValueError) ---
+        let mut state = match self.load_simulation_state(simulation_id)? {
+            Some(s) => s,
+            None => {
+                return Err(TeriError::Sim(format!("模拟不存在: {simulation_id}")));
+            }
+        };
+
+        // --- status = PREPARING + save (Python L267-268) ---
+        state.status = SimulationStatus::Preparing;
+        self.save_simulation_state(&mut state)?;
+
+        let sim_dir = self.get_simulation_dir(simulation_id)?;
+
+        // ===== Stage 1: Reading entities (Python L272-302) =====
+
+        // reading/0 — "正在连接Zep图谱..."
+        if let Some(cb) = progress_callback.as_mut() {
+            cb(PrepareProgress {
+                stage: "reading",
+                progress: 0,
+                message: t("progress.connectingZepGraph"),
+                current: None,
+                total: None,
+            });
+        }
+
+        let reader = KnowledgeGraphEntityReader::new(graph);
+
+        // reading/30 — "正在读取节点数据..."
+        if let Some(cb) = progress_callback.as_mut() {
+            cb(PrepareProgress {
+                stage: "reading",
+                progress: 30,
+                message: t("progress.readingNodeData"),
+                current: None,
+                total: None,
+            });
+        }
+
+        let filtered = reader.filter_defined_entities(defined_entity_types, true);
+
+        state.entities_count = filtered.filtered_count;
+        // list(filtered.entity_types) — Python set→list (unspecified order in both)
+        state.entity_types = filtered.entity_types.iter().cloned().collect();
+
+        // reading/100 — "完成，共 N 个实体"
+        if let Some(cb) = progress_callback.as_mut() {
+            cb(PrepareProgress {
+                stage: "reading",
+                progress: 100,
+                message: t_args(
+                    "progress.readingComplete",
+                    &[("count", &filtered.filtered_count)],
+                ),
+                current: Some(filtered.filtered_count),
+                total: Some(filtered.filtered_count),
+            });
+        }
+
+        // Zero entities → FAILED, save, return Ok(state)
+        // Python L298-302: `return state` (NOT raise — this is the Ok path, NOT Err).
+        // This is a contractual distinction: zero-entities is a FAILED terminal state,
+        // not an exception; the route layer gets Ok(state) with status=FAILED.
+        if filtered.filtered_count == 0 {
+            state.status = SimulationStatus::Failed;
+            state.error = Some(
+                "没有找到符合条件的实体，请检查图谱是否正确构建".to_string(),
+            );
+            self.save_simulation_state(&mut state)?;
+            return Ok(state);
+        }
+
+        // --- Exception wrapper: stages 2+3 run under try/except (Python L266+L450) ---
+        // Any error from stages 2-3 → FAILED + save + re-raise.
+        // We run the stages inline with `?`; a macro captures errors to apply FAILED-save.
+        macro_rules! try_stage {
+            ($expr:expr) => {
+                match $expr {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Python L450-457: except Exception as e: … raise
+                        tracing::error!("模拟准备失败: {}, error={}", simulation_id, e);
+                        state.status = SimulationStatus::Failed;
+                        state.error = Some(e.to_string());
+                        // Best-effort save; if this fails too we still return original error.
+                        let _ = self.save_simulation_state(&mut state);
+                        return Err(e);
+                    }
+                }
+            };
+        }
+
+        // ===== Stage 2: Generating profiles (Python L304-382) =====
+
+        let total_entities = filtered.entities.len();
+
+        // generating_profiles/0 — "开始生成..." current=0 total=N
+        if let Some(cb) = progress_callback.as_mut() {
+            cb(PrepareProgress {
+                stage: "generating_profiles",
+                progress: 0,
+                message: t("progress.startGenerating"),
+                current: Some(0),
+                total: Some(total_entities as i64),
+            });
+        }
+
+        // Realtime output path: Reddit > Twitter > None (Python L329-337)
+        let realtime_output: Option<(std::path::PathBuf, OutputPlatform)> =
+            if state.enable_reddit {
+                Some((sim_dir.join("reddit_profiles.json"), OutputPlatform::Reddit))
+            } else if state.enable_twitter {
+                Some((sim_dir.join("twitter_profiles.csv"), OutputPlatform::Twitter))
+            } else {
+                None
+            };
+
+        // Build the profile_progress closure (Python L318-327).
+        // Maps (current, total, msg) → generating_profiles/pct/msg with current/total.
+        //
+        // We need to pass `progress_callback` into the inner closure while also using it
+        // after the generate call. We use a raw pointer to avoid a second mutable borrow.
+        // SAFETY: The closure is invoked synchronously from `generate_profiles_from_entities`
+        // (via buffer_unordered on the current task — no spawn), so `cb_ptr` is always
+        // valid and there is no concurrent aliasing. The pointer's target (`progress_callback`)
+        // lives on this function's stack and outlives the closure.
+        let cb_ptr: *mut Option<&mut dyn FnMut(PrepareProgress<'_>)> =
+            &raw mut progress_callback;
+
+        let mut profile_progress = |current: i64, total: i64, msg: String| {
+            let cb = unsafe { &mut *cb_ptr };
+            if let Some(outer_cb) = cb.as_mut() {
+                let pct = if total > 0 { (current * 100) / total } else { 0 };
+                outer_cb(PrepareProgress {
+                    stage: "generating_profiles",
+                    progress: pct,
+                    message: msg,
+                    current: Some(current),
+                    total: Some(total),
+                });
+            }
+        };
+
+        let rt_ref: Option<(&std::path::Path, OutputPlatform)> =
+            realtime_output.as_ref().map(|(p, pl)| (p.as_path(), *pl));
+
+        let profiles = generate_profiles_from_entities(
+            persona_generator,
+            llm,
+            &filtered.entities,
+            Some(graph),
+            use_llm_for_profiles,
+            parallel_profile_count,
+            rt_ref,
+            &mut profile_progress,
+        )
+        .await;
+
+        // Drop the raw-ptr closure before next use of progress_callback.
+        let _ = profile_progress;
+
+        state.profiles_count = profiles.len() as i64;
+
+        // generating_profiles/95 — "保存Profile文件..." current=N total=N
+        if let Some(cb) = progress_callback.as_mut() {
+            cb(PrepareProgress {
+                stage: "generating_profiles",
+                progress: 95,
+                message: t("progress.savingProfiles"),
+                current: Some(total_entities as i64),
+                total: Some(total_entities as i64),
+            });
+        }
+
+        // Final saves (Python L361-374: two independent `if` branches, NOT elif).
+        if state.enable_reddit {
+            try_stage!(save_profiles(
+                &profiles,
+                &sim_dir.join("reddit_profiles.json"),
+                OutputPlatform::Reddit,
+            ).map_err(TeriError::from));
+        }
+        if state.enable_twitter {
+            try_stage!(save_profiles(
+                &profiles,
+                &sim_dir.join("twitter_profiles.csv"),
+                OutputPlatform::Twitter,
+            ).map_err(TeriError::from));
+        }
+
+        // generating_profiles/100 — "完成，共 N 个Profile"
+        let profile_count = profiles.len();
+        if let Some(cb) = progress_callback.as_mut() {
+            cb(PrepareProgress {
+                stage: "generating_profiles",
+                progress: 100,
+                message: t_args(
+                    "progress.profilesComplete",
+                    &[("count", &(profile_count as i64))],
+                ),
+                current: Some(profile_count as i64),
+                total: Some(profile_count as i64),
+            });
+        }
+
+        // ===== Stage 3: Generating config (Python L384-436) =====
+
+        // generating_config/0 — "正在分析模拟需求..." current=0 total=3
+        if let Some(cb) = progress_callback.as_mut() {
+            cb(PrepareProgress {
+                stage: "generating_config",
+                progress: 0,
+                message: t("progress.analyzingRequirements"),
+                current: Some(0),
+                total: Some(3),
+            });
+        }
+
+        // generating_config/30 — "正在调用LLM生成配置..." current=1 total=3
+        if let Some(cb) = progress_callback.as_mut() {
+            cb(PrepareProgress {
+                stage: "generating_config",
+                progress: 30,
+                message: t("progress.callingLLMConfig"),
+                current: Some(1),
+                total: Some(3),
+            });
+        }
+
+        let sim_params = config_generator
+            .generate_config(
+                simulation_id,
+                state.project_id.as_str(),
+                state.graph_id.as_str(),
+                simulation_requirement,
+                document_text,
+                &filtered.entities,
+                state.enable_twitter,
+                state.enable_reddit,
+                None,
+            )
+            .await;
+
+        // generating_config/70 — "正在保存配置文件..." current=2 total=3
+        if let Some(cb) = progress_callback.as_mut() {
+            cb(PrepareProgress {
+                stage: "generating_config",
+                progress: 70,
+                message: t("progress.savingConfigFiles"),
+                current: Some(2),
+                total: Some(3),
+            });
+        }
+
+        // Write simulation_config.json (Python L423-425: open+write as UTF-8)
+        let config_path = sim_dir.join("simulation_config.json");
+        try_stage!(std::fs::write(&config_path, sim_params.to_json().as_bytes()).map_err(TeriError::from));
+
+        state.config_generated = true;
+        state.config_reasoning = sim_params.generation_reasoning.clone();
+
+        // generating_config/100 — "配置生成完成" current=3 total=3
+        if let Some(cb) = progress_callback.as_mut() {
+            cb(PrepareProgress {
+                stage: "generating_config",
+                progress: 100,
+                message: t("progress.configComplete"),
+                current: Some(3),
+                total: Some(3),
+            });
+        }
+
+        // --- Finish: status=READY, save, log (Python L441-448) ---
+        state.status = SimulationStatus::Ready;
+        self.save_simulation_state(&mut state)?;
+        tracing::info!(
+            "模拟准备完成: {}, entities={}, profiles={}",
+            simulation_id,
+            state.entities_count,
+            state.profiles_count
+        );
+        Ok(state)
+    }
+
+    // -----------------------------------------------------------------------
     // get_simulation (S-676)
     // -----------------------------------------------------------------------
 
@@ -1700,5 +2088,539 @@ mod manager_tests {
         let unique: std::collections::HashSet<&str> =
             ids.iter().map(|s| s.as_str()).collect();
         assert_eq!(unique.len(), ids.len(), "all simulation IDs must be unique");
+    }
+}
+
+// =============================================================================
+// Tests — prepare_simulation (S-675)
+// =============================================================================
+
+#[cfg(test)]
+mod prepare_tests {
+    use super::*;
+    use crate::agent::PersonaGenerator;
+    use crate::graph::{KnowledgeGraph, Entity, EntityKind};
+    use crate::services::simulation_config::SimulationConfigGenerator;
+    use std::env;
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
+    fn temp_prepare_dir(suffix: &str) -> PathBuf {
+        let mut p = env::temp_dir();
+        p.push(format!(
+            "teri_prepare_sim_{}_{suffix}",
+            std::process::id()
+        ));
+        p
+    }
+
+    // ── MockLlm (reused from oasis_profile_export tests — kept local) ─────────
+
+    struct MockLlm {
+        profile_response: String,
+    }
+
+    impl MockLlm {
+        fn all_ok() -> Self {
+            Self {
+                profile_response: r#"{
+                    "bio": "Test bio.",
+                    "persona": "Test persona.",
+                    "karma": 500,
+                    "friend_count": 50,
+                    "follower_count": 80,
+                    "statuses_count": 200,
+                    "age": 30,
+                    "gender": "female",
+                    "mbti": "INFP",
+                    "country": "China",
+                    "profession": "Researcher",
+                    "interested_topics": ["Science"],
+                    "posting_style": "Thoughtful"
+                }"#
+                .to_string(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmClient for MockLlm {
+        async fn complete(&self, _prompt: &str) -> crate::error::Result<String> {
+            Ok(self.profile_response.clone())
+        }
+        async fn complete_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _prompt: &str,
+        ) -> crate::error::Result<T> {
+            serde_json::from_str(&self.profile_response)
+                .map_err(|e| crate::error::TeriError::Unknown(e.to_string()))
+        }
+        async fn stream(
+            &self,
+            _prompt: &str,
+        ) -> crate::error::Result<
+            std::pin::Pin<
+                Box<dyn futures::Stream<Item = crate::error::Result<String>> + Send>,
+            >,
+        > {
+            use futures::stream;
+            Ok(Box::pin(stream::iter(vec![Ok(self.profile_response.clone())])))
+        }
+        async fn chat(
+            &self,
+            _messages: &[crate::llm::ChatMessage],
+            _opts: &crate::llm::ChatOptions,
+        ) -> crate::error::Result<String> {
+            Ok(self.profile_response.clone())
+        }
+        async fn chat_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _messages: &[crate::llm::ChatMessage],
+            _opts: &crate::llm::ChatOptions,
+        ) -> crate::error::Result<T> {
+            serde_json::from_str(&self.profile_response)
+                .map_err(|e| crate::error::TeriError::Unknown(e.to_string()))
+        }
+    }
+
+    /// Build a KnowledgeGraph with N entities of the given kind.
+    fn make_graph_with_entities(names: &[&str], kind: EntityKind) -> KnowledgeGraph {
+        let mut g = KnowledgeGraph::new();
+        for name in names {
+            let entity = Entity {
+                id: uuid::Uuid::new_v4(),
+                name: name.to_string(),
+                kind: kind.clone(),
+            };
+            g.add_entity(entity).expect("add_entity must succeed");
+        }
+        g
+    }
+
+    // ── Test 1: missing simulation_id → Err "模拟不存在" ────────────────────────
+
+    #[tokio::test]
+    async fn prepare_simulation_missing_id_returns_err() {
+        let dir = temp_prepare_dir("missing_id");
+        let mgr = SimulationManager::new(&dir);
+        let graph = KnowledgeGraph::new();
+        let pg = PersonaGenerator::new();
+        let llm = MockLlm::all_ok();
+        let config_gen = SimulationConfigGenerator::new(MockLlm::all_ok(), "test-model", "http://localhost");
+
+        let result = mgr
+            .prepare_simulation(
+                "sim_doesnotexist",
+                "test requirement",
+                "test document",
+                None,
+                false,
+                1,
+                &llm,
+                &graph,
+                &pg,
+                &config_gen,
+                None,
+            )
+            .await;
+
+        assert!(result.is_err(), "missing simulation must return Err");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("模拟不存在"),
+            "error must contain '模拟不存在': {msg}"
+        );
+        assert!(
+            msg.contains("sim_doesnotexist"),
+            "error must contain the id: {msg}"
+        );
+    }
+
+    // ── Test 2: zero filtered entities → Ok(state) with status=FAILED ───────────
+
+    #[tokio::test]
+    async fn prepare_simulation_zero_entities_returns_ok_with_failed_status() {
+        let dir = temp_prepare_dir("zero_entities");
+        let mgr = SimulationManager::new(&dir);
+        // Graph has NO entities → filter returns 0
+        let graph = KnowledgeGraph::new();
+        let pg = PersonaGenerator::new();
+        let llm = MockLlm::all_ok();
+        let config_gen = SimulationConfigGenerator::new(MockLlm::all_ok(), "test-model", "http://localhost");
+
+        let state = mgr.create_simulation("proj", "graph", true, true).unwrap();
+
+        let result = mgr
+            .prepare_simulation(
+                &state.simulation_id,
+                "req",
+                "doc",
+                None,
+                false,
+                1,
+                &llm,
+                &graph,
+                &pg,
+                &config_gen,
+                None,
+            )
+            .await;
+
+        // Python `return state` → Ok (NOT Err)
+        assert!(
+            result.is_ok(),
+            "zero entities must return Ok(state), not Err: {:?}",
+            result.err()
+        );
+        let final_state = result.unwrap();
+        assert_eq!(
+            final_state.status,
+            SimulationStatus::Failed,
+            "zero entities must set status=FAILED"
+        );
+        assert!(
+            final_state.error.as_deref().unwrap_or("").contains("没有找到"),
+            "error message must mention 没有找到: {:?}",
+            final_state.error
+        );
+
+        // state.json on disk must also have FAILED
+        let state_json_path = dir.join(&state.simulation_id).join("state.json");
+        let raw = std::fs::read_to_string(&state_json_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            parsed["status"].as_str().unwrap(),
+            "failed",
+            "persisted state.json must have status=failed"
+        );
+    }
+
+    // ── Test 3: happy path (enable_reddit only) ─────────────────────────────────
+
+    #[tokio::test]
+    async fn prepare_simulation_happy_path_reddit_only() {
+        let dir = temp_prepare_dir("happy_reddit");
+        let mgr = SimulationManager::new(&dir);
+
+        let graph = make_graph_with_entities(&["Alice", "Bob"], EntityKind::Person);
+        let pg = PersonaGenerator::new();
+        let llm = MockLlm::all_ok();
+        let config_gen = SimulationConfigGenerator::new(MockLlm::all_ok(), "test-model", "http://localhost");
+
+        let mut init = mgr.create_simulation("proj", "graph", false, true).unwrap();
+        // enable_reddit=true, enable_twitter=false
+        init.enable_twitter = false;
+        init.enable_reddit = true;
+        mgr.save_simulation_state(&mut init).unwrap();
+
+        let result = mgr
+            .prepare_simulation(
+                &init.simulation_id,
+                "Test simulation requirement",
+                "Test document text",
+                None,
+                false,
+                1,
+                &llm,
+                &graph,
+                &pg,
+                &config_gen,
+                None,
+            )
+            .await;
+
+        let final_state = result.expect("happy path must succeed");
+
+        assert_eq!(final_state.status, SimulationStatus::Ready, "must be READY");
+        assert!(final_state.entities_count > 0, "entities_count must be set");
+        assert!(final_state.profiles_count > 0, "profiles_count must be set");
+        assert!(final_state.config_generated, "config_generated must be true");
+        // config_reasoning may be empty for the mock LLM (SimulationConfigGenerator has
+        // internal fallback, so reasoning is set to the fallback text or empty string).
+        // We only assert config_generated=true (the contractual field).
+        let _ = &final_state.config_reasoning; // accessed for completeness; not asserted
+
+        let sim_dir = dir.join(&init.simulation_id);
+
+        // reddit_profiles.json must exist
+        let reddit_path = sim_dir.join("reddit_profiles.json");
+        assert!(reddit_path.exists(), "reddit_profiles.json must be written");
+        let reddit_content = std::fs::read_to_string(&reddit_path).unwrap();
+        let reddit: Vec<serde_json::Value> = serde_json::from_str(&reddit_content).unwrap();
+        assert!(!reddit.is_empty(), "reddit_profiles.json must have profiles");
+
+        // twitter_profiles.csv must NOT exist (enable_twitter=false)
+        let twitter_path = sim_dir.join("twitter_profiles.csv");
+        assert!(
+            !twitter_path.exists(),
+            "twitter_profiles.csv must NOT be written when enable_twitter=false"
+        );
+
+        // simulation_config.json must exist
+        let config_path = sim_dir.join("simulation_config.json");
+        assert!(config_path.exists(), "simulation_config.json must be written");
+        let config_raw = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!config_raw.is_empty(), "simulation_config.json must not be empty");
+        // Must be valid JSON
+        let _parsed: serde_json::Value = serde_json::from_str(&config_raw)
+            .expect("simulation_config.json must be valid JSON");
+
+        // state.json must have status=ready
+        let state_json = std::fs::read_to_string(sim_dir.join("state.json")).unwrap();
+        let state_val: serde_json::Value = serde_json::from_str(&state_json).unwrap();
+        assert_eq!(state_val["status"].as_str().unwrap(), "ready");
+    }
+
+    // ── Test 4: enable_twitter only ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn prepare_simulation_twitter_only() {
+        let dir = temp_prepare_dir("twitter_only");
+        let mgr = SimulationManager::new(&dir);
+
+        let graph = make_graph_with_entities(&["Charlie"], EntityKind::Person);
+        let pg = PersonaGenerator::new();
+        let llm = MockLlm::all_ok();
+        let config_gen = SimulationConfigGenerator::new(MockLlm::all_ok(), "test-model", "http://localhost");
+
+        let mut init = mgr.create_simulation("proj", "graph", true, false).unwrap();
+        init.enable_twitter = true;
+        init.enable_reddit = false;
+        mgr.save_simulation_state(&mut init).unwrap();
+
+        let result = mgr
+            .prepare_simulation(
+                &init.simulation_id,
+                "req",
+                "doc",
+                None,
+                false,
+                1,
+                &llm,
+                &graph,
+                &pg,
+                &config_gen,
+                None,
+            )
+            .await;
+
+        let final_state = result.expect("twitter-only happy path must succeed");
+        assert_eq!(final_state.status, SimulationStatus::Ready);
+
+        let sim_dir = dir.join(&init.simulation_id);
+
+        // twitter_profiles.csv must exist
+        let twitter_path = sim_dir.join("twitter_profiles.csv");
+        assert!(twitter_path.exists(), "twitter_profiles.csv must be written");
+
+        // reddit_profiles.json must NOT exist (enable_reddit=false)
+        // Note: realtime_output might have written one if enable_reddit were true.
+        // With enable_reddit=false, no reddit file should exist.
+        let reddit_path = sim_dir.join("reddit_profiles.json");
+        assert!(
+            !reddit_path.exists(),
+            "reddit_profiles.json must NOT exist when enable_reddit=false"
+        );
+    }
+
+    // ── Test 5: progress callback receives staged sequence ─────────────────────
+
+    #[tokio::test]
+    async fn prepare_simulation_progress_callback_receives_all_stages() {
+        let dir = temp_prepare_dir("progress_stages");
+        let mgr = SimulationManager::new(&dir);
+
+        let graph = make_graph_with_entities(&["Dave"], EntityKind::Person);
+        let pg = PersonaGenerator::new();
+        let llm = MockLlm::all_ok();
+        let config_gen = SimulationConfigGenerator::new(MockLlm::all_ok(), "test-model", "http://localhost");
+
+        let init = mgr.create_simulation("proj", "graph", false, true).unwrap();
+
+        // Collect stages + progress values seen
+        let mut stages_seen: Vec<(String, i64)> = Vec::new();
+        let mut current_totals: Vec<(Option<i64>, Option<i64>)> = Vec::new();
+
+        {
+            let stages_ref = &mut stages_seen;
+            let ct_ref = &mut current_totals;
+            let mut cb = |p: PrepareProgress<'_>| {
+                stages_ref.push((p.stage.to_string(), p.progress));
+                ct_ref.push((p.current, p.total));
+            };
+
+            mgr.prepare_simulation(
+                &init.simulation_id,
+                "req",
+                "doc",
+                None,
+                false,
+                1,
+                &llm,
+                &graph,
+                &pg,
+                &config_gen,
+                Some(&mut cb),
+            )
+            .await
+            .expect("happy path must succeed");
+        }
+
+        // Stage sequence must start with reading, then generating_profiles, then generating_config
+        let stage_names: Vec<&str> = stages_seen.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(
+            stage_names.contains(&"reading"),
+            "must have 'reading' stage events"
+        );
+        assert!(
+            stage_names.contains(&"generating_profiles"),
+            "must have 'generating_profiles' stage events"
+        );
+        assert!(
+            stage_names.contains(&"generating_config"),
+            "must have 'generating_config' stage events"
+        );
+
+        // reading must come before generating_profiles, which must come before generating_config
+        let first_reading = stage_names.iter().position(|&s| s == "reading").unwrap();
+        let first_profile = stage_names.iter().position(|&s| s == "generating_profiles").unwrap();
+        let first_config = stage_names.iter().position(|&s| s == "generating_config").unwrap();
+        assert!(first_reading < first_profile, "reading must precede generating_profiles");
+        assert!(first_profile < first_config, "generating_profiles must precede generating_config");
+
+        // reading/0 must have current=None, total=None
+        let reading_0 = stages_seen.iter().position(|(s, p)| s == "reading" && *p == 0);
+        assert!(reading_0.is_some(), "must have reading/0 event");
+        let (cur0, tot0) = &current_totals[reading_0.unwrap()];
+        assert!(cur0.is_none(), "reading/0 must have current=None");
+        assert!(tot0.is_none(), "reading/0 must have total=None");
+
+        // reading/100 must have current and total set
+        let reading_100 = stages_seen.iter().position(|(s, p)| s == "reading" && *p == 100);
+        assert!(reading_100.is_some(), "must have reading/100 event");
+        let (cur100, tot100) = &current_totals[reading_100.unwrap()];
+        assert!(cur100.is_some(), "reading/100 must have current set");
+        assert!(tot100.is_some(), "reading/100 must have total set");
+
+        // generating_config/0 must have current=Some(0), total=Some(3)
+        let cfg_0 = stages_seen.iter().position(|(s, p)| s == "generating_config" && *p == 0);
+        assert!(cfg_0.is_some(), "must have generating_config/0 event");
+        let (cfg_cur, cfg_tot) = &current_totals[cfg_0.unwrap()];
+        assert_eq!(*cfg_cur, Some(0), "generating_config/0 must have current=Some(0)");
+        assert_eq!(*cfg_tot, Some(3), "generating_config/0 must have total=Some(3)");
+    }
+
+    // ── Test 6: exception path → status FAILED saved + Err returned ─────────────
+    //
+    // We simulate a stage-2 IO failure by creating the simulation dir, then making
+    // the reddit_profiles.json path be a directory (so write fails with EISDIR).
+    // This verifies that: Err → state.status=FAILED saved to disk.
+
+    #[tokio::test]
+    async fn prepare_simulation_exception_sets_failed_and_returns_err() {
+        let dir = temp_prepare_dir("exception_path");
+        let mgr = SimulationManager::new(&dir);
+
+        let graph = make_graph_with_entities(&["Eve"], EntityKind::Person);
+        let pg = PersonaGenerator::new();
+        let llm = MockLlm::all_ok();
+        let config_gen = SimulationConfigGenerator::new(MockLlm::all_ok(), "test-model", "http://localhost");
+
+        let mut init = mgr.create_simulation("proj", "graph", false, true).unwrap();
+        init.enable_reddit = true;
+        init.enable_twitter = false;
+        mgr.save_simulation_state(&mut init).unwrap();
+
+        // Sabotage: create reddit_profiles.json as a DIRECTORY so the final save_profiles
+        // call (which tries to write a file there) will fail with EISDIR.
+        let sim_dir = dir.join(&init.simulation_id);
+        std::fs::create_dir_all(sim_dir.join("reddit_profiles.json"))
+            .expect("create sabotage dir");
+
+        let result = mgr
+            .prepare_simulation(
+                &init.simulation_id,
+                "req",
+                "doc",
+                None,
+                false,
+                1,
+                &llm,
+                &graph,
+                &pg,
+                &config_gen,
+                None,
+            )
+            .await;
+
+        // The final save_profiles call will fail (EISDIR); the exception handler must
+        // set status=FAILED and save state.json, then return Err.
+        // (generate_profiles_from_entities' realtime write to the same path may also fail
+        // but those are logged+ignored, not propagated — only the final save_profiles is fatal.)
+        assert!(result.is_err(), "IO sabotage must result in Err");
+
+        // Read state.json (the realtime save by the exception handler must have updated it).
+        // Note: sim_dir/state.json is the file; we need to read past the dir entry.
+        let state_json_path = sim_dir.join("state.json");
+        if state_json_path.exists() {
+            let state_json = std::fs::read_to_string(&state_json_path).unwrap();
+            let state_val: serde_json::Value = serde_json::from_str(&state_json).unwrap();
+            assert_eq!(
+                state_val["status"].as_str().unwrap(),
+                "failed",
+                "on Err, persisted state must have status=failed"
+            );
+            assert!(
+                !state_val["error"].is_null(),
+                "on Err, persisted state must have error field set"
+            );
+        }
+    }
+
+    // ── Test 7: entities_count, profiles_count, config_generated, config_reasoning ──
+
+    #[tokio::test]
+    async fn prepare_simulation_state_fields_populated() {
+        let dir = temp_prepare_dir("state_fields");
+        let mgr = SimulationManager::new(&dir);
+
+        let graph = make_graph_with_entities(&["Alice", "Bob", "Carol"], EntityKind::Person);
+        let pg = PersonaGenerator::new();
+        let llm = MockLlm::all_ok();
+        let config_gen = SimulationConfigGenerator::new(MockLlm::all_ok(), "test-model", "http://localhost");
+
+        let mut init = mgr.create_simulation("proj", "graph", true, true).unwrap();
+        // Both platforms enabled
+        init.enable_reddit = true;
+        init.enable_twitter = true;
+        mgr.save_simulation_state(&mut init).unwrap();
+
+        let final_state = mgr
+            .prepare_simulation(
+                &init.simulation_id,
+                "test requirement",
+                "test document",
+                None,
+                false,
+                1,
+                &llm,
+                &graph,
+                &pg,
+                &config_gen,
+                None,
+            )
+            .await
+            .expect("must succeed");
+
+        assert_eq!(final_state.entities_count, 3, "entities_count must be 3");
+        assert_eq!(final_state.profiles_count, 3, "profiles_count must be 3");
+        assert!(final_state.config_generated, "config_generated must be true");
+        assert!(!final_state.entity_types.is_empty(), "entity_types must be populated");
+
+        // Both files written
+        let sim_dir = dir.join(&init.simulation_id);
+        assert!(sim_dir.join("reddit_profiles.json").exists());
+        assert!(sim_dir.join("twitter_profiles.csv").exists());
+        assert!(sim_dir.join("simulation_config.json").exists());
     }
 }

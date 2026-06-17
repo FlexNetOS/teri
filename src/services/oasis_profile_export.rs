@@ -28,6 +28,7 @@ use crate::agent::{Persona, PersonaGenerator, Platform, SocialProfile};
 use crate::graph::KnowledgeGraph;
 use crate::llm::LlmClient;
 use crate::services::entity_reader::EntityNode;
+use futures::stream::{self, StreamExt};
 use std::io;
 use std::path::Path;
 use tracing::{info, warn};
@@ -328,25 +329,42 @@ pub fn save_profiles_to_json(
 // S-367: generate_profiles_from_entities  (batch generator)
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Batch-generate `SocialProfile`s from a slice of `EntityNode`s.
+/// Batch-generate `SocialProfile`s from a slice of `EntityNode`s with LIVE bounded concurrency.
 ///
 /// Ports `OasisProfileGenerator.generate_profiles_from_entities` (L851-1014).
 ///
-/// **Concurrency:** MiroFish runs this with a `ThreadPoolExecutor(max_workers=parallel_count)`.
-/// DECISION-10 §4 rules that the concurrency model is the CALLER's concern
-/// (e.g. `prepare_simulation` chooses sequential vs `tokio::JoinSet`). This function
-/// runs SEQUENTIALLY (each entity awaited in order) — preserving the ordered `Vec` result
-/// and per-entity fallback semantics.
+/// **Concurrency (DECISION-11 §2 — LIVE knob):** MiroFish uses
+/// `ThreadPoolExecutor(max_workers=parallel_count)` + `concurrent.futures.as_completed`.
+/// This function ports that model to async Rust via
+/// `futures::stream::iter(…).buffer_unordered(parallel_count.max(1))`:
 ///
-/// **Realtime-save path (`realtime_output`):** after EACH profile is generated, if
-/// `realtime_output` is `Some((path, platform))`, the complete set of
-/// successfully-generated profiles so far is written to the file.
+/// - Each entity maps to an independent async future that generates one profile.
+/// - `buffer_unordered(n)` polls up to `n` futures concurrently, completing them in
+///   ARRIVAL order (non-deterministic by design — matches Python's `as_completed`).
+/// - The consumer loop writes each result into a pre-allocated indexed `Vec<Option<…>>`
+///   (`results[idx] = Some(…)`) so the FINAL `Vec` is ORDER-PRESERVING regardless of
+///   arrival order (`results[0]` is always entity 0's profile, etc.).
+/// - Realtime-save (write all completed-so-far non-None slots) and the monotonic
+///   1-based progress callback happen in the consumer loop — NOT inside the concurrent
+///   futures — so no shared-mutable-state/locks are needed (matches Python's
+///   `with lock: completed_count[0] += 1; save_profiles_realtime()` pattern exactly,
+///   just without the lock because we do it serially in the consumer).
+/// - Borrowed `&` refs are fine: `buffer_unordered` polls futures on the CURRENT task
+///   (no `spawn`, so no `'static` bound needed).
+///
+/// **Determinism:** the final output `Vec` AND the final file bytes are deterministic
+/// for any `parallel_count` (they depend only on entity input order). Only wall-clock
+/// timing and intermediate realtime-file/progress order differ across runs (non-contractual,
+/// even in Python's `as_completed` which returns in arrival order).
+///
+/// **Realtime-save path (`realtime_output`):** after EACH profile arrives (in arrival
+/// order, which may differ from entity order), all completed-so-far non-None slots are
+/// written to the file, matching MiroFish's `save_profiles_realtime()` inner closure.
 ///
 /// - Reddit platform: uses `Persona::to_reddit_format` (as MiroFish's realtime closure does).
 /// - Twitter platform: uses `Persona::to_twitter_format` (as MiroFish's realtime closure does).
 ///
-/// A write failure does NOT abort the batch — only logged as a warning, matching MiroFish's
-/// `except Exception as e: logger.warning(...)`.
+/// A write failure does NOT abort the batch — only logged as a warning.
 ///
 /// **Fallback profile:** on generation error, a baseline `SocialProfile` is constructed
 /// (entity_type: entity_name for bio, entity.summary or generic persona, user_id=idx)
@@ -355,10 +373,12 @@ pub fn save_profiles_to_json(
 /// **`user_id`:** set to `idx` (the entity's position in the input slice), matching
 /// MiroFish `generate_profile_from_entity(entity=entity, user_id=idx, ...)`.
 ///
-/// `progress_callback(current, total, message)`: called after each entity (including
-/// fallbacks); `current` is 1-based, `total` is `entities.len()`.
+/// `progress_callback(current, total, message)`: called after each entity completes
+/// (including fallbacks); `current` is the monotonically-incrementing 1-based completion
+/// count (arrival order), `total` is `entities.len()`.
 ///
-/// Returns profiles in ENTITY ORDER (Vec index == idx).
+/// Returns profiles in ENTITY ORDER (Vec index == entity idx). The output is DETERMINISTIC
+/// and ORDER-PRESERVING for any `parallel_count ∈ {1, 3, 10, …}`.
 #[allow(clippy::too_many_arguments)]
 pub async fn generate_profiles_from_entities<L: LlmClient>(
     generator: &PersonaGenerator,
@@ -366,92 +386,110 @@ pub async fn generate_profiles_from_entities<L: LlmClient>(
     entities: &[EntityNode],
     graph: Option<&KnowledgeGraph>,
     use_llm: bool,
-    _parallel_count: usize, // reserved for caller-level parallelism; sequential here
+    parallel_count: usize,
     realtime_output: Option<(&Path, OutputPlatform)>,
     progress_callback: &mut dyn FnMut(i64, i64, String),
 ) -> Vec<(SocialProfile, String)> {
     let total = entities.len() as i64;
+    // Pre-allocate indexed slots for order-preserving collection.
     let mut results: Vec<Option<(SocialProfile, String)>> = vec![None; entities.len()];
+    // Monotonic 1-based completion counter (arrival order).
+    let mut completed_count: i64 = 0;
 
-    for (idx, entity) in entities.iter().enumerate() {
+    // `use_llm` is consumed by caller semantics; `generate_social` internally always
+    // tries LLM first and falls back to rule-based — we cannot bypass it here.
+    let _ = use_llm;
+
+    // Build a stream of (idx, profile, entity_name, had_error) futures.
+    // Each future is independent and borrows generator/llm/entities by shared ref.
+    let futures_iter = entities.iter().enumerate().map(|(idx, entity)| {
         let entity_type = entity.get_entity_type().unwrap_or_else(|| "Entity".to_string());
         let entity_name = entity.name.clone();
+        let entity_uuid = entity.uuid.clone();
+        let entity_summary = entity.summary.clone();
 
-        // Platform: Reddit as the neutral internal format for batch generation.
-        // The dedicated writers apply the OASIS-required shape per platform.
+        // Platform: Reddit as neutral internal format for batch generation.
         let platform = Platform::Reddit;
 
-        // Graph context: resolve entity by uuid if the graph is available
+        // Resolve graph context (borrow, no clone of graph needed).
         let graph_ctx = graph.and_then(|g| {
-            uuid::Uuid::parse_str(&entity.uuid)
+            uuid::Uuid::parse_str(&entity_uuid)
                 .ok()
                 .and_then(|id| g.get_entity_by_id(id))
                 .map(|e| (g, e))
         });
 
-        // generate_social has LLM → salvage → rule-based fallback internally;
-        // `use_llm=false` cannot bypass it at this call level (generate_social always
-        // tries LLM first). The `_parallel_count` hint and `use_llm` flag are preserved
-        // as parameters for caller semantics; the sequential body is faithful per DECISION-10.
-        let _ = use_llm; // consumed by caller semantics; generate_social has its own fallback
-
-        let generation_result = generator
-            .generate_social(
-                &entity_name,
-                &entity_type,
-                &entity.summary,
-                platform,
-                llm,
-                graph_ctx,
-            )
-            .await;
-
-        let (mut profile, had_error) = match generation_result {
-            Ok(p) => (p, false),
-            Err(e) => {
-                // Fallback profile — mirrors MiroFish's `except Exception: OasisAgentProfile(...)`
-                warn!(
-                    "Failed to generate profile for entity '{}': {}; using fallback",
-                    entity_name, e
-                );
-                let fallback = SocialProfile {
-                    user_id: 0,
-                    user_name: PersonaGenerator::generate_username(&entity_name),
-                    bio: format!("{entity_type}: {entity_name}"),
-                    persona: if entity.summary.is_empty() {
-                        "A participant in social discussions.".to_string()
-                    } else {
-                        entity.summary.clone()
-                    },
+        async move {
+            let generation_result = generator
+                .generate_social(
+                    &entity_name,
+                    &entity_type,
+                    &entity_summary,
                     platform,
-                    karma: 1000,
-                    friend_count: 100,
-                    follower_count: 150,
-                    following_count: 100,
-                    statuses_count: 500,
-                    age: None,
-                    gender: None,
-                    mbti: None,
-                    country: None,
-                    profession: None,
-                    interested_topics: vec![],
-                    posting_style: None,
-                    source_entity_uuid: Some(entity.uuid.clone()),
-                    source_entity_type: Some(entity_type.clone()),
-                    created_at: chrono::Utc::now().format("%Y-%m-%d").to_string(),
-                };
-                (fallback, true)
-            }
-        };
+                    llm,
+                    graph_ctx,
+                )
+                .await;
 
-        // Set user_id = idx (matching MiroFish `user_id=idx` in generate_profile_from_entity)
-        profile.user_id = idx as u64;
-        profile.source_entity_uuid = Some(entity.uuid.clone());
-        profile.source_entity_type = Some(entity_type.clone());
+            let (mut profile, had_error) = match generation_result {
+                Ok(p) => (p, false),
+                Err(e) => {
+                    warn!(
+                        "Failed to generate profile for entity '{}': {}; using fallback",
+                        entity_name, e
+                    );
+                    let fallback = SocialProfile {
+                        user_id: 0,
+                        user_name: PersonaGenerator::generate_username(&entity_name),
+                        bio: format!("{entity_type}: {entity_name}"),
+                        persona: if entity_summary.is_empty() {
+                            "A participant in social discussions.".to_string()
+                        } else {
+                            entity_summary.clone()
+                        },
+                        platform,
+                        karma: 1000,
+                        friend_count: 100,
+                        follower_count: 150,
+                        following_count: 100,
+                        statuses_count: 500,
+                        age: None,
+                        gender: None,
+                        mbti: None,
+                        country: None,
+                        profession: None,
+                        interested_topics: vec![],
+                        posting_style: None,
+                        source_entity_uuid: Some(entity_uuid.clone()),
+                        source_entity_type: Some(entity_type.clone()),
+                        created_at: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+                    };
+                    (fallback, true)
+                }
+            };
 
+            // Set user_id = idx, source fields (matches MiroFish `user_id=idx`).
+            profile.user_id = idx as u64;
+            profile.source_entity_uuid = Some(entity_uuid);
+            profile.source_entity_type = Some(entity_type);
+
+            (idx, profile, entity_name, had_error)
+        }
+    });
+
+    // Drive up to `parallel_count` futures concurrently (mirroring
+    // `ThreadPoolExecutor(max_workers=parallel_count)` + `as_completed`).
+    // Arrival order is non-deterministic; we write into indexed slots so the
+    // final Vec is order-preserving regardless.
+    let concurrency = parallel_count.max(1);
+    let mut stream = stream::iter(futures_iter).buffer_unordered(concurrency);
+
+    while let Some((idx, profile, entity_name, had_error)) = stream.next().await {
+        // Write to indexed slot (order-preserving regardless of arrival order).
         results[idx] = Some((profile, entity_name.clone()));
 
-        // Realtime-save: write all completed profiles so far
+        // Realtime-save: write all completed (non-None) profiles so far.
+        // Matches Python's `save_profiles_realtime()` called inside `as_completed` loop.
         if let Some((rt_path, rt_platform)) = realtime_output {
             let completed: Vec<&(SocialProfile, String)> =
                 results.iter().flatten().collect();
@@ -462,17 +500,23 @@ pub async fn generate_profiles_from_entities<L: LlmClient>(
             }
         }
 
-        // Progress callback — 1-based current count
-        let current = (idx as i64) + 1;
+        // Progress callback — monotonically increasing 1-based completion count.
+        // Mirrors Python's `completed_count[0] += 1; progress_callback(current, total, msg)`.
+        completed_count += 1;
+        let current = completed_count;
+        let entity_type_display = results[idx]
+            .as_ref()
+            .and_then(|(p, _)| p.source_entity_type.clone())
+            .unwrap_or_else(|| "Entity".to_string());
         let msg = if had_error {
             format!("[{current}/{total}] {entity_name} 使用备用人设")
         } else {
-            format!("已完成 {current}/{total}: {entity_name}（{entity_type}）")
+            format!("已完成 {current}/{total}: {entity_name}（{entity_type_display}）")
         };
         progress_callback(current, total, msg);
     }
 
-    // Unwrap — every slot was filled (either Ok or fallback)
+    // Unwrap — every slot was filled (either Ok or fallback).
     results.into_iter().flatten().collect()
 }
 
@@ -1309,6 +1353,111 @@ mod tests {
         let mut reader = csv::Reader::from_path(&twitter_path).unwrap();
         let count = reader.records().count();
         assert_eq!(count, 2);
+    }
+
+    // ── Determinism: parallel_count ∈ {1, 3, 10} → identical ordered Vec + identical file bytes
+    //
+    // Proves DECISION-11 §2: the final output is ORDER-PRESERVING and DETERMINISTIC
+    // regardless of parallel_count. Wall-clock timing and intermediate realtime-file/progress
+    // order MAY differ (non-contractual), but the final Vec and written files are identical.
+
+    async fn run_generate(
+        parallel_count: usize,
+    ) -> Vec<(SocialProfile, String)> {
+        let generator = PersonaGenerator::new();
+        let llm = MockLlm::always_ok();
+        let entities = vec![
+            make_entity("00000000-0000-0000-0000-000000000001", "Alice"),
+            make_entity("00000000-0000-0000-0000-000000000002", "Bob"),
+            make_entity("00000000-0000-0000-0000-000000000003", "Carol"),
+            make_entity("00000000-0000-0000-0000-000000000004", "Dave"),
+            make_entity("00000000-0000-0000-0000-000000000005", "Eve"),
+        ];
+        let mut cb = |_c: i64, _t: i64, _m: String| {};
+        generate_profiles_from_entities(
+            &generator, &llm, &entities, None, true, parallel_count, None, &mut cb,
+        )
+        .await
+    }
+
+    /// Parallel_count ∈ {1,3,10} → identical ordered Vec output (determinism).
+    ///
+    /// Compares user_id (= entity index) and entity name to confirm order preservation
+    /// without depending on LLM-generated fields (which may vary by concurrency timing).
+    #[tokio::test]
+    async fn generate_profiles_determinism_across_parallel_counts() {
+        let results_1 = run_generate(1).await;
+        let results_3 = run_generate(3).await;
+        let results_10 = run_generate(10).await;
+
+        // All three must produce 5 profiles
+        assert_eq!(results_1.len(), 5);
+        assert_eq!(results_3.len(), 5);
+        assert_eq!(results_10.len(), 5);
+
+        // user_id must equal entity index (0..4) for all parallel counts
+        for (i, (profile, name)) in results_1.iter().enumerate() {
+            assert_eq!(
+                profile.user_id, i as u64,
+                "parallel=1: profile[{i}].user_id must be {i}, got {} (entity: {})",
+                profile.user_id, name
+            );
+        }
+        for (i, (profile, name)) in results_3.iter().enumerate() {
+            assert_eq!(
+                profile.user_id, i as u64,
+                "parallel=3: profile[{i}].user_id must be {i}, got {} (entity: {})",
+                profile.user_id, name
+            );
+        }
+        for (i, (profile, name)) in results_10.iter().enumerate() {
+            assert_eq!(
+                profile.user_id, i as u64,
+                "parallel=10: profile[{i}].user_id must be {i}, got {} (entity: {})",
+                profile.user_id, name
+            );
+        }
+
+        // Entity names must be in original entity order for all parallel counts
+        let expected_names = ["Alice", "Bob", "Carol", "Dave", "Eve"];
+        for (i, expected) in expected_names.iter().enumerate() {
+            assert_eq!(results_1[i].1, *expected, "parallel=1: name at [{i}]");
+            assert_eq!(results_3[i].1, *expected, "parallel=3: name at [{i}]");
+            assert_eq!(results_10[i].1, *expected, "parallel=10: name at [{i}]");
+        }
+    }
+
+    /// Parallel_count ∈ {1,3,10} → identical final file bytes (determinism).
+    ///
+    /// Writes the resulting profiles to reddit_profiles.json and compares the file
+    /// bytes across all three parallel counts. The files must be byte-for-byte identical
+    /// (since the final Vec is order-preserving and the MockLlm response is deterministic).
+    #[tokio::test]
+    async fn generate_profiles_final_file_bytes_deterministic() {
+        let dir = tempdir().unwrap();
+
+        let write_reddit_file = |results: &[(SocialProfile, String)], suffix: &str| {
+            let path = dir.path().join(format!("reddit_{suffix}.json"));
+            save_profiles(results, &path, OutputPlatform::Reddit).unwrap();
+            std::fs::read(&path).unwrap()
+        };
+
+        let results_1 = run_generate(1).await;
+        let results_3 = run_generate(3).await;
+        let results_10 = run_generate(10).await;
+
+        let bytes_1 = write_reddit_file(&results_1, "1");
+        let bytes_3 = write_reddit_file(&results_3, "3");
+        let bytes_10 = write_reddit_file(&results_10, "10");
+
+        assert_eq!(
+            bytes_1, bytes_3,
+            "reddit_profiles.json must be byte-for-byte identical for parallel=1 vs parallel=3"
+        );
+        assert_eq!(
+            bytes_1, bytes_10,
+            "reddit_profiles.json must be byte-for-byte identical for parallel=1 vs parallel=10"
+        );
     }
 
     // ── round-trip: write then read back ─────────────────────────────────────

@@ -1344,3 +1344,55 @@ Test `get_run_instructions_structural_fields` asserts both path fields + non-emp
 
 ### Rollup
 **VERDICT: PASS** for sub-cycle (c). 12/12 in-scope symbols verified: S-668..S-674, S-676..S-679 → `- [x]`; S-680 → `- [x]` (partial port w/ adjudicated `[≠]` on the script-command sub-fields, carry-forward gate on U-026). S-675 (`prepare_simulation`) stays `- [ ]` (sub-cycle d). U-023 stays `- [ ]` at unit level — only sub-cycle (d) remains. Do NOT commit U-023 as done.
+
+---
+
+## 2026-06-17 — U-023 sub-cycle (d) `prepare_simulation` (S-675) → COMPLETES U-023 · + RE-OPENED S-367 `generate_profiles_from_entities` (concurrency made live)
+
+**Gate:** rust-port-parity-verifier (opus). **Verdict: PASS** (no downgrade found).
+**Source:** `MiroFish/backend/app/services/simulation_manager.py` L230-458 (`prepare_simulation`); `.../oasis_profile_generator.py` L851-1014 (`generate_profiles_from_entities`).
+**Rust:** `teri/src/services/simulation_manager.rs` (`PrepareProgress`, `prepare_simulation`, `prepare_tests`); `teri/src/services/oasis_profile_export.rs` (`generate_profiles_from_entities` seq→`buffer_unordered`, 3 determinism tests).
+**Design verified against:** DECISION-11 (target-architecture.md L741-799).
+
+### By-RUNNING (cargo test, full lib green)
+- `cargo test --lib prepare_simulation` → **7 passed / 0 failed**.
+- `cargo test --lib oasis_profile_export` → **38 passed / 0 failed** (incl. both determinism tests).
+- `cargo test --lib t_args` → **4 passed** (i18n count-interpolation correct).
+- `cargo test --lib` (full) → **786 passed / 0 failed** — no regression.
+- `cargo check --lib` clean; no stray `_parallel_count` (knob fully live).
+
+### By-READING (differential, branch-by-branch — source vs Rust)
+
+**DECISION-11 §1 — no spawn/task_id smuggled.** `prepare_simulation` is `async fn -> Result<SimulationState>` (sim_manager.rs:1159). `grep tokio::spawn` over both files = ZERO. The realtime-progress closure uses a `&raw mut` ptr (cb_ptr) with a documented SAFETY note; `buffer_unordered` polls on the CURRENT task (no spawn), so the pointer is non-aliasing and valid. CONFIRMED: no task_id/Thread wrapping (that lives in U-026 route layer per design).
+
+**DECISION-11 §3 — no `force_regenerate`.** Signature has no skip flag; all 3 stages always run. CONFIRMED — no file-existence shortcut anywhere.
+
+**DECISION-11 §4 — 0-entity (Ok) vs exception (Err) DISTINCT.**
+- 0-entity (py L298-302 `return state`): rs:1243-1250 → status=FAILED + error `"没有找到符合条件的实体，请检查图谱是否正确构建"` (exact) + save + `return Ok(state)`. Test `prepare_simulation_zero_entities_returns_ok_with_failed_status` asserts `result.is_ok()` AND status==Failed AND disk state.json status="failed". CORRECT.
+- exception (py L450-457 `except: …; raise`): `try_stage!` macro (rs:1255-1270) sets status=FAILED + error=e.to_string() + saves state BEFORE `return Err(e)`. Test `prepare_simulation_exception_sets_failed_and_returns_err` sabotages reddit path → EISDIR → asserts `result.is_err()` AND disk state.json status="failed" with non-null error. CORRECT — FAILED state IS persisted before Err propagates.
+- Missing sim (py L262-264 raise ValueError): rs:1180-1185 → `Err(TeriError::Sim("模拟不存在: {id}"))`. Test asserts Err + message contains 模拟不存在 + the id. CORRECT.
+- **Fallible-stage coverage note (verified, not a narrowing):** in the Rust port `filter_defined_entities -> FilteredEntities` and `generate_config -> SimulationParameters` are INFALLIBLE by prior locked design (internal fallback), and `generate_profiles_from_entities -> Vec` is infallible. The only fallible ops in the body are the two `save_profiles` + the config `fs::write` — ALL wrapped in `try_stage!`. Python's broad try/except is faithfully mapped: every operation that *can* error is under the FAILED-save handler; the infallible-by-design stages have no error path to drop. Not a downgrade.
+
+**DECISION-11 §4 — stage order + state writes.** PREPARING+save → stage1(entities_count/entity_types, reading 0/30/100) → stage2(profiles_count; realtime reddit>twitter>None; FINAL save_profiles gated by enable_reddit AND enable_twitter as TWO independent `if` branches NOT elif, rs:1355-1368 = py L361-374) → stage3(generate_config.await; write simulation_config.json via `sim_params.to_json()`; config_generated=true; config_reasoning) → READY+save. CONFIRMED faithful. Tests: happy_path_reddit_only (reddit.json written, twitter.csv NOT), twitter_only (csv written, reddit.json NOT), state_fields_populated (both files, entities_count=3, profiles_count=3, config_generated).
+
+**DECISION-11 §5 — full progress surface (SSE contract).** All **11** `progress_callback` callsites reproduced with EXACT stage label + percentage + current/total:
+reading 0(—/—), 30(—/—), 100(fc/fc); generating_profiles 0(0/N), inner pct=int(c·100/t)(c/t), 95(N/N), 100(len/len); generating_config 0(0/3), 30(1/3), 70(2/3), 100(3/3). Verified line-by-line vs py L273-436. Inner pct: Rust `(current*100)/total` == Python `int(current/total*100)` for non-neg ints. **item_name folding LOSSLESS:** Python passes `item_name=msg` (==message) at the ONLY callsite that sets it (py L318-327); the other 10 callsites omit it; PrepareProgress folds item_name into message — identical where present, absent elsewhere. No field dropped. Test `progress_callback_receives_all_stages` asserts stage ordering + reading/0 None-None + reading/100 set + config/0 Some(0)/Some(3). All 10 `progress.*` i18n keys present in BOTH en.json + zh.json.
+
+**DECISION-11 §2 / S-367 concurrency (the re-opened crux):**
+- `parallel_count` LIVE: `buffer_unordered(parallel_count.max(1))` (export.rs:484-485) — genuinely bounds in-flight futures. No stray `_parallel_count`.
+- **DETERMINISM:** consumer writes `results[idx] = Some(...)` (indexed slot, export.rs:489), NOT push-on-completion → final Vec order-preserving regardless of arrival order. Test `generate_profiles_final_file_bytes_deterministic` does REAL `assert_eq!(bytes_1, bytes_3)`/`(bytes_1, bytes_10)` on `fs::read` of written reddit JSON (byte-for-byte Vec<u8>, not a length check). Test `determinism_across_parallel_counts` asserts per-slot `user_id==idx` AND `name==expected[idx]` for parallel ∈ {1,3,10} — these ARE per-entity-distinct/order-sensitive, proving indexed-slot writes. (Honest caveat: MockLlm response is identical per entity, so byte-equality proves ORDER preservation; the per-slot user_id/name assertions carry the per-entity distinctness. Sufficient.)
+- Per-entity fallback (py L939-951): export.rs:441-468 builds baseline SocialProfile on generation error — **bio and persona are DISTINCT fields** (`bio=f"{type}: {name}"`, `persona=summary or generic`), NOT collapsed. This avoids the MiroFish→teri cycle-8/9 hidden bio+persona-collapse downgrade class. user_id=idx, source_entity_uuid/type set. Test `fallback_on_llm_error` confirms fallback returned with non-empty bio + user_id=0.
+- Realtime-save after each completion (py L979-980): export.rs:493-501 writes all completed non-None slots; write failure is `warn!`-logged not fatal (py L916-917 `logger.warning`). Realtime uses `to_reddit_format`/`to_twitter_format` (matches py `save_profiles_realtime` closure); FINAL save uses dedicated `save_reddit_json`/`save_twitter_csv` with OASIS forced defaults — faithful to MiroFish's own realtime-vs-final split. Test `realtime_write_after_each` confirms incremental file ≤ current entries + final file complete.
+- **No regression to U-018 output shape:** SocialProfiles + reddit JSON / twitter CSV formats UNCHANGED — only the scheduling (sequential→buffer_unordered) changed. S-369/370/371/372/373 stay `[x]` (their 38 tests still green).
+
+### [≠] adjudications (sharpened owner rule)
+- **S-368 `_print_generated_profile` — `[≠]` SURVIVES.** Console pretty-print to stdout (`【简介】`/`【详细人设】` blocks); no API/get_profiles/SimEngine/file consumer reads it; user-facing progress carried by progress_callback. Genuinely NON-CONTRACTUAL (console artifact — the exact class the owner rule names legal). NOT a disguised feature-skip.
+- **S-680 `get_run_instructions` script-command sub-fields — `[≠]`-substrate SURVIVES** (out of this cycle's flip scope; prior adjudication under DECISION-9/sub-cycle-c). The `scripts_dir`/`commands`/`instructions` strings invoke MiroFish's Python OASIS subprocess scripts under conda; teri runs in-process via SimEngine — those scripts/env do NOT exist, so the strings are genuinely INEXPRESSIBLE (fabricating them yields commands that cannot run). Structural fields (simulation_dir, config_file) ARE ported. Legal substrate `[≠]`.
+
+### Symbols verified (orchestrator flips `[x]`)
+- **S-675** `prepare_simulation` → `- [x]` (PASS; all 4 stages + 3 error/terminal branches + 11 progress events differential-verified).
+- **S-367** `generate_profiles_from_entities` → `- [x]` (re-verified with LIVE bounded concurrency; determinism proven byte-identical across parallel ∈ {1,3,10}).
+- S-368 stays `- [≠]` (survives challenge). S-369/370/371/372/373 unchanged `- [x]`.
+
+### Rollup
+**VERDICT: PASS.** S-675 `[x]` ⇒ **U-023 COMPLETE** (all S-636..S-680 now `[x]`/legal-`[≠]`). S-367 `[x]` (re-verified). No downgrade, no narrowed branch, no disguised-skip `[≠]`. Orchestrator may flip U-023 ledger `- [x]` and commit.

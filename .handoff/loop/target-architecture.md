@@ -735,3 +735,64 @@ The export layer (§3) is a **hard dependency of `prepare_simulation` stage 2** 
 4. **New module `src/services/oasis_profile_export.rs`** (free-fn service): `generate_profiles_from_entities` (async, ordered Vec, per-error fallback, progress_callback, realtime hook), `save_profiles` (dispatch), `save_reddit_json`/`save_twitter_csv` (dedicated writers — twitter header `['user_id','name','username','user_char','description']`, user_id=row-index), `normalize_gender` — all reusing `SocialProfile` + the verified serializers.
 5. **Sub-cycle order: A (export layer, re-opens U-018, gated standalone) → B (state types) → C (manager + FS persistence + getters incl. get_profiles) → D (prepare_simulation 4-stage async task, parallel via JoinSet).** Export-layer FIRST because it is stage-2's dependency and is independently verifiable.
 6. **Blast radius: additive only** — new file + one `pub mod` line; zero edits to the parity-verified `SocialProfile`/`PersonaGenerator`/serializers; the dedicated writers do NOT route through `to_*_format` (faithful to MiroFish's own realtime-vs-save split). Parity gate: golden-byte-compare both files, `normalize_gender` map, batch ordering + fallback.
+
+---
+
+## DECISION-11 — U-023 sub-cycle (d) `prepare_simulation` (S-675) → COMPLETES U-023
+
+**Trigger:** the convergence point of the service layer (`simulation_manager.py:230-458`). Handoff flagged it
+likely-architect. Resolved by SOURCE evidence (the handoff's own predictions were inaccurate — see corrections).
+
+**Source-authoritative corrections to the handoff (the handoff guessed; source is the contract):**
+- **NO `task_id` / `tokio::spawn` at this level.** Source `prepare_simulation` is a **synchronous** method that
+  runs all stages inline and `return`s `SimulationState`. The `task_manager.create_task` + `threading.Thread` +
+  `task_id`-returned-immediately wrapping lives in the **API ROUTE** layer (`api/simulation.py:360-618`) = **U-026**,
+  not here. (Carry-forward to U-026 already logged.)
+- **NO `force_regenerate` parameter.** Source signature is `(simulation_id, simulation_requirement, document_text,
+  defined_entity_types=None, use_llm_for_profiles=True, progress_callback=None, parallel_profile_count=3)`. There is
+  **no** stage-skipping / already-completed-files check. Do NOT fabricate one.
+
+**The 5 locked decisions:**
+1. **Async mapping (sync→async):** `pub async fn prepare_simulation<L: LlmClient>(&self, simulation_id: &str,
+   simulation_requirement: &str, document_text: &str, defined_entity_types: Option<&[String]>,
+   use_llm_for_profiles: bool, parallel_profile_count: usize, llm: &L, graph: &KnowledgeGraph,
+   generator: &PersonaGenerator, progress_callback: Option<&mut dyn FnMut(PrepareProgress<'_>)>)
+   -> Result<SimulationState>`. SimulationManager holds NO llm/graph/persona — caller provides them (teri's
+   caller-constructs-clients design; the `&KnowledgeGraph` IS the substrate for `state.graph_id` per DECISION-9).
+2. **Concurrency — the LIVE knob (no-downgrade):** port REAL bounded concurrency into
+   `oasis_profile_export::generate_profiles_from_entities` via `futures::stream::iter(...).buffer_unordered(
+   parallel_count.max(1))` (precedent: `src/sim/mod.rs:502`). This is the faithful map of Python's
+   `ThreadPoolExecutor(max_workers=parallel_count)` + `as_completed`: each future returns `(idx, profile, error)`;
+   the consumer loop writes to the pre-allocated indexed `Vec` (order-preserving final result), then does
+   realtime-save + the monotonic 1-based progress callback per completion — exactly Python's `as_completed` body.
+   This **re-opens U-018's `generate_profiles_from_entities`** (`_parallel_count` → live `parallel_count`); it drops
+   to `[~]` and re-verifies. Borrowed `&` refs are fine (buffer_unordered polls on the current task, no `'static`/
+   spawn). Final Vec + files are deterministic regardless of `parallel_count`; only wall-clock + race-dependent
+   intermediate realtime-file/progress ordering differ (non-contractual even in Python). Making the knob live (vs
+   the deferred sequential adjudication) satisfies the owner "PORT a feature with observable surface / WHEN IN DOUBT
+   PORT IT" rule — `parallel_profile_count` is a real parameter, not dead.
+3. **No `force_regenerate`** — every stage always runs (source has no skip path).
+4. **FS state machine (faithful):** `load_simulation_state` → `None` ⇒ `Err("模拟不存在: {id}")`. Then:
+   PREPARING + save → **stage1** `KnowledgeGraphEntityReader::new(graph).filter_defined_entities(defined_entity_types,
+   enrich_with_edges=true)`; set `entities_count`/`entity_types` (= `list(filtered.entity_types)`); **if
+   `filtered_count == 0` ⇒ status FAILED + error "没有找到符合条件的实体，请检查图谱是否正确构建" + save + `return
+   Ok(state)`** (Python `return state`, NOT raise) → **stage2** realtime path (`reddit_profiles.json` if
+   enable_reddit else `twitter_profiles.csv` if enable_twitter) + `generate_profiles_from_entities(...,
+   parallel_profile_count, realtime_output, ...)`; set `profiles_count`; then `save_profiles` reddit (if enable_reddit)
+   + twitter CSV (if enable_twitter) — both dedicated writers → **stage3** `SimulationConfigGenerator::new(llm)
+   .generate_config(simulation_id, project_id, graph_id, simulation_requirement, document_text, &entities,
+   enable_twitter, enable_reddit, None)`; write `simulation_config.json` via `sim_params.to_json()`;
+   set `config_generated=true` + `config_reasoning = sim_params.generation_reasoning` → status READY + save +
+   return Ok(state). **Any error in the body ⇒ status FAILED + `error = e.to_string()` + save + return `Err`**
+   (Python `except: … raise`). The 0-entities case is `Ok`, the exception case is `Err` — distinct.
+5. **Progress callback — full observable surface (no SSE downgrade):** `PrepareProgress<'a> { stage: &'a str,
+   progress: i64, message: String, current: Option<i64>, total: Option<i64> }` — carries every kwarg Python's
+   `progress_callback(stage, progress, message, current=, total=, item_name=)` passes (these feed the U-026 SSE
+   stream; dropping them would downgrade the route contract). Stage labels verbatim: `"reading"` /
+   `"generating_profiles"` / `"generating_config"`. All 10 `progress.*` i18n keys verified present in zh.json.
+
+**Blast radius:** new `prepare_simulation` method in `simulation_manager.rs`; re-touch
+`oasis_profile_export::generate_profiles_from_entities` (sequential→buffer_unordered, knob live — U-018 re-verify).
+Parity gate: differential vs source on (a) 0-entity FAILED-Ok path, (b) exception FAILED-Err path, (c) stage
+ordering + state.json after each stage, (d) `parallel_count` final-output determinism, (e) reddit/twitter file
+gating by enable flags. **S-675 `[x]` ⇒ U-023 COMPLETE (all S-636..S-680).**

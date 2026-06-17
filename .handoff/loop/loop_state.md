@@ -17,7 +17,7 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 3   # RESUMED 2026-06-17 (8th resume, reset 0); c1=U-018 export; c2=U-023(b) state types; c3=U-023(c) manager+FS+getters
+cycles_this_session: 0   # RESUMED 2026-06-17 (9th resume, reset 0); baseline re-verified 788 green. Target: U-023 sub-cycle (d) prepare_simulation (S-675) → COMPLETES U-023.
 cycles_total: 27
 # CYCLE3 (8th resume) 2026-06-17: U-023 sub-cycle (c) SimulationManager + FS persistence + create_simulation +
 #   5 getters — opus PASS (12/12). src/services/simulation_manager.rs: SimulationManager{Mutex<HashMap> cache},
