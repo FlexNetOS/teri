@@ -1848,6 +1848,22 @@ mod tests {
         ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
             Err(TeriError::Llm("Streaming not implemented in mock".to_string()))
         }
+
+        async fn chat(
+            &self,
+            _messages: &[crate::llm::ChatMessage],
+            _opts: &crate::llm::ChatOptions,
+        ) -> Result<String> {
+            Err(TeriError::Llm("chat not implemented in mock".to_string()))
+        }
+
+        async fn chat_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _messages: &[crate::llm::ChatMessage],
+            _opts: &crate::llm::ChatOptions,
+        ) -> Result<T> {
+            Err(TeriError::Llm("chat_json not implemented in mock".to_string()))
+        }
     }
 
     #[test]
@@ -2495,6 +2511,20 @@ mod tests {
                 _prompt: &str,
             ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
                 Err(TeriError::Llm("Mock error".to_string()))
+            }
+            async fn chat(
+                &self,
+                _messages: &[crate::llm::ChatMessage],
+                _opts: &crate::llm::ChatOptions,
+            ) -> Result<String> {
+                Err(TeriError::Llm("not used".into()))
+            }
+            async fn chat_json<T: serde::de::DeserializeOwned>(
+                &self,
+                _messages: &[crate::llm::ChatMessage],
+                _opts: &crate::llm::ChatOptions,
+            ) -> Result<T> {
+                Err(TeriError::Llm("not used".into()))
             }
         }
 
@@ -3209,6 +3239,20 @@ mod tests {
             {
                 Err(TeriError::Llm("not implemented".to_string()))
             }
+            async fn chat(
+                &self,
+                _messages: &[crate::llm::ChatMessage],
+                _opts: &crate::llm::ChatOptions,
+            ) -> Result<String> {
+                Err(TeriError::Llm("not used".into()))
+            }
+            async fn chat_json<T: serde::de::DeserializeOwned>(
+                &self,
+                _messages: &[crate::llm::ChatMessage],
+                _opts: &crate::llm::ChatOptions,
+            ) -> Result<T> {
+                Err(TeriError::Llm("not used".into()))
+            }
         }
 
         let generator = PersonaGenerator::new();
@@ -3736,6 +3780,20 @@ mod tests {
             {
                 Err(TeriError::Llm("not implemented".to_string()))
             }
+            async fn chat(
+                &self,
+                _messages: &[crate::llm::ChatMessage],
+                _opts: &crate::llm::ChatOptions,
+            ) -> Result<String> {
+                Err(TeriError::Llm("not used".into()))
+            }
+            async fn chat_json<T: serde::de::DeserializeOwned>(
+                &self,
+                _messages: &[crate::llm::ChatMessage],
+                _opts: &crate::llm::ChatOptions,
+            ) -> Result<T> {
+                Err(TeriError::Llm("not used".into()))
+            }
         }
 
         // Build a graph with one entity and one neighbor
@@ -3810,6 +3868,20 @@ mod tests {
             {
                 Err(TeriError::Llm("not implemented".to_string()))
             }
+            async fn chat(
+                &self,
+                _messages: &[crate::llm::ChatMessage],
+                _opts: &crate::llm::ChatOptions,
+            ) -> Result<String> {
+                Err(TeriError::Llm("not used".into()))
+            }
+            async fn chat_json<T: serde::de::DeserializeOwned>(
+                &self,
+                _messages: &[crate::llm::ChatMessage],
+                _opts: &crate::llm::ChatOptions,
+            ) -> Result<T> {
+                Err(TeriError::Llm("not used".into()))
+            }
         }
 
         let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
@@ -3868,6 +3940,20 @@ mod tests {
             {
                 Err(TeriError::Llm("not implemented".to_string()))
             }
+            async fn chat(
+                &self,
+                _messages: &[crate::llm::ChatMessage],
+                _opts: &crate::llm::ChatOptions,
+            ) -> Result<String> {
+                Err(TeriError::Llm("not used".into()))
+            }
+            async fn chat_json<T: serde::de::DeserializeOwned>(
+                &self,
+                _messages: &[crate::llm::ChatMessage],
+                _opts: &crate::llm::ChatOptions,
+            ) -> Result<T> {
+                Err(TeriError::Llm("not used".into()))
+            }
         }
 
         let generator = PersonaGenerator::new();
@@ -3917,6 +4003,20 @@ mod tests {
             ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>>
             {
                 Err(TeriError::Llm("not implemented".to_string()))
+            }
+            async fn chat(
+                &self,
+                _messages: &[crate::llm::ChatMessage],
+                _opts: &crate::llm::ChatOptions,
+            ) -> Result<String> {
+                Err(TeriError::Llm("not used".into()))
+            }
+            async fn chat_json<T: serde::de::DeserializeOwned>(
+                &self,
+                _messages: &[crate::llm::ChatMessage],
+                _opts: &crate::llm::ChatOptions,
+            ) -> Result<T> {
+                Err(TeriError::Llm("not used".into()))
             }
         }
 
@@ -3998,6 +4098,20 @@ mod tests {
             ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>>
             {
                 Err(TeriError::Llm("not implemented".to_string()))
+            }
+            async fn chat(
+                &self,
+                _messages: &[crate::llm::ChatMessage],
+                _opts: &crate::llm::ChatOptions,
+            ) -> Result<String> {
+                Err(TeriError::Llm("not used".into()))
+            }
+            async fn chat_json<T: serde::de::DeserializeOwned>(
+                &self,
+                _messages: &[crate::llm::ChatMessage],
+                _opts: &crate::llm::ChatOptions,
+            ) -> Result<T> {
+                Err(TeriError::Llm("not used".into()))
             }
         }
 

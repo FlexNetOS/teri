@@ -98,6 +98,7 @@ Status legend: `pending` (not started).
 The differential gate (reuse is never trusted) refuted the reuse-Y class for every backend unit checked — findings in `findings/reuse-verify-{llm,seed,infra}.md`:
 - [x] U-006 · reuse-Y→**extend-Y DONE** · retry recovery+cap+no-spurious tested, MAX_BACKOFF_SECS clamp; jitter `- [≠]`.
 - [x] U-008 · reuse-Y→**extend-Y DONE** · `strip_think`+`strip_json_fence` across all 3 adapters; teri LLM = proven superset; GAP-6 resolved.
+- [~] U-008 · **extend-Y (pending, DECISION-7)** · additive parameterized `chat`/`chat_json(&[ChatMessage], &ChatOptions)` on all 3 adapters (system+user roles, opt temperature/max_tokens) — `complete`/`complete_json`/`stream` byte-identical (no regression). Built once; reused by U-014 (trigger), U-019, U-024, U-018. Port before U-014. ← `chat_json` callers in `ontology_generator.py:217`, `llm_client.py:35-102`.
 - [~] U-009 · reuse-Y→**extend-Y (pending)** · add encoding-fallback (GBK/Latin-1) + `.md` dispatch + `is_supported` gate + multi-file concat. ← file_parser.py.
 - [~] U-013 · reuse-Y→**port-fresh (pending)** · teri has NO text chunking → new `src/seed/text_processor.rs` (`split_text` 500/50 + `preprocess` + `stats`). **Unblocks GAP-U015-1.** ← text_processor.py.
 - [≠] U-004 · reuse-Y→**intentional-divergence** · teri logs to stdout by design (operators redirect; MiroFish itself does at simulation_runner.py:427); rotating-file appender omitted (owner-optional `tracing-appender` add).

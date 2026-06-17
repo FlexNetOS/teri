@@ -769,6 +769,12 @@ mod tests {
             ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
                 Err(crate::error::TeriError::Llm("not used".into()))
             }
+            async fn chat(&self, _: &[crate::llm::ChatMessage], _: &crate::llm::ChatOptions) -> Result<String> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+            async fn chat_json<T: serde::de::DeserializeOwned>(&self, _: &[crate::llm::ChatMessage], _: &crate::llm::ChatOptions) -> Result<T> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
         }
 
         let mut pool = AgentPool::new();
@@ -826,6 +832,12 @@ mod tests {
                 &self,
                 _: &str,
             ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+            async fn chat(&self, _: &[crate::llm::ChatMessage], _: &crate::llm::ChatOptions) -> Result<String> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+            async fn chat_json<T: serde::de::DeserializeOwned>(&self, _: &[crate::llm::ChatMessage], _: &crate::llm::ChatOptions) -> Result<T> {
                 Err(crate::error::TeriError::Llm("not used".into()))
             }
         }
@@ -900,6 +912,12 @@ mod tests {
                 &self,
                 _: &str,
             ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+            async fn chat(&self, _: &[crate::llm::ChatMessage], _: &crate::llm::ChatOptions) -> Result<String> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+            async fn chat_json<T: serde::de::DeserializeOwned>(&self, _: &[crate::llm::ChatMessage], _: &crate::llm::ChatOptions) -> Result<T> {
                 Err(crate::error::TeriError::Llm("not used".into()))
             }
         }
@@ -1162,6 +1180,12 @@ mod tests {
             ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
                 Err(crate::error::TeriError::Llm("not used".into()))
             }
+            async fn chat(&self, _: &[crate::llm::ChatMessage], _: &crate::llm::ChatOptions) -> Result<String> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+            async fn chat_json<T: serde::de::DeserializeOwned>(&self, _: &[crate::llm::ChatMessage], _: &crate::llm::ChatOptions) -> Result<T> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
         }
 
         const N: u32 = 5;
@@ -1214,6 +1238,12 @@ mod tests {
                 &self,
                 _: &str,
             ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+            async fn chat(&self, _: &[crate::llm::ChatMessage], _: &crate::llm::ChatOptions) -> Result<String> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+            async fn chat_json<T: serde::de::DeserializeOwned>(&self, _: &[crate::llm::ChatMessage], _: &crate::llm::ChatOptions) -> Result<T> {
                 Err(crate::error::TeriError::Llm("not used".into()))
             }
         }
@@ -1270,6 +1300,12 @@ mod tests {
             ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
                 Err(crate::error::TeriError::Llm("not used".into()))
             }
+            async fn chat(&self, _: &[crate::llm::ChatMessage], _: &crate::llm::ChatOptions) -> Result<String> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+            async fn chat_json<T: serde::de::DeserializeOwned>(&self, _: &[crate::llm::ChatMessage], _: &crate::llm::ChatOptions) -> Result<T> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
         }
 
         const N: u32 = 2;
@@ -1320,6 +1356,12 @@ mod tests {
                 &self,
                 _: &str,
             ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+            async fn chat(&self, _: &[crate::llm::ChatMessage], _: &crate::llm::ChatOptions) -> Result<String> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+            async fn chat_json<T: serde::de::DeserializeOwned>(&self, _: &[crate::llm::ChatMessage], _: &crate::llm::ChatOptions) -> Result<T> {
                 Err(crate::error::TeriError::Llm("not used".into()))
             }
         }

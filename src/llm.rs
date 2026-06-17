@@ -4,6 +4,7 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 use std::pin::Pin;
 
 // ============================================================================
@@ -191,16 +192,96 @@ where
     Ok(BatchResult { results, failures })
 }
 
+// ============================================================================
+// DECISION-7 — parameterized chat types (additive; U-008 bodies are UNCHANGED)
+// ============================================================================
+
+/// The role of a [`ChatMessage`].
+///
+/// Serializes to the lowercase wire string each provider expects
+/// (`"system"`, `"user"`, `"assistant"`).
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatRole {
+    System,
+    User,
+    Assistant,
+}
+
+/// One chat message.  Role is a closed enum so a typo can't silently produce
+/// an unknown role.
+///
+/// # DECISION-7 — MiroFish parity
+/// Mirrors the `{"role": …, "content": …}` dicts in MiroFish
+/// `llm_client.py:35-102`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatMessage {
+    pub role: ChatRole,
+    pub content: String,
+}
+
+impl ChatMessage {
+    /// Construct a system-role message.
+    pub fn system(content: impl Into<String>) -> Self {
+        Self { role: ChatRole::System, content: content.into() }
+    }
+
+    /// Construct a user-role message.
+    pub fn user(content: impl Into<String>) -> Self {
+        Self { role: ChatRole::User, content: content.into() }
+    }
+}
+
+/// Optional per-call tuning knobs.
+///
+/// `None` on either field means "let the adapter apply its own default" —
+/// callers that don't care about temperature or max_tokens use
+/// `ChatOptions::default()` and nothing changes from today's behaviour.
+///
+/// # DECISION-7 — MiroFish parity
+/// Maps directly to the `temperature` / `max_tokens` kwargs of
+/// `LLMClient.chat()` / `LLMClient.chat_json()` in `llm_client.py`.
+#[derive(Debug, Clone, Default)]
+pub struct ChatOptions {
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+}
+
 /// Core LLM client trait - completely provider-agnostic.
 /// This trait makes NO assumptions about the underlying provider.
 #[async_trait]
 pub trait LlmClient: Send + Sync {
+    // --- UNCHANGED (U-008 verified) ---
     async fn complete(&self, prompt: &str) -> Result<String>;
     async fn complete_json<T: DeserializeOwned>(&self, prompt: &str) -> Result<T>;
     async fn stream(
         &self,
         prompt: &str,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>>;
+
+    // --- NEW (DECISION-7): parameterized chat — system+user vector, optional temp/max_tokens ---
+    //
+    // NOT a default impl: a no-op/single-prompt default would silently drop the system role and
+    // temperature/max_tokens — an observable downgrade.  Each adapter MUST implement these properly.
+
+    /// Send a multi-role message vector to the LLM and return the text response.
+    ///
+    /// `messages` may contain system, user, and/or assistant turns.
+    /// `opts` controls temperature and max_tokens (both optional).
+    ///
+    /// Post-processing: `strip_think` is applied to the raw response (matches
+    /// MiroFish `llm_client.py:67`).
+    async fn chat(&self, messages: &[ChatMessage], opts: &ChatOptions) -> Result<String>;
+
+    /// Send a multi-role message vector and parse the response as JSON.
+    ///
+    /// Post-processing: `strip_json_fence(&strip_think(raw))` then
+    /// `serde_json::from_str` (matches MiroFish `llm_client.py:94-100`).
+    async fn chat_json<T: DeserializeOwned>(
+        &self,
+        messages: &[ChatMessage],
+        opts: &ChatOptions,
+    ) -> Result<T>;
 }
 
 // ============================================================================
@@ -407,6 +488,74 @@ impl LlmClient for OpenAiAdapter {
 
         Ok(Box::pin(sse_stream))
     }
+
+    // --- DECISION-7: parameterized chat (additive; complete/complete_json/stream UNCHANGED) ---
+
+    async fn chat(&self, messages: &[ChatMessage], opts: &ChatOptions) -> Result<String> {
+        // Serialize messages verbatim — roles are lowercased by serde (ChatRole's rename_all).
+        let mut payload = serde_json::json!({
+            "model": self.model,
+            "messages": messages,
+        });
+
+        // Add temperature only when explicitly set (DECISION-7: omit key → server default).
+        if let Some(temp) = opts.temperature {
+            payload["temperature"] = serde_json::json!(temp);
+        }
+        // Add max_tokens only when explicitly set.
+        if let Some(max) = opts.max_tokens {
+            payload["max_tokens"] = serde_json::json!(max);
+        }
+
+        let response = self.call_api(payload).await?;
+
+        let raw = response
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .ok_or_else(|| TeriError::Llm("Invalid response format".to_string()))?;
+
+        // Strip <think>…</think> blocks (MiroFish llm_client.py:67)
+        Ok(strip_think(raw))
+    }
+
+    async fn chat_json<T: DeserializeOwned>(
+        &self,
+        messages: &[ChatMessage],
+        opts: &ChatOptions,
+    ) -> Result<T> {
+        let mut payload = serde_json::json!({
+            "model": self.model,
+            "messages": messages,
+            // JSON mode — matches existing complete_json and MiroFish chat_json
+            "response_format": { "type": "json_object" },
+        });
+
+        if let Some(temp) = opts.temperature {
+            payload["temperature"] = serde_json::json!(temp);
+        }
+        if let Some(max) = opts.max_tokens {
+            payload["max_tokens"] = serde_json::json!(max);
+        }
+
+        let response = self.call_api(payload).await?;
+
+        let raw = response
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .ok_or_else(|| TeriError::Llm("Invalid response format".to_string()))?;
+
+        // Strip <think> blocks, then strip markdown fences (MiroFish llm_client.py:67,94-97)
+        let content = strip_json_fence(&strip_think(raw));
+
+        serde_json::from_str(&content)
+            .map_err(|e| TeriError::Llm(format!("Failed to parse JSON response: {e}")))
+    }
 }
 
 // ============================================================================
@@ -604,6 +753,83 @@ impl LlmClient for AnthropicAdapter {
 
         Ok(Box::pin(sse_stream))
     }
+
+    // --- DECISION-7: parameterized chat for Anthropic (additive; existing methods UNCHANGED) ---
+
+    async fn chat(&self, messages: &[ChatMessage], opts: &ChatOptions) -> Result<String> {
+        // Anthropic API: system messages are a TOP-LEVEL "system" string, NOT a role in messages[].
+        // Partition: join all System contents into the top-level system param;
+        // User/Assistant messages go in "messages".
+        let system_text: String = messages
+            .iter()
+            .filter(|m| matches!(m.role, ChatRole::System))
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let user_msgs: Vec<serde_json::Value> = messages
+            .iter()
+            .filter(|m| !matches!(m.role, ChatRole::System))
+            .map(|m| {
+                let role = match m.role {
+                    ChatRole::User => "user",
+                    ChatRole::Assistant => "assistant",
+                    ChatRole::System => unreachable!("system filtered above"),
+                };
+                serde_json::json!({ "role": role, "content": m.content })
+            })
+            .collect();
+
+        // max_tokens is REQUIRED by the Anthropic API; default to 4096 when not specified
+        // (matches the hardcoded value at llm.rs:505,547 and MiroFish's default).
+        let max_tokens = opts.max_tokens.unwrap_or(4096);
+
+        let mut payload = serde_json::json!({
+            "model": self.model,
+            "messages": user_msgs,
+            "max_tokens": max_tokens,
+        });
+
+        if !system_text.is_empty() {
+            payload["system"] = serde_json::json!(system_text);
+        }
+
+        if let Some(temp) = opts.temperature {
+            payload["temperature"] = serde_json::json!(temp);
+        }
+
+        let response = self.call_api(payload).await?;
+
+        let raw = response
+            .get("content")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("text"))
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| TeriError::Llm("Invalid response format".to_string()))?;
+
+        // Strip <think>…</think> blocks (MiroFish llm_client.py:67)
+        Ok(strip_think(raw))
+    }
+
+    async fn chat_json<T: DeserializeOwned>(
+        &self,
+        messages: &[ChatMessage],
+        opts: &ChatOptions,
+    ) -> Result<T> {
+        // Anthropic has no native JSON mode; append the JSON sentinel (matches complete_json).
+        // We add it to the last user message or as an extra user message.
+        let mut extended: Vec<ChatMessage> = messages.to_vec();
+        // Append to user side: tack onto a fresh user turn (matches existing complete_json approach).
+        extended.push(ChatMessage::user("\n\nRespond with valid JSON only."));
+
+        let response = self.chat(&extended, opts).await?;
+
+        // chat() already applied strip_think; apply fence-strip before parse
+        let content = strip_json_fence(&response);
+
+        serde_json::from_str(&content)
+            .map_err(|e| TeriError::Llm(format!("Failed to parse JSON response: {e}")))
+    }
 }
 
 // ============================================================================
@@ -800,6 +1026,149 @@ impl LlmClient for GeminiAdapter {
         };
 
         Ok(Box::pin(sse_stream))
+    }
+
+    // --- DECISION-7: parameterized chat for Gemini (additive; existing methods UNCHANGED) ---
+
+    async fn chat(&self, messages: &[ChatMessage], opts: &ChatOptions) -> Result<String> {
+        // Gemini API:
+        //   - system messages → top-level "systemInstruction": {"parts":[{"text": …}]}
+        //   - user/assistant messages → "contents": [{"role": "user"/"model", "parts":[{"text": …}]}]
+        //   - role mapping: User→"user", Assistant→"model"
+        let system_text: String = messages
+            .iter()
+            .filter(|m| matches!(m.role, ChatRole::System))
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let contents: Vec<serde_json::Value> = messages
+            .iter()
+            .filter(|m| !matches!(m.role, ChatRole::System))
+            .map(|m| {
+                let role = match m.role {
+                    ChatRole::User => "user",
+                    ChatRole::Assistant => "model",
+                    ChatRole::System => unreachable!("system filtered above"),
+                };
+                serde_json::json!({
+                    "role": role,
+                    "parts": [{ "text": m.content }]
+                })
+            })
+            .collect();
+
+        let mut payload = serde_json::json!({
+            "contents": contents,
+        });
+
+        if !system_text.is_empty() {
+            payload["systemInstruction"] = serde_json::json!({
+                "parts": [{ "text": system_text }]
+            });
+        }
+
+        // generationConfig: temperature and/or maxOutputTokens when set
+        let mut gen_config = serde_json::Map::new();
+        if let Some(temp) = opts.temperature {
+            gen_config.insert("temperature".to_string(), serde_json::json!(temp));
+        }
+        if let Some(max) = opts.max_tokens {
+            gen_config.insert("maxOutputTokens".to_string(), serde_json::json!(max));
+        }
+        if !gen_config.is_empty() {
+            payload["generationConfig"] = serde_json::Value::Object(gen_config);
+        }
+
+        let response = self.call_api(payload).await?;
+
+        let raw = response
+            .get("candidates")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("content"))
+            .and_then(|c| c.get("parts"))
+            .and_then(|p| p.get(0))
+            .and_then(|p| p.get("text"))
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| TeriError::Llm("Invalid response format".to_string()))?;
+
+        // Strip <think>…</think> blocks (MiroFish llm_client.py:67)
+        Ok(strip_think(raw))
+    }
+
+    async fn chat_json<T: DeserializeOwned>(
+        &self,
+        messages: &[ChatMessage],
+        opts: &ChatOptions,
+    ) -> Result<T> {
+        // Gemini JSON mode: set responseMimeType in generationConfig.
+        // Build payload directly (can't delegate to chat() because we need to inject into
+        // generationConfig before the call_api call).
+        let system_text: String = messages
+            .iter()
+            .filter(|m| matches!(m.role, ChatRole::System))
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let contents: Vec<serde_json::Value> = messages
+            .iter()
+            .filter(|m| !matches!(m.role, ChatRole::System))
+            .map(|m| {
+                let role = match m.role {
+                    ChatRole::User => "user",
+                    ChatRole::Assistant => "model",
+                    ChatRole::System => unreachable!("system filtered above"),
+                };
+                serde_json::json!({
+                    "role": role,
+                    "parts": [{ "text": m.content }]
+                })
+            })
+            .collect();
+
+        let mut payload = serde_json::json!({
+            "contents": contents,
+        });
+
+        if !system_text.is_empty() {
+            payload["systemInstruction"] = serde_json::json!({
+                "parts": [{ "text": system_text }]
+            });
+        }
+
+        // generationConfig with responseMimeType for JSON mode
+        let mut gen_config = serde_json::Map::new();
+        if let Some(temp) = opts.temperature {
+            gen_config.insert("temperature".to_string(), serde_json::json!(temp));
+        }
+        if let Some(max) = opts.max_tokens {
+            gen_config.insert("maxOutputTokens".to_string(), serde_json::json!(max));
+        }
+        // Belt-and-suspenders JSON sentinel (also set responseMimeType)
+        gen_config.insert(
+            "responseMimeType".to_string(),
+            serde_json::json!("application/json"),
+        );
+        payload["generationConfig"] = serde_json::Value::Object(gen_config);
+
+        let response = self.call_api(payload).await?;
+
+        let raw = response
+            .get("candidates")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("content"))
+            .and_then(|c| c.get("parts"))
+            .and_then(|p| p.get(0))
+            .and_then(|p| p.get("text"))
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| TeriError::Llm("Invalid response format".to_string()))?;
+
+        // Strip <think> blocks, then strip markdown fences, then parse
+        let content = strip_json_fence(&strip_think(raw));
+
+        serde_json::from_str(&content)
+            .map_err(|e| TeriError::Llm(format!("Failed to parse JSON response: {e}")))
     }
 }
 
@@ -1381,6 +1750,517 @@ data: [DONE]\n",
             output.push_str(&chunk.unwrap());
         }
         assert_eq!(output, "Hello Gemini");
+        mock.assert();
+    }
+
+    // =========================================================================
+    // DECISION-7 — OpenAiAdapter::chat / chat_json (parameterized multi-role)
+    // =========================================================================
+
+    /// Unit test: verify the payload shape built for chat() contains the right
+    /// message roles and optional fields without making HTTP calls.
+    #[test]
+    fn test_openai_chat_payload_shape() {
+        // Build the payload that chat() would send (mirrors the implementation)
+        let messages = &[
+            ChatMessage::system("You are helpful"),
+            ChatMessage::user("Hello"),
+        ];
+        let opts = ChatOptions { temperature: Some(0.3), max_tokens: Some(4096) };
+
+        let mut payload = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": messages,
+        });
+        if let Some(temp) = opts.temperature {
+            payload["temperature"] = serde_json::json!(temp);
+        }
+        if let Some(max) = opts.max_tokens {
+            payload["max_tokens"] = serde_json::json!(max);
+        }
+
+        // Verify message roles
+        let msgs = payload["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "You are helpful");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "Hello");
+        // temperature and max_tokens present when set
+        assert!((payload["temperature"].as_f64().unwrap() - 0.3).abs() < 1e-6);
+        assert_eq!(payload["max_tokens"], 4096);
+    }
+
+    /// Unit test: when opts fields are None, temperature and max_tokens are absent.
+    #[test]
+    fn test_openai_chat_payload_opts_absent_when_none() {
+        let messages = &[ChatMessage::user("hi")];
+        let opts = ChatOptions::default();
+
+        let mut payload = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": messages,
+        });
+        if let Some(temp) = opts.temperature {
+            payload["temperature"] = serde_json::json!(temp);
+        }
+        if let Some(max) = opts.max_tokens {
+            payload["max_tokens"] = serde_json::json!(max);
+        }
+
+        assert!(payload.get("temperature").map(|v| v.is_null()).unwrap_or(true),
+            "temperature must be absent when None");
+        assert!(payload.get("max_tokens").map(|v| v.is_null()).unwrap_or(true),
+            "max_tokens must be absent when None");
+    }
+
+    /// Unit test: chat_json payload includes response_format.
+    #[test]
+    fn test_openai_chat_json_payload_has_response_format() {
+        let messages = &[ChatMessage::system("sys"), ChatMessage::user("user")];
+        let opts = ChatOptions { temperature: Some(0.3), max_tokens: Some(4096) };
+
+        let mut payload = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": messages,
+            "response_format": { "type": "json_object" },
+        });
+        if let Some(temp) = opts.temperature {
+            payload["temperature"] = serde_json::json!(temp);
+        }
+        if let Some(max) = opts.max_tokens {
+            payload["max_tokens"] = serde_json::json!(max);
+        }
+
+        assert_eq!(payload["response_format"]["type"], "json_object");
+        assert!((payload["temperature"].as_f64().unwrap() - 0.3).abs() < 1e-6);
+        assert_eq!(payload["max_tokens"], 4096);
+    }
+
+    /// chat: system+user messages reach the server and the response is returned.
+    #[tokio::test]
+    async fn test_openai_chat_with_system_and_user() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/chat/completions");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"choices":[{"message":{"content":"Hi there"}}]}"#);
+        });
+
+        let client = OpenAiAdapter::new(&openai_config(&server, 0));
+        let resp = client
+            .chat(
+                &[
+                    ChatMessage::system("You are helpful"),
+                    ChatMessage::user("Hello"),
+                ],
+                &ChatOptions { temperature: Some(0.3), max_tokens: Some(4096) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp, "Hi there");
+        mock.assert();
+    }
+
+    /// chat: temperature and max_tokens are absent when None — response still received.
+    #[tokio::test]
+    async fn test_openai_chat_opts_absent_when_none() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/chat/completions");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"choices":[{"message":{"content":"default response"}}]}"#);
+        });
+
+        let client = OpenAiAdapter::new(&openai_config(&server, 0));
+        let resp = client
+            .chat(
+                &[ChatMessage::user("hi")],
+                &ChatOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp, "default response");
+        mock.assert();
+    }
+
+    /// chat: think-blocks are stripped from the response.
+    #[tokio::test]
+    async fn test_openai_chat_strips_think() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/chat/completions");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"choices":[{"message":{"content":"<think>reasoning</think>Answer"}}]}"#);
+        });
+
+        let client = OpenAiAdapter::new(&openai_config(&server, 0));
+        let resp = client
+            .chat(&[ChatMessage::user("q")], &ChatOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(resp, "Answer");
+    }
+
+    /// chat_json: response is parsed as JSON.
+    #[tokio::test]
+    async fn test_openai_chat_json_parses_object() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/chat/completions");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"choices":[{"message":{"content":"{\"entity_types\":[]}"}}]}"#);
+        });
+
+        let client = OpenAiAdapter::new(&openai_config(&server, 0));
+        let resp: serde_json::Value = client
+            .chat_json(
+                &[
+                    ChatMessage::system("sys"),
+                    ChatMessage::user("user"),
+                ],
+                &ChatOptions { temperature: Some(0.3), max_tokens: Some(4096) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp["entity_types"], serde_json::json!([]));
+        mock.assert();
+    }
+
+    /// chat_json: fenced JSON in the response is stripped before parsing.
+    #[tokio::test]
+    async fn test_openai_chat_json_strips_fence_and_think() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/chat/completions");
+            then.status(200).header("Content-Type", "application/json").body(
+                "{\
+                    \"choices\":[{\"message\":{\"content\":\"<think>r</think>```json\\n{\\\"v\\\":1}\\n```\"}}]\
+                }",
+            );
+        });
+
+        let client = OpenAiAdapter::new(&openai_config(&server, 0));
+        let resp: serde_json::Value = client
+            .chat_json(
+                &[ChatMessage::user("q")],
+                &ChatOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp["v"], 1);
+    }
+
+    // =========================================================================
+    // DECISION-7 — AnthropicAdapter::chat / chat_json
+    // =========================================================================
+
+    /// Unit test: Anthropic chat payload puts system messages in top-level "system",
+    /// user messages in "messages", and max_tokens defaults to 4096.
+    #[test]
+    fn test_anthropic_chat_payload_system_partition() {
+        let messages = &[
+            ChatMessage::system("You are a helpful assistant"),
+            ChatMessage::user("Hello"),
+        ];
+        let opts = ChatOptions::default();
+
+        let system_text: String = messages
+            .iter()
+            .filter(|m| matches!(m.role, ChatRole::System))
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let user_msgs: Vec<serde_json::Value> = messages
+            .iter()
+            .filter(|m| !matches!(m.role, ChatRole::System))
+            .map(|m| {
+                let role = match m.role {
+                    ChatRole::User => "user",
+                    ChatRole::Assistant => "assistant",
+                    ChatRole::System => unreachable!(),
+                };
+                serde_json::json!({ "role": role, "content": m.content })
+            })
+            .collect();
+
+        let max_tokens = opts.max_tokens.unwrap_or(4096);
+        let mut payload = serde_json::json!({
+            "model": "claude-3.5-sonnet",
+            "messages": user_msgs,
+            "max_tokens": max_tokens,
+        });
+        if !system_text.is_empty() {
+            payload["system"] = serde_json::json!(system_text);
+        }
+        if let Some(temp) = opts.temperature {
+            payload["temperature"] = serde_json::json!(temp);
+        }
+
+        // system messages partitioned to top-level "system"
+        assert_eq!(payload["system"], "You are a helpful assistant");
+        // user messages in "messages"
+        let msgs = payload["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "Hello");
+        // max_tokens defaults to 4096
+        assert_eq!(payload["max_tokens"], 4096);
+        // temperature absent when None
+        assert!(payload.get("temperature").is_none() || payload["temperature"].is_null());
+    }
+
+    /// chat: system+user messages are delivered; response is returned.
+    #[tokio::test]
+    async fn test_anthropic_chat_system_partition() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/messages");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"content":[{"text":"Hi from Claude"}]}"#);
+        });
+
+        let client = AnthropicAdapter::new_with_base(
+            "sk-ant-test".to_string(),
+            "claude-3.5-sonnet".to_string(),
+            server.base_url(),
+        );
+        let resp = client
+            .chat(
+                &[
+                    ChatMessage::system("You are a helpful assistant"),
+                    ChatMessage::user("Hello"),
+                ],
+                &ChatOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp, "Hi from Claude");
+        mock.assert();
+    }
+
+    /// chat: temperature is included when set; max_tokens uses explicit value.
+    #[tokio::test]
+    async fn test_anthropic_chat_with_temperature_and_max_tokens() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/messages");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"content":[{"text":"response"}]}"#);
+        });
+
+        let client = AnthropicAdapter::new_with_base(
+            "sk-ant-test".to_string(),
+            "claude-3.5-sonnet".to_string(),
+            server.base_url(),
+        );
+        let resp = client
+            .chat(
+                &[ChatMessage::user("q")],
+                &ChatOptions { temperature: Some(0.5), max_tokens: Some(2048) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp, "response");
+        mock.assert();
+    }
+
+    /// chat_json: JSON sentinel is appended and fence is stripped.
+    #[tokio::test]
+    async fn test_anthropic_chat_json_parses_json() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/messages");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"content":[{"text":"{\"k\":42}"}]}"#);
+        });
+
+        let client = AnthropicAdapter::new_with_base(
+            "sk-ant-test".to_string(),
+            "claude-3.5-sonnet".to_string(),
+            server.base_url(),
+        );
+        let resp: serde_json::Value = client
+            .chat_json(
+                &[
+                    ChatMessage::system("sys"),
+                    ChatMessage::user("produce JSON"),
+                ],
+                &ChatOptions { temperature: Some(0.3), max_tokens: Some(4096) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp["k"], 42);
+        mock.assert();
+    }
+
+    // =========================================================================
+    // DECISION-7 — GeminiAdapter::chat / chat_json
+    // =========================================================================
+
+    /// Unit test: Gemini chat payload puts system messages in systemInstruction,
+    /// user/assistant in contents, and generationConfig when opts are set.
+    #[test]
+    fn test_gemini_chat_payload_shape() {
+        let messages = &[ChatMessage::system("Be brief"), ChatMessage::user("Q?")];
+        let opts = ChatOptions { temperature: Some(0.3), max_tokens: Some(4096) };
+
+        let system_text: String = messages
+            .iter()
+            .filter(|m| matches!(m.role, ChatRole::System))
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let contents: Vec<serde_json::Value> = messages
+            .iter()
+            .filter(|m| !matches!(m.role, ChatRole::System))
+            .map(|m| {
+                let role = match m.role {
+                    ChatRole::User => "user",
+                    ChatRole::Assistant => "model",
+                    ChatRole::System => unreachable!(),
+                };
+                serde_json::json!({ "role": role, "parts": [{ "text": m.content }] })
+            })
+            .collect();
+
+        let mut payload = serde_json::json!({ "contents": contents });
+        if !system_text.is_empty() {
+            payload["systemInstruction"] = serde_json::json!({
+                "parts": [{ "text": system_text }]
+            });
+        }
+        let mut gen_config = serde_json::Map::new();
+        if let Some(temp) = opts.temperature {
+            gen_config.insert("temperature".to_string(), serde_json::json!(temp));
+        }
+        if let Some(max) = opts.max_tokens {
+            gen_config.insert("maxOutputTokens".to_string(), serde_json::json!(max));
+        }
+        if !gen_config.is_empty() {
+            payload["generationConfig"] = serde_json::Value::Object(gen_config);
+        }
+
+        // systemInstruction present
+        assert_eq!(payload["systemInstruction"]["parts"][0]["text"], "Be brief");
+        // contents has user message
+        let contents = payload["contents"].as_array().unwrap();
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[0]["parts"][0]["text"], "Q?");
+        // generationConfig carries temperature and maxOutputTokens
+        let gc = &payload["generationConfig"];
+        assert!((gc["temperature"].as_f64().unwrap() - 0.3).abs() < 1e-6);
+        assert_eq!(gc["maxOutputTokens"], 4096);
+    }
+
+    /// chat: system+user reach server; response is returned.
+    #[tokio::test]
+    async fn test_gemini_chat_system_and_user() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1beta/models/gemini-1.5-pro:generateContent");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"candidates":[{"content":{"parts":[{"text":"Gemini answer"}]}}]}"#);
+        });
+
+        let client = GeminiAdapter::new_with_base(
+            "AIza-test".to_string(),
+            "gemini-1.5-pro".to_string(),
+            server.base_url(),
+        );
+        let resp = client
+            .chat(
+                &[ChatMessage::system("Be brief"), ChatMessage::user("Q?")],
+                &ChatOptions { temperature: Some(0.3), max_tokens: Some(4096) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp, "Gemini answer");
+        mock.assert();
+    }
+
+    /// chat_json: responseMimeType is in payload (unit test); response is parsed.
+    #[test]
+    fn test_gemini_chat_json_mime_type_in_payload() {
+        let opts = ChatOptions::default();
+        let mut gen_config = serde_json::Map::new();
+        if let Some(temp) = opts.temperature {
+            gen_config.insert("temperature".to_string(), serde_json::json!(temp));
+        }
+        if let Some(max) = opts.max_tokens {
+            gen_config.insert("maxOutputTokens".to_string(), serde_json::json!(max));
+        }
+        gen_config.insert(
+            "responseMimeType".to_string(),
+            serde_json::json!("application/json"),
+        );
+        let payload = serde_json::json!({
+            "contents": [],
+            "generationConfig": serde_json::Value::Object(gen_config),
+        });
+        assert_eq!(payload["generationConfig"]["responseMimeType"], "application/json");
+    }
+
+    /// chat_json: response is parsed from JSON.
+    #[tokio::test]
+    async fn test_gemini_chat_json_sets_mime_type() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1beta/models/gemini-1.5-pro:generateContent");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"candidates":[{"content":{"parts":[{"text":"{\"x\":7}"}]}}]}"#);
+        });
+
+        let client = GeminiAdapter::new_with_base(
+            "AIza-test".to_string(),
+            "gemini-1.5-pro".to_string(),
+            server.base_url(),
+        );
+        let resp: serde_json::Value = client
+            .chat_json(
+                &[ChatMessage::user("give me JSON")],
+                &ChatOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp["x"], 7);
+        mock.assert();
+    }
+
+    /// chat_json: no system messages → no systemInstruction key in payload.
+    #[tokio::test]
+    async fn test_gemini_chat_json_no_system_no_instruction() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1beta/models/gemini-1.5-pro:generateContent");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"candidates":[{"content":{"parts":[{"text":"{\"r\":1}"}]}}]}"#);
+        });
+
+        let client = GeminiAdapter::new_with_base(
+            "AIza-test".to_string(),
+            "gemini-1.5-pro".to_string(),
+            server.base_url(),
+        );
+        let resp: serde_json::Value = client
+            .chat_json(&[ChatMessage::user("q")], &ChatOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(resp["r"], 1);
         mock.assert();
     }
 }

@@ -108,8 +108,8 @@
 
 - [x] S-056 · `unit:U-008` · `type` · `LLMClient` · OpenAI-compatible LLM wrapper · `llm_client.py:14` · **rust-target:** `LlmClient` trait + `OpenAiAdapter` / `AnthropicAdapter` / `GeminiAdapter` at `src/llm.rs`; provider-agnostic trait covering chat, chat_json, stream
 - [x] S-057 · `unit:U-008` · `method` · `LLMClient.__init__` · reads LLM_API_KEY/BASE_URL/MODEL_NAME from Config · `llm_client.py:17` · **rust-target:** `OpenAiAdapter::new(&LlmConfig)` / `AnthropicAdapter::new` / `GeminiAdapter::new` at `src/llm.rs`; validated via `LlmConfig::validate()` in config.rs
-- [x] S-058 · `unit:U-008` · `method` · `LLMClient.chat` · calls chat.completions.create, strips `<think>` tags · `llm_client.py:35` · **rust-target:** `LlmClient::complete` on all 3 adapters at `src/llm.rs`; `strip_think` helper (manual scan, no regex dep) applied to raw content; tested: single block, multi-block, no block, multiline, whitespace trim — all 3 adapters covered
-- [x] S-059 · `unit:U-008` · `method` · `LLMClient.chat_json` · calls chat with json_object format, strips markdown fences, parses JSON · `llm_client.py:70` · **rust-target:** `LlmClient::complete_json` on all 3 adapters at `src/llm.rs`; `strip_think` then `strip_json_fence` (handles ```json\n…\n``` and bare ```…```) before serde_json::from_str; parse-fail → TeriError::Llm (matches MiroFish ValueError); tested: plain JSON, ```json fenced, bare ``` fenced, think+fence combined — all 3 adapters covered
+- [x] S-058 · `unit:U-008` · `method` · `LLMClient.chat` · calls chat.completions.create with `messages`+`temperature`+`max_tokens`, strips `<think>` tags · `llm_client.py:35` · **rust-target:** the convenience single-prompt path is `LlmClient::complete`; the FAITHFUL full-signature port (messages-vector + temperature + max_tokens) is `LlmClient::chat(&[ChatMessage], &ChatOptions)` added 2026-06-17 (DECISION-7, extend-Y on U-008) — implemented on all 3 adapters, reuses `strip_think`. The earlier `complete(&str)`-only mapping was a convenience subset; DECISION-7 closes the messages/temp/max_tokens parameterization gap. Both covered.
+- [x] S-059 · `unit:U-008` · `method` · `LLMClient.chat_json` · calls chat with json_object format + `messages`+`temperature`+`max_tokens`, strips fences, parses JSON · `llm_client.py:70` · **rust-target:** convenience single-prompt path `LlmClient::complete_json`; FAITHFUL full-signature port is `LlmClient::chat_json::<T>(&[ChatMessage], &ChatOptions)` added 2026-06-17 (DECISION-7, extend-Y on U-008) — all 3 adapters (OpenAI `response_format:json_object`; Anthropic system-partition + max_tokens default 4096; Gemini systemInstruction + generationConfig + responseMimeType), `strip_think`→`strip_json_fence`→serde_json, parse-fail → TeriError::Llm. Consumed by U-014 generate() (temp 0.3 + max_tokens 4096 + system role). opus-verified additive, no U-008 regression (complete*/stream byte-identical). Both covered.
 
 ---
 
@@ -252,15 +252,15 @@
 
 ## U-014 — `backend/app/services/ontology_generator.py`
 
-- [ ] S-172 · `unit:U-014` · `const` · `ONTOLOGY_SYSTEM_PROMPT` · LLM system prompt for ontology generation · `ontology_generator.py:30`
-- [ ] S-173 · `unit:U-014` · `fn` · `_to_pascal_case` · name normalisation helper · `ontology_generator.py:16`
-- [ ] S-174 · `unit:U-014` · `type` · `OntologyGenerator` · `ontology_generator.py:176`
-- [ ] S-175 · `unit:U-014` · `method` · `OntologyGenerator.__init__` · `ontology_generator.py:182`
-- [ ] S-176 · `unit:U-014` · `method` · `OntologyGenerator.generate` · calls LLM → {entity_types,edge_types,analysis_summary} · `ontology_generator.py:185`
-- [ ] S-177 · `unit:U-014` · `field` · `OntologyGenerator.MAX_TEXT_LENGTH_FOR_LLM` · 50000 chars truncation · `ontology_generator.py:229`
-- [ ] S-178 · `unit:U-014` · `method` · `OntologyGenerator._build_user_message` · `ontology_generator.py:231`
-- [ ] S-179 · `unit:U-014` · `method` · `OntologyGenerator._validate_and_process` · enforces 10 entity types, PascalCase, SCREAMING_SNAKE edge names · `ontology_generator.py:277`
-- [ ] S-180 · `unit:U-014` · `method` · `OntologyGenerator.generate_python_code` · produces Python class definitions from ontology · `ontology_generator.py:400`
+- [x] S-172 · `unit:U-014` · `const` · `ONTOLOGY_SYSTEM_PROMPT` · LLM system prompt for ontology generation · `ontology_generator.py:30` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh+extend)
+- [x] S-173 · `unit:U-014` · `fn` · `_to_pascal_case` · name normalisation helper · `ontology_generator.py:16` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh+extend)
+- [x] S-174 · `unit:U-014` · `type` · `OntologyGenerator` · `ontology_generator.py:176` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh+extend)
+- [x] S-175 · `unit:U-014` · `method` · `OntologyGenerator.__init__` · `ontology_generator.py:182` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh+extend)
+- [x] S-176 · `unit:U-014` · `method` · `OntologyGenerator.generate` · calls LLM → {entity_types,edge_types,analysis_summary} · `ontology_generator.py:185` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh+extend)
+- [x] S-177 · `unit:U-014` · `field` · `OntologyGenerator.MAX_TEXT_LENGTH_FOR_LLM` · 50000 chars truncation · `ontology_generator.py:229` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh+extend)
+- [x] S-178 · `unit:U-014` · `method` · `OntologyGenerator._build_user_message` · `ontology_generator.py:231` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh+extend)
+- [x] S-179 · `unit:U-014` · `method` · `OntologyGenerator._validate_and_process` · enforces 10 entity types, PascalCase, SCREAMING_SNAKE edge names · `ontology_generator.py:277` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh+extend)
+- [≠] S-180 · `unit:U-014` · `method` · `OntologyGenerator.generate_python_code` · produces Python class definitions from ontology · `ontology_generator.py:400` · **INTENTIONAL-DIVERGENCE — opus-ACCEPTED 2026-06-17 (independently verified, NOT a disguised skip).** (1) ZERO callers anywhere in MiroFish (verifier grepped whole repo → only its own def — dead code). (2) Emits Zep-Cloud Python class strings (`from zep_cloud.external_clients.ontology import EntityModel,EntityText,EdgeModel`) for a SaaS teri replaced with native petgraph — genuinely-inexpressible-in-substrate. (3) The real ontology-registration path is `graph_builder.set_ontology` (py:205/288) which builds types dynamically from the validated ontology DICT and calls `client.graph.set_ontology(...)` — `generate_python_code` is NOT on that path; the DICT (which `generate`/`_validate_and_process` produce) IS ported. Registration behavior maps onto teri native `EntityKind::Custom` (OQ-5/GAP-3) via future S-192 set_ontology. The observable output (dict) is ported; only the unused substrate-specific code-string emitter is dropped → legitimate `[≠]`/map-onto. `src/services/ontology.rs` (doc comment)
 
 ---
 

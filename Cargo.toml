@@ -81,6 +81,9 @@ chrono = { version = "0.4", features = ["serde"] }
 # Templating (persona/prompt templates)
 minijinja = "1"
 
+# Regex (used by OntologyGenerator._to_pascal_case — S-173)
+regex = "1"
+
 # File format support
 pdfium-render = "0.8"
 scraper = "0.19"

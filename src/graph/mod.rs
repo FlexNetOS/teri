@@ -1073,6 +1073,20 @@ mod tests {
             ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
                 Err(TeriError::Llm("simulated LLM failure".to_string()))
             }
+            async fn chat(
+                &self,
+                _messages: &[crate::llm::ChatMessage],
+                _opts: &crate::llm::ChatOptions,
+            ) -> Result<String> {
+                Err(TeriError::Llm("not used".into()))
+            }
+            async fn chat_json<T: serde::de::DeserializeOwned>(
+                &self,
+                _messages: &[crate::llm::ChatMessage],
+                _opts: &crate::llm::ChatOptions,
+            ) -> Result<T> {
+                Err(TeriError::Llm("not used".into()))
+            }
         }
 
         let doc = SeedDocument {
@@ -1663,6 +1677,20 @@ mod tests {
         ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
             Err(TeriError::Llm("Streaming not implemented in mock".to_string()))
         }
+        async fn chat(
+            &self,
+            _messages: &[crate::llm::ChatMessage],
+            _opts: &crate::llm::ChatOptions,
+        ) -> Result<String> {
+            Err(TeriError::Llm("not used".into()))
+        }
+        async fn chat_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _messages: &[crate::llm::ChatMessage],
+            _opts: &crate::llm::ChatOptions,
+        ) -> Result<T> {
+            Err(TeriError::Llm("not used".into()))
+        }
     }
 
     // ===== Multi-chunk mock LLM that returns different entities per chunk =====
@@ -1719,6 +1747,20 @@ mod tests {
             _prompt: &str,
         ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
             Err(TeriError::Llm("Streaming not implemented in chunk-counting mock".to_string()))
+        }
+        async fn chat(
+            &self,
+            _messages: &[crate::llm::ChatMessage],
+            _opts: &crate::llm::ChatOptions,
+        ) -> Result<String> {
+            Err(TeriError::Llm("not used".into()))
+        }
+        async fn chat_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _messages: &[crate::llm::ChatMessage],
+            _opts: &crate::llm::ChatOptions,
+        ) -> Result<T> {
+            Err(TeriError::Llm("not used".into()))
         }
     }
 

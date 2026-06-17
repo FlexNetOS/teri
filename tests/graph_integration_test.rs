@@ -76,6 +76,22 @@ impl LlmClient for IntegrationMockLlm {
             "Streaming not implemented in integration mock".to_string(),
         ))
     }
+
+    async fn chat(
+        &self,
+        _messages: &[teri::llm::ChatMessage],
+        _opts: &teri::llm::ChatOptions,
+    ) -> teri::error::Result<String> {
+        Err(teri::error::TeriError::Llm("not used".to_string()))
+    }
+
+    async fn chat_json<T: serde::de::DeserializeOwned>(
+        &self,
+        _messages: &[teri::llm::ChatMessage],
+        _opts: &teri::llm::ChatOptions,
+    ) -> teri::error::Result<T> {
+        Err(teri::error::TeriError::Llm("not used".to_string()))
+    }
 }
 
 #[tokio::test]

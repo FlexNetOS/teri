@@ -268,3 +268,97 @@ U-005/U-050 i18n → U-012 TaskManager → U-011 → U-010 action_logger → U-0
 1. **U-015 wire `build()`** — unblocks the entire graph→report→ontology chain (claim 1; helpers already exist, ~highest-ROI).
 2. **OQ-2 `Relation.valid_at` + OQ-3 `query_vec_similarity`** — the two cross-cutting schema/stub changes; every graph/report consumer depends on the final shapes, so landing them early avoids rework.
 3. **`Action` enum extension + native SimEngine platform layer (Decision-2)** — unlocks U-022/U-028/U-029/U-030 and the whole simulation entrypoint.
+
+---
+
+## DECISION-7 — parameterized chat (system+user, temperature, max_tokens) → extend-Y on U-008 (additive superset; GAP-6 lineage)
+
+**Trigger:** U-014 `OntologyGenerator.generate()` and several other pending units (`SimulationConfigGenerator`, `ReportAgent`, `OasisProfileGenerator`) call MiroFish `LLMClient.chat_json(messages=[{system},{user}], temperature, max_tokens)` / `chat(...)` (`backend/app/utils/llm_client.py:35-102`). teri's `LlmClient` trait (`src/llm.rs:194-204`) only exposes `complete(&str)` / `complete_json::<T>(&str)` / `stream(&str)`: single user-role prompt, HARDCODED temperature (`complete`=0.7, `complete_json`=0.0), no system role, no `max_tokens`. A faithful port of `generate()` cannot currently express (a) a distinct system message, (b) `temperature=0.3`, (c) `max_tokens=4096`. Folding system+user into one prompt and accepting temp=0.0/no-cap is an **observable downgrade** (temperature + max_tokens are explicit source choices; role separation matters for some models).
+
+**Class:** **extend-Y on U-008** (additive superset; GAP-6/Decision-3 lineage). Adds capability, never narrows. U-008 is already parity-verified `[x]` — this MUST NOT regress it.
+
+### 1. New trait surface (chosen: option (a) — message-vector + options struct; reuses MiroFish's own `chat`/`chat_json` shape 1:1)
+
+Add to `src/llm.rs` (new public type defs + two new trait methods):
+
+```rust
+/// One chat message. Role is a closed set (system|user|assistant) so a typo
+/// can't silently produce an unknown role; serializes to the lowercase wire
+/// string each provider expects.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatMessage {
+    pub role: ChatRole,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatRole {
+    System,
+    User,
+    Assistant,
+}
+
+/// Optional tuning. None = adapter's existing default (so options-less callers
+/// are unchanged). Mirrors MiroFish chat() kwargs temperature/max_tokens.
+#[derive(Debug, Clone, Default)]
+pub struct ChatOptions {
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+}
+
+impl ChatMessage {
+    pub fn system(content: impl Into<String>) -> Self { Self { role: ChatRole::System, content: content.into() } }
+    pub fn user(content: impl Into<String>)   -> Self { Self { role: ChatRole::User,   content: content.into() } }
+}
+```
+
+Two new trait methods (additive — the existing three are byte-identical, NOT touched):
+
+```rust
+#[async_trait]
+pub trait LlmClient: Send + Sync {
+    // --- UNCHANGED (U-008 verified) ---
+    async fn complete(&self, prompt: &str) -> Result<String>;
+    async fn complete_json<T: DeserializeOwned>(&self, prompt: &str) -> Result<T>;
+    async fn stream(&self, prompt: &str)
+        -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>>;
+
+    // --- NEW (DECISION-7): parameterized chat. system+user vector, opt temp/max_tokens ---
+    async fn chat(&self, messages: &[ChatMessage], opts: &ChatOptions) -> Result<String>;
+    async fn chat_json<T: DeserializeOwned>(
+        &self,
+        messages: &[ChatMessage],
+        opts: &ChatOptions,
+    ) -> Result<T>;
+}
+```
+
+Rejected options: (b) builder — heavier API surface for no gain over an options struct; (c) one fat `ChatRequest` struct passed by value — fine but `&[ChatMessage] + &ChatOptions` keeps the message vector borrowable and matches MiroFish's `(messages, temperature, max_tokens)` arg shape exactly, easing differential testing.
+
+### 2. No-regression mechanism — REQUIRED on all 3 adapters (NOT a default-impl)
+
+A default trait impl is **forbidden here**: a no-op/single-prompt default would silently drop system role + temperature + max_tokens — a downgrade. Each of the 3 adapters implements `chat`/`chat_json` properly, building its own provider-native payload. The existing `complete`/`complete_json`/`stream` bodies are **unchanged** (byte-identical) — porter does additive `impl` blocks only.
+
+Post-processing parity (reuse existing free fns — do NOT reimplement): `chat` applies `strip_think` to the extracted text; `chat_json` applies `strip_json_fence(&strip_think(raw))` then `serde_json::from_str`. Identical to the existing `complete`/`complete_json` post-processing (`llm.rs:302-303,331-335`) and to MiroFish `chat`/`chat_json` (`llm_client.py:67,94-100`). The retry/back-off path is inherited for free: each adapter's `chat*` calls the SAME `call_api(serde_json::Value)` the existing methods use — no new retry code.
+
+**Per-adapter payload (each `chat_json` = build payload → `call_api` → extract → `strip_json_fence(strip_think(..))` → parse; `chat` = same minus fence/parse):**
+
+- **OpenAiAdapter** (production / shimmy path, `llm.rs:279`): `messages[]` carries system+user roles verbatim; add `temperature` only when `opts.temperature.is_some()`, `max_tokens` only when `opts.max_tokens.is_some()`; `chat_json` also sets `"response_format": {"type":"json_object"}` (matches existing `complete_json` and MiroFish `chat_json`). Reuses `self.call_api(payload)` (llm.rs:236) unchanged. Extract `choices[0].message.content`.
+  *(Defaults when `opts` field is None: omit the key → server/shimmy default. To exactly preserve the current `complete`/`complete_json` temps for any internal caller that migrates, the caller passes `temperature: Some(0.7)` / `Some(0.0)` explicitly — the new method does not hardcode.)*
+
+- **AnthropicAdapter** (`llm.rs:494`): Anthropic does NOT take a `system` message role — it is a **top-level `system` string param**. Partition `messages`: concatenate all `System` contents into the top-level `"system"` field (join with `"\n\n"`), put `User`/`Assistant` into `messages[]`. `max_tokens` is **REQUIRED by the Anthropic API** — when `opts.max_tokens` is None, default to `4096` (matches the value already hardcoded at `llm.rs:505,547` and MiroFish's `max_tokens=4096` default). Add `temperature` when `opts.temperature.is_some()`. Reuses `self.call_api` (llm.rs ~460). Extract `content[0].text`. *(API facts confirmed against the claude-api skill: `system` is top-level, `max_tokens` is required, `temperature` accepted on current models.)*
+
+- **GeminiAdapter** (`llm.rs:693`): system prompt → top-level `"systemInstruction": {"parts":[{"text": <joined system msgs>}]}`; user/assistant → `"contents":[{"role","parts":[{"text"}]}]` (Gemini role is `"user"`/`"model"` — map `Assistant`→`"model"`). Tuning → `"generationConfig": { "temperature": <if some>, "maxOutputTokens": <if some> }`. For `chat_json`, also set `"generationConfig.responseMimeType": "application/json"` (Gemini's JSON mode; the existing `complete_json` instead appends a "Respond with valid JSON only." sentinel — the new method may keep that sentinel as belt-and-suspenders, but the mime-type is the faithful expression of `response_format`). Reuses `self.call_api` (llm.rs:648). Extract `candidates[0].content.parts[0].text`.
+
+### 3. Existing single-prompt callers — UNCHANGED (the no-regression answer: YES, confirmed)
+
+All current callers of `complete`/`complete_json(&str)` keep calling them verbatim. DECISION-7 only ADDS `chat`/`chat_json`. No call site migrates unless it genuinely needs system+temp+max_tokens. The 496 existing tests touch only the unchanged methods.
+
+### 4. Classification & invariants
+
+- **extend-Y on U-008** (additive superset, GAP-6/Decision-3 lineage) — adding capability, never narrowing. NOT a new unit; NOT a `[≠]`.
+- **No-regression guarantee:** existing `complete`/`complete_json`/`stream` bodies are byte-identical; new methods are purely additive `impl` items + new pub types. U-008's verified behavior and the 496 existing tests are untouched. New differential test for DECISION-7: feed `[system, user] + {temp:0.3, max_tokens:4096}` through MiroFish `chat_json` and teri `chat_json`; assert the system message is delivered as a distinct system input, temperature/max_tokens appear in the request payload (golden-capture the outbound JSON per provider), and the parsed JSON shape matches.
+- **Built once, reused by:** U-014 `OntologyGenerator` (the trigger), plus `SimulationConfigGenerator` (U-019), `ReportAgent` (U-024), `OasisProfileGenerator` (U-018/agent persona generation) — every pending unit that calls MiroFish `chat_json`/`chat` with a `get_language_instruction()` system prompt + tuned temperature. Port this method ONCE in U-008-extend, before U-014.
+
+**Idiom-map addendum** (append to the §(d) idiom table): `LLMClient.chat(messages=[{system},{user}], temperature, max_tokens)` → `LlmClient::chat(&[ChatMessage], &ChatOptions)` (system role: OpenAI=messages[], Anthropic/Gemini=top-level system param).
