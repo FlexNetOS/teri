@@ -61,12 +61,19 @@ pub struct LlmConfig {
     pub base_url: String,
     pub api_key: String,
     /// Populated from env `LLM_MODEL_NAME` (MiroFish name) with fallback to `LLM_MODEL`
-    /// (teri legacy name), then to default `"gpt-4o"`.
+    /// (teri legacy name), then to the default top-reasoning model `"OpenThinker3-7B"`.
     ///
-    /// **Default divergence note:** MiroFish defaults to `"gpt-4o-mini"` (config.py:33),
-    /// teri defaults to `"gpt-4o"` (set by the architect).  teri's `"gpt-4o"` default is
-    /// preserved because it was an explicit architect decision; MiroFish users wishing parity
-    /// should set `LLM_MODEL_NAME=gpt-4o-mini` in their env.
+    /// **Owner-resolved (2026-06-17, replaces the prior `gpt-4o`/`gpt-4o-mini` divergence flag):**
+    /// MiroFish targeted Ollama models; teri replaces that backend with **shimmy** (local,
+    /// OpenAI-compatible — see `base_url`). The default is therefore a shimmy-served top
+    /// reasoning model rather than an OpenAI cloud model. Model selection guidance:
+    /// - **`OpenThinker3-7B`** (teri default) — 8–16 GB VRAM; highest raw intelligence for
+    ///   pure text, math, and code reasoning. Matches teri's text-only swarm-prediction workload.
+    /// - **`Gemma 4 (12B)`** — 16–24 GB VRAM; multimodal (vision/audio) reasoner with native
+    ///   tool-calling for AI agents. Set `LLM_MODEL_NAME=Gemma-4-12B` if you have the VRAM and
+    ///   need multimodal or tool-calling.
+    ///
+    /// The model name must match a GGUF model shimmy has registered/discovered.
     pub model: String,
     pub embed_model: String,
     pub timeout_secs: u64,
@@ -178,14 +185,17 @@ impl Config {
 
         // MiroFish U-001 (S-008 / S-007): model name — check LLM_MODEL_NAME (MiroFish env name)
         // first, then LLM_MODEL (teri legacy env name), then fall back to default.
+        // Owner-resolved 2026-06-17: default to a shimmy-served top reasoning model
+        // (MiroFish's Ollama backend is replaced by shimmy). See LlmConfig::model docs.
         let model = std::env::var("LLM_MODEL_NAME")
             .or_else(|_| std::env::var("LLM_MODEL"))
-            .unwrap_or_else(|_| "gpt-4o".to_string());
+            .unwrap_or_else(|_| "OpenThinker3-7B".to_string());
 
         Self {
             llm: LlmConfig {
+                // shimmy's local OpenAI-compatible endpoint (default bind 127.0.0.1:11435).
                 base_url: std::env::var("LLM_BASE_URL")
-                    .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
+                    .unwrap_or_else(|_| "http://127.0.0.1:11435/v1".to_string()),
                 api_key: api_key.unwrap_or_default().to_string(),
                 model,
                 embed_model: std::env::var("EMBED_MODEL")
@@ -726,6 +736,48 @@ mod tests {
         match prev_model {
             Ok(v) => unsafe { std::env::set_var("LLM_MODEL", v) },
             Err(_) => unsafe { std::env::remove_var("LLM_MODEL") },
+        }
+    }
+
+    // --- Owner-resolved default model/endpoint (2026-06-17): shimmy top-reasoning model ---
+
+    #[test]
+    fn test_default_model_is_openthinker_when_no_env() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_name = std::env::var("LLM_MODEL_NAME");
+        let prev_model = std::env::var("LLM_MODEL");
+        unsafe {
+            std::env::remove_var("LLM_MODEL_NAME");
+            std::env::remove_var("LLM_MODEL");
+        }
+        let c = Config::build(Some("key"));
+        assert_eq!(
+            c.llm.model, "OpenThinker3-7B",
+            "default model should be the shimmy-served top reasoning model (owner decision 2026-06-17)"
+        );
+        match prev_name {
+            Ok(v) => unsafe { std::env::set_var("LLM_MODEL_NAME", v) },
+            Err(_) => unsafe { std::env::remove_var("LLM_MODEL_NAME") },
+        }
+        match prev_model {
+            Ok(v) => unsafe { std::env::set_var("LLM_MODEL", v) },
+            Err(_) => unsafe { std::env::remove_var("LLM_MODEL") },
+        }
+    }
+
+    #[test]
+    fn test_default_base_url_is_shimmy_when_no_env() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("LLM_BASE_URL");
+        unsafe { std::env::remove_var("LLM_BASE_URL") };
+        let c = Config::build(Some("key"));
+        assert_eq!(
+            c.llm.base_url, "http://127.0.0.1:11435/v1",
+            "default base_url should point at shimmy's local OpenAI-compatible endpoint"
+        );
+        match prev {
+            Ok(v) => unsafe { std::env::set_var("LLM_BASE_URL", v) },
+            Err(_) => unsafe { std::env::remove_var("LLM_BASE_URL") },
         }
     }
 }

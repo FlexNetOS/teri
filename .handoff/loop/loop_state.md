@@ -19,7 +19,7 @@ dest_base: develop
 cycle_budget: 3
 cycles_this_session: 2
 cycles_total: 12
-HANDOFF: (active session, resumed 2026-06-17) — cycle1: [≠]-audit gate CLEARED (S-360/361/048 PASS as ported; S-356 FAILED→ported related_edges Part2→re-verified PASS; all 4 [x]). cycle2: U-001 AppConfig PARTIAL extend-Y — 20 fields PASS [x] + S-001 [≠]; S-003/S-005 pending-U-002/U-003 (no axum surface yet); unit stays [~]. Fixed porter's flaky env-tests via ENV_LOCK mutex. [!] OWNER-FLAG: LLM_MODEL_NAME default gpt-4o-mini(src) vs gpt-4o(teri). 362 green (+27). Next: U-002/U-003 (axum serve — rolls up U-001) OR U-012 TaskManager OR U-005 locale.
+HANDOFF: (active session, resumed 2026-06-17) — cycle1: [≠]-audit gate CLEARED (S-360/361/048 PASS as ported; S-356 FAILED→ported related_edges Part2→re-verified PASS; all 4 [x]). cycle2: U-001 AppConfig PARTIAL extend-Y — 20 fields PASS [x] + S-001 [≠]; S-003/S-005 pending-U-002/U-003 (no axum surface yet); unit stays [~]. Fixed porter's flaky env-tests via ENV_LOCK mutex. OWNER-RESOLVED LLM_MODEL_NAME: shimmy replaces Ollama -> default model=OpenThinker3-7B + base_url=shimmy local 11435/v1 (Gemma-4-12B documented alt). 364 green (+2). Next: U-002/U-003 (axum serve — rolls up U-001) OR U-012 TaskManager OR U-005 locale.
 ledger: parity 8/50 units verified [x] (U-004, U-006, U-008, U-009, U-013, U-015, U-018, U-048) + GAP-1/2/6/U015-1/ACTION-TAXONOMY resolved; [≠]-audit symbol ports S-360/361/356/048 all [x] parity-verified (opus gate, resume 2026-06-17)   # 335 green
 # [≠] RE-AUDIT DONE (owner-flagged): 47 [≠] re-challenged under tightened bar (harness PR #34). 4 disguised
 #   skips ported [~]; S-189->U-012 + S-192->U-014 reclassified pending; Zep-SaaS/jitter/REFRESH/json-superset keep.
