@@ -163,46 +163,46 @@
 
 ## U-011 — `backend/app/models/project.py`
 
-- [ ] S-098 · `unit:U-011` · `type` · `ProjectStatus` · enum: CREATED/ONTOLOGY_GENERATED/GRAPH_BUILDING/GRAPH_COMPLETED/FAILED · `project.py:17`
-- [ ] S-099 · `unit:U-011` · `variant` · `ProjectStatus.CREATED` · `project.py:19`
-- [ ] S-100 · `unit:U-011` · `variant` · `ProjectStatus.ONTOLOGY_GENERATED` · `project.py:20`
-- [ ] S-101 · `unit:U-011` · `variant` · `ProjectStatus.GRAPH_BUILDING` · `project.py:21`
-- [ ] S-102 · `unit:U-011` · `variant` · `ProjectStatus.GRAPH_COMPLETED` · `project.py:22`
-- [ ] S-103 · `unit:U-011` · `variant` · `ProjectStatus.FAILED` · `project.py:23`
-- [ ] S-104 · `unit:U-011` · `type` · `Project` · dataclass with to_dict/from_dict · `project.py:27`
-- [ ] S-105 · `unit:U-011` · `field` · `Project.project_id` · `project.py:29`
-- [ ] S-106 · `unit:U-011` · `field` · `Project.name` · `project.py:30`
-- [ ] S-107 · `unit:U-011` · `field` · `Project.status` · `project.py:31`
-- [ ] S-108 · `unit:U-011` · `field` · `Project.created_at` · `project.py:32`
-- [ ] S-109 · `unit:U-011` · `field` · `Project.updated_at` · `project.py:33`
-- [ ] S-110 · `unit:U-011` · `field` · `Project.files` · `project.py:36`
-- [ ] S-111 · `unit:U-011` · `field` · `Project.total_text_length` · `project.py:37`
-- [ ] S-112 · `unit:U-011` · `field` · `Project.ontology` · `project.py:40`
-- [ ] S-113 · `unit:U-011` · `field` · `Project.analysis_summary` · `project.py:41`
-- [ ] S-114 · `unit:U-011` · `field` · `Project.graph_id` · `project.py:44`
-- [ ] S-115 · `unit:U-011` · `field` · `Project.graph_build_task_id` · `project.py:45`
-- [ ] S-116 · `unit:U-011` · `field` · `Project.simulation_requirement` · `project.py:48`
-- [ ] S-117 · `unit:U-011` · `field` · `Project.chunk_size` · `project.py:49`
-- [ ] S-118 · `unit:U-011` · `field` · `Project.chunk_overlap` · `project.py:50`
-- [ ] S-119 · `unit:U-011` · `field` · `Project.error` · `project.py:53`
-- [ ] S-120 · `unit:U-011` · `method` · `Project.to_dict` · JSON round-trip serialise · `project.py:55`
-- [ ] S-121 · `unit:U-011` · `method` · `Project.from_dict` · deserialise from JSON dict · `project.py:76`
-- [ ] S-122 · `unit:U-011` · `type` · `ProjectManager` · class-method FS persistence · `project.py:101`
-- [ ] S-123 · `unit:U-011` · `field` · `ProjectManager.PROJECTS_DIR` · `uploads/projects` · `project.py:105`
-- [ ] S-124 · `unit:U-011` · `method` · `ProjectManager._ensure_projects_dir` · `project.py:108`
-- [ ] S-125 · `unit:U-011` · `method` · `ProjectManager._get_project_dir` · `project.py:113`
-- [ ] S-126 · `unit:U-011` · `method` · `ProjectManager._get_project_meta_path` · `project.py:118`
-- [ ] S-127 · `unit:U-011` · `method` · `ProjectManager._get_project_files_dir` · `project.py:123`
-- [ ] S-128 · `unit:U-011` · `method` · `ProjectManager._get_project_text_path` · `project.py:128`
-- [ ] S-129 · `unit:U-011` · `method` · `ProjectManager.create_project` · uuid dir + metadata JSON · `project.py:133`
-- [ ] S-130 · `unit:U-011` · `method` · `ProjectManager.save_project` · `project.py:168`
-- [ ] S-131 · `unit:U-011` · `method` · `ProjectManager.get_project` · returns Optional[Project] · `project.py:177`
-- [ ] S-132 · `unit:U-011` · `method` · `ProjectManager.list_projects` · `project.py:198`
-- [ ] S-133 · `unit:U-011` · `method` · `ProjectManager.delete_project` · raises if not found · `project.py:222`
-- [ ] S-134 · `unit:U-011` · `method` · `ProjectManager.save_file_to_project` · writes to files/ subdir · `project.py:241`
-- [ ] S-135 · `unit:U-011` · `method` · `ProjectManager.save_extracted_text` · `project.py:275`
-- [ ] S-136 · `unit:U-011` · `method` · `ProjectManager.get_extracted_text` · returns Optional[str] · `project.py:282`
-- [ ] S-137 · `unit:U-011` · `method` · `ProjectManager.get_project_files` · list of filenames · `project.py:293`
+- [x] S-098 · `unit:U-011` · `type` · `ProjectStatus` · enum: CREATED/ONTOLOGY_GENERATED/GRAPH_BUILDING/GRAPH_COMPLETED/FAILED · `project.py:17`
+- [x] S-099 · `unit:U-011` · `variant` · `ProjectStatus.CREATED` · `project.py:19`
+- [x] S-100 · `unit:U-011` · `variant` · `ProjectStatus.ONTOLOGY_GENERATED` · `project.py:20`
+- [x] S-101 · `unit:U-011` · `variant` · `ProjectStatus.GRAPH_BUILDING` · `project.py:21`
+- [x] S-102 · `unit:U-011` · `variant` · `ProjectStatus.GRAPH_COMPLETED` · `project.py:22`
+- [x] S-103 · `unit:U-011` · `variant` · `ProjectStatus.FAILED` · `project.py:23`
+- [x] S-104 · `unit:U-011` · `type` · `Project` · dataclass with to_dict/from_dict · `project.py:27`
+- [x] S-105 · `unit:U-011` · `field` · `Project.project_id` · `project.py:29`
+- [x] S-106 · `unit:U-011` · `field` · `Project.name` · `project.py:30`
+- [x] S-107 · `unit:U-011` · `field` · `Project.status` · `project.py:31`
+- [x] S-108 · `unit:U-011` · `field` · `Project.created_at` · `project.py:32`
+- [x] S-109 · `unit:U-011` · `field` · `Project.updated_at` · `project.py:33`
+- [x] S-110 · `unit:U-011` · `field` · `Project.files` · `project.py:36`
+- [x] S-111 · `unit:U-011` · `field` · `Project.total_text_length` · `project.py:37`
+- [x] S-112 · `unit:U-011` · `field` · `Project.ontology` · `project.py:40`
+- [x] S-113 · `unit:U-011` · `field` · `Project.analysis_summary` · `project.py:41`
+- [x] S-114 · `unit:U-011` · `field` · `Project.graph_id` · `project.py:44`
+- [x] S-115 · `unit:U-011` · `field` · `Project.graph_build_task_id` · `project.py:45`
+- [x] S-116 · `unit:U-011` · `field` · `Project.simulation_requirement` · `project.py:48`
+- [x] S-117 · `unit:U-011` · `field` · `Project.chunk_size` · `project.py:49`
+- [x] S-118 · `unit:U-011` · `field` · `Project.chunk_overlap` · `project.py:50`
+- [x] S-119 · `unit:U-011` · `field` · `Project.error` · `project.py:53`
+- [x] S-120 · `unit:U-011` · `method` · `Project.to_dict` · JSON round-trip serialise · `project.py:55`
+- [x] S-121 · `unit:U-011` · `method` · `Project.from_dict` · deserialise from JSON dict · `project.py:76`
+- [x] S-122 · `unit:U-011` · `type` · `ProjectManager` · class-method FS persistence · `project.py:101`
+- [x] S-123 · `unit:U-011` · `field` · `ProjectManager.PROJECTS_DIR` · `uploads/projects` · `project.py:105`
+- [x] S-124 · `unit:U-011` · `method` · `ProjectManager._ensure_projects_dir` · `project.py:108`
+- [x] S-125 · `unit:U-011` · `method` · `ProjectManager._get_project_dir` · `project.py:113`
+- [x] S-126 · `unit:U-011` · `method` · `ProjectManager._get_project_meta_path` · `project.py:118`
+- [x] S-127 · `unit:U-011` · `method` · `ProjectManager._get_project_files_dir` · `project.py:123`
+- [x] S-128 · `unit:U-011` · `method` · `ProjectManager._get_project_text_path` · `project.py:128`
+- [x] S-129 · `unit:U-011` · `method` · `ProjectManager.create_project` · uuid dir + metadata JSON · `project.py:133`
+- [x] S-130 · `unit:U-011` · `method` · `ProjectManager.save_project` · `project.py:168`
+- [x] S-131 · `unit:U-011` · `method` · `ProjectManager.get_project` · returns Optional[Project] · `project.py:177`
+- [x] S-132 · `unit:U-011` · `method` · `ProjectManager.list_projects` · `project.py:198`
+- [x] S-133 · `unit:U-011` · `method` · `ProjectManager.delete_project` · raises if not found · `project.py:222`
+- [x] S-134 · `unit:U-011` · `method` · `ProjectManager.save_file_to_project` · writes to files/ subdir · `project.py:241`
+- [x] S-135 · `unit:U-011` · `method` · `ProjectManager.save_extracted_text` · `project.py:275`
+- [x] S-136 · `unit:U-011` · `method` · `ProjectManager.get_extracted_text` · returns Optional[str] · `project.py:282`
+- [x] S-137 · `unit:U-011` · `method` · `ProjectManager.get_project_files` · list of filenames · `project.py:293`
 
 ---
 

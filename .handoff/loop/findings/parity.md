@@ -703,3 +703,125 @@ With S-155 → `[x]`, U-012 is now **27 `[x]` + 2 `[~]`** (S-163/S-164 pending-U
 
 ### Constraints honored
 - No source/Rust files edited. No commit. Only S-155 `[x]` flip + S-163/S-164 pending-U-005 notes + this verdict appended.
+
+---
+
+## 2026-06-17 · U-011 · `ProjectManager` / `Project` / `ProjectStatus` (project.py) → `src/models/project.rs`
+
+**Verdict: FAIL** — 3 behavioral divergences. 37/40 symbols faithful; unit CANNOT flip `[x]`.
+
+**Type:** literal differential. Source `backend/app/models/project.py` (306 lines) is runnable Python; ran both sides over the same inputs and diffed returned values + on-disk JSON.
+
+**Baseline:** `cargo test project` = 21 passed, 0 failed. Build green. (Compile is precondition only, not parity.)
+
+### FAIL #1 (BLOCKER) — S-129 `create_project` returns stale `updated_at` (the flagged clone)
+- **Python contract** (lines 148-165 + save_project 170): `create_project` builds project (created_at==updated_at==now), then `save_project(project)` MUTATES the SAME object's `updated_at` to a LATER save-time, then returns THAT object. So the **returned** object's `updated_at` == the **persisted** file's `updated_at`, and is STRICTLY LATER than `created_at`.
+- **Rust** (line 453): `self.save_project(&mut project.clone())` — passes a CLONE; mutation lands on the throwaway clone (and on disk), but `create_project` returns the ORIGINAL untouched `project`.
+- **Reproduced** (live, against the crate): returned created_at=`...261049`, returned updated_at=`...261049`, PERSISTED updated_at=`...261141`.
+  - `returned.updated_at == persisted` → **false** (Python: true)
+  - `returned.updated_at == created_at` → **true** (Python: false)
+- The two invariants are INVERTED. A consumer reading the returned object's `updated_at` sees construction-time, not save-time; it disagrees with disk. Real downgrade.
+- **Fix:** save the real object and return it, e.g. `let mut project = …; self.save_project(&mut project)?; Ok(project)` (mirror Python's same-object mutation).
+
+### FAIL #2 — S-121 `from_dict` silently drops malformed/legacy `files` (data loss on load)
+- **Python** (line 88): `files = data.get('files', [])` — keeps the raw list verbatim, NO shape validation (duck-typed).
+- **Rust** (lines 267-270): `serde_json::from_value(v.clone()).ok().unwrap_or_default()` — if ANY entry fails the strict 4-field `ProjectFile` struct, `.ok()` swallows it and the ENTIRE `files` vector collapses to `[]`.
+- **Reproduced:** `files:[{"filename":"x.txt","path":"/a/x.txt","size":10}]` (the 3-key form documented in project.py line-36 comment `{filename, path, size}`) → Rust `files.len()==0`; Python keeps `len==1`.
+- In-system round-trips (save_file_to_project writes the 4-key form) are unaffected, but external/legacy/partial `project.json` loses file records silently. Per "when in doubt, FAIL." Fix: tolerate unknown/partial shapes (passthrough `Value`, or propagate instead of swallow).
+
+### FAIL-adjacent #3 (NON-BLOCKING, recorded) — on-disk JSON key ORDER differs
+- Python `json.dump` emits insertion order (`project_id` first); Rust `serde_json::json!` Map emits alphabetical (`analysis_summary` first).
+- **Assessment:** non-contractual / unobservable — JSON object order is not semantically meaningful, file is read back only via keyed `from_dict`, no byte-comparison consumer exists. Qualifies under the `[≠]` "non-contractual" bar. Does NOT block. Noted only.
+
+### VERIFIED FAITHFUL (37/40 symbols, evidence below)
+- **S-098..S-103 ProjectStatus**: all 5 variants serialize to exact Python `.value` (`created`/`ontology_generated`/`graph_building`/`graph_completed`/`failed`) + round-trip + `as_str()`. Confirmed by test + serde.
+- **S-104..S-119 Project fields + S-120 to_dict**: 15 keys present (NOTE: 15, not 14 — both source & port emit 15; prompt's "14" miscount), status→string value, None→null, non-ASCII written RAW (中文 verified in file, no `\u`), indent=2.
+- **S-121 from_dict defaults** (the EXPRESSIBLE part): name→"Unnamed Project", status→Created, created_at/updated_at→"", total_text_length→0, chunk_size→500, chunk_overlap→50, optionals→None, missing project_id→Err. All exact. (files-tolerance is the FAIL #2 carve-out.)
+- **S-122..S-128**: ProjectManager + path helpers (`{projects_dir}/{id}`, `/project.json`, `/files`, `/extracted_text.txt`) — exact.
+- **S-130 save_project**: mutates updated_at to save-time, writes pretty JSON, ensure_ascii=False parity. Faithful in isolation.
+- **S-131 get_project**: missing→Ok(None); corrupt JSON→Err; valid-but-missing-project_id→Err. Matches actual Python (uncaught JSONDecodeError / KeyError — ledger's "returns None on corrupt" was WRONG; port is correct).
+- **S-132 list_projects**: sort created_at DESC + take limit; non-project dir entries skipped (get_project→None); corrupt propagates Err. Match.
+- **S-133 delete_project**: absent→Ok(false) (NOT an error — ledger's "raises if not found" was WRONG; port is correct), present→true.
+- **S-134 save_file_to_project**: ext = splitext[1].lower() incl. dot (all 6 edge cases incl. trailing-dot `"."` and dotfile→"" match Python), safe_filename=uuid4().hex[:8]+ext (8 hex), 4-key return, size==bytes len. Match.
+- **S-135/S-136 save/get_extracted_text**: round-trip incl. non-ASCII; missing→None. Match.
+- **S-137 get_project_files**: missing dir→[]; only is_file entries; full paths. Match.
+- **S-129 create_project** project_id format `proj_`+12 lowercase hex (no hyphens), dir structure — faithful EXCEPT the updated_at return (FAIL #1).
+
+### Symbols that must stay `[~]` (not provably faithful)
+- **S-129 create_project** — FAIL #1 (returned `updated_at` stale). Stays `[~]`.
+- **S-121 from_dict** — FAIL #2 (files silently dropped). Stays `[~]`.
+
+### Verdict on flagged #1 (clone)
+REAL divergence, not acceptable. The clone makes the returned object's `updated_at` disagree with both Python and the persisted file. Unit cannot flip `[x]` until create_project saves-and-returns the same object.
+
+### Overall
+**U-011 → FAIL.** Route to porter: (1) fix create_project to mutate+return the same object (S-129); (2) make from_dict tolerate non-strict `files` shapes instead of `.ok()`-swallowing the whole vector (S-121). 38/40 symbols are `[x]`-ready on re-verify; S-129 + S-121 stay `[~]`. Key-order (#3) is a recorded non-contractual `[≠]`, no action required.
+
+### Constraints honored
+- No source/Rust files edited. No ledger/symbol-map rows flipped. Temp differential probe written to `tests/` and REMOVED after run. Only this verdict appended.
+
+---
+
+## 2026-06-17 — U-011 `project.py` RE-VERIFY (FAIL #1 S-129 + FAIL #2 S-121 fixes) → PASS
+
+Re-verification of the two prior FAILs after porter fix. Read `src/models/project.rs`,
+diffed against `MiroFish/backend/app/models/project.py`, ran the named regression tests
+plus the full suite. Did NOT take the porter report on faith.
+
+### FAIL #1 (S-129 create_project) — RESOLVED ✓
+- **Source contract** (project.py:148-165): builds `project` with `updated_at=now` (==created_at),
+  calls `save_project(project)` which mutates **the same object** in-place
+  (`project.updated_at = datetime.now().isoformat()`, line 170), then returns that same object.
+  So the returned object's `updated_at` = save-time value, `>= created_at`, == on-disk value.
+- **Rust** (project.rs:470-472): `self.save_project(&mut project)?; Ok(project)` — `save_project`
+  (line 487) stamps `project.updated_at = python_isoformat_local()` in-place before serialising,
+  and the SAME `project` is returned. Exact behavioral match. The old `&mut project.clone()`
+  bug (mutated a throwaway temp, returned stale `updated_at == created_at`) is gone.
+- **Test** `test_create_project_updated_at_matches_persisted_and_gte_created_at`: PASS.
+  Asserts (a) returned `updated_at` == persisted project.json `updated_at`, (b) `updated_at >= created_at`.
+
+### FAIL #2 (S-121 from_dict files) — RESOLVED ✓
+- **Source contract** (project.py:88): `files=data.get('files', [])` — pure untyped passthrough,
+  zero per-element validation; Python (`List[Dict[str,str]]`) keeps ANY array verbatim including
+  the legacy on-disk 3-key form. `to_dict` (line 63) emits `self.files` verbatim.
+  `save_file_to_project` (lines 267-272) returns the **4-key** shape
+  (`original_filename, saved_filename, path, size`) — the docstring's `{filename,path,size}`
+  at line 251 is a stale comment; actual runtime return is 4 keys.
+- **Rust**: `Project.files: Vec<Value>` (project.rs:159); from_dict
+  `obj.get("files").and_then(|v| v.as_array().cloned()).unwrap_or_default()` (lines 280-283) —
+  exact match to Python's untyped passthrough. The old `Vec<ProjectFile>` strict per-element
+  `.ok()` parse collapsed the WHOLE vector to `[]` on any non-4-key entry (the downgrade) — gone.
+  `to_dict` emits `self.files` verbatim (line 205). `save_file_to_project` (lines 613-618) still
+  produces the 4-key `ProjectFile` shape (return type unchanged).
+- **Test** `test_from_dict_legacy_3key_files_entry_preserved_verbatim`: PASS. Legacy
+  `{filename,path,size}` entry → len==1 (not 0), preserved verbatim, survives to_dict→from_dict round-trip.
+
+### No NEW divergence from the `Vec<ProjectFile>`→`Vec<Value>` field-type change
+- to_dict 15-key shape intact: `test_to_dict_has_all_14_keys` PASS (15 keys: project_id, name,
+  status, created_at, updated_at, files, total_text_length, ontology, analysis_summary, graph_id,
+  graph_build_task_id, simulation_requirement, chunk_size, chunk_overlap, error — matches py:57-72).
+- Non-ASCII-raw (ensure_ascii=False) intact: `test_to_dict_non_ascii_not_escaped` PASS.
+- save_file 4-key shape intact: `test_save_file_to_project` PASS. save/get round-trip: PASS.
+- Blast radius: only consumer of `Project.files`/`ProjectFile` outside project.rs is the re-export
+  in `src/models/mod.rs`. No code expects the typed `Vec<ProjectFile>` for the `files` field. None.
+
+### Evidence
+- `cargo test --lib models::project`: 23 passed, 0 failed.
+- Two named regression tests (`--exact`): 2 passed.
+- Shape/non-ascii/save_file/roundtrip (`--exact`): 4 passed.
+- Full suite: **446 passed, 6 ignored, 0 failed** (5 suites). Matches porter report.
+- `cargo clippy --lib`: clean (0 warnings/errors).
+
+### Recorded `[≠]` (carried, non-contractual — no action)
+- **JSON key order**: serde_json::json! emits in declaration order matching Python dict insertion
+  order; even if it diverged, key order in a JSON object is non-contractual (unobservable to any
+  consumer that parses by key). Survives the `[≠]` bar = non-contractual. Not a feature skip.
+
+### Verdict
+- **S-129: PASS.  S-121: PASS.**
+- **U-011: 40/40 symbols `[x]`** (S-098..S-137 all exercised; symbol-map updated this session).
+- **U-011 → PASS.** May flip ledger `- [x]` and commit. The two prior FAILs are genuinely resolved
+  in code + proven by passing differential tests; no new divergence introduced.
+
+### Constraints honored
+- No source/Rust impl files edited. Only symbol-map S-098..S-137 flipped to `[x]` and this verdict appended.

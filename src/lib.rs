@@ -8,6 +8,7 @@ pub mod i18n;
 pub mod llm;
 pub mod logging;
 pub mod memory;
+pub mod models;
 pub mod preflight;
 pub mod report;
 pub mod seed;
