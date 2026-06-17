@@ -869,3 +869,79 @@ NOTE: worker re-extracts names inline (graph_builder.rs:192-212) rather than cal
 
 ### Symbols verified (U-015): 19/19 → all `- [x]`/`- [≠]`
 S-189 `[x]`, S-192 `[x]`, S-190 `[x]` (prior). `[≠]`: S-181..S-188, S-191, S-193, S-194, S-195, S-196, S-197 (Zep-SaaS-specific, DECISION-1 scope; each independently confirmed inexpressible/non-contractual). EntityKind/RelationKind::Custom additions PASS. Rollup satisfied → U-015 `- [x]`.
+
+---
+
+## 2026-06-17 — U-019 sub-cycle (a): simulation-config DATA MODEL — VERDICT: PASS (opus)
+
+**Scope:** ONLY the data model (S-374..S-429, 56 symbols). The `SimulationConfigGenerator` class and
+its LLM/generation logic (S-430+) are later sub-cycles and correctly remain `- [ ]`. The U-019 UNIT is
+NOT marked done.
+
+**Method:** Differential / golden. The Python source's top-level imports (`openai`, `..config`)
+prevent direct import, so the 5 dataclasses + 2 consts + `to_dict`/`to_json` (which have NO external
+deps) were extracted verbatim into a standalone module and run as the authoritative source-of-truth.
+Rust outputs were emitted from a temporary `examples/` harness (since removed) and byte-diffed.
+
+### Byte-exact differential results (Python `json.dumps(..., ensure_ascii=False, indent=2)` vs Rust `to_json()`)
+| Scenario | Result |
+|----------|--------|
+| `CHINA_TIMEZONE_CONFIG` (`china_timezone_config()`) | **IDENTICAL** (`diff` clean) |
+| `SimulationParameters` defaults (generated_at pinned) | **IDENTICAL** |
+| Full: twitter+reddit PlatformConfig + 1 agent + Chinese `narrative_direction`/`hot_topics` | **IDENTICAL** |
+
+All three `diff`s returned zero differences. This single byte-diff proves, simultaneously:
+- **Every default is byte-exact** — `active_hours` = `(8..23)` → 15 elements ending at 22, NO 23
+  (range exclusive, empirically confirmed `len 15 last 22 has23 False`); all 12 TimeSimulationConfig
+  defaults; PlatformConfig 0.4/0.3/0.3/10/0.5; EventConfig all-empty; AgentActivityConfig
+  0.5/1.0/2.0/5/60/0.0/"neutral"/1.0; required fields have no default (constructor signatures).
+- **`to_dict` emits EXACTLY 13 keys in declaration order** (`obj.len()==13`, key-order assert passes)
+  AND every nested struct (`time_config`, each `agent_configs[]`, `event_config`, platform configs)
+  is recursively a dict with ITS fields in declaration order — proven by the full-scenario byte-diff,
+  not just the top level. `None` → `null` (twitter/reddit when unset).
+- **Float fidelity** — `0.05`, `0.4`, `0.7`, `1.5`, `1.0`, `2.0`, `0.0`, `0.3` all render identically
+  to Python (serde_json float formatting matches `json.dumps`).
+- **`to_json`** = 2-space indent + `ensure_ascii=False` — Chinese (`需求描述`/`舆论引导`/`人工智能`)
+  appears RAW UTF-8; `grep -c '\u'` = 0 escapes.
+- **`generated_at`** reuses `project::python_isoformat_local()` (confirmed `pub(crate)`,
+  local-naive, µs-omitted-when-zero) — correct reuse; shape asserted (no tz suffix, T separator).
+
+19 in-crate `simulation_config` unit tests pass; full suite **579 passed, 0 failed, 6 ignored**.
+
+### preserve_order BLAST-RADIUS — CLEARED (it is a crate-wide PARITY GAIN, zero regression)
+The porter added `serde_json` feature `preserve_order` (Cargo.toml:35), switching every `Value::Object`
+/`Map`/`json!` from `BTreeMap` (alphabetical) to insertion-ordered. Decisive evidence it is safe:
+- **MiroFish app code uses NO `sort_keys=True` anywhere** — `grep -rn sort_keys backend/app` is empty
+  (only `.venv` third-party hits). Every `json.dumps` in MiroFish emits Python-dict INSERTION order.
+- **Flask is 3.1.2** (`requirements.txt: flask>=3.0.0`, venv `flask-3.1.2`). Flask ≥2.3 defaults
+  `JSON_SORT_KEYS=False` → route responses are insertion-ordered too (e.g. `/health` returns
+  `{'status':'ok','service':...}` in that order).
+- Therefore the OLD BTreeMap behavior was a LATENT divergence from Python on every multi-key
+  `json!`/Map whose declared order ≠ alphabetical. `preserve_order` RETIRES that latent risk.
+
+Empirically confirmed across previously-verified units (re-run, all green, output order now matches Python):
+- **U-010 action_logger** (`json!` entries `round,timestamp,agent_id,…`): emitted order now `round,
+  timestamp,agent_id,agent_name,action_type,action_args,result,success` — byte-matches Python's
+  `json.dumps(entry)` order (which under old BTreeMap would have been the alphabetical
+  `action_args,action_type,…` — a divergence preserve_order FIXES). 33 tests pass.
+- **U-011 project.to_dict** (`json!` in declaration order): the recorded `[≠]` "JSON key order
+  non-contractual" is now ACTUALLY-ORDERED to match Python — the `[≠]` could be retired as a parity
+  GAIN. 23 tests pass.
+- **U-002/U-003 `/health` + server JSON** (`server.rs:77 json!{status,service}`): now emits
+  `status,service` = Flask 3.x insertion order (old BTreeMap → `service,status`, divergent). Gain.
+- **U-012 task to_dict, U-014 ontology validate_and_process, S-005 ensure_ascii**: full suite green;
+  no code builds an object relying on sorted keys, and no MiroFish output is sorted, so insertion
+  order can only match-or-improve. No test anywhere asserts a SORTED key order (`grep` swept; the only
+  `sorted` hits are list-element ordering by `created_at`, unrelated to Map type).
+
+**Conclusion:** preserve_order introduced NO regression to any verified unit; it is strictly MORE
+faithful (Python dicts/Flask 3.x are insertion-ordered). The U-011 `[≠]` for key-order is now a
+parity gain and may be retired by the porter/cartographer if desired (not required for this verdict).
+
+### `[≠]` challenge
+No `- [≠]` rows were proposed for this sub-cycle — every data-model symbol was ported faithfully and
+exercised, so all 56 are `- [x]` (none `- [≠]`). Nothing to challenge.
+
+### Symbols verified: 56/56 → S-374..S-429 all flipped `- [x]` in symbol-map.md. S-430+ remain `- [ ]`.
+### VERDICT: **PASS** (data model). U-019 UNIT remains `- [ ]` — sub-cycles (b)/(c)/(d) outstanding.
+### Constraints honored: no source/Rust impl files edited; temporary `examples/_parity_*.rs` harness removed; only symbol-map S-374..S-429, the U-019 ledger note, and this verdict block written.

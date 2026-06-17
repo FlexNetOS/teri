@@ -485,62 +485,62 @@
 
 ## U-019 — `backend/app/services/simulation_config_generator.py`
 
-- [ ] S-374 · `unit:U-019` · `const` · `CHINA_TIMEZONE_CONFIG` · timezone constant dict · `simulation_config_generator.py:29`
-- [ ] S-375 · `unit:U-019` · `type` · `AgentActivityConfig` · dataclass · `simulation_config_generator.py:52`
-- [ ] S-376 · `unit:U-019` · `field` · `AgentActivityConfig.agent_id` · `simulation_config_generator.py:54`
-- [ ] S-377 · `unit:U-019` · `field` · `AgentActivityConfig.entity_uuid` · `simulation_config_generator.py:55`
-- [ ] S-378 · `unit:U-019` · `field` · `AgentActivityConfig.entity_name` · `simulation_config_generator.py:56`
-- [ ] S-379 · `unit:U-019` · `field` · `AgentActivityConfig.entity_type` · `simulation_config_generator.py:57`
-- [ ] S-380 · `unit:U-019` · `field` · `AgentActivityConfig.activity_level` · `simulation_config_generator.py:60`
-- [ ] S-381 · `unit:U-019` · `field` · `AgentActivityConfig.posts_per_hour` · `simulation_config_generator.py:63`
-- [ ] S-382 · `unit:U-019` · `field` · `AgentActivityConfig.comments_per_hour` · `simulation_config_generator.py:64`
-- [ ] S-383 · `unit:U-019` · `field` · `AgentActivityConfig.active_hours` · `simulation_config_generator.py:67`
-- [ ] S-384 · `unit:U-019` · `field` · `AgentActivityConfig.response_delay_min` · `simulation_config_generator.py:70`
-- [ ] S-385 · `unit:U-019` · `field` · `AgentActivityConfig.response_delay_max` · `simulation_config_generator.py:71`
-- [ ] S-386 · `unit:U-019` · `field` · `AgentActivityConfig.sentiment_bias` · `simulation_config_generator.py:74`
-- [ ] S-387 · `unit:U-019` · `field` · `AgentActivityConfig.stance` · `simulation_config_generator.py:77`
-- [ ] S-388 · `unit:U-019` · `field` · `AgentActivityConfig.influence_weight` · `simulation_config_generator.py:80`
-- [ ] S-389 · `unit:U-019` · `type` · `TimeSimulationConfig` · dataclass · `simulation_config_generator.py:84`
-- [ ] S-390 · `unit:U-019` · `field` · `TimeSimulationConfig.total_simulation_hours` · `simulation_config_generator.py:87`
-- [ ] S-391 · `unit:U-019` · `field` · `TimeSimulationConfig.minutes_per_round` · `simulation_config_generator.py:90`
-- [ ] S-392 · `unit:U-019` · `field` · `TimeSimulationConfig.agents_per_hour_min` · `simulation_config_generator.py:93`
-- [ ] S-393 · `unit:U-019` · `field` · `TimeSimulationConfig.agents_per_hour_max` · `simulation_config_generator.py:94`
-- [ ] S-394 · `unit:U-019` · `field` · `TimeSimulationConfig.peak_hours` · `simulation_config_generator.py:97`
-- [ ] S-395 · `unit:U-019` · `field` · `TimeSimulationConfig.peak_activity_multiplier` · `simulation_config_generator.py:98`
-- [ ] S-396 · `unit:U-019` · `field` · `TimeSimulationConfig.off_peak_hours` · `simulation_config_generator.py:101`
-- [ ] S-397 · `unit:U-019` · `field` · `TimeSimulationConfig.off_peak_activity_multiplier` · `simulation_config_generator.py:102`
-- [ ] S-398 · `unit:U-019` · `field` · `TimeSimulationConfig.morning_hours` · `simulation_config_generator.py:105`
-- [ ] S-399 · `unit:U-019` · `field` · `TimeSimulationConfig.morning_activity_multiplier` · `simulation_config_generator.py:106`
-- [ ] S-400 · `unit:U-019` · `field` · `TimeSimulationConfig.work_hours` · `simulation_config_generator.py:109`
-- [ ] S-401 · `unit:U-019` · `field` · `TimeSimulationConfig.work_activity_multiplier` · `simulation_config_generator.py:110`
-- [ ] S-402 · `unit:U-019` · `type` · `EventConfig` · dataclass · `simulation_config_generator.py:114`
-- [ ] S-403 · `unit:U-019` · `field` · `EventConfig.initial_posts` · `simulation_config_generator.py:117`
-- [ ] S-404 · `unit:U-019` · `field` · `EventConfig.scheduled_events` · `simulation_config_generator.py:120`
-- [ ] S-405 · `unit:U-019` · `field` · `EventConfig.hot_topics` · `simulation_config_generator.py:123`
-- [ ] S-406 · `unit:U-019` · `field` · `EventConfig.narrative_direction` · `simulation_config_generator.py:126`
-- [ ] S-407 · `unit:U-019` · `type` · `PlatformConfig` · dataclass · `simulation_config_generator.py:130`
-- [ ] S-408 · `unit:U-019` · `field` · `PlatformConfig.platform` · `simulation_config_generator.py:132`
-- [ ] S-409 · `unit:U-019` · `field` · `PlatformConfig.recency_weight` · `simulation_config_generator.py:135`
-- [ ] S-410 · `unit:U-019` · `field` · `PlatformConfig.popularity_weight` · `simulation_config_generator.py:136`
-- [ ] S-411 · `unit:U-019` · `field` · `PlatformConfig.relevance_weight` · `simulation_config_generator.py:137`
-- [ ] S-412 · `unit:U-019` · `field` · `PlatformConfig.viral_threshold` · `simulation_config_generator.py:140`
-- [ ] S-413 · `unit:U-019` · `field` · `PlatformConfig.echo_chamber_strength` · `simulation_config_generator.py:143`
-- [ ] S-414 · `unit:U-019` · `type` · `SimulationParameters` · master config dataclass · `simulation_config_generator.py:147`
-- [ ] S-415 · `unit:U-019` · `field` · `SimulationParameters.simulation_id` · `simulation_config_generator.py:150`
-- [ ] S-416 · `unit:U-019` · `field` · `SimulationParameters.project_id` · `simulation_config_generator.py:151`
-- [ ] S-417 · `unit:U-019` · `field` · `SimulationParameters.graph_id` · `simulation_config_generator.py:152`
-- [ ] S-418 · `unit:U-019` · `field` · `SimulationParameters.simulation_requirement` · `simulation_config_generator.py:153`
-- [ ] S-419 · `unit:U-019` · `field` · `SimulationParameters.time_config` · `simulation_config_generator.py:156`
-- [ ] S-420 · `unit:U-019` · `field` · `SimulationParameters.agent_configs` · `simulation_config_generator.py:159`
-- [ ] S-421 · `unit:U-019` · `field` · `SimulationParameters.event_config` · `simulation_config_generator.py:162`
-- [ ] S-422 · `unit:U-019` · `field` · `SimulationParameters.twitter_config` · `simulation_config_generator.py:165`
-- [ ] S-423 · `unit:U-019` · `field` · `SimulationParameters.reddit_config` · `simulation_config_generator.py:166`
-- [ ] S-424 · `unit:U-019` · `field` · `SimulationParameters.llm_model` · `simulation_config_generator.py:169`
-- [ ] S-425 · `unit:U-019` · `field` · `SimulationParameters.llm_base_url` · `simulation_config_generator.py:170`
-- [ ] S-426 · `unit:U-019` · `field` · `SimulationParameters.generated_at` · `simulation_config_generator.py:173`
-- [ ] S-427 · `unit:U-019` · `field` · `SimulationParameters.generation_reasoning` · `simulation_config_generator.py:174`
-- [ ] S-428 · `unit:U-019` · `method` · `SimulationParameters.to_dict` · `simulation_config_generator.py:176`
-- [ ] S-429 · `unit:U-019` · `method` · `SimulationParameters.to_json` · `simulation_config_generator.py:195`
+- [x] S-374 · `unit:U-019` · `const` · `CHINA_TIMEZONE_CONFIG` · timezone constant dict · `simulation_config_generator.py:29` → `teri::services::simulation_config::china_timezone_config` (fn)
+- [x] S-375 · `unit:U-019` · `type` · `AgentActivityConfig` · dataclass · `simulation_config_generator.py:52` → `teri::services::simulation_config::AgentActivityConfig`
+- [x] S-376 · `unit:U-019` · `field` · `AgentActivityConfig.agent_id` · `simulation_config_generator.py:54` → `teri::services::simulation_config::AgentActivityConfig`
+- [x] S-377 · `unit:U-019` · `field` · `AgentActivityConfig.entity_uuid` · `simulation_config_generator.py:55` → `teri::services::simulation_config::AgentActivityConfig`
+- [x] S-378 · `unit:U-019` · `field` · `AgentActivityConfig.entity_name` · `simulation_config_generator.py:56` → `teri::services::simulation_config::AgentActivityConfig`
+- [x] S-379 · `unit:U-019` · `field` · `AgentActivityConfig.entity_type` · `simulation_config_generator.py:57` → `teri::services::simulation_config::AgentActivityConfig`
+- [x] S-380 · `unit:U-019` · `field` · `AgentActivityConfig.activity_level` · `simulation_config_generator.py:60` → `teri::services::simulation_config::AgentActivityConfig`
+- [x] S-381 · `unit:U-019` · `field` · `AgentActivityConfig.posts_per_hour` · `simulation_config_generator.py:63` → `teri::services::simulation_config::AgentActivityConfig`
+- [x] S-382 · `unit:U-019` · `field` · `AgentActivityConfig.comments_per_hour` · `simulation_config_generator.py:64` → `teri::services::simulation_config::AgentActivityConfig`
+- [x] S-383 · `unit:U-019` · `field` · `AgentActivityConfig.active_hours` · `simulation_config_generator.py:67` → `teri::services::simulation_config::AgentActivityConfig`
+- [x] S-384 · `unit:U-019` · `field` · `AgentActivityConfig.response_delay_min` · `simulation_config_generator.py:70` → `teri::services::simulation_config::AgentActivityConfig`
+- [x] S-385 · `unit:U-019` · `field` · `AgentActivityConfig.response_delay_max` · `simulation_config_generator.py:71` → `teri::services::simulation_config::AgentActivityConfig`
+- [x] S-386 · `unit:U-019` · `field` · `AgentActivityConfig.sentiment_bias` · `simulation_config_generator.py:74` → `teri::services::simulation_config::AgentActivityConfig`
+- [x] S-387 · `unit:U-019` · `field` · `AgentActivityConfig.stance` · `simulation_config_generator.py:77` → `teri::services::simulation_config::AgentActivityConfig`
+- [x] S-388 · `unit:U-019` · `field` · `AgentActivityConfig.influence_weight` · `simulation_config_generator.py:80` → `teri::services::simulation_config::AgentActivityConfig`
+- [x] S-389 · `unit:U-019` · `type` · `TimeSimulationConfig` · dataclass · `simulation_config_generator.py:84` → `teri::services::simulation_config::TimeSimulationConfig`
+- [x] S-390 · `unit:U-019` · `field` · `TimeSimulationConfig.total_simulation_hours` · `simulation_config_generator.py:87` → `teri::services::simulation_config::TimeSimulationConfig`
+- [x] S-391 · `unit:U-019` · `field` · `TimeSimulationConfig.minutes_per_round` · `simulation_config_generator.py:90` → `teri::services::simulation_config::TimeSimulationConfig`
+- [x] S-392 · `unit:U-019` · `field` · `TimeSimulationConfig.agents_per_hour_min` · `simulation_config_generator.py:93` → `teri::services::simulation_config::TimeSimulationConfig`
+- [x] S-393 · `unit:U-019` · `field` · `TimeSimulationConfig.agents_per_hour_max` · `simulation_config_generator.py:94` → `teri::services::simulation_config::TimeSimulationConfig`
+- [x] S-394 · `unit:U-019` · `field` · `TimeSimulationConfig.peak_hours` · `simulation_config_generator.py:97` → `teri::services::simulation_config::TimeSimulationConfig`
+- [x] S-395 · `unit:U-019` · `field` · `TimeSimulationConfig.peak_activity_multiplier` · `simulation_config_generator.py:98` → `teri::services::simulation_config::TimeSimulationConfig`
+- [x] S-396 · `unit:U-019` · `field` · `TimeSimulationConfig.off_peak_hours` · `simulation_config_generator.py:101` → `teri::services::simulation_config::TimeSimulationConfig`
+- [x] S-397 · `unit:U-019` · `field` · `TimeSimulationConfig.off_peak_activity_multiplier` · `simulation_config_generator.py:102` → `teri::services::simulation_config::TimeSimulationConfig`
+- [x] S-398 · `unit:U-019` · `field` · `TimeSimulationConfig.morning_hours` · `simulation_config_generator.py:105` → `teri::services::simulation_config::TimeSimulationConfig`
+- [x] S-399 · `unit:U-019` · `field` · `TimeSimulationConfig.morning_activity_multiplier` · `simulation_config_generator.py:106` → `teri::services::simulation_config::TimeSimulationConfig`
+- [x] S-400 · `unit:U-019` · `field` · `TimeSimulationConfig.work_hours` · `simulation_config_generator.py:109` → `teri::services::simulation_config::TimeSimulationConfig`
+- [x] S-401 · `unit:U-019` · `field` · `TimeSimulationConfig.work_activity_multiplier` · `simulation_config_generator.py:110` → `teri::services::simulation_config::TimeSimulationConfig`
+- [x] S-402 · `unit:U-019` · `type` · `EventConfig` · dataclass · `simulation_config_generator.py:114` → `teri::services::simulation_config::EventConfig`
+- [x] S-403 · `unit:U-019` · `field` · `EventConfig.initial_posts` · `simulation_config_generator.py:117` → `teri::services::simulation_config::EventConfig`
+- [x] S-404 · `unit:U-019` · `field` · `EventConfig.scheduled_events` · `simulation_config_generator.py:120` → `teri::services::simulation_config::EventConfig`
+- [x] S-405 · `unit:U-019` · `field` · `EventConfig.hot_topics` · `simulation_config_generator.py:123` → `teri::services::simulation_config::EventConfig`
+- [x] S-406 · `unit:U-019` · `field` · `EventConfig.narrative_direction` · `simulation_config_generator.py:126` → `teri::services::simulation_config::EventConfig`
+- [x] S-407 · `unit:U-019` · `type` · `PlatformConfig` · dataclass · `simulation_config_generator.py:130` → `teri::services::simulation_config::PlatformConfig`
+- [x] S-408 · `unit:U-019` · `field` · `PlatformConfig.platform` · `simulation_config_generator.py:132` → `teri::services::simulation_config::PlatformConfig`
+- [x] S-409 · `unit:U-019` · `field` · `PlatformConfig.recency_weight` · `simulation_config_generator.py:135` → `teri::services::simulation_config::PlatformConfig`
+- [x] S-410 · `unit:U-019` · `field` · `PlatformConfig.popularity_weight` · `simulation_config_generator.py:136` → `teri::services::simulation_config::PlatformConfig`
+- [x] S-411 · `unit:U-019` · `field` · `PlatformConfig.relevance_weight` · `simulation_config_generator.py:137` → `teri::services::simulation_config::PlatformConfig`
+- [x] S-412 · `unit:U-019` · `field` · `PlatformConfig.viral_threshold` · `simulation_config_generator.py:140` → `teri::services::simulation_config::PlatformConfig`
+- [x] S-413 · `unit:U-019` · `field` · `PlatformConfig.echo_chamber_strength` · `simulation_config_generator.py:143` → `teri::services::simulation_config::PlatformConfig`
+- [x] S-414 · `unit:U-019` · `type` · `SimulationParameters` · master config dataclass · `simulation_config_generator.py:147` → `teri::services::simulation_config::SimulationParameters`
+- [x] S-415 · `unit:U-019` · `field` · `SimulationParameters.simulation_id` · `simulation_config_generator.py:150` → `teri::services::simulation_config::SimulationParameters`
+- [x] S-416 · `unit:U-019` · `field` · `SimulationParameters.project_id` · `simulation_config_generator.py:151` → `teri::services::simulation_config::SimulationParameters`
+- [x] S-417 · `unit:U-019` · `field` · `SimulationParameters.graph_id` · `simulation_config_generator.py:152` → `teri::services::simulation_config::SimulationParameters`
+- [x] S-418 · `unit:U-019` · `field` · `SimulationParameters.simulation_requirement` · `simulation_config_generator.py:153` → `teri::services::simulation_config::SimulationParameters`
+- [x] S-419 · `unit:U-019` · `field` · `SimulationParameters.time_config` · `simulation_config_generator.py:156` → `teri::services::simulation_config::SimulationParameters`
+- [x] S-420 · `unit:U-019` · `field` · `SimulationParameters.agent_configs` · `simulation_config_generator.py:159` → `teri::services::simulation_config::SimulationParameters`
+- [x] S-421 · `unit:U-019` · `field` · `SimulationParameters.event_config` · `simulation_config_generator.py:162` → `teri::services::simulation_config::SimulationParameters`
+- [x] S-422 · `unit:U-019` · `field` · `SimulationParameters.twitter_config` · `simulation_config_generator.py:165` → `teri::services::simulation_config::SimulationParameters`
+- [x] S-423 · `unit:U-019` · `field` · `SimulationParameters.reddit_config` · `simulation_config_generator.py:166` → `teri::services::simulation_config::SimulationParameters`
+- [x] S-424 · `unit:U-019` · `field` · `SimulationParameters.llm_model` · `simulation_config_generator.py:169` → `teri::services::simulation_config::SimulationParameters`
+- [x] S-425 · `unit:U-019` · `field` · `SimulationParameters.llm_base_url` · `simulation_config_generator.py:170` → `teri::services::simulation_config::SimulationParameters`
+- [x] S-426 · `unit:U-019` · `field` · `SimulationParameters.generated_at` · `simulation_config_generator.py:173` → `teri::services::simulation_config::SimulationParameters`
+- [x] S-427 · `unit:U-019` · `field` · `SimulationParameters.generation_reasoning` · `simulation_config_generator.py:174` → `teri::services::simulation_config::SimulationParameters`
+- [x] S-428 · `unit:U-019` · `method` · `SimulationParameters.to_dict` · `simulation_config_generator.py:176` → `teri::services::simulation_config::SimulationParameters::to_dict`
+- [x] S-429 · `unit:U-019` · `method` · `SimulationParameters.to_json` · `simulation_config_generator.py:195` → `teri::services::simulation_config::SimulationParameters::to_json`
 - [ ] S-430 · `unit:U-019` · `type` · `SimulationConfigGenerator` · `simulation_config_generator.py:200`
 - [ ] S-431 · `unit:U-019` · `field` · `SimulationConfigGenerator.MAX_CONTEXT_LENGTH` · `simulation_config_generator.py:214`
 - [ ] S-432 · `unit:U-019` · `field` · `SimulationConfigGenerator.AGENTS_PER_BATCH` · `simulation_config_generator.py:216`

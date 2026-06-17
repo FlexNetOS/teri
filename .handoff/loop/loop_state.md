@@ -17,8 +17,18 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 1   # RESUMED 2026-06-17 (5th resume, reset 0); c1=U-015 completion (S-189 build_graph_async + S-192 set_ontology)
-cycles_total: 19
+cycles_this_session: 2   # RESUMED 2026-06-17 (5th resume, reset 0); c1=U-015 completion; c2=U-019 sub-cycle(a) config data model
+cycles_total: 20
+# CYCLE2 (5th resume) 2026-06-17: U-019 sub-cycle (a) config DATA MODEL — opus PASS (byte-identical diff ×3). New
+#   src/services/simulation_config.rs: CHINA_TIMEZONE_CONFIG (china_timezone_config()->Value), AgentActivityConfig,
+#   TimeSimulationConfig, EventConfig, PlatformConfig, SimulationParameters (+to_dict 13-key decl-order, +to_json
+#   2-space ensure_ascii=False). S-374..S-429 [x] (56). U-019 UNIT STAYS [ ] (sub-cycles b/c/d remain: LLM stages,
+#   agent-config gen, retry/fix-json/generate_config orchestration). active_hours default=range(8,23)=[8..22] 15 elems.
+#   generated_at reuses python_isoformat_local. GLOBAL CARGO CHANGE: serde_json +preserve_order feature — opus
+#   verified this is a PARITY GAIN not a regression: MiroFish runs Flask 3.x (JSON_SORT_KEYS=False) + no sort_keys
+#   anywhere, so old BTreeMap alphabetical order was a LATENT DIVERGENCE; preserve_order makes ALL teri JSON
+#   (U-010/U-011/U-002 /health/U-012/U-014) byte-faithful to Python insertion order. >>> U-011 [≠] JSON-key-order
+#   can be RETIRED (now actually-ordered). 19 new tests, teri 579 green, clippy --all-targets clean.
 # CYCLE1 (5th resume) 2026-06-17: U-015 COMPLETE — S-189 build_graph_async + S-192 set_ontology (rollup) — opus PASS.
 #   DECISION-8 (architect, map-onto teri's native async build over the petgraph 2-pass pipeline). New src/services/
 #   graph_builder.rs: build_graph_async(text,ontology,graph_name,chunk params)->task_id (TaskManager::create_task
