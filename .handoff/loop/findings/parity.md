@@ -1396,3 +1396,49 @@ reading 0(—/—), 30(—/—), 100(fc/fc); generating_profiles 0(0/N), inner p
 
 ### Rollup
 **VERDICT: PASS.** S-675 `[x]` ⇒ **U-023 COMPLETE** (all S-636..S-680 now `[x]`/legal-`[≠]`). S-367 `[x]` (re-verified). No downgrade, no narrowed branch, no disguised-skip `[≠]`. Orchestrator may flip U-023 ledger `- [x]` and commit.
+
+---
+
+## 2026-06-17 — U-007 `zep_paging.py` (S-049..S-055) — MAP-ONTO-SUBSTRATE — opus parity gate — **PASS**
+
+**Verifier:** rust-port-parity-verifier · **Unit:** U-007 (map-onto-substrate; NO new production code — Zep-Cloud network pagination → teri in-process `KnowledgeGraph`).
+**Source:** `MiroFish/backend/app/utils/zep_paging.py:1-143` · **Map-onto targets:** `src/graph/mod.rs:1046 get_all_entities` / `:830 get_all_edges`; `src/services/entity_reader.rs:560 get_all_nodes` / `:585 get_all_edges`. **Contract:** DECISION-1 §3 / U-007 row (target-architecture.md:43,134).
+**Method:** differential read of source vs. the substrate primitives, plus an adversarial consumer sweep for the `_MAX_NODES=2000` cap (the key challenge). U-016's PASS verdict (parity.md:1167-1237) is the established node/edge-dict shape equivalence this builds on.
+
+### Crux #1 — the map-onto targets return EVERYTHING (no silent drop) — CONFIRMED
+- `KnowledgeGraph::get_all_entities()` (`graph/mod.rs:1046-1048`) = `self.inner.node_weights().collect()` — every petgraph node weight, no limit/filter/skip.
+- `KnowledgeGraph::get_all_edges()` (`graph/mod.rs:830-839`) = `self.inner.edge_references().map(|e| (src.id, tgt.id, weight.clone()))` — every petgraph edge, no limit/filter.
+- `entity_count()`/`relation_count()` = `node_count()`/`edge_count()` — full counts, consistent with the full iteration.
+- The reader's `get_all_nodes`/`get_all_edges` (`entity_reader.rs:560-593`) are thin `.map()`s over those primitives — no truncation, no pagination, no hidden bound.
+**Result:** "return all" genuinely means ALL. teri NEVER needed a separate paging layer — petgraph iteration is the complete-set primitive.
+
+### Crux #2 — shape equivalence — CONFIRMED (inherits U-016 PASS)
+MiroFish's `fetch_all_*` returns raw Zep node/edge objects; its `ZepEntityReader.get_all_nodes/get_all_edges` (`zep_entity_reader.py:650-715`) build NodeInfo/EdgeInfo lists FROM those. teri's reader `get_all_nodes` (5-key node dict) / `get_all_edges` (6-key edge dict) were parity-verified `[x]` in U-016 (parity.md:1234), including the `[≠]` field-level empties (summary/attributes/fact/uuid), each with a confirmed consumer-side graceful fallback — zero disguised feature-skips. U-007 is the LOWER primitive (`fetch_all_*`): verified subsumed — teri reads the complete in-memory set directly; the U-016-verified dict shape is the faithful equivalent of what MiroFish built from `fetch_all_*`.
+
+### Crux #3 — the `_MAX_NODES=2000` cap (S-050) — adversarial `[≠]`-strict-superset challenge — SURVIVES
+**Why the cap exists in source:** it bounds the number of paged Zep HTTP round-trips against a huge remote graph (truncate to 2000 + warn, `zep_paging.py:90-93`). Its ONLY observable behavior is SILENTLY DROPPING nodes beyond 2000. Note the source is asymmetric — `fetch_all_edges` (`zep_paging.py:105`) has **NO cap at all**, which alone shows the cap is a node-paging artifact, not a downstream contract.
+**Adversarial consumer sweep (every reader consumer of get_all_nodes/get_all_entities, source + teri):**
+- **MiroFish consumers** of `fetch_all_nodes`: `graph_builder._get_graph_info`/`get_graph_data` (count + iterate, `node_count=len(nodes)`), `zep_tools.get_all_nodes` (iterate→NodeInfo list), `zep_entity_reader.get_all_nodes` (the U-016 source). **None** has a ≤2000 array-size or context assumption — all treat the result as "all nodes."
+- **teri `AgentPool::spawn`** (`agent/mod.rs:737`): `entities[i % entities.len()]` — modulo-cycles personas; MORE entities = larger anchor pool, never an overflow. No ≤2000 dependency.
+- **teri `filter_defined_entities`** (`entity_reader.rs:675`): builds a `Vec<EntityNode>` + `HashMap` over ALL entities; no fixed-size buffer. No dependency.
+- **teri `prepare_simulation`** (`simulation_manager.rs:1219`): calls `filter_defined_entities` → `entities_count = filtered_count`. No dependency.
+- **The LLM-context path (the strongest candidate for a hidden ≤2000 budget) — REFUTED:** `SimulationConfigGenerator::summarize_entities` (`simulation_config.rs:1185-1231`) groups by type, then **`.take(ENTITIES_PER_TYPE_DISPLAY=20)` per type** + char-truncates each summary to `ENTITY_SUMMARY_LENGTH=300` + an overall `MAX_CONTEXT_LENGTH=50_000` char budget. This is a **content-length/per-type-display budget that is INDEPENDENT of total entity count** — identical whether 5 or 2,000,000 entities. It is a faithful port of MiroFish's OWN `simulation_config_generator.py:223,402,424-429` (`ENTITIES_PER_TYPE_DISPLAY=20`, `type_entities[:display_count]`, `document_text[:remaining_length]`). **MiroFish's LLM context was NEVER protected by the 2000 cap — it is protected by this per-type `take(20)` + char truncation, which teri ports verbatim.** So >2000 nodes in teri cannot blow any context budget MiroFish kept safe.
+**Conclusion:** NO consumer (teri or source) depends on count ≤2000. The cap is a pure Zep-network paging round-trip safety limit; truncating removes valid data. teri returning the full in-memory set is a **strict SUPERSET** (genuinely more faithful — it's the data MiroFish itself wanted but capped for network safety). **`[≠]`-strict-superset adjudication HOLDS — NOT a disguised feature-skip.**
+
+### Crux #4 — retry/page-size/delay (S-053, S-049, S-051, S-052) — `[≠]`-inexpressible challenge — SURVIVES
+`_fetch_page_with_retry` retries `ConnectionError`/`TimeoutError`/`OSError`/`zep_cloud.InternalServerError` (`zep_paging.py:44`) — strictly **network/IO transient errors of a remote SaaS call**. The map-onto target is `petgraph::node_weights()`/`edge_references()` — an in-process `Vec`/HashMap traversal with **no I/O, no socket, no remote server**. There is no transient-failure mode in teri's read path that a retry would meaningfully address (a missing entity is `None`/`[]`, deterministic, not retried — same adjudication already CONFIRMED for the SIBLING `_call_with_retry` (S-216) in U-016, parity.md:1142,1225-1228, where the except→None/[] fallback CONTRACTS were verified ported). `page_size=100`/`uuid_cursor` is the Zep cursor-paging mechanism itself (no cursors over an in-memory iterator); `retry_delay=2.0`/`max_retries=3` are the retry's tuning constants — all pure network-cursor/retry artifacts. Genuinely inexpressible / non-contractual; no observable output dropped. **Legal substrate `[≠]`.**
+
+### No-downgrade honesty check — CLEAN
+This is NOT the owner's flagged bad pattern ("dest won't use it" rationalizing a portable feature skip). The distinction is real and substrate-grounded: paging/cursor/retry/cap are all about HOW Zep delivers data over a NETWORK; teri has the entire graph in RAM and reads it completely in one pass. The adjudication rests on genuine substrate-inexpressibility (no network → no cursor/retry) and strict-superset (full set ≥ capped set), NOT on convenience. The observable contract — "retrieve ALL nodes/edges" — is preserved and (for the cap) strengthened.
+
+### Per-symbol verdict
+- `- [x]` **S-054 `fetch_all_nodes`** — map-onto `get_all_entities`/`get_all_nodes`; complete-set iteration, no drop. Contract ("retrieve all nodes") preserved (cap removed = superset).
+- `- [x]` **S-055 `fetch_all_edges`** — map-onto `get_all_edges`; complete-set iteration, no drop. (Source itself has no edge cap — exact superset.)
+- `- [≠]` **S-049 `_DEFAULT_PAGE_SIZE=100`** — Zep cursor page size; no paging over in-memory iterator. Inexpressible.
+- `- [≠]` **S-050 `_MAX_NODES=2000`** — network paging round-trip safety limit; NO consumer depends on ≤2000 (swept exhaustively, incl. the LLM-context path which is bounded by per-type `take(20)`, not node count). teri returns the full set = strict SUPERSET. Survives challenge.
+- `- [≠]` **S-051 `_DEFAULT_MAX_RETRIES=3`** — Zep transient-error retry count; no I/O to retry in-process. Inexpressible/non-contractual.
+- `- [≠]` **S-052 `_DEFAULT_RETRY_DELAY=2.0`** — retry backoff base; same. Inexpressible/non-contractual.
+- `- [≠]` **S-053 `_fetch_page_with_retry`** — single-page Zep call + network-transient retry; in-process petgraph read has no network/transient failure. Inexpressible/non-contractual (sibling of U-016 S-216, already confirmed).
+
+### Rollup
+**VERDICT: PASS (5/7 `[≠]`, 2/7 `[x]`).** S-054/S-055 → `- [x]` (map-onto). S-049/S-050/S-051/S-052/S-053 → `- [≠]` (all challenge-surviving: inexpressible network-cursor/retry artifacts; S-050 strict-superset). All S-049..S-055 are `[x]`/legal-`[≠]` → rollup rule satisfied ⇒ **U-007 COMPLETE**. No silent drop (full petgraph iteration), no narrowed branch, no disguised-skip `[≠]`. Orchestrator may flip U-007 ledger `- [x]` and commit.

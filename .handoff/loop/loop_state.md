@@ -17,7 +17,23 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 0   # RESUMED 2026-06-17 (9th resume, reset 0); baseline re-verified 788 green. Target: U-023 sub-cycle (d) prepare_simulation (S-675) → COMPLETES U-023.
+cycles_this_session: 2   # RESUMED 2026-06-17 (9th resume, reset 0); baseline re-verified 788 green.
+# CYCLE2 (9th resume) 2026-06-17: U-007 zep_paging COMPLETE — opus PASS (DECISION-12, map-onto-substrate, NO new code).
+#   Whole module is Zep-Cloud network pagination; teri's in-process petgraph has no network/cursor/pages/I/O. S-054
+#   fetch_all_nodes / S-055 fetch_all_edges [x] map-onto (subsumed by U-016 KnowledgeGraphEntityReader::get_all_nodes/
+#   get_all_edges over KnowledgeGraph::get_all_entities(node_weights)/get_all_edges(edge_references) — return ALL,
+#   no limit/filter). S-053 _fetch_page_with_retry + S-049/051/052 [≠] inexpressible (no I/O to retry). S-050
+#   _MAX_NODES=2000 [≠] strict-SUPERSET (gate checked EVERY consumer for ≤2000 dep, found NONE; LLM context bounded
+#   independently by ENTITIES_PER_TYPE_DISPLAY/MAX_CONTEXT_LENGTH). 20/50 units [x]. Unblocks U-017, U-021. No code
+#   change → 797 green unchanged.
+# CYCLE1 (9th resume) 2026-06-17: U-023 sub-cycle (d) prepare_simulation (S-675) → U-023 COMPLETE — opus PASS.
+#   src/services/simulation_manager.rs: PrepareProgress<'a> + prepare_simulation<L>(...)->Result<SimulationState>
+#   (sync->async map, NO task_id/spawn here = U-026 route's job confirmed in api/simulation.py; NO force_regenerate
+#   — source has none, handoff/cartographer guessed wrong). 4 stages reading→profiles→config→READY; 0-entity→Ok(FAILED)
+#   vs exception→Err(FAILED) distinct via try_stage!. S-367 RE-OPENED by DECISION-11: generate_profiles_from_entities
+#   sequential→futures buffer_unordered(parallel_count.max(1)) — parallel_profile_count now LIVE knob; final Vec+file
+#   bytes proven deterministic across {1,3,10} (indexed-slot writes). opus gate PASS (S-675+S-367); 797 green, clippy
+#   --all-targets clean. 19/50 units [x] (all S-636..S-680). HEAD=a94658a. DECISION-11 recorded in target-architecture.md.
 cycles_total: 27
 # CYCLE3 (8th resume) 2026-06-17: U-023 sub-cycle (c) SimulationManager + FS persistence + create_simulation +
 #   5 getters — opus PASS (12/12). src/services/simulation_manager.rs: SimulationManager{Mutex<HashMap> cache},

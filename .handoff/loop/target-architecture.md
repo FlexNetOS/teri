@@ -796,3 +796,43 @@ likely-architect. Resolved by SOURCE evidence (the handoff's own predictions wer
 Parity gate: differential vs source on (a) 0-entity FAILED-Ok path, (b) exception FAILED-Err path, (c) stage
 ordering + state.json after each stage, (d) `parallel_count` final-output determinism, (e) reddit/twitter file
 gating by enable flags. **S-675 `[x]` ⇒ U-023 COMPLETE (all S-636..S-680).**
+
+---
+
+## DECISION-12 — U-007 `zep_paging.py` (S-049..S-055) → map-onto-substrate (subsumed by `KnowledgeGraph` in-process reads)
+
+**Class:** map-onto-substrate. **New production code: NONE** — the observable contract is already satisfied by
+U-016's parity-verified reader symbols. U-007 is a verification + `[≠]`-adjudication unit.
+
+**Source (`backend/app/utils/zep_paging.py`, 143 lines):** the entire module is Zep-Cloud **network** pagination —
+`fetch_all_nodes`/`fetch_all_edges` page the Zep graph via `client.graph.node/edge.get_by_graph_id` with a UUID
+`uuid_cursor`, `page_size=100`, per-page retry on transient network errors (`ConnectionError`/`TimeoutError`/
+`OSError`/`InternalServerError`) with exponential backoff (`delay*=2`), capping nodes at `_MAX_NODES=2000`.
+
+**Substrate reality:** teri's graph is in-process petgraph (`KnowledgeGraph`). There is **no network, no cursor, no
+pages, no transient I/O**. The consumers MiroFish feeds with `fetch_all_*` are already ported to read the graph
+directly: U-016 `KnowledgeGraphEntityReader::get_all_nodes`/`get_all_edges` (`entity_reader.rs:560/585`, returning
+the same node/edge-dict shapes), built on `KnowledgeGraph::get_all_entities` (`graph/mod.rs:1046`) /
+`get_all_edges` (`graph/mod.rs:830`). U-015 build reads the graph directly too.
+
+**Per-symbol mapping (the gate confirms each):**
+- **S-054 `fetch_all_nodes` / S-055 `fetch_all_edges`** → `[x]` map-onto: subsumed by `KnowledgeGraphEntityReader::
+  get_all_nodes`/`get_all_edges` (already parity-verified in U-016). Observable contract "return ALL nodes/edges of
+  the graph" is met (the full in-memory set, in petgraph insertion order — deterministic, a parity improvement over
+  Zep's cursor-order).
+- **S-053 `_fetch_page_with_retry`** → `[≠]` inexpressible: retries network/IO transient errors; an in-memory
+  `Vec`/`HashMap` read cannot raise `ConnectionError`/`InternalServerError` — nothing to retry. (Consistent with the
+  U-016 adjudication of Zep `_call_with_retry` as `[≠]` non-contractual.)
+- **S-049 `_DEFAULT_PAGE_SIZE=100` / S-051 `_DEFAULT_MAX_RETRIES=3` / S-052 `_DEFAULT_RETRY_DELAY=2.0`** → `[≠]`
+  inexpressible: page-size/retry knobs for a pagination+retry loop that does not exist in-process.
+- **S-050 `_MAX_NODES=2000`** → `[≠]` strict-SUPERSET: the cap exists ONLY to bound unbounded Zep network paging
+  (a safety limit), with NO in-process analog. teri returns the full in-memory set; applying `.take(2000)` would
+  ARTIFICIALLY truncate valid data teri already holds in RAM — removing capability the cap was never meant to remove.
+  Returning all nodes is MORE complete (superset), not a downgrade. (This is the rare legitimate `[≠]`-superset under
+  the owner rule: not "the destination won't use it" — the destination returns *more*, and the source behavior is a
+  network-safety artifact, not a semantic contract. The gate must confirm no downstream consumer asserts `len<=2000`.)
+
+**Gate:** confirm (1) `get_all_nodes`/`get_all_edges` return every graph node/edge (no silent drop), (2) the
+node/edge-dict shapes match what MiroFish's `fetch_all_*` feed consumers (already shown in U-016), (3) no teri
+consumer depends on the 2000-cap. On PASS: S-054/055 `[x]`, S-049/050/051/052/053 `[≠]` ⇒ **U-007 COMPLETE**,
+unblocking U-017/U-021.

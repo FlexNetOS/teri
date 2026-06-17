@@ -94,13 +94,13 @@
 
 ## U-007 — `backend/app/utils/zep_paging.py`
 
-- [ ] S-049 · `unit:U-007` · `const` · `_DEFAULT_PAGE_SIZE` · 100 · `zep_paging.py:20`
-- [ ] S-050 · `unit:U-007` · `const` · `_MAX_NODES` · 2000 · `zep_paging.py:21`
-- [ ] S-051 · `unit:U-007` · `const` · `_DEFAULT_MAX_RETRIES` · 3 · `zep_paging.py:22`
-- [ ] S-052 · `unit:U-007` · `const` · `_DEFAULT_RETRY_DELAY` · retry delay · `zep_paging.py:23`
-- [ ] S-053 · `unit:U-007` · `fn` · `_fetch_page_with_retry` · single page fetch with exponential backoff · `zep_paging.py:26`
-- [ ] S-054 · `unit:U-007` · `fn` · `fetch_all_nodes` · paginate all graph nodes via UUID cursor · `zep_paging.py:59`
-- [ ] S-055 · `unit:U-007` · `fn` · `fetch_all_edges` · paginate all graph edges via UUID cursor · `zep_paging.py:105`
+- [≠] S-049 · `unit:U-007` · `const` · `_DEFAULT_PAGE_SIZE` · 100 · `zep_paging.py:20` · **[≠] inexpressible (DECISION-12, opus PASS):** page-size knob for a pagination loop that does not exist in-process (petgraph is fully in RAM).
+- [≠] S-050 · `unit:U-007` · `const` · `_MAX_NODES` · 2000 · `zep_paging.py:21` · **[≠] strict-SUPERSET (DECISION-12, opus PASS):** network-paging safety cap with NO in-process analog; teri returns the full in-memory set (`.take(2000)` would truncate valid data). Verifier checked every consumer (graph_builder/zep_tools/entity_reader + teri AgentPool/filter_defined_entities/prepare_simulation/summarize_entities) — NONE depend on ≤2000 (LLM context bounded independently by ENTITIES_PER_TYPE_DISPLAY=20/MAX_CONTEXT_LENGTH=50000). Superset, not a skip.
+- [≠] S-051 · `unit:U-007` · `const` · `_DEFAULT_MAX_RETRIES` · 3 · `zep_paging.py:22` · **[≠] inexpressible (DECISION-12):** retry-count for a network-retry loop absent in-process.
+- [≠] S-052 · `unit:U-007` · `const` · `_DEFAULT_RETRY_DELAY` · retry delay · `zep_paging.py:23` · **[≠] inexpressible (DECISION-12):** backoff delay for absent network-retry loop.
+- [≠] S-053 · `unit:U-007` · `fn` · `_fetch_page_with_retry` · single page fetch with exponential backoff · `zep_paging.py:26` · **[≠] inexpressible (DECISION-12, opus PASS):** retries `ConnectionError`/`TimeoutError`/`OSError`/`InternalServerError`; an in-memory `Vec`/`HashMap` read has no transient I/O to retry (consistent with U-016 S-216 `_call_with_retry` adjudication).
+- [x] S-054 · `unit:U-007` · `fn` · `fetch_all_nodes` · paginate all graph nodes via UUID cursor · `zep_paging.py:59` · **[x] map-onto (DECISION-12, opus PASS):** subsumed by `KnowledgeGraphEntityReader::get_all_nodes` (`entity_reader.rs:560`) over `KnowledgeGraph::get_all_entities` (`graph/mod.rs:1046`, `node_weights().collect()` — returns ALL nodes, deterministic insertion order). Verified in U-016.
+- [x] S-055 · `unit:U-007` · `fn` · `fetch_all_edges` · paginate all graph edges via UUID cursor · `zep_paging.py:105` · **[x] map-onto (DECISION-12, opus PASS):** subsumed by `KnowledgeGraphEntityReader::get_all_edges` (`entity_reader.rs:585`) over `KnowledgeGraph::get_all_edges` (`graph/mod.rs:830`, `edge_references()` — returns ALL edges). Verified in U-016.
 
 ---
 
