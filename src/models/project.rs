@@ -44,7 +44,10 @@ use crate::error::{Result, TeriError};
 /// Format a local naive datetime exactly like Python's `datetime.now().isoformat()`:
 /// emit the microsecond fraction ONLY when it is non-zero (Python omits `.000000`
 /// for whole-second times), with NO timezone suffix (naive datetime).
-fn python_isoformat_local() -> String {
+///
+/// This is `pub(crate)` so that `sim::action_logger` can reuse it — both modules
+/// call Python's `datetime.now().isoformat()` which has the same local-naive semantics.
+pub(crate) fn python_isoformat_local() -> String {
     let now = Local::now().naive_local();
     let micros = now.and_utc().timestamp_subsec_micros();
     if micros == 0 {

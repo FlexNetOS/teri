@@ -130,34 +130,34 @@
 
 ## U-010 — `backend/scripts/action_logger.py`
 
-- [ ] S-070 · `unit:U-010` · `type` · `PlatformActionLogger` · per-platform JSONL action logger · `action_logger.py:22`
-- [ ] S-071 · `unit:U-010` · `method` · `PlatformActionLogger.__init__` · `action_logger.py:25`
-- [ ] S-072 · `unit:U-010` · `method` · `PlatformActionLogger._ensure_dir` · creates log dir · `action_logger.py:39`
-- [ ] S-073 · `unit:U-010` · `method` · `PlatformActionLogger.log_action` · writes action JSON line · `action_logger.py:43`
-- [ ] S-074 · `unit:U-010` · `method` · `PlatformActionLogger.log_round_start` · `action_logger.py:68`
-- [ ] S-075 · `unit:U-010` · `method` · `PlatformActionLogger.log_round_end` · `action_logger.py:80`
-- [ ] S-076 · `unit:U-010` · `method` · `PlatformActionLogger.log_simulation_start` · `action_logger.py:92`
-- [ ] S-077 · `unit:U-010` · `method` · `PlatformActionLogger.log_simulation_end` · `action_logger.py:105`
-- [ ] S-078 · `unit:U-010` · `type` · `SimulationLogManager` · aggregates twitter+reddit+main loggers · `action_logger.py:119`
-- [ ] S-079 · `unit:U-010` · `method` · `SimulationLogManager.__init__` · `action_logger.py:125`
-- [ ] S-080 · `unit:U-010` · `method` · `SimulationLogManager._setup_main_logger` · `action_logger.py:140`
-- [ ] S-081 · `unit:U-010` · `method` · `SimulationLogManager.get_twitter_logger` · `action_logger.py:169`
-- [ ] S-082 · `unit:U-010` · `method` · `SimulationLogManager.get_reddit_logger` · `action_logger.py:175`
-- [ ] S-083 · `unit:U-010` · `method` · `SimulationLogManager.log` · `action_logger.py:181`
-- [ ] S-084 · `unit:U-010` · `method` · `SimulationLogManager.info` · `action_logger.py:186`
-- [ ] S-085 · `unit:U-010` · `method` · `SimulationLogManager.warning` · `action_logger.py:189`
-- [ ] S-086 · `unit:U-010` · `method` · `SimulationLogManager.error` · `action_logger.py:192`
-- [ ] S-087 · `unit:U-010` · `method` · `SimulationLogManager.debug` · `action_logger.py:195`
-- [ ] S-088 · `unit:U-010` · `type` · `ActionLogger` · legacy compat interface · `action_logger.py:201`
-- [ ] S-089 · `unit:U-010` · `method` · `ActionLogger.__init__` · `action_logger.py:207`
-- [ ] S-090 · `unit:U-010` · `method` · `ActionLogger._ensure_dir` · `action_logger.py:211`
-- [ ] S-091 · `unit:U-010` · `method` · `ActionLogger.log_action` · `action_logger.py:216`
-- [ ] S-092 · `unit:U-010` · `method` · `ActionLogger.log_round_start` · `action_logger.py:242`
-- [ ] S-093 · `unit:U-010` · `method` · `ActionLogger.log_round_end` · `action_logger.py:254`
-- [ ] S-094 · `unit:U-010` · `method` · `ActionLogger.log_simulation_start` · `action_logger.py:266`
-- [ ] S-095 · `unit:U-010` · `method` · `ActionLogger.log_simulation_end` · `action_logger.py:278`
-- [ ] S-096 · `unit:U-010` · `const` · `_global_logger` · module-level logger · `action_logger.py:292`
-- [ ] S-097 · `unit:U-010` · `fn` · `get_logger` · returns global logger · `action_logger.py:295`
+- [x] S-070 · `unit:U-010` · `type` · `PlatformActionLogger` · per-platform JSONL action logger · `action_logger.py:22` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-071 · `unit:U-010` · `method` · `PlatformActionLogger.__init__` · `action_logger.py:25` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-072 · `unit:U-010` · `method` · `PlatformActionLogger._ensure_dir` · creates log dir · `action_logger.py:39` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-073 · `unit:U-010` · `method` · `PlatformActionLogger.log_action` · writes action JSON line · `action_logger.py:43` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-074 · `unit:U-010` · `method` · `PlatformActionLogger.log_round_start` · `action_logger.py:68` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-075 · `unit:U-010` · `method` · `PlatformActionLogger.log_round_end` · `action_logger.py:80` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-076 · `unit:U-010` · `method` · `PlatformActionLogger.log_simulation_start` · `action_logger.py:92` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-077 · `unit:U-010` · `method` · `PlatformActionLogger.log_simulation_end` · `action_logger.py:105` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-078 · `unit:U-010` · `type` · `SimulationLogManager` · aggregates twitter+reddit+main loggers · `action_logger.py:119` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-079 · `unit:U-010` · `method` · `SimulationLogManager.__init__` · `action_logger.py:125` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-080 · `unit:U-010` · `method` · `SimulationLogManager._setup_main_logger` · `action_logger.py:140` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-081 · `unit:U-010` · `method` · `SimulationLogManager.get_twitter_logger` · `action_logger.py:169` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-082 · `unit:U-010` · `method` · `SimulationLogManager.get_reddit_logger` · `action_logger.py:175` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-083 · `unit:U-010` · `method` · `SimulationLogManager.log` · `action_logger.py:181` · PARITY-VERIFIED 2026-06-17 (opus, FAIL→fix→PASS): Python `getattr(logger, level.lower(), logger.info)` resolves REAL logging method names — match now maps `info`→Info, `warning|warn`→Warning, `error|exception`→Error, `critical|fatal`→Critical (new LogLevel variant, not suppressed), `debug`→Debug, `_`→Info (getattr fallback). 5 regression tests (critical/fatal/warn/exception/bogus). **One `[≠]` sub-behavior (opus-ACCEPTED):** Python `logger.exception()` appends `formatException(sys.exc_info())` (a trailing `NoneType: None`/traceback line) — depends on Python's AMBIENT current-exception state which has NO Rust equivalent (genuinely-inexpressible); the contractual ERROR-level dispatch IS ported; verifier confirmed ZERO source call sites pass "exception" (sole consumer run_parallel_simulation.py uses only `.info`). Not a disguised skip.
+- [x] S-084 · `unit:U-010` · `method` · `SimulationLogManager.info` · `action_logger.py:186` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-085 · `unit:U-010` · `method` · `SimulationLogManager.warning` · `action_logger.py:189` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-086 · `unit:U-010` · `method` · `SimulationLogManager.error` · `action_logger.py:192` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-087 · `unit:U-010` · `method` · `SimulationLogManager.debug` · `action_logger.py:195` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-088 · `unit:U-010` · `type` · `ActionLogger` · legacy compat interface · `action_logger.py:201` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-089 · `unit:U-010` · `method` · `ActionLogger.__init__` · `action_logger.py:207` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-090 · `unit:U-010` · `method` · `ActionLogger._ensure_dir` · `action_logger.py:211` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-091 · `unit:U-010` · `method` · `ActionLogger.log_action` · `action_logger.py:216` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-092 · `unit:U-010` · `method` · `ActionLogger.log_round_start` · `action_logger.py:242` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-093 · `unit:U-010` · `method` · `ActionLogger.log_round_end` · `action_logger.py:254` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-094 · `unit:U-010` · `method` · `ActionLogger.log_simulation_start` · `action_logger.py:266` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-095 · `unit:U-010` · `method` · `ActionLogger.log_simulation_end` · `action_logger.py:278` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-096 · `unit:U-010` · `const` · `_global_logger` · module-level logger · `action_logger.py:292` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
+- [x] S-097 · `unit:U-010` · `fn` · `get_logger` · returns global logger · `action_logger.py:295` · PARITY-VERIFIED 2026-06-17 (opus, port-fresh)
 
 ---
 

@@ -1,3 +1,5 @@
+pub mod action_logger;
+
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
