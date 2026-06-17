@@ -2,9 +2,9 @@ use crate::error::{Result, TeriError};
 use crate::llm::LlmClient;
 use crate::seed::SeedDocument;
 use crate::seed::text_processor;
+use petgraph::Direction;
 use petgraph::graph::{Graph, NodeIndex};
 use petgraph::visit::EdgeRef;
-use petgraph::Direction;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -240,20 +240,18 @@ impl KnowledgeGraph {
 
         // Outgoing: entity --[rel]--> neighbor  (is_outgoing = true)
         for edge in self.inner.edges_directed(*idx, Direction::Outgoing) {
-            if let (Some(neighbor), Some(rel)) = (
-                self.inner.node_weight(edge.target()),
-                Some(edge.weight()),
-            ) {
+            if let (Some(neighbor), Some(rel)) =
+                (self.inner.node_weight(edge.target()), Some(edge.weight()))
+            {
                 result.push((neighbor, rel, true));
             }
         }
 
         // Incoming: neighbor --[rel]--> entity  (is_outgoing = false)
         for edge in self.inner.edges_directed(*idx, Direction::Incoming) {
-            if let (Some(neighbor), Some(rel)) = (
-                self.inner.node_weight(edge.source()),
-                Some(edge.weight()),
-            ) {
+            if let (Some(neighbor), Some(rel)) =
+                (self.inner.node_weight(edge.source()), Some(edge.weight()))
+            {
                 result.push((neighbor, rel, false));
             }
         }

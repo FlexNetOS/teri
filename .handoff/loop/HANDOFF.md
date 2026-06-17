@@ -37,13 +37,13 @@
 1. **🔴 NEXT (recommended): U-002 `serve_cmd` + U-003 `create_app` (axum server)** — porting these brings SECRET_KEY/JSON_AS_ASCII into a live HTTP surface → **rolls U-001 up to `[x]`** and unblocks U-025/026/027 (HTTP API, 59 routes) + the 9 Vue reuse-Y units. Alternatively the smaller self-contained leaves: **U-012 TaskManager** (deps:none → then port reclassified S-189 build_graph_async) · **U-005 locale** (deps:none, i18n thread-local → feeds U-036).
 2. **U-024 ReportAgent ReACT** (the biggest extend-Y) — extend report::generate_stream with plan_outline + a per-section graph-tool ReACT loop using KnowledgeGraph::search/get_subgraph + panorama via valid_at + insight via vec-sim; chat mode; section-by-section progress. NOTE GAP-OQ3-EMBED blocks the embeddings-backed semantic-search path until the substrate decision.
 3. **remaining extend-Y / deps**: U-049 graceful shutdown · U-036 i18n · **U-014 OntologyGenerator** (then port S-192 set_ontology, OQ-5/GAP-3 EntityKind::Custom).
-4. **GAP-OQ3-EMBED decision** — embedding-generation substrate (add `/v1/embeddings` to shimmy via Airframe, OR a teri `EmbeddingClient` vs an OpenAI-compatible provider).
 4. **port-fresh** (the heavy surface): HTTP/axum API routes (U-025/026/027, 59 routes — unblocks the 9 Vue reuse-Y units), simulation lifecycle manager (U-023), community platform adapters + social-sim consuming the Action taxonomy (U-022/028/029/030, resolves GAP-SOCIAL-WORLDSTATE), IPC/interview (U-020), config generator (U-019), ontology (U-014, OQ-5), Vue re-pointed at teri's axum API (OQ-4).
 5. **Vue reuse-Y verify (9 units, BLOCKED until the axum API exists)** — U-035/037/038/039/040/042/043/044 + SWEEP-1: verify the kept-Vue shapes against teri's API once routes land.
 
 ## Open gaps (flagged `- [!]`, no silent drop)
-- **GAP-OQ3-EMBED** — embedding generation substrate (shimmy `/v1/embeddings` absent).
-- **GAP-U015-1** — `build()` large-doc chunking (sequenced after U-013).
+- **GAP-SOCIAL-WORLDSTATE** — rich social world-state (timeline/posts/engagement) deferred to U-022/028/029/030.
+- ✅ **GAP-OQ3-EMBED RESOLVED 2026-06-17** — owner chose (a): shimmy gained real `/v1/embeddings` (candle BERT all-MiniLM-L6-v2, FlexNetOS/shimmy#6 MERGED) + teri `EmbeddingClient` (`src/embedding.rs`) wired to it; embed_model default → `all-MiniLM-L6-v2`. Unblocks U-017/021/024 vec-search consumers.
+- ✅ **GAP-U015-1 RESOLVED** (cycle-5) — `build()` large-doc chunking.
 
 ## Loop discipline
 Each /loop iteration: run ITERATE cycles (cycle_budget 3, or to ~50% context) → `/harness-evolution find` → commit → `ScheduleWakeup`. DONE only at 100% parity-ledger `- [x]` + 100% symbol-map `- [x]`/`- [≠]` + both left-behind sweeps clean + teri green + Vue re-pointed at teri API (OQ-4). Then open PR `port/mirofish → develop` (auto-merge armed).

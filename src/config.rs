@@ -175,12 +175,8 @@ impl Config {
         ];
 
         // MiroFish U-001 (S-012): allowed upload extensions — fixed, not env-backed.
-        let mut allowed_extensions = vec![
-            "pdf".to_string(),
-            "md".to_string(),
-            "txt".to_string(),
-            "markdown".to_string(),
-        ];
+        let mut allowed_extensions =
+            vec!["pdf".to_string(), "md".to_string(), "txt".to_string(), "markdown".to_string()];
         allowed_extensions.sort();
 
         // MiroFish U-001 (S-008 / S-007): model name — check LLM_MODEL_NAME (MiroFish env name)
@@ -198,8 +194,11 @@ impl Config {
                     .unwrap_or_else(|_| "http://127.0.0.1:11435/v1".to_string()),
                 api_key: api_key.unwrap_or_default().to_string(),
                 model,
+                // Default targets shimmy's POST /v1/embeddings (candle BERT
+                // sentence-transformer, default served model all-MiniLM-L6-v2, 384-dim).
+                // Override with env EMBED_MODEL to select a different model.
                 embed_model: std::env::var("EMBED_MODEL")
-                    .unwrap_or_else(|_| "text-embedding-3-small".to_string()),
+                    .unwrap_or_else(|_| "all-MiniLM-L6-v2".to_string()),
                 timeout_secs: std::env::var("LLM_TIMEOUT_SECS")
                     .ok()
                     .and_then(|v| v.parse().ok())
@@ -238,9 +237,7 @@ impl Config {
                     .unwrap_or_else(|_| "teri=debug,tower_http=info".to_string()),
             },
             // MiroFish U-001 fields below.
-            debug: std::env::var("FLASK_DEBUG")
-                .map(|v| v.to_lowercase() == "true")
-                .unwrap_or(true),
+            debug: std::env::var("FLASK_DEBUG").map(|v| v.to_lowercase() == "true").unwrap_or(true),
             zep_api_key: std::env::var("ZEP_API_KEY").ok(),
             // 50 MB — constant in MiroFish (50 * 1024 * 1024).
             max_content_length: 50 * 1024 * 1024,
@@ -261,12 +258,10 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(5),
-            report_agent_max_reflection_rounds: std::env::var(
-                "REPORT_AGENT_MAX_REFLECTION_ROUNDS",
-            )
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2),
+            report_agent_max_reflection_rounds: std::env::var("REPORT_AGENT_MAX_REFLECTION_ROUNDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2),
             report_agent_temperature: std::env::var("REPORT_AGENT_TEMPERATURE")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -546,20 +541,9 @@ mod tests {
             );
         }
         // Order is preserved (TREND before REFRESH, matching config.py:55-59).
-        let trend_pos = c
-            .oasis_reddit_actions
-            .iter()
-            .position(|a| a == "TREND")
-            .unwrap();
-        let refresh_pos = c
-            .oasis_reddit_actions
-            .iter()
-            .position(|a| a == "REFRESH")
-            .unwrap();
-        assert!(
-            trend_pos < refresh_pos,
-            "TREND must precede REFRESH (source order preserved)"
-        );
+        let trend_pos = c.oasis_reddit_actions.iter().position(|a| a == "TREND").unwrap();
+        let refresh_pos = c.oasis_reddit_actions.iter().position(|a| a == "REFRESH").unwrap();
+        assert!(trend_pos < refresh_pos, "TREND must precede REFRESH (source order preserved)");
     }
 
     // --- S-019 / REPORT_AGENT_MAX_TOOL_CALLS ---
@@ -643,14 +627,8 @@ mod tests {
         c.zep_api_key = None;
         let errors = c.validate_collect();
         assert_eq!(errors.len(), 2, "expected 2 errors, got: {errors:?}");
-        assert!(
-            errors.iter().any(|e| e.contains("LLM_API_KEY")),
-            "LLM_API_KEY error missing"
-        );
-        assert!(
-            errors.iter().any(|e| e.contains("ZEP_API_KEY")),
-            "ZEP_API_KEY error missing"
-        );
+        assert!(errors.iter().any(|e| e.contains("LLM_API_KEY")), "LLM_API_KEY error missing");
+        assert!(errors.iter().any(|e| e.contains("ZEP_API_KEY")), "ZEP_API_KEY error missing");
 
         if let Ok(v) = prev_zep {
             unsafe { std::env::set_var("ZEP_API_KEY", v) }

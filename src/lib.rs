@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod api;
 pub mod config;
+pub mod embedding;
 pub mod error;
 pub mod graph;
 pub mod llm;

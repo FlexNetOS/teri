@@ -28,7 +28,9 @@ ledger: parity 8/50 units verified [x] (U-004, U-006, U-008, U-009, U-013, U-015
 #   PORTED. U-004 rotating-file logging same error -> reclassify extend-Y, port next. Audit other [≠].
 # U-023 sweep TODO (tracked, not lost): gender 中文-normalization (S-371), truncated-JSON salvage (S-360/361).
 symbols: ~52/1087 [x] + ~19 [≠] of 1087 mapped   # +U-001 S-002/S-004/S-006..S-022 [x] (20) + S-001 [≠]; S-003/S-005 pending-U-002/U-003; +S-360/361/356/048 [x] ([≠]-audit, 2026-06-17); +S-TAX-001..019,021 [x] (social Action taxonomy); S-TAX-020 REFRESH [≠]
-gaps_open: GAP-OQ3-EMBED [!] (embedding generation: shimmy has no /v1/embeddings); GAP-U015-1 [!] (build() large-doc chunking after U-013); GAP-SOCIAL-WORLDSTATE [!] (rich social-world-state timeline/posts/engagement deferred to U-022/028/029/030)
+gaps_open: GAP-SOCIAL-WORLDSTATE [!] (rich social-world-state timeline/posts/engagement deferred to U-022/028/029/030)
+# GAP-OQ3-EMBED RESOLVED 2026-06-17 (owner chose (a)): shimmy gained real /v1/embeddings (candle BERT all-MiniLM-L6-v2, FlexNetOS/shimmy#6 MERGED) + teri EmbeddingClient (src/embedding.rs) wired to it. embed_model default ->all-MiniLM-L6-v2. 371 green. Unblocks U-017/021/024 vec-search consumers.
+# GAP-U015-1 RESOLVED earlier (build() large-doc chunking, cycle-5).
 action_taxonomy: Action::Social(SocialAction) — 12 OASIS types (Trend included; Like/Dislike carry TargetKind{Post,Comment}); REFRESH [≠] (FILTERED_ACTIONS). READY for U-022/028/029/030.
 # TRUE BASELINE CORRECTION: DISCOVER baseline.md claimed 142 tests GREEN on c894de8 — FALSE-GREEN.
 #   c894de8 (PR #4 merge) was a BAD MERGE: duplicated api_key field (config.rs) + dead from_env/dup
