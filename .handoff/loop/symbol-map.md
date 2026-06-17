@@ -292,22 +292,22 @@
 
 ## U-016 — `backend/app/services/zep_entity_reader.py`
 
-- [ ] S-198 · `unit:U-016` · `type` · `EntityNode` · dataclass with related_edges,related_nodes · `zep_entity_reader.py:23`
-- [ ] S-199 · `unit:U-016` · `field` · `EntityNode.uuid` · `zep_entity_reader.py:25`
-- [ ] S-200 · `unit:U-016` · `field` · `EntityNode.name` · `zep_entity_reader.py:26`
-- [ ] S-201 · `unit:U-016` · `field` · `EntityNode.labels` · `zep_entity_reader.py:27`
-- [ ] S-202 · `unit:U-016` · `field` · `EntityNode.summary` · `zep_entity_reader.py:28`
-- [ ] S-203 · `unit:U-016` · `field` · `EntityNode.attributes` · `zep_entity_reader.py:29`
-- [ ] S-204 · `unit:U-016` · `field` · `EntityNode.related_edges` · `zep_entity_reader.py:31`
-- [ ] S-205 · `unit:U-016` · `field` · `EntityNode.related_nodes` · `zep_entity_reader.py:33`
-- [ ] S-206 · `unit:U-016` · `method` · `EntityNode.to_dict` · `zep_entity_reader.py:35`
-- [ ] S-207 · `unit:U-016` · `method` · `EntityNode.get_entity_type` · extracts type from labels · `zep_entity_reader.py:46`
-- [ ] S-208 · `unit:U-016` · `type` · `FilteredEntities` · dataclass: entities,entity_types,total_count,filtered_count · `zep_entity_reader.py:55`
-- [ ] S-209 · `unit:U-016` · `field` · `FilteredEntities.entities` · `zep_entity_reader.py:57`
-- [ ] S-210 · `unit:U-016` · `field` · `FilteredEntities.entity_types` · `zep_entity_reader.py:58`
-- [ ] S-211 · `unit:U-016` · `field` · `FilteredEntities.total_count` · `zep_entity_reader.py:59`
-- [ ] S-212 · `unit:U-016` · `field` · `FilteredEntities.filtered_count` · `zep_entity_reader.py:60`
-- [ ] S-213 · `unit:U-016` · `method` · `FilteredEntities.to_dict` · `zep_entity_reader.py:62`
+- [x] S-198 · `unit:U-016` · `type` · `EntityNode` · dataclass with related_edges,related_nodes · `zep_entity_reader.py:23` → `teri::services::entity_reader::EntityNode`
+- [x] S-199 · `unit:U-016` · `field` · `EntityNode.uuid` · `zep_entity_reader.py:25` → `teri::services::entity_reader::EntityNode`
+- [x] S-200 · `unit:U-016` · `field` · `EntityNode.name` · `zep_entity_reader.py:26` → `teri::services::entity_reader::EntityNode`
+- [x] S-201 · `unit:U-016` · `field` · `EntityNode.labels` · `zep_entity_reader.py:27` → `teri::services::entity_reader::EntityNode`
+- [x] S-202 · `unit:U-016` · `field` · `EntityNode.summary` · `zep_entity_reader.py:28` → `teri::services::entity_reader::EntityNode`
+- [x] S-203 · `unit:U-016` · `field` · `EntityNode.attributes` · `zep_entity_reader.py:29` → `teri::services::entity_reader::EntityNode` (Map<String,Value>)
+- [x] S-204 · `unit:U-016` · `field` · `EntityNode.related_edges` · `zep_entity_reader.py:31` → `teri::services::entity_reader::EntityNode`
+- [x] S-205 · `unit:U-016` · `field` · `EntityNode.related_nodes` · `zep_entity_reader.py:33` → `teri::services::entity_reader::EntityNode`
+- [x] S-206 · `unit:U-016` · `method` · `EntityNode.to_dict` · `zep_entity_reader.py:35` → `teri::services::entity_reader::EntityNode::to_dict`
+- [x] S-207 · `unit:U-016` · `method` · `EntityNode.get_entity_type` · extracts type from labels · `zep_entity_reader.py:46` → `teri::services::entity_reader::EntityNode::get_entity_type`
+- [x] S-208 · `unit:U-016` · `type` · `FilteredEntities` · dataclass: entities,entity_types,total_count,filtered_count · `zep_entity_reader.py:55` → `teri::services::entity_reader::FilteredEntities`
+- [x] S-209 · `unit:U-016` · `field` · `FilteredEntities.entities` · `zep_entity_reader.py:57` → `teri::services::entity_reader::FilteredEntities`
+- [x] S-210 · `unit:U-016` · `field` · `FilteredEntities.entity_types` · `zep_entity_reader.py:58` → `teri::services::entity_reader::FilteredEntities` (HashSet<String>)
+- [x] S-211 · `unit:U-016` · `field` · `FilteredEntities.total_count` · `zep_entity_reader.py:59` → `teri::services::entity_reader::FilteredEntities`
+- [x] S-212 · `unit:U-016` · `field` · `FilteredEntities.filtered_count` · `zep_entity_reader.py:60` → `teri::services::entity_reader::FilteredEntities`
+- [x] S-213 · `unit:U-016` · `method` · `FilteredEntities.to_dict` · `zep_entity_reader.py:62` → `teri::services::entity_reader::FilteredEntities::to_dict`
 - [ ] S-214 · `unit:U-016` · `type` · `ZepEntityReader` · `zep_entity_reader.py:71`
 - [ ] S-215 · `unit:U-016` · `method` · `ZepEntityReader.__init__` · `zep_entity_reader.py:81`
 - [ ] S-216 · `unit:U-016` · `method` · `ZepEntityReader._call_with_retry` · `zep_entity_reader.py:88`
@@ -541,29 +541,29 @@
 - [x] S-427 · `unit:U-019` · `field` · `SimulationParameters.generation_reasoning` · `simulation_config_generator.py:174` → `teri::services::simulation_config::SimulationParameters`
 - [x] S-428 · `unit:U-019` · `method` · `SimulationParameters.to_dict` · `simulation_config_generator.py:176` → `teri::services::simulation_config::SimulationParameters::to_dict`
 - [x] S-429 · `unit:U-019` · `method` · `SimulationParameters.to_json` · `simulation_config_generator.py:195` → `teri::services::simulation_config::SimulationParameters::to_json`
-- [ ] S-430 · `unit:U-019` · `type` · `SimulationConfigGenerator` · `simulation_config_generator.py:200`
-- [ ] S-431 · `unit:U-019` · `field` · `SimulationConfigGenerator.MAX_CONTEXT_LENGTH` · `simulation_config_generator.py:214`
-- [ ] S-432 · `unit:U-019` · `field` · `SimulationConfigGenerator.AGENTS_PER_BATCH` · `simulation_config_generator.py:216`
-- [ ] S-433 · `unit:U-019` · `field` · `SimulationConfigGenerator.TIME_CONFIG_CONTEXT_LENGTH` · `simulation_config_generator.py:219`
-- [ ] S-434 · `unit:U-019` · `field` · `SimulationConfigGenerator.EVENT_CONFIG_CONTEXT_LENGTH` · `simulation_config_generator.py:220`
-- [ ] S-435 · `unit:U-019` · `field` · `SimulationConfigGenerator.ENTITY_SUMMARY_LENGTH` · `simulation_config_generator.py:221`
-- [ ] S-436 · `unit:U-019` · `field` · `SimulationConfigGenerator.AGENT_SUMMARY_LENGTH` · `simulation_config_generator.py:222`
-- [ ] S-437 · `unit:U-019` · `field` · `SimulationConfigGenerator.ENTITIES_PER_TYPE_DISPLAY` · `simulation_config_generator.py:223`
-- [ ] S-438 · `unit:U-019` · `method` · `SimulationConfigGenerator.__init__` · `simulation_config_generator.py:225`
-- [ ] S-439 · `unit:U-019` · `method` · `SimulationConfigGenerator.generate_config` · 4-stage: context→time→event→agent_configs · `simulation_config_generator.py:243`
-- [ ] S-440 · `unit:U-019` · `method` · `SimulationConfigGenerator._build_context` · `simulation_config_generator.py:381`
-- [ ] S-441 · `unit:U-019` · `method` · `SimulationConfigGenerator._summarize_entities` · `simulation_config_generator.py:409`
-- [ ] S-442 · `unit:U-019` · `method` · `SimulationConfigGenerator._call_llm_with_retry` · up to 3 retries · `simulation_config_generator.py:434`
-- [ ] S-443 · `unit:U-019` · `method` · `SimulationConfigGenerator._fix_truncated_json` · `simulation_config_generator.py:483`
-- [ ] S-444 · `unit:U-019` · `method` · `SimulationConfigGenerator._try_fix_config_json` · `simulation_config_generator.py:501`
-- [ ] S-445 · `unit:U-019` · `method` · `SimulationConfigGenerator._generate_time_config` · LLM → parse · `simulation_config_generator.py:535`
-- [ ] S-446 · `unit:U-019` · `method` · `SimulationConfigGenerator._get_default_time_config` · `simulation_config_generator.py:597`
-- [ ] S-447 · `unit:U-019` · `method` · `SimulationConfigGenerator._parse_time_config` · `simulation_config_generator.py:611`
-- [ ] S-448 · `unit:U-019` · `method` · `SimulationConfigGenerator._generate_event_config` · LLM → parse · `simulation_config_generator.py:646`
-- [ ] S-449 · `unit:U-019` · `method` · `SimulationConfigGenerator._parse_event_config` · `simulation_config_generator.py:719`
-- [ ] S-450 · `unit:U-019` · `method` · `SimulationConfigGenerator._assign_initial_post_agents` · LLM assigns initial-post agents · `simulation_config_generator.py:728`
-- [ ] S-451 · `unit:U-019` · `method` · `SimulationConfigGenerator._generate_agent_configs_batch` · LLM per-agent config in batches · `simulation_config_generator.py:813`
-- [ ] S-452 · `unit:U-019` · `method` · `SimulationConfigGenerator._generate_agent_config_by_rule` · fallback rule-based · `simulation_config_generator.py:908`
+- [x] S-430 · `unit:U-019` · `type` · `SimulationConfigGenerator` · `simulation_config_generator.py:200` → `teri::services::simulation_config::SimulationConfigGenerator`
+- [x] S-431 · `unit:U-019` · `field` · `SimulationConfigGenerator.MAX_CONTEXT_LENGTH` · `simulation_config_generator.py:214` → `SimulationConfigGenerator::MAX_CONTEXT_LENGTH` (50_000)
+- [x] S-432 · `unit:U-019` · `field` · `SimulationConfigGenerator.AGENTS_PER_BATCH` · `simulation_config_generator.py:216` → `SimulationConfigGenerator::AGENTS_PER_BATCH` (15)
+- [x] S-433 · `unit:U-019` · `field` · `SimulationConfigGenerator.TIME_CONFIG_CONTEXT_LENGTH` · `simulation_config_generator.py:219` → `SimulationConfigGenerator::TIME_CONFIG_CONTEXT_LENGTH` (10_000)
+- [x] S-434 · `unit:U-019` · `field` · `SimulationConfigGenerator.EVENT_CONFIG_CONTEXT_LENGTH` · `simulation_config_generator.py:220` → `SimulationConfigGenerator::EVENT_CONFIG_CONTEXT_LENGTH` (8_000)
+- [x] S-435 · `unit:U-019` · `field` · `SimulationConfigGenerator.ENTITY_SUMMARY_LENGTH` · `simulation_config_generator.py:221` → `SimulationConfigGenerator::ENTITY_SUMMARY_LENGTH` (300)
+- [x] S-436 · `unit:U-019` · `field` · `SimulationConfigGenerator.AGENT_SUMMARY_LENGTH` · `simulation_config_generator.py:222` → `SimulationConfigGenerator::AGENT_SUMMARY_LENGTH` (300)
+- [x] S-437 · `unit:U-019` · `field` · `SimulationConfigGenerator.ENTITIES_PER_TYPE_DISPLAY` · `simulation_config_generator.py:223` → `SimulationConfigGenerator::ENTITIES_PER_TYPE_DISPLAY` (20)
+- [x] S-438 · `unit:U-019` · `method` · `SimulationConfigGenerator.__init__` · `simulation_config_generator.py:225` → `SimulationConfigGenerator::new` (LlmClient injected; model_name + base_url explicit)
+- [ ] S-439 · `unit:U-019` · `method` · `SimulationConfigGenerator.generate_config` · 4-stage: context→time→event→agent_configs · `simulation_config_generator.py:243` (sub-cycles c/d pending)
+- [x] S-440 · `unit:U-019` · `method` · `SimulationConfigGenerator._build_context` · `simulation_config_generator.py:381` → `SimulationConfigGenerator::build_context`
+- [x] S-441 · `unit:U-019` · `method` · `SimulationConfigGenerator._summarize_entities` · `simulation_config_generator.py:409` → `SimulationConfigGenerator::summarize_entities`
+- [x] S-442 · `unit:U-019` · `method` · `SimulationConfigGenerator._call_llm_with_retry` · up to 3 retries · `simulation_config_generator.py:434` → `SimulationConfigGenerator::call_llm_with_retry`
+- [x] S-443 · `unit:U-019` · `method` · `SimulationConfigGenerator._fix_truncated_json` · `simulation_config_generator.py:483` → `SimulationConfigGenerator::fix_truncated_json`
+- [x] S-444 · `unit:U-019` · `method` · `SimulationConfigGenerator._try_fix_config_json` · `simulation_config_generator.py:501` → `SimulationConfigGenerator::try_fix_config_json`
+- [x] S-445 · `unit:U-019` · `method` · `SimulationConfigGenerator._generate_time_config` · LLM → parse · `simulation_config_generator.py:535` → `SimulationConfigGenerator::generate_time_config`
+- [x] S-446 · `unit:U-019` · `method` · `SimulationConfigGenerator._get_default_time_config` · `simulation_config_generator.py:597` → `SimulationConfigGenerator::get_default_time_config`
+- [x] S-447 · `unit:U-019` · `method` · `SimulationConfigGenerator._parse_time_config` · `simulation_config_generator.py:611` → `SimulationConfigGenerator::parse_time_config`
+- [x] S-448 · `unit:U-019` · `method` · `SimulationConfigGenerator._generate_event_config` · LLM → parse · `simulation_config_generator.py:646` → `SimulationConfigGenerator::generate_event_config`
+- [x] S-449 · `unit:U-019` · `method` · `SimulationConfigGenerator._parse_event_config` · `simulation_config_generator.py:719` → `SimulationConfigGenerator::parse_event_config`
+- [ ] S-450 · `unit:U-019` · `method` · `SimulationConfigGenerator._assign_initial_post_agents` · LLM assigns initial-post agents · `simulation_config_generator.py:728` (sub-cycle c)
+- [ ] S-451 · `unit:U-019` · `method` · `SimulationConfigGenerator._generate_agent_configs_batch` · LLM per-agent config in batches · `simulation_config_generator.py:813` (sub-cycle c)
+- [ ] S-452 · `unit:U-019` · `method` · `SimulationConfigGenerator._generate_agent_config_by_rule` · fallback rule-based · `simulation_config_generator.py:908` (sub-cycle d)
 
 ---
 

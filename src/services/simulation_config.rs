@@ -24,10 +24,17 @@
 //! `serde_json` serializes to UTF-8 by default; Chinese characters are NOT escaped.
 //! This matches `json.dumps(..., ensure_ascii=False)`.
 
+use std::collections::HashMap;
+
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::error::{Result, TeriError};
+use crate::i18n::get_language_instruction;
+use crate::llm::{ChatMessage, ChatOptions, LlmClient};
 use crate::models::project::python_isoformat_local;
+use crate::services::entity_reader::EntityNode;
 
 // ---------------------------------------------------------------------------
 // CHINA_TIMEZONE_CONFIG (S-374)
@@ -998,5 +1005,1303 @@ mod tests {
             !ts.ends_with('Z') && !ts.contains('+') && !ts.contains(" UTC"),
             "generated_at must be local naive (no tz suffix): {ts}"
         );
+    }
+}
+
+// ===========================================================================
+// SimulationConfigGenerator (S-430..S-449)
+//
+// Port of `backend/app/services/simulation_config_generator.py` L200-727
+// (MiroFish).  Covers: struct + class constants + constructor + context/LLM
+// foundation + time/event stages.
+//
+// NOT ported here (later sub-cycles):
+//   _assign_initial_post_agents (S-450)
+//   _generate_agent_configs_batch (S-451)
+//   _generate_agent_config_by_rule (S-452)
+//   generate_config (S-439) — orchestrates all stages including the above
+//
+// # finish_reason decision
+//
+// Python's `_call_llm_with_retry` detects truncation via `finish_reason ==
+// "length"` and immediately applies `_fix_truncated_json` before any parse
+// attempt.  teri's `LlmClient::chat` returns a content `String`; it does NOT
+// surface `finish_reason` (the OpenAI adapter extracts `.choices[0].message.
+// content` and discards the finish_reason field — DECISION-7).
+//
+// Decision: we adopt strategy (a) — always attempt `_fix_truncated_json`
+// salvage when the initial parse fails, which subsumes the truncation-detection
+// case:
+//
+// 1. Call `chat` → raw `String`.
+// 2. `serde_json::from_str` on raw → success → return.
+// 3. Failure → run `_fix_truncated_json(raw)` → try parse → success → return.
+// 4. Failure → run `_try_fix_config_json(raw)` → success → return.
+// 5. Failure → record error, next attempt (with lower temperature).
+//
+// This loses NO salvage behaviour:
+//   - Python's "finish_reason==length → fix → parse" path becomes step 3.
+//   - Python's "parse fail → try_fix_config_json" path becomes step 4.
+//   - All other repair paths are included.
+//
+// The only Python behaviour this can't reproduce is the case where truncated
+// output parses as valid JSON but is semantically incomplete — but Python's own
+// code wouldn't catch that either (it just returns the first successful parse).
+// ===========================================================================
+
+/// Simulation configuration generator.
+///
+/// Port of `SimulationConfigGenerator` (`simulation_config_generator.py:200`).
+///
+/// Uses an injected `LlmClient` (no direct OpenAI import); model_name and
+/// base_url are stored for embedding into `SimulationParameters.llm_*` fields.
+///
+/// # Type parameter
+/// `L` follows the `OntologyGenerator<L: LlmClient>` pattern from
+/// `src/services/ontology.rs`.
+///
+/// S-430
+pub struct SimulationConfigGenerator<L: LlmClient> {
+    /// Injected LLM client.
+    client: L,
+    /// S-438 `self.model_name`
+    pub model_name: String,
+    /// S-438 `self.base_url`
+    pub base_url: String,
+}
+
+impl<L: LlmClient> SimulationConfigGenerator<L> {
+    // -----------------------------------------------------------------------
+    // Class constants (S-431..S-437)
+    // -----------------------------------------------------------------------
+
+    /// S-431 — `MAX_CONTEXT_LENGTH = 50000`
+    pub const MAX_CONTEXT_LENGTH: usize = 50_000;
+
+    /// S-432 — `AGENTS_PER_BATCH = 15`
+    pub const AGENTS_PER_BATCH: usize = 15;
+
+    /// S-433 — `TIME_CONFIG_CONTEXT_LENGTH = 10000`
+    pub const TIME_CONFIG_CONTEXT_LENGTH: usize = 10_000;
+
+    /// S-434 — `EVENT_CONFIG_CONTEXT_LENGTH = 8000`
+    pub const EVENT_CONFIG_CONTEXT_LENGTH: usize = 8_000;
+
+    /// S-435 — `ENTITY_SUMMARY_LENGTH = 300`
+    pub const ENTITY_SUMMARY_LENGTH: usize = 300;
+
+    /// S-436 — `AGENT_SUMMARY_LENGTH = 300`
+    pub const AGENT_SUMMARY_LENGTH: usize = 300;
+
+    /// S-437 — `ENTITIES_PER_TYPE_DISPLAY = 20`
+    pub const ENTITIES_PER_TYPE_DISPLAY: usize = 20;
+
+    // -----------------------------------------------------------------------
+    // S-438 — __init__
+    // -----------------------------------------------------------------------
+
+    /// Construct a `SimulationConfigGenerator`.
+    ///
+    /// Port of `SimulationConfigGenerator.__init__` (`simulation_config_generator.py:225-241`).
+    ///
+    /// In MiroFish the constructor reads `Config.LLM_*` env vars and builds an
+    /// OpenAI client.  In teri the LLM client is injected; `model_name` and
+    /// `base_url` are passed explicitly and stored for embedding in the output
+    /// `SimulationParameters`.
+    pub fn new(client: L, model_name: impl Into<String>, base_url: impl Into<String>) -> Self {
+        Self { client, model_name: model_name.into(), base_url: base_url.into() }
+    }
+
+    // -----------------------------------------------------------------------
+    // S-440 — _build_context
+    // -----------------------------------------------------------------------
+
+    /// Build the LLM context string, capped to `MAX_CONTEXT_LENGTH` chars.
+    ///
+    /// Port of `SimulationConfigGenerator._build_context`
+    /// (`simulation_config_generator.py:381-407`).
+    ///
+    /// Algorithm (all lengths in CHARS, not bytes — matching Python `len()` on str):
+    /// 1. Generate entity summary via `_summarize_entities`.
+    /// 2. Build context_parts: `## 模拟需求\n{req}` and `\n## 实体信息 ({n}个)\n{summary}`.
+    /// 3. `remaining_length = MAX_CONTEXT_LENGTH - sum(char_len(parts)) - 500`.
+    /// 4. If `remaining_length > 0` and `document_text` is non-empty:
+    ///    a. Take first `remaining_length` chars of `document_text`.
+    ///    b. If the original was longer, append `\n...(文档已截断)`.
+    ///    c. Append `\n## 原始文档内容\n{doc_text}` to context_parts.
+    /// 5. Join parts with `"\n"`.
+    pub fn build_context(
+        &self,
+        simulation_requirement: &str,
+        document_text: &str,
+        entities: &[EntityNode],
+    ) -> String {
+        let entity_summary = self.summarize_entities(entities);
+
+        let part1 = format!("## 模拟需求\n{simulation_requirement}");
+        let part2 = format!("\n## 实体信息 ({}个)\n{entity_summary}", entities.len());
+
+        let current_length: usize = part1.chars().count() + part2.chars().count();
+        let remaining_length =
+            (Self::MAX_CONTEXT_LENGTH as isize - current_length as isize - 500).max(0) as usize;
+
+        let mut context_parts = vec![part1, part2];
+
+        if remaining_length > 0 && !document_text.is_empty() {
+            let doc_chars: Vec<char> = document_text.chars().collect();
+            let truncated = doc_chars.len() > remaining_length;
+            let doc_text: String = doc_chars.into_iter().take(remaining_length).collect();
+            let doc_text = if truncated {
+                format!("{doc_text}\n...(文档已截断)")
+            } else {
+                doc_text
+            };
+            context_parts.push(format!("\n## 原始文档内容\n{doc_text}"));
+        }
+
+        context_parts.join("\n")
+    }
+
+    // -----------------------------------------------------------------------
+    // S-441 — _summarize_entities
+    // -----------------------------------------------------------------------
+
+    /// Generate a compact entity summary grouped by type.
+    ///
+    /// Port of `SimulationConfigGenerator._summarize_entities`
+    /// (`simulation_config_generator.py:409-432`).
+    ///
+    /// Algorithm:
+    /// 1. Group entities by `get_entity_type()` (default `"Unknown"`).
+    /// 2. For each group:
+    ///    a. Header line: `\n### {type} ({n}个)`.
+    ///    b. Up to `ENTITIES_PER_TYPE_DISPLAY` entries (truncated to `ENTITY_SUMMARY_LENGTH` chars).
+    ///    c. If more remain: `  ... 还有 {k} 个`.
+    /// 3. Join all lines with `"\n"`.
+    ///
+    /// Summary truncation is CHAR-based (`.chars()`) to match Python `len()` on str,
+    /// which counts Unicode scalar values (not bytes).  This is important for
+    /// Chinese summaries where each character is 3 bytes in UTF-8.
+    pub fn summarize_entities(&self, entities: &[EntityNode]) -> String {
+        // Group by entity type, preserving insertion order (Python dict preserves insertion order
+        // since 3.7; we match that by iterating entities once).
+        let mut by_type: HashMap<String, Vec<&EntityNode>> = HashMap::new();
+        let mut type_order: Vec<String> = Vec::new();
+
+        for e in entities {
+            let t = e.get_entity_type().unwrap_or_else(|| "Unknown".to_string());
+            if !by_type.contains_key(&t) {
+                type_order.push(t.clone());
+                by_type.insert(t.clone(), Vec::new());
+            }
+            by_type.get_mut(&t).unwrap().push(e);
+        }
+
+        let mut lines: Vec<String> = Vec::new();
+
+        for entity_type in &type_order {
+            let type_entities = &by_type[entity_type];
+            lines.push(format!("\n### {} ({}个)", entity_type, type_entities.len()));
+
+            let display_count = Self::ENTITIES_PER_TYPE_DISPLAY;
+            let summary_len = Self::ENTITY_SUMMARY_LENGTH;
+
+            for e in type_entities.iter().take(display_count) {
+                // CHAR-based truncation — Python: len(e.summary) > summary_len
+                let char_count = e.summary.chars().count();
+                let summary_preview = if char_count > summary_len {
+                    // take first summary_len chars + "..."
+                    let truncated: String = e.summary.chars().take(summary_len).collect();
+                    format!("{truncated}...")
+                } else {
+                    e.summary.clone()
+                };
+                lines.push(format!("- {}: {summary_preview}", e.name));
+            }
+
+            if type_entities.len() > display_count {
+                lines.push(format!(
+                    "  ... 还有 {} 个",
+                    type_entities.len() - display_count
+                ));
+            }
+        }
+
+        lines.join("\n")
+    }
+
+    // -----------------------------------------------------------------------
+    // S-442 — _call_llm_with_retry
+    // -----------------------------------------------------------------------
+
+    /// Call the LLM with up to 3 attempts, descending temperature, and JSON salvage.
+    ///
+    /// Port of `SimulationConfigGenerator._call_llm_with_retry`
+    /// (`simulation_config_generator.py:434-481`).
+    ///
+    /// # Algorithm
+    /// - `max_attempts = 3`
+    /// - Per attempt temperature: `0.7 - (attempt * 0.1)` (0.7, 0.6, 0.5)
+    /// - Call `chat(messages, opts)` → raw `String`.
+    /// - Step 1: try `serde_json::from_str(raw)` → success → return.
+    /// - Step 2: run `fix_truncated_json(raw)` → try parse → success → return.
+    ///   (Subsumes Python's finish_reason=="length" branch — see module docstring.)
+    /// - Step 3: run `try_fix_config_json(raw)` → `Some(v)` → return.
+    /// - On exception / all parse fails: `sleep(2 * (attempt + 1))` and retry.
+    /// - After 3 exhausted attempts: return last error.
+    ///
+    /// Return type: `Result<Value>` (a `serde_json::Value::Object`).
+    pub async fn call_llm_with_retry(
+        &self,
+        prompt: &str,
+        system_prompt: &str,
+    ) -> Result<Value> {
+        let max_attempts = 3usize;
+        let mut last_error: Option<TeriError> = None;
+
+        for attempt in 0..max_attempts {
+            let temperature = 0.7 - (attempt as f32 * 0.1);
+            let messages = [
+                ChatMessage::system(system_prompt),
+                ChatMessage::user(prompt),
+            ];
+            let opts = ChatOptions { temperature: Some(temperature), max_tokens: None };
+
+            match self.client.chat(&messages, &opts).await {
+                Ok(raw) => {
+                    // Step 1: direct parse
+                    if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                        return Ok(v);
+                    }
+
+                    // Step 2: fix-truncated then parse
+                    let fixed = Self::fix_truncated_json(&raw);
+                    if let Ok(v) = serde_json::from_str::<Value>(&fixed) {
+                        return Ok(v);
+                    }
+
+                    // Step 3: try_fix_config_json salvage
+                    if let Some(v) = Self::try_fix_config_json(&raw) {
+                        return Ok(v);
+                    }
+
+                    // All parse paths failed — treat as a soft error and retry
+                    last_error = Some(TeriError::Config(format!(
+                        "JSON parse failed after all repair attempts (attempt {})",
+                        attempt + 1
+                    )));
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        2 * (attempt as u64 + 1),
+                    ))
+                    .await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "LLM调用失败 (attempt {}): {}",
+                        attempt + 1,
+                        &e.to_string()[..e.to_string().len().min(80)]
+                    );
+                    last_error = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        2 * (attempt as u64 + 1),
+                    ))
+                    .await;
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| TeriError::Config("LLM调用失败".into())))
+    }
+
+    // -----------------------------------------------------------------------
+    // S-443 — _fix_truncated_json
+    // -----------------------------------------------------------------------
+
+    /// Repair a truncated JSON string by closing unbalanced braces/brackets.
+    ///
+    /// Port of `SimulationConfigGenerator._fix_truncated_json`
+    /// (`simulation_config_generator.py:483-499`).
+    ///
+    /// Algorithm (operates on chars, not bytes):
+    /// 1. Strip whitespace.
+    /// 2. Count `open_braces = count('{') - count('}')`.
+    /// 3. Count `open_brackets = count('[') - count(']')`.
+    /// 4. If last char not in `{'"', '}', ']'}`: append `'"'`.
+    /// 5. Append `']'` × `open_brackets`.
+    /// 6. Append `'}'` × `open_braces`.
+    pub fn fix_truncated_json(content: &str) -> String {
+        let content = content.trim();
+
+        let open_braces = content.chars().filter(|&c| c == '{').count() as isize
+            - content.chars().filter(|&c| c == '}').count() as isize;
+        let open_brackets = content.chars().filter(|&c| c == '[').count() as isize
+            - content.chars().filter(|&c| c == ']').count() as isize;
+
+        let mut result = content.to_string();
+
+        // Python: if content and content[-1] not in '",}]'
+        if let Some(last_ch) = result.chars().last()
+            && last_ch != '"'
+            && last_ch != ','
+            && last_ch != '}'
+            && last_ch != ']'
+        {
+            result.push('"');
+        }
+
+        for _ in 0..open_brackets.max(0) {
+            result.push(']');
+        }
+        for _ in 0..open_braces.max(0) {
+            result.push('}');
+        }
+
+        result
+    }
+
+    // -----------------------------------------------------------------------
+    // S-444 — _try_fix_config_json
+    // -----------------------------------------------------------------------
+
+    /// Attempt multi-step JSON repair and return the parsed value if successful.
+    ///
+    /// Port of `SimulationConfigGenerator._try_fix_config_json`
+    /// (`simulation_config_generator.py:501-533`).
+    ///
+    /// Algorithm:
+    /// 1. `fix_truncated_json(content)`.
+    /// 2. Regex-extract `\{[\s\S]*\}` (the outermost JSON object).
+    /// 3. Replace newlines/collapse whitespace INSIDE string literals
+    ///    (regex `"[^"\\]*(?:\\.[^"\\]*)*"` — matches JSON strings).
+    /// 4. Try `serde_json::from_str`.
+    /// 5. On failure: strip control chars `[\x00-\x1f\x7f-\x9f]`, collapse
+    ///    whitespace, try again.
+    /// 6. Return `Some(Value)` on any success, `None` on all failures.
+    pub fn try_fix_config_json(content: &str) -> Option<Value> {
+        // Step 1: fix truncation
+        let content = Self::fix_truncated_json(content);
+
+        // Step 2: extract the outermost JSON object
+        let obj_re = Regex::new(r"\{[\s\S]*\}").expect("static regex");
+        let json_str = obj_re.find(&content)?.as_str().to_string();
+
+        // Step 3: fix newlines inside JSON string literals
+        // Regex matches a JSON string (handles escaped chars)
+        let str_re = Regex::new(r#""[^"\\]*(?:\\.[^"\\]*)*""#).expect("static regex");
+        let ws_re = Regex::new(r"\s+").expect("static regex");
+
+        let json_str = str_re
+            .replace_all(&json_str, |caps: &regex::Captures| {
+                let s = caps.get(0).unwrap().as_str();
+                // Replace \n and \r with space inside the string literal
+                let s = s.replace(['\n', '\r'], " ");
+                // Collapse runs of whitespace inside the literal
+                ws_re.replace_all(&s, " ").into_owned()
+            })
+            .into_owned();
+
+        // Step 4: try parse
+        if let Ok(v) = serde_json::from_str::<Value>(&json_str) {
+            return Some(v);
+        }
+
+        // Step 5: strip control chars + collapse whitespace + retry
+        let ctrl_re = Regex::new(r"[\x00-\x1f\x7f-\x9f]").expect("static regex");
+        let json_str = ctrl_re.replace_all(&json_str, " ").into_owned();
+        let json_str = ws_re.replace_all(&json_str, " ").into_owned();
+
+        serde_json::from_str::<Value>(&json_str).ok()
+    }
+
+    // -----------------------------------------------------------------------
+    // S-445 — _generate_time_config
+    // -----------------------------------------------------------------------
+
+    /// Call LLM to generate a time simulation configuration.
+    ///
+    /// Port of `SimulationConfigGenerator._generate_time_config`
+    /// (`simulation_config_generator.py:535-595`).
+    ///
+    /// - Truncates `context` to `TIME_CONFIG_CONTEXT_LENGTH` chars.
+    /// - `max_agents_allowed = max(1, int(num_entities * 0.9))`.
+    /// - System prompt appends `get_language_instruction()`.
+    /// - On LLM failure: falls back to `_get_default_time_config(num_entities)`.
+    pub async fn generate_time_config(
+        &self,
+        context: &str,
+        num_entities: usize,
+    ) -> Value {
+        // CHAR-based truncation — Python: context[:self.TIME_CONFIG_CONTEXT_LENGTH]
+        let context_truncated: String =
+            context.chars().take(Self::TIME_CONFIG_CONTEXT_LENGTH).collect();
+
+        let max_agents_allowed = (num_entities as f64 * 0.9).max(1.0) as usize;
+
+        let prompt = format!(
+            r#"基于以下模拟需求，生成时间模拟配置。
+
+{context_truncated}
+
+## 任务
+请生成时间配置JSON。
+
+### 基本原则（仅供参考，需根据具体事件和参与群体灵活调整）：
+- 请根据模拟场景推断目标用户群体所在时区和作息习惯，以下为东八区(UTC+8)的参考示例
+- 凌晨0-5点几乎无人活动（活跃度系数0.05）
+- 早上6-8点逐渐活跃（活跃度系数0.4）
+- 工作时间9-18点中等活跃（活跃度系数0.7）
+- 晚间19-22点是高峰期（活跃度系数1.5）
+- 23点后活跃度下降（活跃度系数0.5）
+- 一般规律：凌晨低活跃、早间渐增、工作时段中等、晚间高峰
+- **重要**：以下示例值仅供参考，你需要根据事件性质、参与群体特点来调整具体时段
+  - 例如：学生群体高峰可能是21-23点；媒体全天活跃；官方机构只在工作时间
+  - 例如：突发热点可能导致深夜也有讨论，off_peak_hours 可适当缩短
+
+### 返回JSON格式（不要markdown）
+
+示例：
+{{
+    "total_simulation_hours": 72,
+    "minutes_per_round": 60,
+    "agents_per_hour_min": 5,
+    "agents_per_hour_max": 50,
+    "peak_hours": [19, 20, 21, 22],
+    "off_peak_hours": [0, 1, 2, 3, 4, 5],
+    "morning_hours": [6, 7, 8],
+    "work_hours": [9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+    "reasoning": "针对该事件的时间配置说明"
+}}
+
+字段说明：
+- total_simulation_hours (int): 模拟总时长，24-168小时，突发事件短、持续话题长
+- minutes_per_round (int): 每轮时长，30-120分钟，建议60分钟
+- agents_per_hour_min (int): 每小时最少激活Agent数（取值范围: 1-{max_agents_allowed}）
+- agents_per_hour_max (int): 每小时最多激活Agent数（取值范围: 1-{max_agents_allowed}）
+- peak_hours (int数组): 高峰时段，根据事件参与群体调整
+- off_peak_hours (int数组): 低谷时段，通常深夜凌晨
+- morning_hours (int数组): 早间时段
+- work_hours (int数组): 工作时段
+- reasoning (string): 简要说明为什么这样配置"#
+        );
+
+        let lang_instruction = get_language_instruction();
+        let system_prompt = format!(
+            "你是社交媒体模拟专家。返回纯JSON格式，时间配置需符合模拟场景中目标用户群体的作息习惯。\n\n{lang_instruction}"
+        );
+
+        match self.call_llm_with_retry(&prompt, &system_prompt).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("时间配置LLM生成失败: {e}, 使用默认配置");
+                self.get_default_time_config(num_entities)
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // S-446 — _get_default_time_config
+    // -----------------------------------------------------------------------
+
+    /// Return the default time configuration (Chinese work/life schedule).
+    ///
+    /// Port of `SimulationConfigGenerator._get_default_time_config`
+    /// (`simulation_config_generator.py:597-609`).
+    pub fn get_default_time_config(&self, num_entities: usize) -> Value {
+        serde_json::json!({
+            "total_simulation_hours": 72,
+            "minutes_per_round": 60,
+            "agents_per_hour_min": (num_entities / 15).max(1),
+            "agents_per_hour_max": (num_entities / 5).max(5),
+            "peak_hours": [19, 20, 21, 22],
+            "off_peak_hours": [0, 1, 2, 3, 4, 5],
+            "morning_hours": [6, 7, 8],
+            "work_hours": [9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+            "reasoning": "使用默认中国人作息配置（每轮1小时）"
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // S-447 — _parse_time_config
+    // -----------------------------------------------------------------------
+
+    /// Parse an LLM time-config result dict into a `TimeSimulationConfig`.
+    ///
+    /// Port of `SimulationConfigGenerator._parse_time_config`
+    /// (`simulation_config_generator.py:611-644`).
+    ///
+    /// Validation and clamping (preserving ALL branches):
+    /// - `agents_per_hour_min` defaults to `max(1, num_entities // 15)`.
+    /// - `agents_per_hour_max` defaults to `max(5, num_entities // 5)`.
+    /// - If `min > num_entities`: correct to `max(1, num_entities // 10)`.
+    /// - If `max > num_entities`: correct to `max(min + 1, num_entities // 2)`.
+    /// - If `min >= max`: correct min to `max(1, max // 2)`.
+    ///
+    /// All other fields use direct extraction with Python defaults.
+    pub fn parse_time_config(&self, result: &Value, num_entities: usize) -> TimeSimulationConfig {
+        // Helper to extract an integer field
+        let get_int = |key: &str, default: i64| -> i64 {
+            result.get(key).and_then(Value::as_i64).unwrap_or(default)
+        };
+        let get_arr_i64 = |key: &str, default: Vec<i64>| -> Vec<i64> {
+            result
+                .get(key)
+                .and_then(Value::as_array)
+                .map(|arr| arr.iter().filter_map(Value::as_i64).collect())
+                .unwrap_or(default)
+        };
+
+        let default_min = (num_entities / 15).max(1) as i64;
+        let default_max = (num_entities / 5).max(5) as i64;
+
+        let mut agents_per_hour_min = get_int("agents_per_hour_min", default_min);
+        let mut agents_per_hour_max = get_int("agents_per_hour_max", default_max);
+
+        let num_entities_i64 = num_entities as i64;
+
+        // Validate: ensure not exceeding total agent count
+        if agents_per_hour_min > num_entities_i64 {
+            tracing::warn!(
+                "agents_per_hour_min ({agents_per_hour_min}) 超过总Agent数 ({num_entities_i64})，已修正"
+            );
+            agents_per_hour_min = (num_entities_i64 / 10).max(1);
+        }
+
+        if agents_per_hour_max > num_entities_i64 {
+            tracing::warn!(
+                "agents_per_hour_max ({agents_per_hour_max}) 超过总Agent数 ({num_entities_i64})，已修正"
+            );
+            agents_per_hour_max = (agents_per_hour_min + 1).max(num_entities_i64 / 2);
+        }
+
+        // Ensure min < max
+        if agents_per_hour_min >= agents_per_hour_max {
+            agents_per_hour_min = (agents_per_hour_max / 2).max(1);
+            tracing::warn!(
+                "agents_per_hour_min >= max，已修正为 {agents_per_hour_min}"
+            );
+        }
+
+        TimeSimulationConfig {
+            total_simulation_hours: get_int("total_simulation_hours", 72),
+            minutes_per_round: get_int("minutes_per_round", 60),
+            agents_per_hour_min,
+            agents_per_hour_max,
+            peak_hours: get_arr_i64("peak_hours", vec![19, 20, 21, 22]),
+            peak_activity_multiplier: 1.5,
+            off_peak_hours: get_arr_i64("off_peak_hours", vec![0, 1, 2, 3, 4, 5]),
+            off_peak_activity_multiplier: 0.05,
+            morning_hours: get_arr_i64("morning_hours", vec![6, 7, 8]),
+            morning_activity_multiplier: 0.4,
+            work_hours: get_arr_i64("work_hours", (9..19).collect()),
+            work_activity_multiplier: 0.7,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // S-448 — _generate_event_config
+    // -----------------------------------------------------------------------
+
+    /// Call LLM to generate an event configuration.
+    ///
+    /// Port of `SimulationConfigGenerator._generate_event_config`
+    /// (`simulation_config_generator.py:646-717`).
+    ///
+    /// - Builds entity type info (unique types + up to 3 examples per type).
+    /// - Truncates `context` to `EVENT_CONFIG_CONTEXT_LENGTH` chars.
+    /// - System prompt appends `get_language_instruction()` + PascalCase note.
+    /// - On LLM failure: returns empty-default dict.
+    pub async fn generate_event_config(
+        &self,
+        context: &str,
+        simulation_requirement: &str,
+        entities: &[EntityNode],
+    ) -> Value {
+        // Build entity type info: unique types + up to 3 representative names
+        let mut type_examples: HashMap<String, Vec<String>> = HashMap::new();
+        let mut type_order: Vec<String> = Vec::new();
+
+        for e in entities {
+            let etype = e.get_entity_type().unwrap_or_else(|| "Unknown".to_string());
+            if !type_examples.contains_key(&etype) {
+                type_order.push(etype.clone());
+                type_examples.insert(etype.clone(), Vec::new());
+            }
+            let examples = type_examples.get_mut(&etype).unwrap();
+            if examples.len() < 3 {
+                examples.push(e.name.clone());
+            }
+        }
+
+        let type_info = type_order
+            .iter()
+            .map(|t| {
+                let examples = type_examples[t].join(", ");
+                format!("- {t}: {examples}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // CHAR-based truncation
+        let context_truncated: String =
+            context.chars().take(Self::EVENT_CONFIG_CONTEXT_LENGTH).collect();
+
+        let prompt = format!(
+            r#"基于以下模拟需求，生成事件配置。
+
+模拟需求: {simulation_requirement}
+
+{context_truncated}
+
+## 可用实体类型及示例
+{type_info}
+
+## 任务
+请生成事件配置JSON：
+- 提取热点话题关键词
+- 描述舆论发展方向
+- 设计初始帖子内容，**每个帖子必须指定 poster_type（发布者类型）**
+
+**重要**: poster_type 必须从上面的"可用实体类型"中选择，这样初始帖子才能分配给合适的 Agent 发布。
+例如：官方声明应由 Official/University 类型发布，新闻由 MediaOutlet 发布，学生观点由 Student 发布。
+
+返回JSON格式（不要markdown）：
+{{
+    "hot_topics": ["关键词1", "关键词2", ...],
+    "narrative_direction": "<舆论发展方向描述>",
+    "initial_posts": [
+        {{"content": "帖子内容", "poster_type": "实体类型（必须从可用类型中选择）"}},
+        ...
+    ],
+    "reasoning": "<简要说明>"
+}}"#
+        );
+
+        let lang_instruction = get_language_instruction();
+        let system_prompt = format!(
+            "你是舆论分析专家。返回纯JSON格式。注意 poster_type 必须精确匹配可用实体类型。\n\n{lang_instruction}\nIMPORTANT: The 'poster_type' field value MUST be in English PascalCase exactly matching the available entity types. Only 'content', 'narrative_direction', 'hot_topics' and 'reasoning' fields should use the specified language."
+        );
+
+        match self.call_llm_with_retry(&prompt, &system_prompt).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("事件配置LLM生成失败: {e}, 使用默认配置");
+                serde_json::json!({
+                    "hot_topics": [],
+                    "narrative_direction": "",
+                    "initial_posts": [],
+                    "reasoning": "使用默认配置"
+                })
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // S-449 — _parse_event_config
+    // -----------------------------------------------------------------------
+
+    /// Parse an LLM event-config result dict into an `EventConfig`.
+    ///
+    /// Port of `SimulationConfigGenerator._parse_event_config`
+    /// (`simulation_config_generator.py:719-726`).
+    ///
+    /// Field extraction with empty-collection defaults.
+    /// `scheduled_events` is always `[]` (Python hardcodes this too).
+    pub fn parse_event_config(&self, result: &Value) -> EventConfig {
+        let initial_posts = result
+            .get("initial_posts")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        let hot_topics = result
+            .get("hot_topics")
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+
+        let narrative_direction = result
+            .get("narrative_direction")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        EventConfig {
+            initial_posts,
+            scheduled_events: vec![],
+            hot_topics,
+            narrative_direction,
+        }
+    }
+}
+
+// ===========================================================================
+// Tests for SimulationConfigGenerator
+// ===========================================================================
+
+#[cfg(test)]
+mod generator_tests {
+    use super::*;
+    use crate::llm::{ChatMessage, ChatOptions};
+    use async_trait::async_trait;
+    use futures::Stream;
+    use serde::de::DeserializeOwned;
+    use serde_json::Map;
+    use std::pin::Pin;
+
+    // -----------------------------------------------------------------------
+    // Mock LlmClient for deterministic unit tests
+    // -----------------------------------------------------------------------
+
+    /// A mock LLM client that returns a fixed JSON string on `chat`.
+    struct MockLlm {
+        /// The raw string to return from `chat`.
+        response: String,
+        /// If `Some`, fail `chat` with this error message on attempts ≤ fail_until.
+        /// After that, return `response`.
+        fail_until: Option<usize>,
+        call_count: std::sync::Mutex<usize>,
+    }
+
+    impl MockLlm {
+        fn always(response: impl Into<String>) -> Self {
+            Self {
+                response: response.into(),
+                fail_until: None,
+                call_count: std::sync::Mutex::new(0),
+            }
+        }
+
+        fn fail_then(fail_count: usize, response: impl Into<String>) -> Self {
+            Self {
+                response: response.into(),
+                fail_until: Some(fail_count),
+                call_count: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for MockLlm {
+        async fn complete(&self, _prompt: &str) -> crate::error::Result<String> {
+            Ok(self.response.clone())
+        }
+
+        async fn complete_json<T: DeserializeOwned>(&self, _prompt: &str) -> crate::error::Result<T> {
+            serde_json::from_str(&self.response)
+                .map_err(|e| TeriError::Config(e.to_string()))
+        }
+
+        async fn stream(
+            &self,
+            _prompt: &str,
+        ) -> crate::error::Result<Pin<Box<dyn Stream<Item = crate::error::Result<String>> + Send>>> {
+            unimplemented!("not needed for tests")
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _opts: &ChatOptions,
+        ) -> crate::error::Result<String> {
+            let mut count = self.call_count.lock().unwrap();
+            *count += 1;
+            let current = *count;
+            drop(count);
+
+            if let Some(fail_until) = self.fail_until
+                && current <= fail_until
+            {
+                return Err(TeriError::Config("mock failure".into()));
+            }
+            Ok(self.response.clone())
+        }
+
+        async fn chat_json<T: DeserializeOwned>(
+            &self,
+            messages: &[ChatMessage],
+            opts: &ChatOptions,
+        ) -> crate::error::Result<T> {
+            let raw = self.chat(messages, opts).await?;
+            serde_json::from_str(&raw).map_err(|e| TeriError::Config(e.to_string()))
+        }
+    }
+
+    fn make_node(name: &str, labels: Vec<&str>, summary: &str) -> EntityNode {
+        EntityNode::new(
+            "uuid",
+            name,
+            labels.into_iter().map(str::to_string).collect(),
+            summary,
+            Map::new(),
+        )
+    }
+
+    fn make_gen(response: impl Into<String>) -> SimulationConfigGenerator<MockLlm> {
+        SimulationConfigGenerator::new(MockLlm::always(response), "model-x", "http://localhost")
+    }
+
+    // -----------------------------------------------------------------------
+    // _summarize_entities (S-441)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn summarize_entities_groups_by_type() {
+        let entities = vec![
+            make_node("Alice", vec!["Entity", "Person"], "A person"),
+            make_node("Bob", vec!["Entity", "Person"], "Another person"),
+            make_node("CCTV", vec!["Entity", "MediaOutlet"], "A media outlet"),
+        ];
+        let g = make_gen("{}");
+        let summary = g.summarize_entities(&entities);
+
+        // Must contain both type headers
+        assert!(summary.contains("### Person (2个)"), "missing Person header");
+        assert!(summary.contains("### MediaOutlet (1个)"), "missing MediaOutlet header");
+        assert!(summary.contains("- Alice:"), "missing Alice entry");
+        assert!(summary.contains("- Bob:"), "missing Bob entry");
+        assert!(summary.contains("- CCTV:"), "missing CCTV entry");
+    }
+
+    #[test]
+    fn summarize_entities_unknown_type_fallback() {
+        let entities = vec![make_node("X", vec!["Entity", "Node"], "only base labels")];
+        let g = make_gen("{}");
+        let summary = g.summarize_entities(&entities);
+        assert!(summary.contains("### Unknown (1个)"), "should use Unknown for Entity/Node only");
+    }
+
+    #[test]
+    fn summarize_entities_char_truncates_long_summary() {
+        // Build a summary of exactly 301 chars (> ENTITY_SUMMARY_LENGTH=300)
+        let long_summary: String = "中".repeat(301); // 301 Chinese chars
+        let entities = vec![make_node("测试", vec!["Person"], &long_summary)];
+        let g = make_gen("{}");
+        let summary = g.summarize_entities(&entities);
+
+        // The preview should be 300 chars + "..."
+        let expected_preview: String = "中".repeat(300) + "...";
+        assert!(
+            summary.contains(&expected_preview),
+            "summary should contain 300-char truncated preview"
+        );
+    }
+
+    #[test]
+    fn summarize_entities_no_truncation_for_short_summary() {
+        let short_summary = "Short summary.";
+        let entities = vec![make_node("A", vec!["Person"], short_summary)];
+        let g = make_gen("{}");
+        let summary = g.summarize_entities(&entities);
+        assert!(summary.contains("Short summary."), "short summary must not be truncated");
+        assert!(!summary.contains("Short summary...."), "should not add ... to short summaries");
+    }
+
+    #[test]
+    fn summarize_entities_shows_tail_line_when_overflow() {
+        // 21 entities of same type; ENTITIES_PER_TYPE_DISPLAY=20 → "  ... 还有 1 个"
+        let entities: Vec<EntityNode> = (0..21)
+            .map(|i| make_node(&format!("Person{i}"), vec!["Person"], "desc"))
+            .collect();
+        let g = make_gen("{}");
+        let summary = g.summarize_entities(&entities);
+        assert!(
+            summary.contains("  ... 还有 1 个"),
+            "should show tail line for overflow: {summary}"
+        );
+    }
+
+    #[test]
+    fn summarize_entities_no_tail_at_exact_display_count() {
+        let entities: Vec<EntityNode> = (0..20)
+            .map(|i| make_node(&format!("P{i}"), vec!["Person"], "d"))
+            .collect();
+        let g = make_gen("{}");
+        let summary = g.summarize_entities(&entities);
+        assert!(!summary.contains("还有"), "no tail line when exactly at display count");
+    }
+
+    // -----------------------------------------------------------------------
+    // _build_context (S-440)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_context_includes_requirement_and_entity_summary() {
+        let entities = vec![make_node("Alice", vec!["Person"], "test")];
+        let g = make_gen("{}");
+        let ctx = g.build_context("Test requirement", "Some document text", &entities);
+        assert!(ctx.contains("## 模拟需求"), "missing requirement header");
+        assert!(ctx.contains("Test requirement"));
+        assert!(ctx.contains("## 实体信息 (1个)"), "missing entity info header");
+        assert!(ctx.contains("## 原始文档内容"), "should include document text");
+    }
+
+    #[test]
+    fn build_context_truncates_document_when_over_budget() {
+        // Fill context budget by making a huge entity summary
+        // Easiest: make a very long document that should be truncated
+        let entities = vec![];
+        let g = make_gen("{}");
+        // Use a document of 60000 chars (> MAX_CONTEXT_LENGTH=50000)
+        let doc: String = "X".repeat(60_000);
+        let ctx = g.build_context("req", &doc, &entities);
+        // Should be truncated and contain the truncation marker
+        assert!(
+            ctx.contains("...(文档已截断)"),
+            "should have truncation marker in context"
+        );
+        // Total char length should be under MAX_CONTEXT_LENGTH + some margin for markers
+        // The marker itself adds chars, just verify truncation happened
+        let doc_section_start = ctx.find("## 原始文档内容").unwrap();
+        let doc_section = &ctx[doc_section_start..];
+        assert!(
+            doc_section.chars().count() < 51_500,
+            "document section should be capped"
+        );
+    }
+
+    #[test]
+    fn build_context_no_truncation_for_short_document() {
+        let entities = vec![];
+        let g = make_gen("{}");
+        let ctx = g.build_context("req", "Short doc.", &entities);
+        assert!(ctx.contains("Short doc."), "short doc should appear verbatim");
+        assert!(!ctx.contains("...(文档已截断)"), "should not have truncation marker");
+    }
+
+    #[test]
+    fn build_context_skips_document_when_empty() {
+        let entities = vec![];
+        let g = make_gen("{}");
+        let ctx = g.build_context("req", "", &entities);
+        assert!(!ctx.contains("## 原始文档内容"), "should not include doc section when empty");
+    }
+
+    // -----------------------------------------------------------------------
+    // _fix_truncated_json (S-443)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fix_truncated_json_closes_open_brace() {
+        let truncated = r#"{"key": "val""#;
+        let fixed = SimulationConfigGenerator::<MockLlm>::fix_truncated_json(truncated);
+        let parsed: Value = serde_json::from_str(&fixed).expect("should be valid JSON after fix");
+        assert_eq!(parsed["key"].as_str().unwrap(), "val");
+    }
+
+    #[test]
+    fn fix_truncated_json_closes_open_bracket_and_brace() {
+        let truncated = r#"{"items": ["a", "b""#;
+        let fixed = SimulationConfigGenerator::<MockLlm>::fix_truncated_json(truncated);
+        // After fix: {"items": ["a", "b"]}  (no extra quote because last char is '"')
+        let parsed: Value = serde_json::from_str(&fixed).expect("should be valid: {fixed}");
+        let items = parsed["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn fix_truncated_json_appends_quote_when_last_char_not_in_set() {
+        // Last char is 'x' — not in {'"', ',', '}', ']'} → append '"'
+        let truncated = r#"{"key": "val"#; // missing closing "
+        let fixed = SimulationConfigGenerator::<MockLlm>::fix_truncated_json(truncated);
+        // After fix: {"key": "val"} (quote + brace appended)
+        let parsed: Value = serde_json::from_str(&fixed).expect("should be valid: {fixed}");
+        assert_eq!(parsed["key"].as_str().unwrap(), "val");
+    }
+
+    #[test]
+    fn fix_truncated_json_already_valid_unchanged() {
+        let valid = r#"{"key": "value"}"#;
+        let fixed = SimulationConfigGenerator::<MockLlm>::fix_truncated_json(valid);
+        let parsed: Value = serde_json::from_str(&fixed).unwrap();
+        assert_eq!(parsed["key"].as_str().unwrap(), "value");
+    }
+
+    // -----------------------------------------------------------------------
+    // _try_fix_config_json (S-444)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn try_fix_config_json_salvages_newline_in_string() {
+        // A JSON string with a literal newline inside — invalid JSON, should be fixed
+        let broken = "{\"key\": \"val\nue\"}";
+        let result = SimulationConfigGenerator::<MockLlm>::try_fix_config_json(broken);
+        assert!(result.is_some(), "should salvage newline-in-string JSON");
+        assert_eq!(result.unwrap()["key"].as_str().unwrap(), "val ue");
+    }
+
+    #[test]
+    fn try_fix_config_json_salvages_control_chars() {
+        // Control char embedded in JSON — invalid
+        let broken = "{\"key\": \"val\x01ue\"}";
+        let result = SimulationConfigGenerator::<MockLlm>::try_fix_config_json(broken);
+        assert!(result.is_some(), "should salvage control-char JSON");
+    }
+
+    #[test]
+    fn try_fix_config_json_returns_none_for_completely_garbage() {
+        let garbage = "this is not json at all !!!";
+        let result = SimulationConfigGenerator::<MockLlm>::try_fix_config_json(garbage);
+        assert!(result.is_none(), "completely non-JSON should return None");
+    }
+
+    #[test]
+    fn try_fix_config_json_extracts_embedded_json_object() {
+        // JSON embedded in surrounding text
+        let wrapped = r#"Here is your result: {"answer": 42} hope that helps"#;
+        let result = SimulationConfigGenerator::<MockLlm>::try_fix_config_json(wrapped);
+        assert!(result.is_some(), "should extract embedded JSON object");
+        assert_eq!(result.unwrap()["answer"].as_i64().unwrap(), 42);
+    }
+
+    // -----------------------------------------------------------------------
+    // _call_llm_with_retry (S-442) — temperature stepping + retry
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn call_llm_with_retry_succeeds_on_first_attempt() {
+        let g = make_gen(r#"{"result": "ok"}"#);
+        let v = g.call_llm_with_retry("prompt", "system").await.unwrap();
+        assert_eq!(v["result"].as_str().unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn call_llm_with_retry_retries_on_error_and_succeeds() {
+        // Fail on first 1 attempt, succeed on attempt 2
+        let llm = MockLlm::fail_then(1, r#"{"ok": true}"#);
+        let g = SimulationConfigGenerator::new(llm, "m", "b");
+        // This will fail attempt 1 (error), succeed attempt 2
+        // Note: real sleep is 2*(0+1)=2s on failure — we don't want to sleep in tests.
+        // The mock advances call_count per chat() call.
+        // Attempt 1 fails (call_count=1 ≤ fail_until=1) → sleep 2s... but in test we can't
+        // avoid the sleep. Accept that this test takes ~2s.
+        let v = g.call_llm_with_retry("p", "s").await.unwrap();
+        assert!(v["ok"].as_bool().unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // _parse_time_config (S-447) defaults + clamping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_time_config_uses_defaults_when_fields_missing() {
+        let g = make_gen("{}");
+        let result = serde_json::json!({});
+        let tc = g.parse_time_config(&result, 30);
+
+        assert_eq!(tc.total_simulation_hours, 72);
+        assert_eq!(tc.minutes_per_round, 60);
+        assert_eq!(tc.peak_hours, vec![19, 20, 21, 22]);
+        assert_eq!(tc.off_peak_hours, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(tc.morning_hours, vec![6, 7, 8]);
+        assert_eq!(tc.work_hours, (9..19).collect::<Vec<i64>>());
+        // Fixed multipliers
+        assert_eq!(tc.peak_activity_multiplier, 1.5);
+        assert_eq!(tc.off_peak_activity_multiplier, 0.05);
+        assert_eq!(tc.morning_activity_multiplier, 0.4);
+        assert_eq!(tc.work_activity_multiplier, 0.7);
+    }
+
+    #[test]
+    fn parse_time_config_clamps_min_when_exceeds_entity_count() {
+        let g = make_gen("{}");
+        // num_entities=10, but LLM returns min=50 (> 10) → corrected
+        let result = serde_json::json!({
+            "agents_per_hour_min": 50,
+            "agents_per_hour_max": 100
+        });
+        let tc = g.parse_time_config(&result, 10);
+        // min corrected to max(1, 10//10) = 1
+        assert_eq!(tc.agents_per_hour_min, 1);
+        // max corrected to max(min+1, 10//2) = max(2, 5) = 5
+        assert_eq!(tc.agents_per_hour_max, 5);
+    }
+
+    #[test]
+    fn parse_time_config_enforces_min_less_than_max() {
+        let g = make_gen("{}");
+        // min == max — must correct
+        let result = serde_json::json!({
+            "agents_per_hour_min": 10,
+            "agents_per_hour_max": 10
+        });
+        let tc = g.parse_time_config(&result, 100);
+        // Neither exceeds 100, but min >= max: min = max(1, 10//2) = 5
+        assert!(tc.agents_per_hour_min < tc.agents_per_hour_max);
+        assert_eq!(tc.agents_per_hour_min, 5);
+        assert_eq!(tc.agents_per_hour_max, 10);
+    }
+
+    #[test]
+    fn parse_time_config_extracts_all_fields_from_llm() {
+        let g = make_gen("{}");
+        let result = serde_json::json!({
+            "total_simulation_hours": 48,
+            "minutes_per_round": 30,
+            "agents_per_hour_min": 2,
+            "agents_per_hour_max": 8,
+            "peak_hours": [20, 21],
+            "off_peak_hours": [1, 2, 3],
+            "morning_hours": [7, 8],
+            "work_hours": [9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+        });
+        let tc = g.parse_time_config(&result, 50);
+        assert_eq!(tc.total_simulation_hours, 48);
+        assert_eq!(tc.minutes_per_round, 30);
+        assert_eq!(tc.agents_per_hour_min, 2);
+        assert_eq!(tc.agents_per_hour_max, 8);
+        assert_eq!(tc.peak_hours, vec![20, 21]);
+        assert_eq!(tc.off_peak_hours, vec![1, 2, 3]);
+        assert_eq!(tc.morning_hours, vec![7, 8]);
+    }
+
+    // -----------------------------------------------------------------------
+    // _parse_event_config (S-449) defaults + mapping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_event_config_uses_empty_defaults_when_missing() {
+        let g = make_gen("{}");
+        let result = serde_json::json!({});
+        let ec = g.parse_event_config(&result);
+        assert!(ec.initial_posts.is_empty());
+        assert!(ec.scheduled_events.is_empty());
+        assert!(ec.hot_topics.is_empty());
+        assert_eq!(ec.narrative_direction, "");
+    }
+
+    #[test]
+    fn parse_event_config_maps_all_fields() {
+        let g = make_gen("{}");
+        let result = serde_json::json!({
+            "hot_topics": ["AI", "教育"],
+            "narrative_direction": "向积极方向发展",
+            "initial_posts": [
+                {"content": "帖子1", "poster_type": "Student"}
+            ]
+        });
+        let ec = g.parse_event_config(&result);
+        assert_eq!(ec.hot_topics, vec!["AI", "教育"]);
+        assert_eq!(ec.narrative_direction, "向积极方向发展");
+        assert_eq!(ec.initial_posts.len(), 1);
+        assert_eq!(ec.initial_posts[0]["content"].as_str().unwrap(), "帖子1");
+        // scheduled_events always empty (hardcoded)
+        assert!(ec.scheduled_events.is_empty());
+    }
+
+    #[test]
+    fn parse_event_config_scheduled_events_always_empty() {
+        let g = make_gen("{}");
+        // Even if LLM returns scheduled_events, the parse ignores it and uses []
+        let result = serde_json::json!({
+            "scheduled_events": [{"type": "something"}]
+        });
+        let ec = g.parse_event_config(&result);
+        // Python hardcodes scheduled_events=[] in the dataclass constructor
+        assert!(ec.scheduled_events.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // _generate_time_config (S-445) — mock integration
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn generate_time_config_returns_parsed_llm_value() {
+        let llm_response = serde_json::json!({
+            "total_simulation_hours": 48,
+            "minutes_per_round": 60,
+            "agents_per_hour_min": 3,
+            "agents_per_hour_max": 15,
+            "peak_hours": [19, 20, 21, 22],
+            "off_peak_hours": [0, 1, 2, 3, 4, 5],
+            "morning_hours": [6, 7, 8],
+            "work_hours": [9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+            "reasoning": "test"
+        });
+        let g = make_gen(llm_response.to_string());
+        let context = "## 模拟需求\ntest requirement";
+        let result = g.generate_time_config(context, 30).await;
+        assert_eq!(result["total_simulation_hours"].as_i64().unwrap(), 48);
+        assert_eq!(result["reasoning"].as_str().unwrap(), "test");
+    }
+
+    #[tokio::test]
+    async fn generate_time_config_falls_back_to_default_on_llm_failure() {
+        // Return non-JSON to trigger all repair attempts → final fallback
+        let g = make_gen("not valid json at all !!!");
+        let result = g.generate_time_config("context", 15).await;
+        // Default config must have total_simulation_hours = 72
+        assert_eq!(result["total_simulation_hours"].as_i64().unwrap(), 72);
+        assert_eq!(result["reasoning"].as_str().unwrap(), "使用默认中国人作息配置（每轮1小时）");
+    }
+
+    // -----------------------------------------------------------------------
+    // _generate_event_config (S-448) — mock integration
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn generate_event_config_returns_parsed_llm_value() {
+        let llm_response = serde_json::json!({
+            "hot_topics": ["topic1", "topic2"],
+            "narrative_direction": "方向",
+            "initial_posts": [{"content": "post", "poster_type": "Person"}],
+            "reasoning": "test"
+        });
+        let entities = vec![make_node("Alice", vec!["Entity", "Person"], "desc")];
+        let g = make_gen(llm_response.to_string());
+        let result = g.generate_event_config("context", "requirement", &entities).await;
+        let arr = result["hot_topics"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(result["reasoning"].as_str().unwrap(), "test");
+    }
+
+    #[tokio::test]
+    async fn generate_event_config_falls_back_to_empty_on_llm_failure() {
+        let g = make_gen("not json !!!");
+        let entities = vec![];
+        let result = g.generate_event_config("context", "req", &entities).await;
+        assert!(result["hot_topics"].as_array().unwrap().is_empty());
+        assert_eq!(result["narrative_direction"].as_str().unwrap(), "");
+        assert!(result["initial_posts"].as_array().unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // _get_default_time_config (S-446)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_default_time_config_shape() {
+        let g = make_gen("{}");
+        let cfg = g.get_default_time_config(30);
+        assert_eq!(cfg["total_simulation_hours"].as_i64().unwrap(), 72);
+        assert_eq!(cfg["minutes_per_round"].as_i64().unwrap(), 60);
+        // agents_per_hour_min = max(1, 30 // 15) = 2
+        assert_eq!(cfg["agents_per_hour_min"].as_i64().unwrap(), 2);
+        // agents_per_hour_max = max(5, 30 // 5) = 6
+        assert_eq!(cfg["agents_per_hour_max"].as_i64().unwrap(), 6);
+        assert_eq!(cfg["peak_hours"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn get_default_time_config_min_one_for_zero_entities() {
+        let g = make_gen("{}");
+        let cfg = g.get_default_time_config(0);
+        // max(1, 0 // 15) = 1; max(5, 0 // 5) = 5
+        assert_eq!(cfg["agents_per_hour_min"].as_i64().unwrap(), 1);
+        assert_eq!(cfg["agents_per_hour_max"].as_i64().unwrap(), 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // Class constants (S-431..S-437)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn class_constants_match_python() {
+        assert_eq!(SimulationConfigGenerator::<MockLlm>::MAX_CONTEXT_LENGTH, 50_000);
+        assert_eq!(SimulationConfigGenerator::<MockLlm>::AGENTS_PER_BATCH, 15);
+        assert_eq!(SimulationConfigGenerator::<MockLlm>::TIME_CONFIG_CONTEXT_LENGTH, 10_000);
+        assert_eq!(SimulationConfigGenerator::<MockLlm>::EVENT_CONFIG_CONTEXT_LENGTH, 8_000);
+        assert_eq!(SimulationConfigGenerator::<MockLlm>::ENTITY_SUMMARY_LENGTH, 300);
+        assert_eq!(SimulationConfigGenerator::<MockLlm>::AGENT_SUMMARY_LENGTH, 300);
+        assert_eq!(SimulationConfigGenerator::<MockLlm>::ENTITIES_PER_TYPE_DISPLAY, 20);
     }
 }

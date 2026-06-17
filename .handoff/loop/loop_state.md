@@ -17,8 +17,25 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 2   # RESUMED 2026-06-17 (5th resume, reset 0); c1=U-015 completion; c2=U-019 sub-cycle(a) config data model
-cycles_total: 20
+cycles_this_session: 1   # RESUMED 2026-06-17 (6th resume, reset 0); c1=U-019 sub-cycle(b) EntityNode DTO + time/event LLM stages
+cycles_total: 21
+# CYCLE1 (6th resume) 2026-06-17: U-019 sub-cycle (b) + EntityNode DTO — opus PASS (35/35). PART1 (U-016 rows
+#   S-198..S-213): src/services/entity_reader.rs — EntityNode {uuid,name,labels,summary,attributes,related_edges,
+#   related_nodes} +to_dict(7-key)+get_entity_type() (first label ∉{Entity,Node}); FilteredEntities +to_dict
+#   (entity_types=HashSet→Vec faithful to list(set)). NOT teri graph::Entity (distinct read-DTO). ZepEntityReader
+#   machinery S-214..S-219 NOT ported (Zep-read→KnowledgeGraph adapter = later unit / DECISION-9). PART2 (U-019 rows
+#   S-430..S-449 excl S-439): SimulationConfigGenerator<L:LlmClient> added to src/services/simulation_config.rs —
+#   __init__ + consts (MAX_CONTEXT_LENGTH 50000/AGENTS_PER_BATCH 15/TIME_CONFIG_CONTEXT 10000/EVENT_CONFIG_CONTEXT
+#   8000/ENTITY_SUMMARY 300/AGENT_SUMMARY 300/ENTITIES_PER_TYPE_DISPLAY 20), summarize_entities, build_context,
+#   call_llm_with_retry (3 attempts, temp 0.7-attempt*0.1, REUSES DECISION-7 chat() raw String NOT chat_json, salvage
+#   chain), fix_truncated_json (brace/bracket balance), try_fix_config_json (2 regexes via regex crate),
+#   generate_time_config+get_default_time_config+parse_time_config, generate_event_config+parse_event_config.
+#   PROMPTS byte-verbatim (opus diffed 1207==1207, 562==562). CHAR-based truncation (CJK-safe). scheduled_events=[]
+#   confirmed in SOURCE L723. finish_reason: teri chat() can't surface it (DECISION-7 inexpressible) → strategy(a)
+#   always-salvage-on-parse-fail subsumes Python length-branch; opus probed edge divergence = unreachable under
+#   operative contract (brace-imbalance⟺truncation⟺finish_reason=='length'), Rust salvages strict superset → [≠]-class
+#   NOT downgrade. NEITHER U-016 NOR U-019 marked [x] (U-016: ZepEntityReader remains; U-019: c/d + generate_config
+#   remain). 51 new tests, teri 630 green, clippy --all-targets clean.
 # CYCLE2 (5th resume) 2026-06-17: U-019 sub-cycle (a) config DATA MODEL — opus PASS (byte-identical diff ×3). New
 #   src/services/simulation_config.rs: CHINA_TIMEZONE_CONFIG (china_timezone_config()->Value), AgentActivityConfig,
 #   TimeSimulationConfig, EventConfig, PlatformConfig, SimulationParameters (+to_dict 13-key decl-order, +to_json

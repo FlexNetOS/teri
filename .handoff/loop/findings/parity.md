@@ -945,3 +945,55 @@ exercised, so all 56 are `- [x]` (none `- [≠]`). Nothing to challenge.
 ### Symbols verified: 56/56 → S-374..S-429 all flipped `- [x]` in symbol-map.md. S-430+ remain `- [ ]`.
 ### VERDICT: **PASS** (data model). U-019 UNIT remains `- [ ]` — sub-cycles (b)/(c)/(d) outstanding.
 ### Constraints honored: no source/Rust impl files edited; temporary `examples/_parity_*.rs` harness removed; only symbol-map S-374..S-429, the U-019 ledger note, and this verdict block written.
+
+---
+
+## 2026-06-17 — U-019 sub-cycle (b) + EntityNode DTO (U-016 rows) — VERDICT: PASS
+
+**Gate:** rust-port-parity-verifier (opus). **Build precondition:** GREEN (630 passed, clippy --all-targets -D warnings clean). **Method:** differential — source Python re-implemented and run against the same inputs as the Rust; prompts diffed byte-for-byte; salvage logic adversarially probed for a Python-salvages-but-Rust-doesn't counter-example.
+
+### Part 1 — EntityNode / FilteredEntities DTOs (S-198..S-213) → src/services/entity_reader.rs
+
+| Check | Source (zep_entity_reader.py) | Rust (entity_reader.rs) | Result |
+|---|---|---|---|
+| get_entity_type: first label ∉ {Entity,Node}, else None; order-preserving | L46-51 | L165-172 (`label != "Entity" && label != "Node"`, in-order, `None` fallback) | PASS — case-sensitive exact match confirmed (test L316 `entity`/`node` lowercase NOT filtered) |
+| EntityNode.to_dict: 7 keys in order uuid,name,labels,summary,attributes,related_edges,related_nodes | L35-44 | L120-142 (explicit insert order) | PASS — test asserts exact key order + len==7 (L327) |
+| attributes is JSON object; related_edges/nodes default to [] | L29,31,33 default_factory=list | Map<String,Value>; Vec<Value> #[serde(default)]; `new()` empties | PASS (tests L379, L472) |
+| FilteredEntities.to_dict: 4 keys entities,entity_types(list),total_count,filtered_count | L62-68 | L221-246 | PASS — key order + counts as numbers (tests L392,L458) |
+| entity_types = list(set) unordered | L65 `list(self.entity_types)` | HashSet<String> → Vec, no order asserted; test sorts before compare (L453) | PASS — faithful: neither side guarantees order; Rust does NOT assert a spurious order |
+
+### Part 2 — LLM foundation + time/event stages (S-430..S-449, excl S-439) → src/services/simulation_config.rs
+
+| Check | Result + evidence |
+|---|---|
+| Class constants 50000/15/10000/8000/300/300/20 | PASS — source L214-223 vs Rust L1079-1097 (associated consts), exact. Test `class_constants_match_python` L2297. |
+| Verbatim Chinese prompts (time L543-586, event L676-703) | PASS — diffed byte-for-byte via difflib: time 1207==1207 (zero diff after stripping `"""` delimiter), event 562==562 (zero diff). All system-prompt prefixes + the English PascalCase tail + format fragments (## 模拟需求, ## 实体信息, ## 原始文档内容, ...(文档已截断), ### x个), ... 还有 k 个, default-reasoning string) confirmed present on BOTH sides. |
+| get_language_instruction incorporated | PASS — time L1487-1490 (`\n\n{lang}`), event L1679-1682 (`\n\n{lang}\nIMPORTANT:...`) match source L589 / L705-706 ordering exactly. i18n::get_language_instruction (i18n.rs L274) faithfully ports locale→llmInstruction→zh-fallback→`请使用中文回答。`. |
+| CHAR-based truncation (not byte) | PASS — build_context (L1144,L1151-1153 `.chars()`), summarize_entities (L1211-1214 `.chars().count()`/`.take()`), time L1436, event L1646 all use `.chars()`. Test `summarize_entities_char_truncates_long_summary` uses 301 Chinese chars → 300+`...`. Critical for 3-byte CJK; verified no byte-indexing anywhere in the unit. |
+| max_agents_allowed = max(1, int(n*0.9)) | PASS — Rust `(n as f64 * 0.9).max(1.0) as usize` (L1438). Order differs (Rust max-then-trunc vs Python trunc-then-max) but converges for all n≥0 (verified n=0,1,2). |
+| get_default_time_config // floor div + max | PASS — `(n/15).max(1)`, `(n/5).max(5)` (L1513-1514) = Python floor `//` + max. Tests L2271 (n=30→2/6), L2284 (n=0→1/5). |
+| _parse_time_config all clamp branches | PASS — min>n → max(1,n//10) (L1566); max>n → max(min+1,n//2) (L1573, uses corrected min, same as Python L624); min>=max → max(1,max//2) (L1578). Tests L2104,L2119. Defaults max(1,n//15)/max(5,n//5) (L1553-54). |
+| _parse_event_config scheduled_events=[] | PASS — source L723 HARDCODES `scheduled_events=[]` (NOT a porter shortcut). Rust L1730 `scheduled_events: vec![]`. Test L2191 confirms LLM-supplied scheduled_events is ignored. initial_posts/hot_topics/narrative_direction extraction matches (L1709-1727). |
+| _fix_truncated_json brace/bracket balance + trailing-quote | PASS — count `{`-`}`, `[`-`]` (char-based L1335-1338); if last char ∉ `",}]` append `"` (L1343-1350); append `]`×brackets THEN `}`×braces (L1352-1357, order matches source L496-497). Tests L1983-2017. |
+| _try_fix_config_json two regexes | PASS — string-literal regex `"[^"\\]*(?:\\.[^"\\]*)*"` (L1390) + newline→space + `\s+`→` ` collapse (L1397-1399); then control-char `[\x00-\x1f\x7f-\x9f]` strip + collapse + reparse (L1409-1413). Rust `regex` crate syntax verified equivalent to Python `re`. Tests salvage newline-in-string (L2024), control chars (L2032), embedded object extraction (L2047), garbage→None (L2040). |
+
+### _call_llm_with_retry (S-442) + finish_reason mapping — SCRUTINIZED (highest-risk)
+
+- 3 attempts; temperature 0.7−attempt*0.1 → 0.7/0.6/0.5 via ChatOptions.temperature; max_tokens=None (MiroFish sets none) — PASS (L1262-1268).
+- Uses `chat` (raw String), NOT `chat_json` — PASS (salvage path preserved; chat_json would bypass it).
+- Backoff `sleep(2*(attempt+1))` — PASS. Python sleeps ONLY on `except` (LLM-call exception). Rust sleeps on BOTH the Err branch AND the all-parse-failed soft-error branch (L1293,L1305). **Minor divergence:** Python on parse-failure does NOT sleep before the next loop iteration; Rust does. This is a *timing-only* difference on the retry path (a 2/4s extra wait when an attempt returns parseable-failing content), not an output/behavior difference — accepted as non-contractual (both still perform exactly 3 attempts and return identical final value/error).
+
+**finish_reason mapping (strategy a) — salvage equivalence, adversarially verified:**
+Python: if finish_reason=='length' → `_fix_truncated_json` BEFORE first json.loads; else parse raw, on fail → `_try_fix_config_json`. teri's `chat` CANNOT surface finish_reason (DECISION-7 — OpenAI adapter discards it). Rust strategy (a): parse raw → on fail `fix_truncated_json`+parse → on fail `try_fix_config_json`.
+- Ran a faithful Python reimpl of both salvage fns over 8 inputs incl. valid, newline-in-string, control-char, garbage, embedded-object, truncated brace+bracket, truncated string, multi-space-truncated. **All contractual cases (JSON objects) produce identical results on both sides.**
+- Identified ONE non-contractual edge divergence: input `{"msg": "hello  world"` (brace-unbalanced, ends in `"`, internal double-space) — Rust step-2 `fix_truncated_json` parses cleanly and PRESERVES `"hello  world"`; Python (only if finish_reason≠'length') routes to `_try_fix_config_json` which collapses to `"hello world"`. This requires a provider returning unbalanced JSON while reporting a non-`length` finish_reason — brace-imbalance ⟺ truncation ⟺ finish_reason=='length', in which case Python ALSO fix-first and matches Rust. Under the operative contract (`response_format=json_object`, content always an object, truncation⟹length) the two are equivalent; Rust loses NO salvage capability (it salvages a strict superset and, in this edge, mangles the string LESS). The dropped finish_reason signal is genuinely inexpressible in teri's substrate.
+  - **[≠]-class acceptance (documented, NOT a downgrade):** the residual whitespace-preserve-vs-collapse difference is non-contractual + rooted in an inexpressible substrate signal. No symbol is marked `- [≠]` (every in-scope symbol is independently `- [x]`); this is recorded here as the finish_reason rationale.
+  - **Doc-accuracy nit (non-blocking):** the module docstring (L1042) claims "This loses NO salvage behaviour" — precise statement is "no salvage *capability* lost; one non-contractual whitespace-collapse difference exists in the (unreachable-under-contract) unbalanced+non-length case." Recommend the porter tighten the comment; does NOT affect the PASS.
+
+### Minor non-blocking note
+- `parse_time_config` extracts ints via `as_i64`: a JSON float (e.g. `5.0`) for an int field falls to the Python default rather than truncating the float. Non-contractual (prompt + json_object schema specify `(int)`); accepted.
+
+### Symbols verified: 35/35 in scope → S-198..S-213 (16) + S-430..S-449 excl S-439 (19) all flipped `- [x]` in symbol-map.md.
+### Out of scope, left `- [ ]`: S-214..S-219 (ZepEntityReader machinery), S-439 (generate_config orchestration), S-450/S-451/S-452 (agent-config stages, sub-cycles c/d). Confirmed still `- [ ]`.
+### VERDICT: **PASS**. U-016 UNIT remains `- [ ]` (EntityNode DTO done; ZepEntityReader machinery outstanding). U-019 UNIT remains `- [ ]` (sub-cycles a+b done; c/d outstanding).
+### Constraints honored: no source/Rust impl files edited; differential harness was external (Python), removed. Only symbol-map flips + this verdict block + the ledger annotations written.
