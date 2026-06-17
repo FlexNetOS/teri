@@ -767,38 +767,38 @@
 
 ## U-023 — `backend/app/services/simulation_manager.py`
 
-- [ ] S-636 · `unit:U-023` · `type` · `SimulationStatus` · enum 8 variants · `simulation_manager.py:25`
-- [ ] S-637 · `unit:U-023` · `variant` · `SimulationStatus.CREATED` · `simulation_manager.py:27`
-- [ ] S-638 · `unit:U-023` · `variant` · `SimulationStatus.PREPARING` · `simulation_manager.py:28`
-- [ ] S-639 · `unit:U-023` · `variant` · `SimulationStatus.READY` · `simulation_manager.py:29`
-- [ ] S-640 · `unit:U-023` · `variant` · `SimulationStatus.RUNNING` · `simulation_manager.py:30`
-- [ ] S-641 · `unit:U-023` · `variant` · `SimulationStatus.PAUSED` · `simulation_manager.py:31`
-- [ ] S-642 · `unit:U-023` · `variant` · `SimulationStatus.STOPPED` · `simulation_manager.py:32`
-- [ ] S-643 · `unit:U-023` · `variant` · `SimulationStatus.COMPLETED` · `simulation_manager.py:33`
-- [ ] S-644 · `unit:U-023` · `variant` · `SimulationStatus.FAILED` · `simulation_manager.py:34`
-- [ ] S-645 · `unit:U-023` · `type` · `PlatformType` · enum: TWITTER/REDDIT · `simulation_manager.py:37`
-- [ ] S-646 · `unit:U-023` · `variant` · `PlatformType.TWITTER` · `simulation_manager.py:39`
-- [ ] S-647 · `unit:U-023` · `variant` · `PlatformType.REDDIT` · `simulation_manager.py:40`
-- [ ] S-648 · `unit:U-023` · `type` · `SimulationState` · dataclass with to_dict/to_simple_dict · `simulation_manager.py:44`
-- [ ] S-649 · `unit:U-023` · `field` · `SimulationState.simulation_id` · `simulation_manager.py:46`
-- [ ] S-650 · `unit:U-023` · `field` · `SimulationState.project_id` · `simulation_manager.py:47`
-- [ ] S-651 · `unit:U-023` · `field` · `SimulationState.graph_id` · `simulation_manager.py:48`
-- [ ] S-652 · `unit:U-023` · `field` · `SimulationState.enable_twitter` · `simulation_manager.py:51`
-- [ ] S-653 · `unit:U-023` · `field` · `SimulationState.enable_reddit` · `simulation_manager.py:52`
-- [ ] S-654 · `unit:U-023` · `field` · `SimulationState.status` · `simulation_manager.py:55`
-- [ ] S-655 · `unit:U-023` · `field` · `SimulationState.entities_count` · `simulation_manager.py:58`
-- [ ] S-656 · `unit:U-023` · `field` · `SimulationState.profiles_count` · `simulation_manager.py:59`
-- [ ] S-657 · `unit:U-023` · `field` · `SimulationState.entity_types` · `simulation_manager.py:60`
-- [ ] S-658 · `unit:U-023` · `field` · `SimulationState.config_generated` · `simulation_manager.py:63`
-- [ ] S-659 · `unit:U-023` · `field` · `SimulationState.config_reasoning` · `simulation_manager.py:64`
-- [ ] S-660 · `unit:U-023` · `field` · `SimulationState.current_round` · `simulation_manager.py:67`
-- [ ] S-661 · `unit:U-023` · `field` · `SimulationState.twitter_status` · `simulation_manager.py:68`
-- [ ] S-662 · `unit:U-023` · `field` · `SimulationState.reddit_status` · `simulation_manager.py:69`
-- [ ] S-663 · `unit:U-023` · `field` · `SimulationState.created_at` · `simulation_manager.py:72`
-- [ ] S-664 · `unit:U-023` · `field` · `SimulationState.updated_at` · `simulation_manager.py:73`
-- [ ] S-665 · `unit:U-023` · `field` · `SimulationState.error` · `simulation_manager.py:76`
-- [ ] S-666 · `unit:U-023` · `method` · `SimulationState.to_dict` · `simulation_manager.py:78`
-- [ ] S-667 · `unit:U-023` · `method` · `SimulationState.to_simple_dict` · `simulation_manager.py:100`
+- [x] S-636 · `unit:U-023` · `type` · `SimulationStatus` · enum 8 variants · `simulation_manager.py:25` → `teri::services::simulation_manager::SimulationStatus`
+- [x] S-637 · `unit:U-023` · `variant` · `SimulationStatus.CREATED` · `simulation_manager.py:27` → `SimulationStatus::Created`
+- [x] S-638 · `unit:U-023` · `variant` · `SimulationStatus.PREPARING` · `simulation_manager.py:28` → `SimulationStatus::Preparing`
+- [x] S-639 · `unit:U-023` · `variant` · `SimulationStatus.READY` · `simulation_manager.py:29` → `SimulationStatus::Ready`
+- [x] S-640 · `unit:U-023` · `variant` · `SimulationStatus.RUNNING` · `simulation_manager.py:30` → `SimulationStatus::Running`
+- [x] S-641 · `unit:U-023` · `variant` · `SimulationStatus.PAUSED` · `simulation_manager.py:31` → `SimulationStatus::Paused`
+- [x] S-642 · `unit:U-023` · `variant` · `SimulationStatus.STOPPED` · `simulation_manager.py:32` → `SimulationStatus::Stopped`
+- [x] S-643 · `unit:U-023` · `variant` · `SimulationStatus.COMPLETED` · `simulation_manager.py:33` → `SimulationStatus::Completed`
+- [x] S-644 · `unit:U-023` · `variant` · `SimulationStatus.FAILED` · `simulation_manager.py:34` → `SimulationStatus::Failed`
+- [x] S-645 · `unit:U-023` · `type` · `PlatformType` · enum: TWITTER/REDDIT (2 variants only; ledger-summary BOTH was wrong) · `simulation_manager.py:37` → `teri::services::simulation_manager::PlatformType`
+- [x] S-646 · `unit:U-023` · `variant` · `PlatformType.TWITTER` · `simulation_manager.py:39` → `PlatformType::Twitter`
+- [x] S-647 · `unit:U-023` · `variant` · `PlatformType.REDDIT` · `simulation_manager.py:40` → `PlatformType::Reddit`
+- [x] S-648 · `unit:U-023` · `type` · `SimulationState` · dataclass with to_dict/to_simple_dict · `simulation_manager.py:44` → `teri::services::simulation_manager::SimulationState`
+- [x] S-649 · `unit:U-023` · `field` · `SimulationState.simulation_id` · `simulation_manager.py:46` → `SimulationState::simulation_id`
+- [x] S-650 · `unit:U-023` · `field` · `SimulationState.project_id` · `simulation_manager.py:47` → `SimulationState::project_id`
+- [x] S-651 · `unit:U-023` · `field` · `SimulationState.graph_id` · `simulation_manager.py:48` → `SimulationState::graph_id`
+- [x] S-652 · `unit:U-023` · `field` · `SimulationState.enable_twitter` · `simulation_manager.py:51` → `SimulationState::enable_twitter`
+- [x] S-653 · `unit:U-023` · `field` · `SimulationState.enable_reddit` · `simulation_manager.py:52` → `SimulationState::enable_reddit`
+- [x] S-654 · `unit:U-023` · `field` · `SimulationState.status` · `simulation_manager.py:55` → `SimulationState::status`
+- [x] S-655 · `unit:U-023` · `field` · `SimulationState.entities_count` · `simulation_manager.py:58` → `SimulationState::entities_count`
+- [x] S-656 · `unit:U-023` · `field` · `SimulationState.profiles_count` · `simulation_manager.py:59` → `SimulationState::profiles_count`
+- [x] S-657 · `unit:U-023` · `field` · `SimulationState.entity_types` · `simulation_manager.py:60` → `SimulationState::entity_types`
+- [x] S-658 · `unit:U-023` · `field` · `SimulationState.config_generated` · `simulation_manager.py:63` → `SimulationState::config_generated`
+- [x] S-659 · `unit:U-023` · `field` · `SimulationState.config_reasoning` · `simulation_manager.py:64` → `SimulationState::config_reasoning`
+- [x] S-660 · `unit:U-023` · `field` · `SimulationState.current_round` · `simulation_manager.py:67` → `SimulationState::current_round`
+- [x] S-661 · `unit:U-023` · `field` · `SimulationState.twitter_status` · `simulation_manager.py:68` → `SimulationState::twitter_status`
+- [x] S-662 · `unit:U-023` · `field` · `SimulationState.reddit_status` · `simulation_manager.py:69` → `SimulationState::reddit_status`
+- [x] S-663 · `unit:U-023` · `field` · `SimulationState.created_at` · `simulation_manager.py:72` → `SimulationState::created_at`
+- [x] S-664 · `unit:U-023` · `field` · `SimulationState.updated_at` · `simulation_manager.py:73` → `SimulationState::updated_at`
+- [x] S-665 · `unit:U-023` · `field` · `SimulationState.error` · `simulation_manager.py:76` → `SimulationState::error`
+- [x] S-666 · `unit:U-023` · `method` · `SimulationState.to_dict` · `simulation_manager.py:78` → `SimulationState::to_dict` (17 keys, insertion order, status as string, error null/string)
+- [x] S-667 · `unit:U-023` · `method` · `SimulationState.to_simple_dict` · `simulation_manager.py:100` → `SimulationState::to_simple_dict` (9 keys, insertion order)
 - [ ] S-668 · `unit:U-023` · `type` · `SimulationManager` · FS-backed manager (not singleton) · `simulation_manager.py:115`
 - [ ] S-669 · `unit:U-023` · `field` · `SimulationManager.SIMULATION_DATA_DIR` · `simulation_manager.py:127`
 - [ ] S-670 · `unit:U-023` · `method` · `SimulationManager.__init__` · `simulation_manager.py:132`

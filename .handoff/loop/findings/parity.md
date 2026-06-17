@@ -1270,3 +1270,32 @@ This cycle's working-tree diff: NEW `src/services/oasis_profile_export.rs`; `+pu
 
 ### Rollup
 U-018 was already `[x]` at unit level; S-367/369/370/371/372/373 moving `[≠]`/`[~]`→`[x]` STRENGTHENS it (the wrongly-`[≠]`'d export symbols corrected). S-368 stays challenge-surviving `[≠]`. All U-018 symbols now `[x]`/`[≠]` → rollup rule satisfied. No downgrade.
+
+---
+
+## 2026-06-17 — U-023 sub-cycle (b): simulation STATE TYPES (S-636..S-667) — PASS
+
+**Unit:** U-023 sub-cycle (b) only — the state types. `SimulationManager` (S-668+, sub-cycles c/d) NOT in scope and confirmed still `- [ ]`.
+**Source:** `MiroFish/backend/app/services/simulation_manager.py:25-112`
+**Rust:** `src/services/simulation_manager.rs` (wired via `src/services/mod.rs:11`)
+**Method:** differential — ran the Python dataclass standalone to capture golden `to_dict`/`to_simple_dict`/enum values, then dumped the actual Rust `serde_json` output via an injected throwaway test and byte-compared key sets, order, shape, and enum strings. 18 module tests pass; targeted `cargo test` green.
+
+### Group verdicts (file:line both sides)
+
+1. **SimulationStatus S-636..S-644 — PASS.** All **8** variants present. py L27-34 `.value` = `[created,preparing,ready,running,paused,stopped,completed,failed]`; Rust `simulation_manager.rs:35-52` serde `snake_case` + `as_str`/`Display` (L59-77) emit the identical 8 strings in the same order. Differential serde dump matched exactly. No narrowing (the "4 statuses" summary was wrong; source is authoritative — 8).
+2. **PlatformType S-645..S-647 — PASS.** Exactly **2** variants: `twitter`,`reddit` (py L39-40 vs Rust L91-96). Confirmed **NO `both`** variant: `serde_json::from_str::<PlatformType>("\"both\"")` errors (test `platform_type_has_exactly_two_variants`). The "3 variants incl. BOTH" summary was wrong.
+3. **SimulationState fields S-648..S-665 — PASS.** All 17 fields with exact defaults: enable_twitter/enable_reddit=true, status=Created, entities_count/profiles_count/current_round=0, entity_types=[], config_generated=false, config_reasoning="", twitter_status/reddit_status="not_started", error=None; created_at/updated_at stamped via `python_isoformat_local()`. Required IDs (simulation_id/project_id/graph_id) have no default — modeled as required ctor params on `SimulationState::new` (L203). py L46-76 ↔ Rust L148-224.
+4. **to_dict S-666 — PASS.** Exactly **17 keys** in identical declaration order; byte-identical between py golden and Rust dump. `status` emitted as the lowercase STRING (`self.status.to_string()`, not a nested object); `error` = JSON null when None, string when Some. py L80-98 ↔ Rust L238-278. Insertion order preserved (serde_json `preserve_order`).
+5. **to_simple_dict S-667 — PASS.** Exactly **9 keys** (`simulation_id, project_id, graph_id, status, entities_count, profiles_count, entity_types, config_generated, error`) in identical order; status as string; error null/string. Byte-identical to py golden. py L102-112 ↔ Rust L289-318.
+6. **python_isoformat_local reuse — PASS.** Timestamps use the established `crate::models::project::python_isoformat_local` (`project.rs:50`, `pub(crate)`, imported at `simulation_manager.rs:21`) — NOT hand-rolled. Same local-naive ISO semantics as `datetime.now().isoformat()`.
+
+### Non-contractual note (not a divergence)
+Python's two `default_factory` lambdas can stamp `created_at` and `updated_at` microseconds apart; the Rust ctor stamps once and clones to both. Both produce ISO strings of identical shape; the timestamp values are non-deterministic and non-contractual, so this is observationally equivalent — no `[≠]` needed, no downgrade.
+
+### Ledger-summary corrections recorded
+- **8 statuses, not 4** — the ledger summary undercounted `SimulationStatus`.
+- **2 platforms, not 3** — `PlatformType` has no `BOTH` variant; the ledger summary was wrong.
+Both annotated on the U-023 row in `parity-ledger.md`.
+
+### Rollup
+**VERDICT: PASS** for sub-cycle (b). 32/32 in-scope symbols (S-636..S-667) → `- [x]`. No `[≠]` claimed (nothing skipped). U-023 stays `- [ ]` at unit level — sub-cycles (c) `SimulationManager` and (d) `create_simulation`/`prepare_simulation`/`get_profiles`/`get_simulation_config` remain (S-668+ still `- [ ]`). Do NOT commit U-023 as done.

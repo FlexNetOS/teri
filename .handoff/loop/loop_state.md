@@ -17,8 +17,15 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 1   # RESUMED 2026-06-17 (8th resume, reset 0); c1=U-018 OASIS export layer (DECISION-10, un-[≠]'d wrongly-skipped symbols)
-cycles_total: 25
+cycles_this_session: 2   # RESUMED 2026-06-17 (8th resume, reset 0); c1=U-018 export layer; c2=U-023 sub-cycle(b) state types
+cycles_total: 26
+# CYCLE2 (8th resume) 2026-06-17: U-023 sub-cycle (b) state types — opus PASS (32/32, byte-identical). New
+#   src/services/simulation_manager.rs: SimulationStatus (8 variants created..failed, serde snake_case),
+#   PlatformType (2: twitter/reddit), SimulationState (17 fields + to_dict 17-key + to_simple_dict 9-key, status as
+#   lowercase string, created_at/updated_at via python_isoformat_local). S-636..S-667 [x]. U-023 UNIT STAYS [~]
+#   (sub-cycles c=SimulationManager+FS+getters, d=prepare_simulation 4-stage async remain). 2 LEDGER-SUMMARY
+#   CORRECTIONS (source authoritative): SimulationStatus has 8 variants NOT 4; PlatformType has 2 NOT 3 (no BOTH).
+#   18 new tests, teri 767 green, clippy --all-targets clean.
 # CYCLE1 (8th resume) 2026-06-17: U-018 OASIS profile EXPORT layer — opus PASS (6/6). DECISION-10 (architect):
 #   dependency-confirmation for U-023 surfaced a NO-DOWNGRADE issue — S-367/369/370/371/372/373 were [≠]'d as
 #   "OASIS export not needed"/"orchestrator does it", but U-023 prepare_simulation CALLS generate_profiles_from_entities
