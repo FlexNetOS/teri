@@ -2022,6 +2022,221 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
     }
 
     // -----------------------------------------------------------------------
+    // S-439 — generate_config
+    // -----------------------------------------------------------------------
+
+    /// Orchestrate all stages to produce a complete `SimulationParameters`.
+    ///
+    /// Port of `SimulationConfigGenerator.generate_config`
+    /// (`simulation_config_generator.py:243-379`).
+    ///
+    /// # Parameters
+    /// - `simulation_id`, `project_id`, `graph_id`, `simulation_requirement`, `document_text`:
+    ///   passed straight through to `SimulationParameters`.
+    /// - `entities`: the filtered entity list used for all generation stages.
+    /// - `enable_twitter`: whether to include a Twitter `PlatformConfig` (Python default `True`).
+    /// - `enable_reddit`: whether to include a Reddit `PlatformConfig` (Python default `True`).
+    /// - `progress_callback`: optional `(current_step, total_steps, message)` callback invoked
+    ///   after each stage completes.  Python type: `Optional[Callable[[int, int, str], None]]`.
+    ///   Rust idiom: `Option<&mut dyn FnMut(i64, i64, &str)>` — mutable borrow avoids a generic
+    ///   type parameter on the method while keeping it ergonomic at call sites.
+    ///
+    /// # Step numbering (contractual)
+    /// - `num_batches = ceil(entities.len() / AGENTS_PER_BATCH)` — integer ceiling division.
+    /// - `total_steps = 3 + num_batches` (time config + event config + N agent batches +
+    ///   platform config, where platform config is reported at `total_steps`).
+    /// - Steps 1, 2 → time config, event config.
+    /// - Steps 3 .. 3+num_batches-1 → agent-config batches.
+    /// - Step `total_steps` → platform config.
+    ///
+    /// # Platform config literal values (NOTE: reddit differs from struct defaults)
+    /// Twitter: recency=0.4, popularity=0.3, relevance=0.3, viral=10, echo=0.5 (= defaults).
+    /// Reddit:  recency=0.3, popularity=0.4, relevance=0.3, viral=15, echo=0.6 (NON-default).
+    ///
+    /// S-439
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub async fn generate_config(
+        &self,
+        simulation_id: impl Into<String>,
+        project_id: impl Into<String>,
+        graph_id: impl Into<String>,
+        simulation_requirement: impl Into<String>,
+        document_text: &str,
+        entities: &[EntityNode],
+        enable_twitter: bool,
+        enable_reddit: bool,
+        mut progress_callback: Option<&mut dyn FnMut(i64, i64, &str)>,
+    ) -> SimulationParameters {
+        use crate::i18n::{t, t_args};
+
+        let simulation_id = simulation_id.into();
+        let project_id = project_id.into();
+        let graph_id = graph_id.into();
+        let simulation_requirement = simulation_requirement.into();
+
+        tracing::info!(
+            "开始智能生成模拟配置: simulation_id={}, 实体数={}",
+            simulation_id,
+            entities.len()
+        );
+
+        // Calculate total steps: num_batches = ceil(len / AGENTS_PER_BATCH).
+        // Python: math.ceil(len(entities) / self.AGENTS_PER_BATCH).
+        // Use div_ceil for integer ceiling division.
+        let num_batches = entities.len().div_ceil(Self::AGENTS_PER_BATCH);
+        let total_steps: i64 = (3 + num_batches) as i64;
+        // Python tracks current_step as a nonlocal; we track it here so the macro can log it.
+        // `allow(unused_assignments)` silences the "initial value 0 immediately overwritten"
+        // lint — the variable IS read inside the macro after each assignment.
+        #[allow(unused_assignments)]
+        let mut current_step: i64 = 0;
+
+        // Inner report_progress closure — captures callback mutably.
+        // Python: sets current_step, calls callback, logs.
+        macro_rules! report_progress {
+            ($step:expr, $msg:expr) => {{
+                current_step = $step as i64;
+                let msg: String = $msg;
+                if let Some(ref mut cb) = progress_callback {
+                    cb(current_step, total_steps, &msg);
+                }
+                tracing::info!("[{}/{}] {}", current_step, total_steps, msg);
+            }};
+        }
+
+        // 1. Build base context
+        let context = self.build_context(&simulation_requirement, document_text, entities);
+
+        let mut reasoning_parts: Vec<String> = Vec::new();
+
+        // ===== Step 1: time config =====
+        report_progress!(1, t("progress.generatingTimeConfig"));
+        let num_entities = entities.len();
+        let time_config_result = self.generate_time_config(&context, num_entities).await;
+        let time_config = self.parse_time_config(&time_config_result, num_entities);
+        let time_reasoning = time_config_result
+            .get("reasoning")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| t("common.success"));
+        reasoning_parts.push(format!("{}: {}", t("progress.timeConfigLabel"), time_reasoning));
+
+        // ===== Step 2: event config =====
+        report_progress!(2, t("progress.generatingEventConfig"));
+        let event_config_result =
+            self.generate_event_config(&context, &simulation_requirement, entities).await;
+        let mut event_config = self.parse_event_config(&event_config_result);
+        let event_reasoning = event_config_result
+            .get("reasoning")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| t("common.success"));
+        reasoning_parts.push(format!("{}: {}", t("progress.eventConfigLabel"), event_reasoning));
+
+        // ===== Steps 3..N: agent configs in batches =====
+        let mut all_agent_configs: Vec<AgentActivityConfig> = Vec::new();
+        for batch_idx in 0..num_batches {
+            let start_idx = batch_idx * Self::AGENTS_PER_BATCH;
+            let end_idx = (start_idx + Self::AGENTS_PER_BATCH).min(entities.len());
+            let batch_entities = &entities[start_idx..end_idx];
+
+            report_progress!(
+                3 + batch_idx,
+                t_args(
+                    "progress.generatingAgentConfig",
+                    &[
+                        ("start", &(start_idx + 1)),
+                        ("end", &end_idx),
+                        ("total", &entities.len()),
+                    ],
+                )
+            );
+
+            let batch_configs = self
+                .generate_agent_configs_batch(
+                    &context,
+                    batch_entities,
+                    start_idx as i64,
+                    &simulation_requirement,
+                )
+                .await;
+            all_agent_configs.extend(batch_configs);
+        }
+        reasoning_parts.push(t_args(
+            "progress.agentConfigResult",
+            &[("count", &all_agent_configs.len())],
+        ));
+
+        // ===== Assign initial-post agents =====
+        tracing::info!("为初始帖子分配合适的发布者 Agent...");
+        event_config = self.assign_initial_post_agents(event_config, &all_agent_configs);
+        let assigned_count = event_config
+            .initial_posts
+            .iter()
+            .filter(|p| !p.get("poster_agent_id").map(Value::is_null).unwrap_or(true))
+            .count();
+        reasoning_parts.push(t_args(
+            "progress.postAssignResult",
+            &[("count", &assigned_count)],
+        ));
+
+        // ===== Last step: platform configs =====
+        report_progress!(total_steps, t("progress.generatingPlatformConfig"));
+
+        let twitter_config = if enable_twitter {
+            Some(PlatformConfig {
+                platform: "twitter".to_string(),
+                recency_weight: 0.4,
+                popularity_weight: 0.3,
+                relevance_weight: 0.3,
+                viral_threshold: 10,
+                echo_chamber_strength: 0.5,
+            })
+        } else {
+            None
+        };
+
+        let reddit_config = if enable_reddit {
+            // NOTE: reddit values differ from PlatformConfig struct defaults.
+            // recency=0.3 (not 0.4), popularity=0.4 (not 0.3), viral=15 (not 10), echo=0.6 (not 0.5).
+            Some(PlatformConfig {
+                platform: "reddit".to_string(),
+                recency_weight: 0.3,
+                popularity_weight: 0.4,
+                relevance_weight: 0.3,
+                viral_threshold: 15,
+                echo_chamber_strength: 0.6,
+            })
+        } else {
+            None
+        };
+
+        // Build final params — generated_at uses the struct default (python_isoformat_local).
+        let params = SimulationParameters {
+            simulation_id,
+            project_id,
+            graph_id,
+            simulation_requirement,
+            time_config,
+            agent_configs: all_agent_configs,
+            event_config,
+            twitter_config,
+            reddit_config,
+            llm_model: self.model_name.clone(),
+            llm_base_url: self.base_url.clone(),
+            generated_at: python_isoformat_local(),
+            generation_reasoning: reasoning_parts.join(" | "),
+        };
+
+        tracing::info!(
+            "模拟配置生成完成: {} 个Agent配置",
+            params.agent_configs.len()
+        );
+
+        params
+    }
+
+    // -----------------------------------------------------------------------
     // S-452 — _generate_agent_config_by_rule
     // -----------------------------------------------------------------------
 
@@ -3269,6 +3484,358 @@ mod generator_tests {
         assert_eq!(configs.len(), 1);
         // rule-based for Student
         assert_eq!(configs[0].activity_level, 0.8);
+    }
+
+    // -----------------------------------------------------------------------
+    // generate_config (S-439) tests
+    // -----------------------------------------------------------------------
+
+    /// Build a mock LLM that returns fixed time/event/agent JSON in sequence.
+    ///
+    /// The mock always returns the same JSON regardless of which method calls it —
+    /// each stage calls `chat` once per invocation and reads the fields it needs,
+    /// ignoring unknown ones. We compose a response that satisfies all three stage
+    /// parsers simultaneously.
+    fn make_multi_stage_gen(
+        n_entities: usize,
+    ) -> (SimulationConfigGenerator<MockLlm>, String) {
+        // Build agent_configs entries that cover all n_entities agent_ids
+        let agent_cfgs: Vec<serde_json::Value> = (0..n_entities)
+            .map(|i| serde_json::json!({
+                "agent_id": i as i64,
+                "activity_level": 0.5_f64,
+                "posts_per_hour": 0.5_f64,
+                "comments_per_hour": 1.0_f64,
+                "active_hours": [9, 10, 11, 12, 18, 19, 20, 21, 22],
+                "response_delay_min": 5_i64,
+                "response_delay_max": 60_i64,
+                "sentiment_bias": 0.0_f64,
+                "stance": "neutral",
+                "influence_weight": 1.0_f64,
+            }))
+            .collect();
+
+        // One JSON blob that works for time config, event config, AND agent_configs batch —
+        // parsers only read their own fields and ignore the rest.
+        let combined = serde_json::json!({
+            // time config fields
+            "total_simulation_hours": 48_i64,
+            "minutes_per_round": 60_i64,
+            "agents_per_hour_min": 2_i64,
+            "agents_per_hour_max": 8_i64,
+            "peak_hours": [19_i64, 20, 21, 22],
+            "off_peak_hours": [0_i64, 1, 2, 3, 4, 5],
+            "morning_hours": [6_i64, 7, 8],
+            "work_hours": [9_i64, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+            "reasoning": "test-time-reasoning",
+            // event config fields
+            "hot_topics": ["AI", "教育"],
+            "narrative_direction": "积极",
+            "initial_posts": [
+                {"content": "post1", "poster_type": "Student"}
+            ],
+            // agent_configs batch fields
+            "agent_configs": agent_cfgs,
+        });
+        let json_str = combined.to_string();
+        let g = make_gen(json_str.clone());
+        (g, json_str)
+    }
+
+    #[tokio::test]
+    async fn generate_config_total_steps_formula() {
+        // total_steps = 3 + ceil(n / 15)
+        // For N=17 entities: ceil(17/15)=2 → total_steps=5
+        let n = 17usize;
+        let (g, _) = make_multi_stage_gen(n);
+        let entities: Vec<EntityNode> = (0..n)
+            .map(|i| make_node(&format!("E{i}"), vec!["Entity", "Student"], "desc"))
+            .collect();
+
+        let mut steps_received: Vec<(i64, i64, String)> = Vec::new();
+        let params = g
+            .generate_config(
+                "sim-1",
+                "proj-1",
+                "graph-1",
+                "requirement",
+                "doc text",
+                &entities,
+                true,
+                true,
+                Some(&mut |step, total, msg| {
+                    steps_received.push((step, total, msg.to_string()));
+                }),
+            )
+            .await;
+
+        // Expected total_steps = 3 + ceil(17/15) = 3 + 2 = 5
+        let expected_total: i64 = 5;
+        assert_eq!(params.agent_configs.len(), n, "agent_configs length must equal entity count");
+
+        // Every callback invocation must report the same total_steps
+        for (_, total, _) in &steps_received {
+            assert_eq!(*total, expected_total, "all callbacks must see total_steps={expected_total}");
+        }
+
+        // Step sequence: 1, 2, 3 (batch 0), 4 (batch 1), 5 (platform)
+        let steps: Vec<i64> = steps_received.iter().map(|(s, _, _)| *s).collect();
+        assert_eq!(steps, vec![1, 2, 3, 4, 5], "step sequence must be [1,2,3,4,5]");
+    }
+
+    #[tokio::test]
+    async fn generate_config_zero_entities_total_steps_3() {
+        // 0 entities → ceil(0/15)=0 → total_steps=3; no agent-batch steps.
+        let (g, _) = make_multi_stage_gen(0);
+        let entities: Vec<EntityNode> = vec![];
+
+        let mut steps_received: Vec<(i64, i64)> = Vec::new();
+        let params = g
+            .generate_config(
+                "sim-z",
+                "proj-z",
+                "graph-z",
+                "req",
+                "",
+                &entities,
+                true,
+                true,
+                Some(&mut |step, total, _| {
+                    steps_received.push((step, total));
+                }),
+            )
+            .await;
+
+        assert_eq!(params.agent_configs.len(), 0, "zero entities → zero agent configs");
+        // Callbacks: step 1 (time), step 2 (event), step 3 (platform) — no batch steps.
+        let steps: Vec<i64> = steps_received.iter().map(|(s, _)| *s).collect();
+        assert_eq!(steps, vec![1, 2, 3], "zero entities: step sequence must be [1,2,3]");
+        let totals: Vec<i64> = steps_received.iter().map(|(_, t)| *t).collect();
+        assert!(totals.iter().all(|&t| t == 3), "all totals must be 3");
+    }
+
+    #[tokio::test]
+    async fn generate_config_twitter_config_present_with_correct_values() {
+        let (g, _) = make_multi_stage_gen(1);
+        let entities = vec![make_node("E0", vec!["Entity", "Student"], "d")];
+        let params = g
+            .generate_config("s", "p", "g", "r", "", &entities, true, true, None)
+            .await;
+
+        let tw = params.twitter_config.expect("twitter_config must be present when enable_twitter=true");
+        assert_eq!(tw.platform, "twitter");
+        assert_eq!(tw.recency_weight, 0.4);
+        assert_eq!(tw.popularity_weight, 0.3);
+        assert_eq!(tw.relevance_weight, 0.3);
+        assert_eq!(tw.viral_threshold, 10);
+        assert_eq!(tw.echo_chamber_strength, 0.5);
+    }
+
+    #[tokio::test]
+    async fn generate_config_reddit_config_non_default_literals() {
+        // Reddit config has VALUES that differ from PlatformConfig struct defaults:
+        //   recency=0.3 (default 0.4), popularity=0.4 (default 0.3), viral=15 (default 10), echo=0.6 (default 0.5).
+        let (g, _) = make_multi_stage_gen(1);
+        let entities = vec![make_node("E0", vec!["Entity", "Student"], "d")];
+        let params = g
+            .generate_config("s", "p", "g", "r", "", &entities, true, true, None)
+            .await;
+
+        let rd = params.reddit_config.expect("reddit_config must be present when enable_reddit=true");
+        assert_eq!(rd.platform, "reddit");
+        assert_eq!(rd.recency_weight, 0.3, "reddit recency_weight must be 0.3 (not default 0.4)");
+        assert_eq!(rd.popularity_weight, 0.4, "reddit popularity_weight must be 0.4 (not default 0.3)");
+        assert_eq!(rd.relevance_weight, 0.3);
+        assert_eq!(rd.viral_threshold, 15, "reddit viral_threshold must be 15 (not default 10)");
+        assert_eq!(rd.echo_chamber_strength, 0.6, "reddit echo_chamber_strength must be 0.6 (not default 0.5)");
+    }
+
+    #[tokio::test]
+    async fn generate_config_enable_twitter_false_no_twitter_config() {
+        let (g, _) = make_multi_stage_gen(1);
+        let entities = vec![make_node("E0", vec!["Entity", "Student"], "d")];
+        let params = g
+            .generate_config("s", "p", "g", "r", "", &entities, false, true, None)
+            .await;
+        assert!(params.twitter_config.is_none(), "twitter_config must be None when enable_twitter=false");
+        assert!(params.reddit_config.is_some(), "reddit_config must be Some when enable_reddit=true");
+    }
+
+    #[tokio::test]
+    async fn generate_config_enable_reddit_false_no_reddit_config() {
+        let (g, _) = make_multi_stage_gen(1);
+        let entities = vec![make_node("E0", vec!["Entity", "Student"], "d")];
+        let params = g
+            .generate_config("s", "p", "g", "r", "", &entities, true, false, None)
+            .await;
+        assert!(params.reddit_config.is_none(), "reddit_config must be None when enable_reddit=false");
+        assert!(params.twitter_config.is_some(), "twitter_config must be Some when enable_twitter=true");
+    }
+
+    #[tokio::test]
+    async fn generate_config_both_disabled_no_platform_configs() {
+        let (g, _) = make_multi_stage_gen(1);
+        let entities = vec![make_node("E0", vec!["Entity", "Student"], "d")];
+        let params = g
+            .generate_config("s", "p", "g", "r", "", &entities, false, false, None)
+            .await;
+        assert!(params.twitter_config.is_none());
+        assert!(params.reddit_config.is_none());
+    }
+
+    #[tokio::test]
+    async fn generate_config_generation_reasoning_joins_with_pipe() {
+        // reasoning_parts joined by " | "; must contain all 4 sections.
+        let n = 2usize;
+        let (g, _) = make_multi_stage_gen(n);
+        let entities: Vec<EntityNode> = (0..n)
+            .map(|i| make_node(&format!("E{i}"), vec!["Entity", "Student"], "d"))
+            .collect();
+        let params = g
+            .generate_config("s", "p", "g", "r", "", &entities, true, true, None)
+            .await;
+
+        let reasoning = &params.generation_reasoning;
+        // Must contain the " | " separator
+        assert!(reasoning.contains(" | "), "reasoning must join parts with \" | \"");
+        // Must contain time config label
+        assert!(reasoning.contains("Time Config") || reasoning.contains("时间配置"),
+            "reasoning must contain time config label: {reasoning}");
+        // Must contain event config label
+        assert!(reasoning.contains("Event Config") || reasoning.contains("事件配置"),
+            "reasoning must contain event config label: {reasoning}");
+        // Must contain agent config result
+        assert!(reasoning.contains("Agent Config") || reasoning.contains("Agent配置"),
+            "reasoning must contain agent config result: {reasoning}");
+        // Must contain post assignment result
+        assert!(reasoning.contains("Post Assignment") || reasoning.contains("帖子分配"),
+            "reasoning must contain post assignment result: {reasoning}");
+        // Must have exactly 3 " | " separators (4 parts, 3 joins)
+        assert_eq!(reasoning.matches(" | ").count(), 3,
+            "reasoning must have exactly 3 ' | ' separators (4 parts): {reasoning}");
+    }
+
+    #[tokio::test]
+    async fn generate_config_llm_model_and_base_url_in_params() {
+        // llm_model and llm_base_url must be passed from self.model_name / self.base_url.
+        let llm = MockLlm::always(serde_json::json!({
+            "total_simulation_hours": 72_i64, "minutes_per_round": 60_i64,
+            "agents_per_hour_min": 1_i64, "agents_per_hour_max": 5_i64,
+            "peak_hours": [19_i64], "off_peak_hours": [0_i64],
+            "morning_hours": [6_i64], "work_hours": [9_i64],
+            "hot_topics": [], "narrative_direction": "", "initial_posts": [],
+            "agent_configs": [],
+        }).to_string());
+        let g = SimulationConfigGenerator::new(llm, "my-model-x", "http://example.com");
+        let entities = vec![make_node("E0", vec!["Entity", "Student"], "d")];
+        let params = g
+            .generate_config("s", "p", "g", "r", "", &entities, false, false, None)
+            .await;
+        assert_eq!(params.llm_model, "my-model-x");
+        assert_eq!(params.llm_base_url, "http://example.com");
+    }
+
+    #[tokio::test]
+    async fn generate_config_simulation_id_project_graph_in_params() {
+        let (g, _) = make_multi_stage_gen(0);
+        let params = g
+            .generate_config("sim-123", "proj-456", "graph-789", "My requirement", "", &[], false, false, None)
+            .await;
+        assert_eq!(params.simulation_id, "sim-123");
+        assert_eq!(params.project_id, "proj-456");
+        assert_eq!(params.graph_id, "graph-789");
+        assert_eq!(params.simulation_requirement, "My requirement");
+    }
+
+    #[tokio::test]
+    async fn generate_config_progress_callback_invoked_correct_sequence() {
+        // N=16 → ceil(16/15)=2 → total_steps=5; steps = [1,2,3,4,5]
+        let n = 16usize;
+        let (g, _) = make_multi_stage_gen(n);
+        let entities: Vec<EntityNode> = (0..n)
+            .map(|i| make_node(&format!("E{i}"), vec!["Entity", "Student"], "d"))
+            .collect();
+
+        let mut calls: Vec<(i64, i64, String)> = Vec::new();
+        g.generate_config(
+            "s", "p", "g", "r", "", &entities, true, true,
+            Some(&mut |step, total, msg| calls.push((step, total, msg.to_string()))),
+        ).await;
+
+        let steps: Vec<i64> = calls.iter().map(|(s, _, _)| *s).collect();
+        let totals: Vec<i64> = calls.iter().map(|(_, t, _)| *t).collect();
+        assert_eq!(steps, vec![1, 2, 3, 4, 5]);
+        assert!(totals.iter().all(|&t| t == 5), "all totals must be 5");
+
+        // Step 1 message must relate to time config
+        let msg1 = &calls[0].2;
+        assert!(msg1.contains("time") || msg1.contains("Time") || msg1.contains("时间"),
+            "step 1 message must be about time config: {msg1}");
+        // Step 2 message must relate to event config
+        let msg2 = &calls[1].2;
+        assert!(msg2.contains("event") || msg2.contains("Event") || msg2.contains("事件"),
+            "step 2 message must be about event config: {msg2}");
+        // Last step message must relate to platform config
+        let msg_last = &calls[4].2;
+        assert!(msg_last.contains("platform") || msg_last.contains("Platform") || msg_last.contains("平台"),
+            "last step message must be about platform config: {msg_last}");
+    }
+
+    #[tokio::test]
+    async fn generate_config_agent_configs_length_equals_entities() {
+        // All N=15 entity configs must be generated (exactly one batch).
+        let n = 15usize;
+        let (g, _) = make_multi_stage_gen(n);
+        let entities: Vec<EntityNode> = (0..n)
+            .map(|i| make_node(&format!("E{i}"), vec!["Entity", "Student"], "d"))
+            .collect();
+        let params = g
+            .generate_config("s", "p", "g", "r", "", &entities, true, true, None)
+            .await;
+        assert_eq!(params.agent_configs.len(), n);
+        // ceil(15/15) = 1 → total_steps = 4
+        // (not tested here — covered by generate_config_total_steps_formula)
+    }
+
+    #[tokio::test]
+    async fn generate_config_generated_at_is_isoformat() {
+        let (g, _) = make_multi_stage_gen(0);
+        let params = g
+            .generate_config("s", "p", "g", "r", "", &[], false, false, None)
+            .await;
+        let ts = &params.generated_at;
+        assert!(ts.len() >= 19, "generated_at must be at least 19 chars: {ts}");
+        assert_eq!(&ts[10..11], "T", "generated_at must have T separator: {ts}");
+        assert!(!ts.ends_with('Z'), "generated_at must be local naive: {ts}");
+    }
+
+    #[tokio::test]
+    async fn generate_config_reasoning_uses_success_fallback_when_no_reasoning_key() {
+        // When the LLM result lacks a "reasoning" key, t("common.success") is used.
+        // The combined JSON used here has "reasoning": "test-time-reasoning" for time config
+        // and also for event config — to test the fallback we use a response with no "reasoning".
+        let no_reasoning = serde_json::json!({
+            "total_simulation_hours": 72_i64, "minutes_per_round": 60_i64,
+            "agents_per_hour_min": 1_i64, "agents_per_hour_max": 5_i64,
+            "peak_hours": [19_i64], "off_peak_hours": [0_i64],
+            "morning_hours": [6_i64], "work_hours": [9_i64],
+            "hot_topics": [], "narrative_direction": "", "initial_posts": [],
+            "agent_configs": [],
+            // NOTE: no "reasoning" field
+        }).to_string();
+        let g = make_gen(no_reasoning);
+        let entities = vec![make_node("E0", vec!["Entity", "Student"], "d")];
+        let params = g
+            .generate_config("s", "p", "g", "r", "", &entities, false, false, None)
+            .await;
+
+        let reasoning = &params.generation_reasoning;
+        // The t("common.success") fallback should appear in the reasoning string.
+        // "Success" (en locale) or "成功" (zh locale) depending on locale.
+        assert!(
+            reasoning.contains("Success") || reasoning.contains("成功") || reasoning.contains("success"),
+            "reasoning must contain common.success fallback when no reasoning key: {reasoning}"
+        );
     }
 
 }

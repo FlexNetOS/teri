@@ -1064,3 +1064,38 @@ Re-verification of the symbol FAILed on 2026-06-14 (alias inner-loop uncondition
 
 ### Result — **PASS**
 Symbol-map: S-450 flipped `- [~]` → `- [x]`. U-019 sub-cycles a+b+c are now ALL parity-verified; only sub-cycle (d) (`generate_config` S-439 + save) remains. U-019 stays `- [ ]` (NOT marked done — sub-cycle d outstanding). No source/Rust impl edited by the verifier (porter's regression test is the only test added; it ships in the crate). Verified inside worktree `/home/drdave/Desktop/meta/.worktrees/mirofish-port/teri` (branch port/mirofish).
+
+---
+
+## 2026-06-17 — U-019 sub-cycle (d): `generate_config` (S-439) — FINAL symbol of U-019
+
+**Verifier:** rust-port-parity-verifier (opus). **Worktree:** `/home/drdave/Desktop/meta/.worktrees/mirofish-port/teri` (branch `port/mirofish`).
+**Source:** `MiroFish/backend/app/services/simulation_config_generator.py:243-379`.
+**Rust:** `teri::services::simulation_config::SimulationConfigGenerator::generate_config` (`src/services/simulation_config.rs:2058-2237`).
+**Method:** differential re-trace of source vs Rust (file:line both sides) + read of the 14 added `generate_config_*` tests + full run.
+
+### Checks (all PASS)
+
+1. **Step math (total_steps = 3 + num_batches).** Python `num_batches = math.ceil(len/15)` (py:275); Rust `entities.len().div_ceil(15)` (rs:2086). Cross-checked 0/1/14/15/16/17/30/31/45/46 — `div_ceil` ≡ `math.ceil` on all (0→3, 15→4, 16→5, 17→5, 30→5, 31→6). **0-entities edge:** `math.ceil(0/15)=0` → total_steps=3, agent-batch loop runs 0×, platform reported at step 3 — identical Rust; tested by `generate_config_zero_entities_total_steps_3` asserting step seq `[1,2,3]`.
+
+2. **Step numbering + progress_callback.** py:279-284 `report_progress(step,msg)` sets current_step, calls `progress_callback(step,total_steps,message)` if present; rs:2096-2105 `report_progress!` macro does the same. Steps: 1=time (py:296/rs:2113), 2=event (py:303/rs:2125), 3+batch_idx=agent (py:315-318/rs:2143-2153), total_steps=platform (py:337/rs:2184). Idiom `Option<&mut dyn FnMut(i64,i64,&str)>` accepted. `generate_config_total_steps_formula` (n=17) and `_progress_callback_invoked_correct_sequence` (n=16) assert seq `[1,2,3,4,5]`, all callbacks see total=5, and msg1/msg2/msg_last match time/event/platform.
+
+3. **i18n keys + placeholders EXACT.** All present in `src/i18n/locales/{en,zh}.json`: progress.generatingTimeConfig, timeConfigLabel, generatingEventConfig, eventConfigLabel, generatingAgentConfig (`{start}-{end}/{total}`), agentConfigResult (`{count}`), postAssignResult (`{count}`), generatingPlatformConfig, common.success. `generatingAgentConfig` args: start=start_idx+1, end=end_idx, total=entities.len() (py:317 / rs:2145-2152) — exact. `t` used for no-arg keys, `t_args` for placeholder keys — arity-correct. `t_args` (`src/i18n/mod.rs:209`) `{name}`→`str(v)` replacement ≡ Python `t(key,**kwargs)` (`utils/locale.py:35-63`).
+
+4. **reasoning-or-success fallback.** Python `result.get('reasoning', t('common.success'))` time (py:300) + event (py:306). Rust `.get("reasoning").and_then(Value::as_str).map(to_string).unwrap_or_else(|| t("common.success"))` time (rs:2117-2121) + event (rs:2129-2133) — uses the JSON string only when present AND a string, else fallback. Present-path tested via `make_multi_stage_gen` (responses carry `"reasoning":"test-time-reasoning"`); fallback-path tested by `_reasoning_uses_success_fallback_when_no_reasoning_key`.
+
+5. **batch loop.** start_idx=batch_idx*15 (py:311/rs:2139); end_idx=min(start+15,len) (py:312/rs:2140); batch=entities[start..end] (py:313/rs:2141); `generate_agent_configs_batch(context,batch,start_idx,sim_req).await` with start_idx as i64 (py:320-325/rs:2155-2162); extend all_agent_configs (py:326/rs:2163). `_agent_configs_length_equals_entities` (n=15) confirms all N flow through.
+
+6. **assigned_count.** Python `len([p ... if p.get("poster_agent_id") is not None])` (py:333). Rust `.filter(|p| !p.get("poster_agent_id").map(Value::is_null).unwrap_or(true)).count()` (rs:2173-2177). Equivalence: key absent → None/`unwrap_or(true)`→excluded; key present + JSON null → `is_null`→excluded; present non-null → included. Exact.
+
+7. **Platform config literals.** twitter recency=0.4/popularity=0.3/relevance=0.3/viral=10/echo=0.5 (py:342-349/rs:2187-2194) — equals struct defaults but written as explicit literals. reddit recency=0.3/popularity=0.4/relevance=0.3/viral=15/echo=0.6 (py:352-359/rs:2202-2209) — DIFFER from struct defaults (0.4/0.3/.../10/0.5), written as explicit literals (NOT `..Default`). enable_twitter/enable_reddit gating both default-true; tested: twitter_present_correct, reddit_non_default_literals, twitter_false, reddit_false, both_disabled.
+
+8. **SimulationParameters construction (py:362-375 / rs:2215-2229).** All fields field-for-field. llm_model=self.model_name (rs:2225), llm_base_url=self.base_url (rs:2226) — tested `_llm_model_and_base_url_in_params`. generation_reasoning=reasoning_parts.join(" | ") (rs:2228) — tested `_generation_reasoning_joins_with_pipe` (exactly 3 separators / 4 parts, all labels present). generated_at=python_isoformat_local() (rs:2227): Python field default_factory `datetime.now().isoformat()` (dataclass L173) is NOT overridden in generate_config → calling the same factory is the faithful equivalent (a struct literal cannot omit a non-Default field); tested `_generated_at_is_isoformat` (T-separator, local-naive, no Z). simulation_id/project_id/graph_id/simulation_requirement passthrough tested.
+
+9. **No regression.** Edit only ADDED `generate_config` + 14 `generate_config_*` tests. `cargo test --lib`: 662 passed. `cargo test --lib services::simulation_config`: 96 passed. `cargo clippy --all-targets -- -D warnings`: clean. Stage methods (S-430..S-452) undisturbed.
+
+### `[≠]` challenge
+None. U-019 had ZERO `[≠]` rows; S-439 was the sole `- [~]`. No disguised feature-skip to challenge.
+
+### Result — **PASS**
+S-439 flipped `- [~]` → `- [x]` in symbol-map.md. **All U-019 symbols S-374..S-452 now `- [x]` (73 symbols, zero `[≠]`)** — confirmed via tally (72 `[x]` + S-439 = 73, the only prior open row was S-439). **U-019 UNIT flipped `- [ ]` → `- [x]` in parity-ledger.md** (rollup rule satisfied). Verifier edited no source/Rust impl. Orchestrator may mark the unit done and commit.
