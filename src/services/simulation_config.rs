@@ -1732,6 +1732,414 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
             narrative_direction,
         }
     }
+
+    // -----------------------------------------------------------------------
+    // S-450 — _assign_initial_post_agents
+    // -----------------------------------------------------------------------
+
+    /// Assign agent IDs to initial posts based on poster_type matching.
+    ///
+    /// Port of `SimulationConfigGenerator._assign_initial_post_agents`
+    /// (`simulation_config_generator.py:728-811`).
+    ///
+    /// # Algorithm
+    /// 1. If `event_config.initial_posts` is empty, return unchanged.
+    /// 2. Build `agents_by_type: HashMap<String, Vec<&AgentActivityConfig>>` keyed by
+    ///    `agent.entity_type.to_lowercase()`, preserving insertion order of agents.
+    /// 3. Type alias table (insertion order matters for match priority — stored as Vec of pairs):
+    ///    `official → [official, university, governmentagency, government]`
+    ///    `university → [university, official]`
+    ///    `mediaoutlet → [mediaoutlet, media]`
+    ///    `student → [student, person]`
+    ///    `professor → [professor, expert, teacher]`
+    ///    `alumni → [alumni, person]`
+    ///    `organization → [organization, ngo, company, group]`
+    ///    `person → [person, student, alumni]`
+    /// 4. `used_indices` round-robin counter per type key.
+    /// 5. For each post: (a) Direct match → round-robin pick from `agents_by_type`.
+    ///    (b) Alias match → iterate alias table IN INSERTION ORDER, first hit wins.
+    ///    (c) Fallback → highest `influence_weight` (stable tie-break: first-in-original-order).
+    ///    If `agent_configs` is empty: agent_id = 0.
+    /// 6. Append `{content, poster_type: ORIGINAL cased value (default "Unknown"), poster_agent_id}`.
+    pub fn assign_initial_post_agents(
+        &self,
+        mut event_config: EventConfig,
+        agent_configs: &[AgentActivityConfig],
+    ) -> EventConfig {
+        if event_config.initial_posts.is_empty() {
+            return event_config;
+        }
+
+        // Build agents_by_type index (lowercase key, preserve insertion order within each type)
+        let mut agents_by_type: HashMap<String, Vec<&AgentActivityConfig>> = HashMap::new();
+        for agent in agent_configs {
+            let etype = agent.entity_type.to_lowercase();
+            agents_by_type.entry(etype).or_default().push(agent);
+        }
+
+        // Type alias table — MUST be a Vec of pairs to preserve Python dict insertion order.
+        // Python L750-759: official first, then university, mediaoutlet, student, professor,
+        // alumni, organization, person.  Order governs which alias group wins when multiple
+        // groups match a poster_type.
+        let type_aliases: Vec<(&str, Vec<&str>)> = vec![
+            ("official",      vec!["official", "university", "governmentagency", "government"]),
+            ("university",    vec!["university", "official"]),
+            ("mediaoutlet",   vec!["mediaoutlet", "media"]),
+            ("student",       vec!["student", "person"]),
+            ("professor",     vec!["professor", "expert", "teacher"]),
+            ("alumni",        vec!["alumni", "person"]),
+            ("organization",  vec!["organization", "ngo", "company", "group"]),
+            ("person",        vec!["person", "student", "alumni"]),
+        ];
+
+        // Round-robin counter: maps type key → next index to use
+        let mut used_indices: HashMap<String, usize> = HashMap::new();
+
+        let mut updated_posts: Vec<Value> = Vec::with_capacity(event_config.initial_posts.len());
+
+        for post in &event_config.initial_posts {
+            let poster_type_lower = post
+                .get("poster_type")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_lowercase();
+            let content = post
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            // Preserve the ORIGINAL cased poster_type value (Python L804: post.get("poster_type", "Unknown"))
+            let original_poster_type = post
+                .get("poster_type")
+                .and_then(Value::as_str)
+                .unwrap_or("Unknown")
+                .to_string();
+
+            let mut matched_agent_id: Option<i64> = None;
+
+            // (1) Direct match
+            if let Some(agents) = agents_by_type.get(&poster_type_lower) {
+                let idx = used_indices.get(&poster_type_lower).copied().unwrap_or(0)
+                    % agents.len();
+                matched_agent_id = Some(agents[idx].agent_id);
+                used_indices.insert(poster_type_lower.clone(), idx + 1);
+            } else {
+                // (2) Alias match — iterate in insertion order
+                'outer: for (alias_key, aliases) in &type_aliases {
+                    if aliases.contains(&poster_type_lower.as_str())
+                        || *alias_key == poster_type_lower
+                    {
+                        for alias in aliases {
+                            if let Some(agents) = agents_by_type.get(*alias) {
+                                let idx = used_indices.get(*alias).copied().unwrap_or(0)
+                                    % agents.len();
+                                matched_agent_id = Some(agents[idx].agent_id);
+                                used_indices.insert(alias.to_string(), idx + 1);
+                                break 'outer;
+                            }
+                        }
+                        // This alias group matched the poster_type but none of its member
+                        // types are present among the agents. Python only breaks the outer
+                        // loop when a match was actually found (`if matched_agent_id is not
+                        // None: break`), so we must NOT break here — continue scanning the
+                        // remaining alias groups (a later group may resolve a member). Only
+                        // when no group resolves does the influence-max fallback (3) apply.
+                    }
+                }
+            }
+
+            // (3) Fallback: highest influence_weight agent (stable sort → first-in-original wins ties)
+            if matched_agent_id.is_none() {
+                if !agent_configs.is_empty() {
+                    // Python: sorted(agent_configs, key=lambda a: a.influence_weight, reverse=True)
+                    // Python sort is stable, so on ties the first in the original order is kept.
+                    // We replicate by iterating once and tracking the current best.
+                    let best = agent_configs
+                        .iter()
+                        .reduce(|best, a| {
+                            // Strict greater-than: only replace on strictly higher influence
+                            // so that on ties we keep the first (original order).
+                            if a.influence_weight > best.influence_weight { a } else { best }
+                        })
+                        .unwrap(); // agent_configs is non-empty
+                    matched_agent_id = Some(best.agent_id);
+                } else {
+                    matched_agent_id = Some(0);
+                }
+            }
+
+            updated_posts.push(serde_json::json!({
+                "content": content,
+                "poster_type": original_poster_type,
+                "poster_agent_id": matched_agent_id.unwrap(),
+            }));
+        }
+
+        event_config.initial_posts = updated_posts;
+        event_config
+    }
+
+    // -----------------------------------------------------------------------
+    // S-451 — _generate_agent_configs_batch
+    // -----------------------------------------------------------------------
+
+    /// Generate a batch of `AgentActivityConfig`s for the given entities.
+    ///
+    /// Port of `SimulationConfigGenerator._generate_agent_configs_batch`
+    /// (`simulation_config_generator.py:813-906`).
+    ///
+    /// # Algorithm
+    /// 1. Build `entity_list` (JSON array) with `agent_id = start_idx + i`,
+    ///    `entity_name`, `entity_type`, `summary` truncated to `AGENT_SUMMARY_LENGTH` chars.
+    /// 2. Build prompt and system_prompt (byte-verbatim Chinese strings).
+    /// 3. Call `call_llm_with_retry(prompt, system_prompt)`.
+    ///    - On success: build `llm_configs: HashMap<i64, Value>` keyed by agent_id.
+    ///    - On ANY error: set `llm_configs = {}` and proceed with rule fallback (no fault).
+    /// 4. For each entity: if `llm_configs.get(agent_id)` is empty/missing → use
+    ///    `generate_agent_config_by_rule(entity)`.
+    /// 5. Build `AgentActivityConfig` using `.get(key).or_default()` fallbacks that match
+    ///    Python's `cfg.get("key", default)` — NOTE these defaults differ from the
+    ///    dataclass defaults: posts_per_hour=0.5, comments_per_hour=1.0, active_hours=9..=22.
+    pub async fn generate_agent_configs_batch(
+        &self,
+        _context: &str,
+        entities: &[EntityNode],
+        start_idx: i64,
+        simulation_requirement: &str,
+    ) -> Vec<AgentActivityConfig> {
+        // Step 1 — build entity_list
+        let summary_len = Self::AGENT_SUMMARY_LENGTH;
+        let entity_list: Vec<Value> = entities
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let summary: String = if e.summary.is_empty() {
+                    String::new()
+                } else {
+                    e.summary.chars().take(summary_len).collect()
+                };
+                serde_json::json!({
+                    "agent_id": start_idx + i as i64,
+                    "entity_name": e.name,
+                    "entity_type": e.get_entity_type().unwrap_or_else(|| "Unknown".to_string()),
+                    "summary": summary,
+                })
+            })
+            .collect();
+
+        // Step 2 — build prompt (byte-verbatim, with json.dumps(ensure_ascii=False, indent=2))
+        let entity_list_json =
+            serde_json::to_string_pretty(&entity_list).expect("entity_list is always serializable");
+
+        let prompt = format!(
+            "基于以下信息，为每个实体生成社交媒体活动配置。\n\n模拟需求: {simulation_requirement}\n\n## 实体列表\n```json\n{entity_list_json}\n```\n\n## 任务\n为每个实体生成活动配置，注意：\n- **时间符合目标用户群体作息**：以下为参考（东八区），请根据模拟场景调整\n- **官方机构**（University/GovernmentAgency）：活跃度低(0.1-0.3)，工作时间(9-17)活动，响应慢(60-240分钟)，影响力高(2.5-3.0)\n- **媒体**（MediaOutlet）：活跃度中(0.4-0.6)，全天活动(8-23)，响应快(5-30分钟)，影响力高(2.0-2.5)\n- **个人**（Student/Person/Alumni）：活跃度高(0.6-0.9)，主要晚间活动(18-23)，响应快(1-15分钟)，影响力低(0.8-1.2)\n- **公众人物/专家**：活跃度中(0.4-0.6)，影响力中高(1.5-2.0)\n\n返回JSON格式（不要markdown）：\n{{\n    \"agent_configs\": [\n        {{\n            \"agent_id\": <必须与输入一致>,\n            \"activity_level\": <0.0-1.0>,\n            \"posts_per_hour\": <发帖频率>,\n            \"comments_per_hour\": <评论频率>,\n            \"active_hours\": [<活跃小时列表，考虑中国人作息>],\n            \"response_delay_min\": <最小响应延迟分钟>,\n            \"response_delay_max\": <最大响应延迟分钟>,\n            \"sentiment_bias\": <-1.0到1.0>,\n            \"stance\": \"<supportive/opposing/neutral/observer>\",\n            \"influence_weight\": <影响力权重>\n        }},\n        ...\n    ]\n}}"
+        );
+
+        let base_system = "你是社交媒体行为分析专家。返回纯JSON，配置需符合模拟场景中目标用户群体的作息习惯。";
+        let lang_instruction = get_language_instruction();
+        let system_prompt = format!(
+            "{base_system}\n\n{lang_instruction}\nIMPORTANT: The 'stance' field value MUST be one of the English strings: 'supportive', 'opposing', 'neutral', 'observer'. All JSON field names and numeric values must remain unchanged. Only natural language text fields should use the specified language."
+        );
+
+        // Step 3 — call LLM; on ANY error fall back to empty map (rule generation below)
+        let llm_configs: HashMap<i64, Value> =
+            match self.call_llm_with_retry(&prompt, &system_prompt).await {
+                Ok(result) => result
+                    .get("agent_configs")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|cfg| {
+                                let id = cfg.get("agent_id")?.as_i64()?;
+                                Some((id, cfg.clone()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                Err(e) => {
+                    tracing::warn!("Agent配置批次LLM生成失败: {e}, 使用规则生成");
+                    HashMap::new()
+                }
+            };
+
+        // Step 4+5 — build AgentActivityConfig for each entity
+        // NOTE: the .get() defaults here DIFFER from the struct's dataclass defaults.
+        // Python L895-902: activity_level=0.5, posts_per_hour=0.5, comments_per_hour=1.0,
+        // active_hours=list(range(9,23))=[9..=22], delay_min=5, delay_max=60,
+        // sentiment_bias=0.0, stance="neutral", influence_weight=1.0.
+        let default_active_hours_batch: Vec<i64> = (9i64..23).collect(); // [9..=22], 14 elements
+
+        entities
+            .iter()
+            .enumerate()
+            .map(|(i, entity)| {
+                let agent_id = start_idx + i as i64;
+                let cfg = match llm_configs.get(&agent_id) {
+                    Some(v) if !v.is_null() && v.as_object().map(|o| !o.is_empty()).unwrap_or(false) => {
+                        v.clone()
+                    }
+                    _ => self.generate_agent_config_by_rule(entity),
+                };
+
+                let get_f64 = |key: &str, default: f64| -> f64 {
+                    cfg.get(key).and_then(Value::as_f64).unwrap_or(default)
+                };
+                let get_i64 = |key: &str, default: i64| -> i64 {
+                    cfg.get(key).and_then(Value::as_i64).unwrap_or(default)
+                };
+                let get_str = |key: &str, default: &str| -> String {
+                    cfg.get(key)
+                        .and_then(Value::as_str)
+                        .unwrap_or(default)
+                        .to_string()
+                };
+                let get_hours = |key: &str, default: Vec<i64>| -> Vec<i64> {
+                    cfg.get(key)
+                        .and_then(Value::as_array)
+                        .map(|arr| arr.iter().filter_map(Value::as_i64).collect())
+                        .unwrap_or(default)
+                };
+
+                AgentActivityConfig {
+                    agent_id,
+                    entity_uuid: entity.uuid.clone(),
+                    entity_name: entity.name.clone(),
+                    entity_type: entity
+                        .get_entity_type()
+                        .unwrap_or_else(|| "Unknown".to_string()),
+                    activity_level:      get_f64("activity_level",      0.5),
+                    posts_per_hour:      get_f64("posts_per_hour",       0.5),  // NOTE: 0.5, not 1.0
+                    comments_per_hour:   get_f64("comments_per_hour",    1.0),  // NOTE: 1.0, not 2.0
+                    active_hours:        get_hours("active_hours", default_active_hours_batch.clone()), // [9..=22]
+                    response_delay_min:  get_i64("response_delay_min",   5),
+                    response_delay_max:  get_i64("response_delay_max",   60),
+                    sentiment_bias:      get_f64("sentiment_bias",        0.0),
+                    stance:              get_str("stance",                "neutral"),
+                    influence_weight:    get_f64("influence_weight",      1.0),
+                }
+            })
+            .collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // S-452 — _generate_agent_config_by_rule
+    // -----------------------------------------------------------------------
+
+    /// Generate a rule-based agent config dict for a single entity (Chinese lifestyle schedule).
+    ///
+    /// Port of `SimulationConfigGenerator._generate_agent_config_by_rule`
+    /// (`simulation_config_generator.py:908-989`).
+    ///
+    /// Returns a `serde_json::Value` (JSON object) with the same field names that
+    /// `generate_agent_configs_batch` reads via `.get(key)` — this allows the same
+    /// `.get(key, default)` pattern to work for both LLM-generated and rule-generated configs.
+    ///
+    /// # Branches (6 total, all ported, exact numeric values and active_hours lists)
+    /// 1. `["university", "governmentagency", "ngo"]` — official institutions, work hours
+    /// 2. `["mediaoutlet"]` — media, full-day coverage
+    /// 3. `["professor", "expert", "official"]` — experts, work+evening
+    /// 4. `["student"]` — students, morning+evening (explicit list)
+    /// 5. `["alumni"]` — alumni, lunch+evening (explicit list)
+    /// 6. else (普通人) — general public, daytime+evening (explicit list)
+    pub fn generate_agent_config_by_rule(&self, entity: &EntityNode) -> Value {
+        let entity_type = entity
+            .get_entity_type()
+            .unwrap_or_else(|| "Unknown".to_string())
+            .to_lowercase();
+
+        match entity_type.as_str() {
+            "university" | "governmentagency" | "ngo" => {
+                // 官方机构：工作时间活动，低频率，高影响力
+                // active_hours: list(range(9, 18)) → [9, 10, 11, 12, 13, 14, 15, 16, 17]
+                serde_json::json!({
+                    "activity_level": 0.2_f64,
+                    "posts_per_hour": 0.1_f64,
+                    "comments_per_hour": 0.05_f64,
+                    "active_hours": [9, 10, 11, 12, 13, 14, 15, 16, 17],
+                    "response_delay_min": 60_i64,
+                    "response_delay_max": 240_i64,
+                    "sentiment_bias": 0.0_f64,
+                    "stance": "neutral",
+                    "influence_weight": 3.0_f64,
+                })
+            }
+            "mediaoutlet" => {
+                // 媒体：全天活动，中等频率，高影响力
+                // active_hours: list(range(7, 24)) → [7, 8, 9, ..., 23]
+                serde_json::json!({
+                    "activity_level": 0.5_f64,
+                    "posts_per_hour": 0.8_f64,
+                    "comments_per_hour": 0.3_f64,
+                    "active_hours": [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23],
+                    "response_delay_min": 5_i64,
+                    "response_delay_max": 30_i64,
+                    "sentiment_bias": 0.0_f64,
+                    "stance": "observer",
+                    "influence_weight": 2.5_f64,
+                })
+            }
+            "professor" | "expert" | "official" => {
+                // 专家/教授：工作+晚间活动，中等频率
+                // active_hours: list(range(8, 22)) → [8, 9, 10, ..., 21]
+                serde_json::json!({
+                    "activity_level": 0.4_f64,
+                    "posts_per_hour": 0.3_f64,
+                    "comments_per_hour": 0.5_f64,
+                    "active_hours": [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
+                    "response_delay_min": 15_i64,
+                    "response_delay_max": 90_i64,
+                    "sentiment_bias": 0.0_f64,
+                    "stance": "neutral",
+                    "influence_weight": 2.0_f64,
+                })
+            }
+            "student" => {
+                // 学生：晚间为主，高频率 (上午+晚间)
+                // active_hours: explicit [8,9,10,11,12,13,18,19,20,21,22,23]
+                serde_json::json!({
+                    "activity_level": 0.8_f64,
+                    "posts_per_hour": 0.6_f64,
+                    "comments_per_hour": 1.5_f64,
+                    "active_hours": [8, 9, 10, 11, 12, 13, 18, 19, 20, 21, 22, 23],
+                    "response_delay_min": 1_i64,
+                    "response_delay_max": 15_i64,
+                    "sentiment_bias": 0.0_f64,
+                    "stance": "neutral",
+                    "influence_weight": 0.8_f64,
+                })
+            }
+            "alumni" => {
+                // 校友：晚间为主 (午休+晚间)
+                // active_hours: explicit [12,13,19,20,21,22,23]
+                serde_json::json!({
+                    "activity_level": 0.6_f64,
+                    "posts_per_hour": 0.4_f64,
+                    "comments_per_hour": 0.8_f64,
+                    "active_hours": [12, 13, 19, 20, 21, 22, 23],
+                    "response_delay_min": 5_i64,
+                    "response_delay_max": 30_i64,
+                    "sentiment_bias": 0.0_f64,
+                    "stance": "neutral",
+                    "influence_weight": 1.0_f64,
+                })
+            }
+            _ => {
+                // 普通人：白天+晚间
+                // active_hours: explicit [9,10,11,12,13,18,19,20,21,22,23]
+                serde_json::json!({
+                    "activity_level": 0.7_f64,
+                    "posts_per_hour": 0.5_f64,
+                    "comments_per_hour": 1.2_f64,
+                    "active_hours": [9, 10, 11, 12, 13, 18, 19, 20, 21, 22, 23],
+                    "response_delay_min": 2_i64,
+                    "response_delay_max": 20_i64,
+                    "sentiment_bias": 0.0_f64,
+                    "stance": "neutral",
+                    "influence_weight": 1.0_f64,
+                })
+            }
+        }
+    }
 }
 
 // ===========================================================================
@@ -2304,4 +2712,563 @@ mod generator_tests {
         assert_eq!(SimulationConfigGenerator::<MockLlm>::AGENT_SUMMARY_LENGTH, 300);
         assert_eq!(SimulationConfigGenerator::<MockLlm>::ENTITIES_PER_TYPE_DISPLAY, 20);
     }
+
+    // -----------------------------------------------------------------------
+    // _assign_initial_post_agents (S-450) tests
+    // -----------------------------------------------------------------------
+
+    fn make_agent(agent_id: i64, entity_type: &str, influence: f64) -> AgentActivityConfig {
+        AgentActivityConfig {
+            agent_id,
+            entity_uuid: format!("uuid-{agent_id}"),
+            entity_name: format!("Agent{agent_id}"),
+            entity_type: entity_type.to_string(),
+            activity_level: 0.5,
+            posts_per_hour: 1.0,
+            comments_per_hour: 2.0,
+            active_hours: (8..23).collect(),
+            response_delay_min: 5,
+            response_delay_max: 60,
+            sentiment_bias: 0.0,
+            stance: "neutral".to_string(),
+            influence_weight: influence,
+        }
+    }
+
+    fn make_event_with_posts(posts: Vec<Value>) -> EventConfig {
+        EventConfig {
+            initial_posts: posts,
+            scheduled_events: vec![],
+            hot_topics: vec![],
+            narrative_direction: String::new(),
+        }
+    }
+
+    #[test]
+    fn assign_initial_post_agents_empty_posts_returns_unchanged() {
+        let g = make_gen("{}");
+        let event = EventConfig::default();
+        let agents = vec![make_agent(1, "student", 1.0)];
+        let result = g.assign_initial_post_agents(event, &agents);
+        assert!(result.initial_posts.is_empty());
+    }
+
+    #[test]
+    fn assign_initial_post_agents_direct_match() {
+        let g = make_gen("{}");
+        let agents = vec![make_agent(42, "Student", 1.0)];
+        let posts = vec![serde_json::json!({"content": "hello", "poster_type": "Student"})];
+        let event = make_event_with_posts(posts);
+        let result = g.assign_initial_post_agents(event, &agents);
+        let p = &result.initial_posts[0];
+        assert_eq!(p["poster_agent_id"].as_i64().unwrap(), 42);
+        // Preserves ORIGINAL cased poster_type
+        assert_eq!(p["poster_type"].as_str().unwrap(), "Student");
+        assert_eq!(p["content"].as_str().unwrap(), "hello");
+    }
+
+    #[test]
+    fn assign_initial_post_agents_direct_match_round_robin() {
+        let g = make_gen("{}");
+        // Two student agents
+        let agents = vec![make_agent(10, "student", 1.0), make_agent(11, "student", 1.0)];
+        let posts = vec![
+            serde_json::json!({"content": "a", "poster_type": "student"}),
+            serde_json::json!({"content": "b", "poster_type": "student"}),
+            serde_json::json!({"content": "c", "poster_type": "student"}),
+        ];
+        let event = make_event_with_posts(posts);
+        let result = g.assign_initial_post_agents(event, &agents);
+        // Round-robin: post0→agent10 (idx=0), post1→agent11 (idx=1), post2→agent10 (idx=0)
+        assert_eq!(result.initial_posts[0]["poster_agent_id"].as_i64().unwrap(), 10);
+        assert_eq!(result.initial_posts[1]["poster_agent_id"].as_i64().unwrap(), 11);
+        assert_eq!(result.initial_posts[2]["poster_agent_id"].as_i64().unwrap(), 10);
+    }
+
+    #[test]
+    fn assign_initial_post_agents_alias_match_media() {
+        let g = make_gen("{}");
+        // No "media" agents directly, but "mediaoutlet" is present
+        let agents = vec![make_agent(5, "mediaoutlet", 2.5)];
+        // poster_type "media" should alias-match "mediaoutlet" (the mediaoutlet alias group contains "media")
+        let posts = vec![serde_json::json!({"content": "news", "poster_type": "media"})];
+        let event = make_event_with_posts(posts);
+        let result = g.assign_initial_post_agents(event, &agents);
+        assert_eq!(result.initial_posts[0]["poster_agent_id"].as_i64().unwrap(), 5);
+    }
+
+    #[test]
+    fn assign_initial_post_agents_alias_match_by_alias_key() {
+        let g = make_gen("{}");
+        // poster_type == "official" (an alias_key); the aliases list is
+        // ["official","university","governmentagency","government"].
+        // agents_by_type has "official" → should match via direct OR alias
+        let agents = vec![make_agent(7, "official", 2.0)];
+        let posts = vec![serde_json::json!({"content": "statement", "poster_type": "official"})];
+        let event = make_event_with_posts(posts);
+        let result = g.assign_initial_post_agents(event, &agents);
+        // Direct match (official in agents_by_type)
+        assert_eq!(result.initial_posts[0]["poster_agent_id"].as_i64().unwrap(), 7);
+    }
+
+    #[test]
+    fn assign_initial_post_agents_alias_poster_type_university_in_official_group() {
+        // poster_type "university" appears in the "official" alias group
+        // AND "university" is also its own alias_key with aliases ["university","official"]
+        // First matching group in insertion order wins → "official" group is index 0
+        let g = make_gen("{}");
+        let agents = vec![make_agent(3, "official", 2.0)];
+        let posts = vec![serde_json::json!({"content": "x", "poster_type": "university"})];
+        let event = make_event_with_posts(posts);
+        let result = g.assign_initial_post_agents(event, &agents);
+        // The "official" alias group (first in table) lists "official" first; "official" is in agents_by_type
+        assert_eq!(result.initial_posts[0]["poster_agent_id"].as_i64().unwrap(), 3);
+    }
+
+    #[test]
+    fn assign_initial_post_agents_continues_past_empty_alias_group() {
+        // Regression (opus parity gate, sub-cycle c FAIL→fix): a poster_type can match an
+        // alias GROUP whose member types are all absent, while a LATER group resolves.
+        // Python only breaks the outer loop when a match was actually found, so it keeps
+        // scanning; an earlier unconditional break wrongly fell through to influence-max.
+        //
+        // poster_type "person" first matches the "student" group ["student","person"]
+        // (insertion index 3) — both absent here — then the "alumni" group
+        // ["alumni","person"] (index 5), where "alumni" IS present → agent 100.
+        // The influence-max fallback would instead pick the higher-influence "official"
+        // agent 200, so this test distinguishes the correct alias-scan from the bug.
+        let g = make_gen("{}");
+        let agents = vec![make_agent(100, "alumni", 1.0), make_agent(200, "official", 9.0)];
+        let posts = vec![serde_json::json!({"content": "hi", "poster_type": "person"})];
+        let event = make_event_with_posts(posts);
+        let result = g.assign_initial_post_agents(event, &agents);
+        assert_eq!(result.initial_posts[0]["poster_agent_id"].as_i64().unwrap(), 100);
+    }
+
+    #[test]
+    fn assign_initial_post_agents_influence_fallback_no_match() {
+        let g = make_gen("{}");
+        // poster_type "alien" — no direct or alias match
+        // agents: three with different influences; highest wins, ties → first in original order
+        let agents = vec![
+            make_agent(1, "person", 1.0),
+            make_agent(2, "student", 2.0), // highest
+            make_agent(3, "alumni", 1.5),
+        ];
+        let posts = vec![serde_json::json!({"content": "hi", "poster_type": "alien"})];
+        let event = make_event_with_posts(posts);
+        let result = g.assign_initial_post_agents(event, &agents);
+        // agent 2 has highest influence_weight 2.0
+        assert_eq!(result.initial_posts[0]["poster_agent_id"].as_i64().unwrap(), 2);
+    }
+
+    #[test]
+    fn assign_initial_post_agents_influence_fallback_tie_first_wins() {
+        let g = make_gen("{}");
+        // Two agents with identical influence; first in original order should win (stable sort)
+        let agents = vec![
+            make_agent(10, "person", 2.0), // tied highest, FIRST
+            make_agent(11, "student", 2.0), // tied highest, second
+        ];
+        let posts = vec![serde_json::json!({"content": "hi", "poster_type": "alien"})];
+        let event = make_event_with_posts(posts);
+        let result = g.assign_initial_post_agents(event, &agents);
+        // Stable: first in original order wins the tie
+        assert_eq!(result.initial_posts[0]["poster_agent_id"].as_i64().unwrap(), 10);
+    }
+
+    #[test]
+    fn assign_initial_post_agents_influence_fallback_no_agents() {
+        let g = make_gen("{}");
+        let posts = vec![serde_json::json!({"content": "hi", "poster_type": "alien"})];
+        let event = make_event_with_posts(posts);
+        let result = g.assign_initial_post_agents(event, &[]);
+        // No agents → poster_agent_id = 0
+        assert_eq!(result.initial_posts[0]["poster_agent_id"].as_i64().unwrap(), 0);
+    }
+
+    #[test]
+    fn assign_initial_post_agents_default_poster_type_unknown() {
+        let g = make_gen("{}");
+        // Post with no "poster_type" key → original_poster_type defaults to "Unknown"
+        let posts = vec![serde_json::json!({"content": "missing type"})];
+        let event = make_event_with_posts(posts);
+        let agents = vec![make_agent(1, "student", 1.0)];
+        let result = g.assign_initial_post_agents(event, &agents);
+        assert_eq!(result.initial_posts[0]["poster_type"].as_str().unwrap(), "Unknown");
+    }
+
+    #[test]
+    fn assign_initial_post_agents_preserves_original_casing() {
+        let g = make_gen("{}");
+        let agents = vec![make_agent(5, "mediaoutlet", 2.5)];
+        // Original poster_type uses PascalCase "MediaOutlet"
+        let posts = vec![serde_json::json!({"content": "news", "poster_type": "MediaOutlet"})];
+        let event = make_event_with_posts(posts);
+        let result = g.assign_initial_post_agents(event, &agents);
+        // poster_type in output must be the ORIGINAL cased value, not lowercased
+        assert_eq!(result.initial_posts[0]["poster_type"].as_str().unwrap(), "MediaOutlet");
+    }
+
+    // -----------------------------------------------------------------------
+    // _generate_agent_config_by_rule (S-452) tests
+    // -----------------------------------------------------------------------
+
+    fn make_node_with_label(name: &str, label: &str) -> EntityNode {
+        EntityNode::new(
+            "uuid",
+            name,
+            vec![label.to_string()],
+            "summary",
+            Map::new(),
+        )
+    }
+
+    #[test]
+    fn generate_agent_config_by_rule_university() {
+        let g = make_gen("{}");
+        let entity = make_node_with_label("NTU", "University");
+        let cfg = g.generate_agent_config_by_rule(&entity);
+        assert_eq!(cfg["activity_level"].as_f64().unwrap(), 0.2);
+        assert_eq!(cfg["posts_per_hour"].as_f64().unwrap(), 0.1);
+        assert_eq!(cfg["comments_per_hour"].as_f64().unwrap(), 0.05);
+        let hours: Vec<i64> = serde_json::from_value(cfg["active_hours"].clone()).unwrap();
+        assert_eq!(hours, (9i64..18).collect::<Vec<_>>(), "university active_hours = range(9,18)");
+        assert_eq!(cfg["response_delay_min"].as_i64().unwrap(), 60);
+        assert_eq!(cfg["response_delay_max"].as_i64().unwrap(), 240);
+        assert_eq!(cfg["sentiment_bias"].as_f64().unwrap(), 0.0);
+        assert_eq!(cfg["stance"].as_str().unwrap(), "neutral");
+        assert_eq!(cfg["influence_weight"].as_f64().unwrap(), 3.0);
+    }
+
+    #[test]
+    fn generate_agent_config_by_rule_governmentagency() {
+        let g = make_gen("{}");
+        let entity = make_node_with_label("Gov", "GovernmentAgency");
+        let cfg = g.generate_agent_config_by_rule(&entity);
+        assert_eq!(cfg["influence_weight"].as_f64().unwrap(), 3.0);
+        let hours: Vec<i64> = serde_json::from_value(cfg["active_hours"].clone()).unwrap();
+        assert_eq!(hours, (9i64..18).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn generate_agent_config_by_rule_ngo() {
+        let g = make_gen("{}");
+        let entity = make_node_with_label("NGO", "ngo");
+        let cfg = g.generate_agent_config_by_rule(&entity);
+        assert_eq!(cfg["influence_weight"].as_f64().unwrap(), 3.0);
+    }
+
+    #[test]
+    fn generate_agent_config_by_rule_mediaoutlet() {
+        let g = make_gen("{}");
+        let entity = make_node_with_label("CNN", "MediaOutlet");
+        let cfg = g.generate_agent_config_by_rule(&entity);
+        assert_eq!(cfg["activity_level"].as_f64().unwrap(), 0.5);
+        assert_eq!(cfg["posts_per_hour"].as_f64().unwrap(), 0.8);
+        assert_eq!(cfg["comments_per_hour"].as_f64().unwrap(), 0.3);
+        let hours: Vec<i64> = serde_json::from_value(cfg["active_hours"].clone()).unwrap();
+        assert_eq!(hours, (7i64..24).collect::<Vec<_>>(), "mediaoutlet active_hours = range(7,24)");
+        assert_eq!(cfg["response_delay_min"].as_i64().unwrap(), 5);
+        assert_eq!(cfg["response_delay_max"].as_i64().unwrap(), 30);
+        assert_eq!(cfg["stance"].as_str().unwrap(), "observer");
+        assert_eq!(cfg["influence_weight"].as_f64().unwrap(), 2.5);
+    }
+
+    #[test]
+    fn generate_agent_config_by_rule_professor() {
+        let g = make_gen("{}");
+        let entity = make_node_with_label("Prof Chen", "Professor");
+        let cfg = g.generate_agent_config_by_rule(&entity);
+        assert_eq!(cfg["activity_level"].as_f64().unwrap(), 0.4);
+        assert_eq!(cfg["posts_per_hour"].as_f64().unwrap(), 0.3);
+        assert_eq!(cfg["comments_per_hour"].as_f64().unwrap(), 0.5);
+        let hours: Vec<i64> = serde_json::from_value(cfg["active_hours"].clone()).unwrap();
+        assert_eq!(hours, (8i64..22).collect::<Vec<_>>(), "professor active_hours = range(8,22)");
+        assert_eq!(cfg["response_delay_min"].as_i64().unwrap(), 15);
+        assert_eq!(cfg["response_delay_max"].as_i64().unwrap(), 90);
+        assert_eq!(cfg["stance"].as_str().unwrap(), "neutral");
+        assert_eq!(cfg["influence_weight"].as_f64().unwrap(), 2.0);
+    }
+
+    #[test]
+    fn generate_agent_config_by_rule_expert() {
+        let g = make_gen("{}");
+        let entity = make_node_with_label("Dr X", "Expert");
+        let cfg = g.generate_agent_config_by_rule(&entity);
+        assert_eq!(cfg["influence_weight"].as_f64().unwrap(), 2.0);
+        let hours: Vec<i64> = serde_json::from_value(cfg["active_hours"].clone()).unwrap();
+        assert_eq!(hours, (8i64..22).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn generate_agent_config_by_rule_student() {
+        let g = make_gen("{}");
+        let entity = make_node_with_label("Alice", "Student");
+        let cfg = g.generate_agent_config_by_rule(&entity);
+        assert_eq!(cfg["activity_level"].as_f64().unwrap(), 0.8);
+        assert_eq!(cfg["posts_per_hour"].as_f64().unwrap(), 0.6);
+        assert_eq!(cfg["comments_per_hour"].as_f64().unwrap(), 1.5);
+        let hours: Vec<i64> = serde_json::from_value(cfg["active_hours"].clone()).unwrap();
+        assert_eq!(
+            hours,
+            vec![8, 9, 10, 11, 12, 13, 18, 19, 20, 21, 22, 23],
+            "student active_hours explicit list"
+        );
+        assert_eq!(cfg["response_delay_min"].as_i64().unwrap(), 1);
+        assert_eq!(cfg["response_delay_max"].as_i64().unwrap(), 15);
+        assert_eq!(cfg["influence_weight"].as_f64().unwrap(), 0.8);
+    }
+
+    #[test]
+    fn generate_agent_config_by_rule_alumni() {
+        let g = make_gen("{}");
+        let entity = make_node_with_label("Bob", "Alumni");
+        let cfg = g.generate_agent_config_by_rule(&entity);
+        assert_eq!(cfg["activity_level"].as_f64().unwrap(), 0.6);
+        assert_eq!(cfg["posts_per_hour"].as_f64().unwrap(), 0.4);
+        assert_eq!(cfg["comments_per_hour"].as_f64().unwrap(), 0.8);
+        let hours: Vec<i64> = serde_json::from_value(cfg["active_hours"].clone()).unwrap();
+        assert_eq!(hours, vec![12, 13, 19, 20, 21, 22, 23], "alumni active_hours explicit list");
+        assert_eq!(cfg["response_delay_min"].as_i64().unwrap(), 5);
+        assert_eq!(cfg["response_delay_max"].as_i64().unwrap(), 30);
+        assert_eq!(cfg["influence_weight"].as_f64().unwrap(), 1.0);
+    }
+
+    #[test]
+    fn generate_agent_config_by_rule_else_person() {
+        let g = make_gen("{}");
+        let entity = make_node_with_label("普通人", "Person");
+        let cfg = g.generate_agent_config_by_rule(&entity);
+        assert_eq!(cfg["activity_level"].as_f64().unwrap(), 0.7);
+        assert_eq!(cfg["posts_per_hour"].as_f64().unwrap(), 0.5);
+        assert_eq!(cfg["comments_per_hour"].as_f64().unwrap(), 1.2);
+        let hours: Vec<i64> = serde_json::from_value(cfg["active_hours"].clone()).unwrap();
+        assert_eq!(
+            hours,
+            vec![9, 10, 11, 12, 13, 18, 19, 20, 21, 22, 23],
+            "else active_hours explicit list"
+        );
+        assert_eq!(cfg["response_delay_min"].as_i64().unwrap(), 2);
+        assert_eq!(cfg["response_delay_max"].as_i64().unwrap(), 20);
+        assert_eq!(cfg["influence_weight"].as_f64().unwrap(), 1.0);
+    }
+
+    #[test]
+    fn generate_agent_config_by_rule_unknown_type_falls_through() {
+        let g = make_gen("{}");
+        // Unknown type → else branch (普通人)
+        let entity = make_node_with_label("X", "SomeRandomType");
+        let cfg = g.generate_agent_config_by_rule(&entity);
+        assert_eq!(cfg["activity_level"].as_f64().unwrap(), 0.7);
+        assert_eq!(cfg["influence_weight"].as_f64().unwrap(), 1.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // _generate_agent_configs_batch (S-451) tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn generate_agent_configs_batch_happy_path_uses_llm_values() {
+        // LLM returns valid agent_configs for two entities
+        let llm_json = serde_json::json!({
+            "agent_configs": [
+                {
+                    "agent_id": 0,
+                    "activity_level": 0.9,
+                    "posts_per_hour": 1.2,
+                    "comments_per_hour": 2.1,
+                    "active_hours": [8, 9, 18, 19, 20],
+                    "response_delay_min": 3,
+                    "response_delay_max": 30,
+                    "sentiment_bias": 0.1,
+                    "stance": "supportive",
+                    "influence_weight": 1.5,
+                },
+                {
+                    "agent_id": 1,
+                    "activity_level": 0.3,
+                    "posts_per_hour": 0.2,
+                    "comments_per_hour": 0.1,
+                    "active_hours": [9, 10, 11, 12, 13, 14, 15, 16, 17],
+                    "response_delay_min": 60,
+                    "response_delay_max": 180,
+                    "sentiment_bias": 0.0,
+                    "stance": "neutral",
+                    "influence_weight": 3.0,
+                }
+            ]
+        });
+        let g = make_gen(llm_json.to_string());
+        let entities = vec![
+            make_node("Alice", vec!["Entity", "Student"], "student"),
+            make_node("Uni", vec!["Entity", "University"], "uni"),
+        ];
+        let configs = g
+            .generate_agent_configs_batch("context", &entities, 0, "test requirement")
+            .await;
+
+        assert_eq!(configs.len(), 2);
+        // entity 0: Alice, LLM values
+        assert_eq!(configs[0].agent_id, 0);
+        assert_eq!(configs[0].activity_level, 0.9);
+        assert_eq!(configs[0].posts_per_hour, 1.2);
+        assert_eq!(configs[0].stance, "supportive");
+        assert_eq!(configs[0].active_hours, vec![8, 9, 18, 19, 20]);
+        // entity 1: Uni, LLM values
+        assert_eq!(configs[1].agent_id, 1);
+        assert_eq!(configs[1].influence_weight, 3.0);
+        assert_eq!(configs[1].stance, "neutral");
+    }
+
+    #[tokio::test]
+    async fn generate_agent_configs_batch_llm_failure_falls_back_to_rules() {
+        // LLM returns invalid JSON → all entries use rule-based fallback
+        let g = make_gen("not json at all!!!");
+        let entities = vec![
+            make_node("Alice", vec!["Entity", "Student"], "student desc"),
+            make_node("CNN", vec!["Entity", "MediaOutlet"], "media desc"),
+        ];
+        let configs = g
+            .generate_agent_configs_batch("context", &entities, 0, "test")
+            .await;
+        assert_eq!(configs.len(), 2);
+        // Alice (Student) → rule: activity_level=0.8
+        assert_eq!(configs[0].agent_id, 0);
+        assert_eq!(configs[0].activity_level, 0.8);
+        assert_eq!(configs[0].posts_per_hour, 0.6);
+        assert_eq!(configs[0].comments_per_hour, 1.5);
+        assert_eq!(configs[0].active_hours, vec![8, 9, 10, 11, 12, 13, 18, 19, 20, 21, 22, 23]);
+        // CNN (MediaOutlet) → rule: activity_level=0.5
+        assert_eq!(configs[1].agent_id, 1);
+        assert_eq!(configs[1].activity_level, 0.5);
+        assert_eq!(configs[1].stance, "observer");
+    }
+
+    #[tokio::test]
+    async fn generate_agent_configs_batch_missing_agent_id_in_llm_response_falls_back() {
+        // LLM returns configs for agent_id=0 but not agent_id=1
+        let llm_json = serde_json::json!({
+            "agent_configs": [
+                {
+                    "agent_id": 0,
+                    "activity_level": 0.99,
+                    "posts_per_hour": 0.5,
+                    "comments_per_hour": 1.0,
+                    "active_hours": [10, 11, 12],
+                    "response_delay_min": 5,
+                    "response_delay_max": 60,
+                    "sentiment_bias": 0.0,
+                    "stance": "opposing",
+                    "influence_weight": 1.0,
+                }
+                // agent_id=1 is absent
+            ]
+        });
+        let g = make_gen(llm_json.to_string());
+        let entities = vec![
+            make_node("Alice", vec!["Entity", "Student"], "s"),
+            make_node("Uni", vec!["Entity", "University"], "u"),
+        ];
+        let configs = g
+            .generate_agent_configs_batch("context", &entities, 0, "test")
+            .await;
+        assert_eq!(configs.len(), 2);
+        // agent 0 from LLM
+        assert_eq!(configs[0].activity_level, 0.99);
+        // agent 1 missing → rule for University: activity_level=0.2, influence=3.0
+        assert_eq!(configs[1].activity_level, 0.2);
+        assert_eq!(configs[1].influence_weight, 3.0);
+    }
+
+    #[tokio::test]
+    async fn generate_agent_configs_batch_defaults_differ_from_dataclass() {
+        // When the LLM response for an agent omits fields, we use the BATCH defaults (not struct defaults).
+        // Batch defaults: posts_per_hour=0.5 (struct default=1.0), comments_per_hour=1.0 (struct=2.0),
+        // active_hours=[9..=22] 14 elements (struct default=[8..=22] 15 elements).
+        let llm_json = serde_json::json!({
+            "agent_configs": [
+                {
+                    "agent_id": 5,
+                    // No posts_per_hour, comments_per_hour, or active_hours → use batch defaults
+                    "activity_level": 0.5,
+                    "response_delay_min": 5,
+                    "response_delay_max": 60,
+                    "sentiment_bias": 0.0,
+                    "stance": "neutral",
+                    "influence_weight": 1.0,
+                }
+            ]
+        });
+        let g = make_gen(llm_json.to_string());
+        let entities = vec![make_node("Entity5", vec!["Entity", "Person"], "desc")];
+        let configs = g
+            .generate_agent_configs_batch("ctx", &entities, 5, "test")
+            .await;
+        assert_eq!(configs.len(), 1);
+        let c = &configs[0];
+        assert_eq!(c.agent_id, 5);
+        // Batch defaults (NOT struct defaults)
+        assert_eq!(c.posts_per_hour, 0.5, "batch default posts_per_hour must be 0.5, not 1.0");
+        assert_eq!(c.comments_per_hour, 1.0, "batch default comments_per_hour must be 1.0, not 2.0");
+        assert_eq!(c.active_hours, (9i64..23).collect::<Vec<_>>(), "batch default active_hours=[9..=22]");
+        assert_eq!(c.active_hours.len(), 14, "batch default active_hours has 14 elements");
+    }
+
+    #[tokio::test]
+    async fn generate_agent_configs_batch_start_idx_applied() {
+        // start_idx=10: agent_ids should be 10, 11
+        let llm_json = serde_json::json!({
+            "agent_configs": [
+                {"agent_id": 10, "activity_level": 0.5, "posts_per_hour": 0.5,
+                 "comments_per_hour": 1.0, "active_hours": [9,10],
+                 "response_delay_min": 5, "response_delay_max": 60,
+                 "sentiment_bias": 0.0, "stance": "neutral", "influence_weight": 1.0},
+                {"agent_id": 11, "activity_level": 0.3, "posts_per_hour": 0.1,
+                 "comments_per_hour": 0.05, "active_hours": [9,10,11,12,13,14,15,16,17],
+                 "response_delay_min": 60, "response_delay_max": 240,
+                 "sentiment_bias": 0.0, "stance": "neutral", "influence_weight": 3.0}
+            ]
+        });
+        let g = make_gen(llm_json.to_string());
+        let entities = vec![
+            make_node("Alice", vec!["Entity", "Student"], "s"),
+            make_node("Uni", vec!["Entity", "University"], "u"),
+        ];
+        let configs = g
+            .generate_agent_configs_batch("ctx", &entities, 10, "req")
+            .await;
+        assert_eq!(configs[0].agent_id, 10);
+        assert_eq!(configs[1].agent_id, 11);
+    }
+
+    #[tokio::test]
+    async fn generate_agent_configs_batch_entity_uuid_and_name_preserved() {
+        let g = make_gen("{\"agent_configs\": []}"); // empty → all use rules
+        let mut entity = make_node("TestEntity", vec!["Entity", "Alumni"], "desc");
+        entity.uuid = "my-uuid-123".to_string();
+        let configs = g
+            .generate_agent_configs_batch("ctx", &[entity], 0, "req")
+            .await;
+        assert_eq!(configs[0].entity_uuid, "my-uuid-123");
+        assert_eq!(configs[0].entity_name, "TestEntity");
+    }
+
+    #[tokio::test]
+    async fn generate_agent_configs_batch_summary_truncated_to_agent_summary_length() {
+        // Verify that entity summaries longer than AGENT_SUMMARY_LENGTH (300 chars) are
+        // truncated char-by-char (not byte-by-byte) when building the prompt.
+        // We can't inspect the prompt directly, but we can verify the call succeeds
+        // and the returned config is valid (smoke test).
+        let long_summary = "A".repeat(500); // 500 chars > 300 AGENT_SUMMARY_LENGTH
+        let g = make_gen("{\"agent_configs\": []}");
+        let entity = make_node("LongSummaryEntity", vec!["Entity", "Student"], &long_summary);
+        let configs = g
+            .generate_agent_configs_batch("ctx", &[entity], 0, "req")
+            .await;
+        assert_eq!(configs.len(), 1);
+        // rule-based for Student
+        assert_eq!(configs[0].activity_level, 0.8);
+    }
+
 }

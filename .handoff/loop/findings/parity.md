@@ -997,3 +997,70 @@ Python: if finish_reason=='length' → `_fix_truncated_json` BEFORE first json.l
 ### Out of scope, left `- [ ]`: S-214..S-219 (ZepEntityReader machinery), S-439 (generate_config orchestration), S-450/S-451/S-452 (agent-config stages, sub-cycles c/d). Confirmed still `- [ ]`.
 ### VERDICT: **PASS**. U-016 UNIT remains `- [ ]` (EntityNode DTO done; ZepEntityReader machinery outstanding). U-019 UNIT remains `- [ ]` (sub-cycles a+b done; c/d outstanding).
 ### Constraints honored: no source/Rust impl files edited; differential harness was external (Python), removed. Only symbol-map flips + this verdict block + the ledger annotations written.
+
+---
+
+## 2026-06-17 — U-019 sub-cycle (c): agent-config generation (S-450, S-451, S-452) — opus parity-verifier
+
+### Unit: U-019 sub-cycle (c) | Source: simulation_config_generator.py L728-989 | Rust: src/services/simulation_config.rs (impl<L: LlmClient> SimulationConfigGenerator<L>)
+### Method: differential vs standalone Python (alias-resolution model + byte-diff of rendered prompt/system_prompt against Python golden via temporary in-test capture mock; temp tests removed after verification — src tree contains only the porter's code).
+
+### VERDICT: **FAIL** — 2/3 symbols PASS (S-451, S-452); S-450 has a confirmed runtime behavioral divergence (downgrade). U-019 sub-cycle (c) does NOT complete; U-019 stays `- [ ]`.
+
+---
+
+### S-451 `generate_agent_configs_batch` — **PASS** ✅
+- **Prompt byte-IDENTICAL.** Rust prompt (`simulation_config.rs:1931-1933`) == Python prompt (`L833-867`): **1657 bytes, zero diff**, including the embedded `serde_json::to_string_pretty(entity_list)` == `json.dumps(entity_list, ensure_ascii=False, indent=2)` — UTF-8 Chinese preserved (no \uXXXX escaping), 2-space pretty, key insertion order (agent_id, entity_name, entity_type, summary) preserved (serde_json `preserve_order` feature confirmed in Cargo.toml:35), empty-summary `""` case correct.
+- **system_prompt byte-IDENTICAL.** Rust (`1935-1939`) == Python (`L869-870`): **400 bytes, zero diff**, including `get_language_instruction()` placement (zh default `请使用中文回答。`) + the English stance IMPORTANT note. (get_language_instruction is the same ported fn used identically on both sides.)
+- **entity_list build** (`1908-1925` vs `L823-831`): agent_id=start_idx+i, entity_name, entity_type=`get_entity_type()||"Unknown"`, summary char-truncated to AGENT_SUMMARY_LENGTH (`.chars().take()`), "" when empty. ✓
+- **try/except → rule fallback** (`1942-1960` vs `L872-877`): any LLM/parse error ⇒ `llm_configs = {}` (HashMap::new), no error propagated; loop uses rule per entity. ✓
+- **cfg precedence** (`1974-1998` vs `L883-902`): `cfg = llm_configs.get(agent_id)` if Some+non-null+non-empty-object (mirrors Python `if not cfg` treating `{}` as falsy) else `generate_agent_config_by_rule(entity)`; then each field = `cfg.get(field).unwrap_or(BATCH_DEFAULT)` — same `.get(field,default)` extraction feeds BOTH the LLM-cfg and rule-cfg paths. ✓
+- **BATCH defaults DIFFER from dataclass — CONFIRMED CORRECT** (`2007-2015` vs `L894-902`): activity_level 0.5, **posts_per_hour 0.5** (NOT dataclass 1.0), **comments_per_hour 1.0** (NOT 2.0), **active_hours `(9..23)` = [9..=22] = 14 elems** (NOT range(8,23)=15), delay 5/60, sentiment 0.0, stance "neutral", influence 1.0. No regression to dataclass defaults. ✓
+- Existing tests (happy-path, llm-failure-fallback, missing-agent_id-fallback, batch-defaults-differ, start_idx, entity-fields, summary-truncation) all green.
+
+### S-452 `generate_agent_config_by_rule` — **PASS** ✅
+All 6 branches diffed value-by-value vs `L912-989`; every numeric + active_hours list EXACT:
+- university/governmentagency/ngo (`2048-2062`): 0.2/0.1/0.05/[9..=17]/60/240/0.0/neutral/3.0 ✓ (`range(9,18)` expanded to 9 elems)
+- mediaoutlet (`2063-2077`): 0.5/0.8/0.3/[7..=23] 17 elems/5/30/0.0/observer/2.5 ✓ (`range(7,24)`)
+- professor/expert/official (`2078-2091`): 0.4/0.3/0.5/[8..=21] 14 elems/15/90/0.0/neutral/2.0 ✓ (`range(8,22)`)
+- student (`2093-2106`): 0.8/0.6/1.5/[8,9,10,11,12,13,18,19,20,21,22,23]/1/15/0.0/neutral/0.8 ✓
+- alumni (`2108-2121`): 0.6/0.4/0.8/[12,13,19,20,21,22,23]/5/30/0.0/neutral/1.0 ✓
+- else (`2123-2137`): 0.7/0.5/1.2/[9,10,11,12,13,18,19,20,21,22,23]/2/20/0.0/neutral/1.0 ✓
+- Branch match on `get_entity_type()||"Unknown".lower()` (`2042-2047` vs `L910`). ✓
+
+### S-450 `assign_initial_post_agents` — **FAIL** ❌ (behavioral downgrade in alias resolution)
+Most of S-450 is faithful: empty-posts unchanged ✓; agents_by_type lower-keyed insertion-order ✓; type_aliases table EXACT + ordered (Vec-of-pairs, `1784-1793` vs `L750-759`) ✓; round-robin `idx = used.get(key,0) % len; used[key]=idx+1` ✓ same counter keying direct & alias ✓; influence fallback STABLE-sort tie-break replicated with strict `>` reduce (first-in-original wins) ✓; empty agent_configs → 0 ✓; output `poster_type` = ORIGINAL cased value, default "Unknown" ✓.
+
+**THE DEFECT — alias inner-loop break is unconditional (`simulation_config.rs:1843`); Python's outer break is conditional on a match (`L789-790`).**
+- Python `L780-790`: when a poster_type matches an alias *group* whose members are ALL absent from agents_by_type, `matched_agent_id` stays None and the `if matched_agent_id is not None: break` does NOT fire → the outer loop **continues to the next matching group**.
+- Rust `1828-1844`: after the inner loop, it `break;` **unconditionally**, exiting the outer loop with matched=None → falls through to the influence-max fallback. The code comment (`1841-1843`) misreads Python ("Python breaks the outer loop here too") — Python breaks only on success.
+- **Reachable & observable.** poster_type is LLM-emitted from the ontology entity vocabulary (Student/Person/Alumni/…). Enumeration found **3 divergent cases** (single-type agent pool):
+  - poster_type=`person`, only `alumni` agents → Python alias-matches the alumni agent; Rust → influence fallback.
+  - poster_type=`alumni`, only `student` agents → Python matches; Rust → fallback.
+  - poster_type=`student`, only `alumni` agents → Python matches; Rust → fallback.
+- **Proven at runtime** with a temporary test (poster=`person`; agents = [id=100 alumni infl 1.0, id=200 official infl 9.0]): Rust returned `poster_agent_id=200` (influence fallback), Python golden = `100` (alumni alias match). The divergence changes an observable output field. NOT non-contractual, NOT inexpressible, NOT a superset → a downgrade.
+
+### FIX (route back to porter — precise):
+In `assign_initial_post_agents` (`simulation_config.rs:1828-1845`), make the OUTER-loop break conditional on a match, mirroring Python's `if matched_agent_id is not None: break`. Replace the unconditional `break;` at line 1843 with: break the outer loop only when `matched_agent_id.is_some()` (i.e. after the inner `break 'outer`, which already handles the success case — so simply REMOVE the trailing unconditional `break;` and let the outer `for` continue to the next group when no member was found). Keep the inner `break 'outer` for the success path. Then add a regression test for poster=`person`/only-`alumni` (expect the alumni agent's id, not the influence fallback).
+
+### Symbol-map flips: S-451 → `- [x]`, S-452 → `- [x]` (independently PASS). S-450 left `- [~]`.
+### U-019 row: sub-cycle (c) is 2/3 — NOT complete. U-019 stays `- [ ]`. Sub-cycle (d) (generate_config orchestration S-439 + save) still remains regardless.
+### Constraints: no source/Rust impl edited; temp capture+probe tests added then REMOVED (src tree = porter's code only, verified via git diff); only symbol-map flips + this verdict + ledger annotation written.
+
+## 2026-06-17 · U-019 sub-cycle (c) RE-VERIFY · S-450 `assign_initial_post_agents` — FAIL→fix→**PASS** ✅
+Re-verification of the symbol FAILed on 2026-06-14 (alias inner-loop unconditional break → influence-max fallthrough). Porter applied the prescribed fix. Re-traced the alias scan against Python `_assign_initial_post_agents` (`simulation_config_generator.py:728-811`) — did NOT pass on faith.
+
+### Fix confirmed (item 1 — control flow now mirrors Python L780-790)
+- The unconditional `break;` after the inner alias loop is GONE. `simulation_config.rs:1828-1848`: `'outer: for (alias_key, aliases) in &type_aliases` → guard `aliases.contains(poster_type_lower) || *alias_key == poster_type_lower` → inner `for alias in aliases { if let Some(agents) = agents_by_type.get(alias) { ...match...; break 'outer; } }`. The `break 'outer` lives INSIDE the `if let Some(agents)` block, so it fires ONLY on a successful match. On no-match, the inner loop exhausts and the OUTER `for` continues to the next group — exactly Python's `if matched_agent_id is not None: break` (L789-790), which breaks only on success. No unconditional break remains that would stop the scan early. ✓
+
+### Original divergent case now matches (item 2)
+- poster=`person`, agents=[id100 alumni infl 1.0, id200 official infl 9.0]. Alias-group insertion order: official, university, mediaoutlet, **student** (idx3, members [student,person] — both absent → continue), professor, **alumni** (idx5, members [alumni,person] — alumni present → match id100). Resolves to **100**, NOT influence-max 200. This is the exact case that returned 200 last cycle (Python golden 100). New regression test `assign_initial_post_agents_continues_past_empty_alias_group` (`simulation_config.rs:2828-2846`) asserts `poster_agent_id == 100` and documents that influence-max would give 200 — it genuinely distinguishes the correct alias-scan from the bug. ✓
+
+### No new regression (item 3)
+- Direct-match round-robin (`idx = used.get(key,0) % len; used[key]=idx+1`), influence-max fallback (strict `>` reduce → first-in-original on ties), empty agent_configs→0, original-cased poster_type default "Unknown", empty initial_posts→unchanged — all still present and covered by 11 prior tests + the new regression test. `cargo test --lib assign_initial_post_agents` = **12 passed, 0 failed**.
+
+### S-451 / S-452 undisturbed (item 4)
+- `cargo test --lib generate_agent_config` = 17 passed; full `simulation_config` module = 82 passed; full lib suite = **648 passed, 0 failed**. Edit was local to the alias branch; no S-451/S-452 path touched.
+
+### Result — **PASS**
+Symbol-map: S-450 flipped `- [~]` → `- [x]`. U-019 sub-cycles a+b+c are now ALL parity-verified; only sub-cycle (d) (`generate_config` S-439 + save) remains. U-019 stays `- [ ]` (NOT marked done — sub-cycle d outstanding). No source/Rust impl edited by the verifier (porter's regression test is the only test added; it ships in the crate). Verified inside worktree `/home/drdave/Desktop/meta/.worktrees/mirofish-port/teri` (branch port/mirofish).

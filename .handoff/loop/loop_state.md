@@ -17,8 +17,21 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 1   # RESUMED 2026-06-17 (6th resume, reset 0); c1=U-019 sub-cycle(b) EntityNode DTO + time/event LLM stages
-cycles_total: 21
+cycles_this_session: 2   # RESUMED 2026-06-17 (6th resume, reset 0); c1=U-019 sub-cycle(b); c2=U-019 sub-cycle(c) agent-config gen
+cycles_total: 22
+# CYCLE2 (6th resume) 2026-06-17: U-019 sub-cycle (c) agent-config generation — opus FAIL→fix→PASS (S-450/451/452).
+#   Added to SimulationConfigGenerator<L> in src/services/simulation_config.rs: S-451 generate_agent_configs_batch
+#   (async; entity_list w/ AGENT_SUMMARY_LENGTH char-trunc; byte-verbatim Chinese prompt 1657B + system_prompt 400B
+#   incl get_language_instruction + English stance note; LLM-failure→rule fallback no fault; BATCH defaults DIFFER
+#   from dataclass: posts 0.5/comments 1.0/active_hours [9..=22]14elem), S-452 generate_agent_config_by_rule (6
+#   branches, exact numeric tables + active_hours lists; returns serde_json Value), S-450 assign_initial_post_agents
+#   (type_aliases 8-key ordered Vec-of-pairs; round-robin used_indices; influence-max stable tie-break strict >).
+#   GATE CAUGHT real downgrade in S-450: alias inner-loop had an UNCONDITIONAL break → when a poster_type matched an
+#   alias group whose members were all absent, Rust fell through to influence-max while Python continues to the next
+#   group (proven: person + [alumni infl1.0, official infl9.0] → Rust gave 200, Python 100). FIXED: removed the
+#   unconditional break (break 'outer stays for success; outer for-loop continues on no-match) + regression test
+#   assign_initial_post_agents_continues_past_empty_alias_group → re-verified PASS. U-019 STAYS [ ] (sub-cycle d =
+#   generate_config orchestration S-439 + save remains). 29 new tests, teri 659 green, clippy --all-targets clean.
 # CYCLE1 (6th resume) 2026-06-17: U-019 sub-cycle (b) + EntityNode DTO — opus PASS (35/35). PART1 (U-016 rows
 #   S-198..S-213): src/services/entity_reader.rs — EntityNode {uuid,name,labels,summary,attributes,related_edges,
 #   related_nodes} +to_dict(7-key)+get_entity_type() (first label ∉{Entity,Node}); FilteredEntities +to_dict
