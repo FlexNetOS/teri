@@ -4,6 +4,7 @@ pub mod config;
 pub mod embedding;
 pub mod error;
 pub mod graph;
+pub mod i18n;
 pub mod llm;
 pub mod logging;
 pub mod memory;

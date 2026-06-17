@@ -71,13 +71,13 @@
 
 ## U-005 — `backend/app/utils/locale.py`
 
-- [ ] S-036 · `unit:U-005` · `const` · `_thread_local` · threading.local for locale storage · `locale.py:6`
-- [ ] S-037 · `unit:U-005` · `const` · `_locales_dir` · path to locales dir · `locale.py:8`
-- [ ] S-038 · `unit:U-005` · `const` · `_translations` · loaded locale dicts · `locale.py:15`
-- [ ] S-039 · `unit:U-005` · `fn` · `set_locale` · stores locale in thread-local · `locale.py:23`
-- [ ] S-040 · `unit:U-005` · `fn` · `get_locale` · Flask request → thread-local → 'zh' fallback · `locale.py:28`
-- [ ] S-041 · `unit:U-005` · `fn` · `t` · i18n string lookup with kwargs interpolation · `locale.py:35`
-- [ ] S-042 · `unit:U-005` · `fn` · `get_language_instruction` · returns LLM language directive string · `locale.py:66`
+- [x] S-036 · `unit:U-005` · `const` · `_thread_local` → `tokio::task_local! LOCALE` · PARITY-VERIFIED 2026-06-17 (opus): task-local survives `.await` across worker threads (thread-local would NOT — task-local is the faithful no-downgrade substrate). `src/i18n/mod.rs`
+- [x] S-037 · `unit:U-005` · `const` · `_locales_dir` → `include_str!` embedded assets · PARITY-VERIFIED 2026-06-17: runtime dir-scan → compile-time embed; embed set = {zh,en,languages}.json, complete. `src/i18n/mod.rs`
+- [x] S-038 · `unit:U-005` · `const` · `_translations` → `OnceLock<HashMap<String,Value>>` · PARITY-VERIFIED 2026-06-17: EXACTLY {en,zh} (no fabrication); all 3 embedded JSON byte-identical to MiroFish (diff IDENTICAL). `src/i18n/mod.rs`
+- [x] S-039 · `unit:U-005` · `fn` · `set_locale` → `with_locale(s, fut).await` (`LOCALE.scope`) · PARITY-VERIFIED 2026-06-17: capture-then-propagate caller pattern expressible; no in-place mutating set possible/needed for task-locals — idiomatic, not a narrowing. `src/i18n/mod.rs`
+- [~] S-040 · `unit:U-005` · `fn` · `get_locale` · **PARTIAL — PARITY-VERIFIED 2026-06-17 (opus PASS) for the task-local branch; request-context branch PENDING-U-002/U-003.** Branch 2 (task-local fallback, default 'zh', returns stored value AS-IS without validation — matches `locale.py:32` exactly) is fully ported + verified. Branch 1 (`has_request_context()` → Accept-Language header, validate `in translations` else 'zh', `locale.py:29-31`) is honestly recorded with a precise wiring TODO (header read + `translations().contains_key` + axum middleware `with_locale`) — pending the axum surface (U-002/U-003), NOT silently dropped/faked (U-001/SECRET_KEY precedent). Flips `[x]` when U-002/U-003 land. `src/i18n/mod.rs`
+- [x] S-041 · `unit:U-005` · `fn` · `t`/`t_args` · PARITY-VERIFIED 2026-06-17 (opus, 17 differential inputs): exact nested hit + dot-split traversal + non-dict-intermediate→None + **second-pass zh fallback** + missing→key-passthrough + literal `{name}` interpolation (numeric+string) all match Python byte-for-byte. `**kwargs` → `&[(&str,&dyn Display)]`. `src/i18n/mod.rs`
+- [x] S-042 · `unit:U-005` · `fn` · `get_language_instruction` · PARITY-VERIFIED 2026-06-17: all **7** languages.json entries embedded (the one place 7 locales matter vs 2 for `t()`); locale→llmInstruction + zh fallback + hard-default "请使用中文回答。". `src/i18n/mod.rs`
 
 ---
 
@@ -233,8 +233,8 @@
 - [x] S-160 · `unit:U-012` · `method` · `TaskManager.create_task` · uuid task_id · `task.py:75`
 - [x] S-161 · `unit:U-012` · `method` · `TaskManager.get_task` · returns Optional[Task] · `task.py:103`
 - [x] S-162 · `unit:U-012` · `method` · `TaskManager.update_task` · `task.py:108`
-- [~] S-163 · `unit:U-012` · `method` · `TaskManager.complete_task` · `task.py:147` · **PENDING-U-005 (re-verify 2026-06-17): silent-narrowing violation RESOLVED; legitimate pending-dependency remains.** Status=COMPLETED/progress=100/result all correct. `message` comes from `t('progress.taskComplete')` (task.py:153) — locale-parameterized over 7 locales. teri emits zh default `"任务完成"` via `MSG_TASK_COMPLETE` (task.rs:43, ==locales/zh.json `progress.taskComplete`). The prior FAIL was that the code FRAMED this as faithful; now task.rs:14-23,35-45 HONESTLY record it as a **TEMPORARY pending-U-005 placeholder (NOT faithful)** with explicit instruction to route through `t()` when U-005 (S-036..S-042) lands. Correctly-recorded pending dependency (U-001/SECRET_KEY→U-002 precedent), NOT a silent skip — stays `[~]`, flips `[x]` only when U-005 lands and `message` routes through `t()`.
-- [~] S-164 · `unit:U-012` · `method` · `TaskManager.fail_task` · `task.py:157` · **PENDING-U-005 (re-verify 2026-06-17): silent-narrowing violation RESOLVED; legitimate pending-dependency remains.** Status=FAILED/error correct; correctly does NOT set progress=100. `message` from `t('progress.taskFailed')` (task.py:162) — locale-parameterized. teri emits zh default `"任务失败"` via `MSG_TASK_FAILED` (task.rs:45, ==locales/zh.json `progress.taskFailed`). Code now HONESTLY frames this as a TEMPORARY pending-U-005 placeholder (NOT faithful) with route-through-`t()` instruction (task.rs:14-23,35-45). Correctly-recorded pending dependency, NOT a silent skip — stays `[~]`, flips `[x]` only when U-005 lands and `message` routes through `t()`.
+- [x] S-163 · `unit:U-012` · `method` · `TaskManager.complete_task` · `task.py:147` · **ROLLED UP 2026-06-17 (opus PASS, U-005 landed): pending-U-005 RESOLVED.** Status=COMPLETED/progress=100/result correct. `message` now routes through `crate::i18n::t("progress.taskComplete")` via `msg_task_complete()` (task.rs:37) — locale-parameterized exactly as `t('progress.taskComplete')` (task.py:153). zh default still yields `"任务完成"` when LOCALE unset (existing task.rs tests stay green). Genuinely faithful → `[x]`.
+- [x] S-164 · `unit:U-012` · `method` · `TaskManager.fail_task` · `task.py:157` · **ROLLED UP 2026-06-17 (opus PASS, U-005 landed): pending-U-005 RESOLVED.** Status=FAILED/error correct; correctly does NOT set progress=100. `message` now routes through `crate::i18n::t("progress.taskFailed")` via `msg_task_failed()` (task.rs:44) — locale-parameterized as `t('progress.taskFailed')` (task.py:162). zh default still yields `"任务失败"` when LOCALE unset. Genuinely faithful → `[x]`.
 - [x] S-165 · `unit:U-012` · `method` · `TaskManager.list_tasks` · `task.py:166`
 - [x] S-166 · `unit:U-012` · `method` · `TaskManager.cleanup_old_tasks` · removes completed/failed > max_age_hours · `task.py:174`
 

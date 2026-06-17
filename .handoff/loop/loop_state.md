@@ -17,8 +17,15 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 3
-cycles_total: 13
+cycles_this_session: 1   # RESUMED 2026-06-17 (reset 0); cycle1 = U-005 locale
+cycles_total: 14
+# CYCLE1 (resumed session) 2026-06-17: U-005 locale/i18n port-fresh — opus gate PASS. Landed src/i18n/mod.rs
+#   (+ byte-identical embed src/i18n/locales/{zh,en,languages}.json). 6/7 symbols [x]: S-036/037/038/039/041/042
+#   (t/t_args 17-input differential match, get_language_instruction 7-locale, with_locale/LOCALE task-local replacing
+#   thread-local — the faithful tokio substrate, OnceLock {en,zh} translations, include_str! embed). S-040 get_locale
+#   [~]: task-local fallback branch verified; has_request_context()->Accept-Language branch PENDING-U-002/U-003 (axum)
+#   honestly recorded (U-001/SECRET_KEY precedent). ROLLED UP U-012: S-163/S-164 task messages now route through
+#   i18n::t() -> U-012 29/29 COMPLETE [x]. 24 new i18n tests, teri 423 green, clippy --all-targets clean.
 # CYCLE3 2026-06-17: U-012 TaskManager port-fresh PARTIAL — 27/29 symbols [x]; src/task.rs (TaskStatus/Task/to_dict/
 #   singleton OnceLock+parking_lot/create/get/update/complete/fail/list/cleanup). Gate caught real bug S-155
 #   (Python isoformat omits .000000 when µs==0) -> fixed via python_isoformat(). S-163/S-164 message stay [~]
@@ -26,14 +33,14 @@ cycles_total: 13
 #   Unit [~] partial, rolls up when U-005. Unblocks S-189->U-012. 399 green. ALSO this session: shimmy /v1/embeddings
 #   (FlexNetOS/shimmy#6 MERGED) + teri EmbeddingClient -> GAP-OQ3-EMBED RESOLVED. + owner LLM_MODEL_NAME resolved.
 HANDOFF: (active session, resumed 2026-06-17) — cycle1: [≠]-audit gate CLEARED (S-360/361/048 PASS as ported; S-356 FAILED→ported related_edges Part2→re-verified PASS; all 4 [x]). cycle2: U-001 AppConfig PARTIAL extend-Y — 20 fields PASS [x] + S-001 [≠]; S-003/S-005 pending-U-002/U-003 (no axum surface yet); unit stays [~]. Fixed porter's flaky env-tests via ENV_LOCK mutex. OWNER-RESOLVED LLM_MODEL_NAME: shimmy replaces Ollama -> default model=OpenThinker3-7B + base_url=shimmy local 11435/v1 (Gemma-4-12B documented alt). 364 green (+2). Next: U-002/U-003 (axum serve — rolls up U-001) OR U-012 TaskManager OR U-005 locale.
-ledger: parity 8/50 units verified [x] (U-004, U-006, U-008, U-009, U-013, U-015, U-018, U-048) + GAP-1/2/6/U015-1/ACTION-TAXONOMY resolved; [≠]-audit symbol ports S-360/361/356/048 all [x] parity-verified (opus gate, resume 2026-06-17)   # 335 green
+ledger: parity 9/50 units verified [x] (U-004, U-006, U-008, U-009, U-012✅, U-013, U-015, U-018, U-048) + U-005 [~] partial (6/7) + U-001 [~] partial + GAP-1/2/6/U015-1/OQ3-EMBED/ACTION-TAXONOMY resolved; [≠]-audit symbol ports S-360/361/356/048 all [x] parity-verified (opus gate, resume 2026-06-17)   # 423 green
 # [≠] RE-AUDIT DONE (owner-flagged): 47 [≠] re-challenged under tightened bar (harness PR #34). 4 disguised
 #   skips ported [~]; S-189->U-012 + S-192->U-014 reclassified pending; Zep-SaaS/jitter/REFRESH/json-superset keep.
 # NO-DOWNGRADE CORRECTION (owner-flagged): [≠] is for genuinely-inexpressible/non-contractual ONLY,
 #   never "destination won't use it". U-018 to_reddit/twitter_format/to_dict were wrongly [≠]-skipped ->
 #   PORTED. U-004 rotating-file logging same error -> reclassify extend-Y, port next. Audit other [≠].
 # U-023 sweep TODO (tracked, not lost): gender 中文-normalization (S-371), truncated-JSON salvage (S-360/361).
-symbols: ~52/1087 [x] + ~19 [≠] of 1087 mapped   # +U-001 S-002/S-004/S-006..S-022 [x] (20) + S-001 [≠]; S-003/S-005 pending-U-002/U-003; +S-360/361/356/048 [x] ([≠]-audit, 2026-06-17); +S-TAX-001..019,021 [x] (social Action taxonomy); S-TAX-020 REFRESH [≠]
+symbols: ~60/1087 [x] + ~19 [≠] of 1087 mapped   # +U-001 S-002/S-004/S-006..S-022 [x] (20) + S-001 [≠]; S-003/S-005 pending-U-002/U-003; +S-360/361/356/048 [x] ([≠]-audit); +S-TAX-001..019,021 [x] (social Action taxonomy); S-TAX-020 REFRESH [≠]; +U-005 S-036/037/038/039/041/042 [x] (6), S-040 [~] pending-U-002/U-003; +U-012 S-163/S-164 [x] (rolled up by U-005) (2026-06-17)
 gaps_open: GAP-SOCIAL-WORLDSTATE [!] (rich social-world-state timeline/posts/engagement deferred to U-022/028/029/030)
 # GAP-OQ3-EMBED RESOLVED 2026-06-17 (owner chose (a)): shimmy gained real /v1/embeddings (candle BERT all-MiniLM-L6-v2, FlexNetOS/shimmy#6 MERGED) + teri EmbeddingClient (src/embedding.rs) wired to it. embed_model default ->all-MiniLM-L6-v2. 371 green. Unblocks U-017/021/024 vec-search consumers.
 # GAP-U015-1 RESOLVED earlier (build() large-doc chunking, cycle-5).

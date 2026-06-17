@@ -11,16 +11,12 @@
 //! contract is identical: one shared registry visible across all threads, safe concurrent
 //! create/update/get.
 //!
-//! # Locale strings — PENDING-U-005 (NOT a faithful literal)
-//! `complete_task` / `fail_task` set the `message` field from MiroFish's i18n system:
-//! `t('progress.taskComplete')` / `t('progress.taskFailed')` (task.py:153,162), which is
-//! **locale-parameterized over 7 locales** (default `zh`; under `en` it is "Task complete" /
-//! "Task failed").  This `message` flows into the observable `to_dict`/`list_tasks` output, so the
-//! full contract is the locale lookup, not a fixed string.  teri's locale subsystem (U-005,
-//! S-036..S-042) is **not yet ported**, so as a TEMPORARY placeholder we emit the `zh` default
-//! values (which exactly match `locales/zh.json`).  This is a deliberate **pending-U-005**
-//! divergence, recorded in symbol-map S-163/S-164 — NOT a faithful port: when U-005 lands these
-//! MUST route through teri's `t()` so the message follows the active locale.  See `MSG_TASK_*`.
+//! # Locale strings (S-163/S-164)
+//! `complete_task` / `fail_task` set the `message` field via teri's i18n system:
+//! `crate::i18n::t("progress.taskComplete")` / `crate::i18n::t("progress.taskFailed")`
+//! (matching MiroFish `task.py:153,162`).  The active task-local locale determines the string;
+//! when no locale is set (the default) both return the `zh` values `"任务完成"` / `"任务失败"`,
+//! so the existing tests remain green.  U-005 is now fully ported — PENDING-U-005 removed.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -32,17 +28,22 @@ use serde_json::Value;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
-// Locale placeholders — PENDING-U-005 (see module docs).
-// TEMPORARY: zh-default values standing in for the locale lookups
-// `t('progress.taskComplete')` / `t('progress.taskFailed')`. When U-005 (locale
-// subsystem, S-036..S-042) lands, replace these constants with `t(key)` calls so
-// `message` follows the active locale instead of always emitting the zh string.
+// Locale helpers (S-163/S-164) — now routing through i18n::t().
 // ---------------------------------------------------------------------------
 
-/// PENDING-U-005 placeholder for `t('progress.taskComplete')` (zh default; matches locales/zh.json).
-const MSG_TASK_COMPLETE: &str = "任务完成";
-/// PENDING-U-005 placeholder for `t('progress.taskFailed')` (zh default; matches locales/zh.json).
-const MSG_TASK_FAILED: &str = "任务失败";
+/// Localised message for task completion.  Routes through `i18n::t` so the
+/// string follows the caller's active task-local locale.  Default (zh) = "任务完成".
+#[inline]
+fn msg_task_complete() -> String {
+    crate::i18n::t("progress.taskComplete")
+}
+
+/// Localised message for task failure.  Routes through `i18n::t` so the
+/// string follows the caller's active task-local locale.  Default (zh) = "任务失败".
+#[inline]
+fn msg_task_failed() -> String {
+    crate::i18n::t("progress.taskFailed")
+}
 
 /// Format a UTC datetime exactly like Python's `datetime.isoformat()`: emit the microsecond
 /// fraction ONLY when it is non-zero (Python omits `.000000` for whole-second times), with no
@@ -332,7 +333,7 @@ impl TaskManager {
             task_id,
             Some(TaskStatus::Completed),
             Some(100),
-            Some(MSG_TASK_COMPLETE.to_string()),
+            Some(msg_task_complete()),
             Some(result),
             None,
             None,
@@ -357,7 +358,7 @@ impl TaskManager {
             task_id,
             Some(TaskStatus::Failed),
             None,
-            Some(MSG_TASK_FAILED.to_string()),
+            Some(msg_task_failed()),
             None,
             Some(error.into()),
             None,
@@ -672,7 +673,7 @@ mod tests {
         let task = tm.get_task(&id).unwrap();
         assert_eq!(task.status, TaskStatus::Completed);
         assert_eq!(task.progress, 100);
-        assert_eq!(task.message, MSG_TASK_COMPLETE);
+        assert_eq!(task.message, "任务完成"); // i18n::t("progress.taskComplete"), zh default
         assert_eq!(task.result.as_ref().unwrap(), &result);
         assert!(task.error.is_none());
     }
@@ -699,7 +700,7 @@ mod tests {
 
         let task = tm.get_task(&id).unwrap();
         assert_eq!(task.status, TaskStatus::Failed);
-        assert_eq!(task.message, MSG_TASK_FAILED);
+        assert_eq!(task.message, "任务失败"); // i18n::t("progress.taskFailed"), zh default
         assert_eq!(task.error.as_deref(), Some("connection refused"));
         assert!(task.result.is_none(), "fail_task must not set result");
         // Python does NOT set progress=100 on failure
