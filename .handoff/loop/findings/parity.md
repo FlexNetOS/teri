@@ -1099,3 +1099,139 @@ None. U-019 had ZERO `[≠]` rows; S-439 was the sole `- [~]`. No disguised feat
 
 ### Result — **PASS**
 S-439 flipped `- [~]` → `- [x]` in symbol-map.md. **All U-019 symbols S-374..S-452 now `- [x]` (73 symbols, zero `[≠]`)** — confirmed via tally (72 `[x]` + S-439 = 73, the only prior open row was S-439). **U-019 UNIT flipped `- [ ]` → `- [x]` in parity-ledger.md** (rollup rule satisfied). Verifier edited no source/Rust impl. Orchestrator may mark the unit done and commit.
+
+---
+
+## 2026-06-17 — U-016 completion (S-214..S-222 `KnowledgeGraphEntityReader`) — **FAIL**
+
+**Verifier:** rust-port-parity-verifier · **Unit:** U-016 (reader machinery; DTOs S-198..S-213 already `[x]`)
+**Source:** `MiroFish/backend/app/services/zep_entity_reader.py:71-435` · **Rust:** `src/services/entity_reader.rs:514-928` + `src/graph/mod.rs:1056 get_entity_by_id`
+**Contract:** DECISION-9 (target-architecture.md:507-619). Baseline: `cargo test --lib` 701 passed (green). FAIL is a parity divergence, NOT a build break.
+
+### Differential method
+Read both implementations symbol-by-symbol; for the equivalence-critical enrich path I ran teri directly via two throwaway probe tests (since removed, tree clean) over a self-loop + bidirectional graph, capturing `related_edges`/`get_node_edges` counts and comparing to MiroFish's documented edge-iteration semantics.
+
+### Self-loop divergence — the FAIL (the exact case the unit spec told me to check)
+
+DECISION-9 Q5 asserts `get_neighbor_relations` (O(degree)) is "provably equivalent" to MiroFish's O(n·e) `all_edges` scan — "same edge set, same direction assignment". **This is FALSE for a self-loop**, and self-loops are REACHABLE in teri (see reachability below).
+
+**MiroFish** uses an **exclusive `if/elif`**: `if edge.source==node: outgoing  elif edge.target==node: incoming` (`filter_defined_entities` L288-303; `get_entity_with_context` L370-385 is `if source: outgoing else: incoming`). A self-loop edge `X→X` matches `if source==X` → emitted **ONCE** (outgoing); the elif/else never fires. `get_node_edges`→Zep `get_entity_edges` returns the incident edge **once**.
+
+**teri** `get_neighbor_relations` (`graph/mod.rs:320-350`) does two non-exclusive passes: `edges_directed(idx, Outgoing)` THEN `edges_directed(idx, Incoming)`. petgraph 0.6 returns a self-loop edge in BOTH queries, so the self-loop is emitted **TWICE** (one outgoing, one incoming).
+
+**Empirical evidence** (graph: `Acme -[RelatedTo]-> Acme` self-loop), run through the actual reader:
+
+| Method (input = self-loop on `Acme`) | teri actual | MiroFish (source) | match? |
+|---|---|---|---|
+| `get_node_edges("…aa")` len | **2** | 1 | **≠** |
+| `filter_defined_entities(None,true)` → Acme.related_edges len | **2** (dir=outgoing, dir=incoming) | 1 (outgoing only) | **≠** |
+| `get_entity_with_context("…aa")` → related_edges len | **2** | 1 | **≠** |
+| related_nodes len | 1 (deduped) | 1 | = (this part matches) |
+
+(Also confirmed at the substrate: a probe of `get_neighbor_relations` on `A` with self-loop A→A + bidir A→B/B→A returned **4** entries — outgoing→B, outgoing→A, incoming→B, incoming→A — i.e. the self-loop A→A counted twice. The bidirectional pair A↔B is handled CORRECTLY by both, 2 distinct edges → 2 related_edges, B deduped to 1 related_node — that case is a genuine MATCH.)
+
+**Reachability (why this is a real bug, not an unreachable branch):** `parse_relations_json` (`graph/mod.rs:977-1031`) and `add_relation` (`:286`) have **NO self-loop guard**. If the relation-extraction LLM emits `{"from":"Acme","to":"Acme",...}` (a common LLM output — an entity related to itself), `from_idx == to_idx` and a self-loop is created. So this divergence is on the real extraction-pipeline output surface, unlike the `{Entity,Node}` skip (Q3) which is genuinely unreachable given typed entities.
+
+**Classification:** NOT a `[≠]` (it is fully expressible — teri can match MiroFish) and NOT owner-approved. It is an unflagged observable divergence in `related_edges`/`get_node_edges` output count → **FAIL** per the no-downgrade gate.
+
+### Required fix (route back to porter)
+Make teri's enrichment match MiroFish's exclusive-direction semantics for self-loops. Cheapest correct fix: in `get_neighbor_relations` (`graph/mod.rs:320-350`), make the Incoming pass skip edges whose `source == idx` (i.e. skip self-loops in the incoming pass), so a self-loop is emitted once as outgoing — exactly MiroFish's `if/elif`. (Alternatively dedup at the reader boundary in `enrich_entity_node` / `get_node_edges`, but fixing the shared accessor is cleaner and benefits every consumer.) Add a self-loop test (`X -[k]-> X`) asserting `related_edges.len()==1` & `get_node_edges(X).len()==1` with `direction=="outgoing"`. NOTE: `get_neighbor_relations` is shared — re-verify U-018/`_build_entity_context` consumers after the change (no behavior loss expected; they only gain self-loop correctness).
+
+### Per-symbol verdict
+- `- [≠]` S-215 `__init__` — CONFIRMED legitimate. api_key + `ZEP_API_KEY` validation + `Zep(api_key)` client = network-client auth; an in-process petgraph read has no auth/client/remote handle. Genuinely inexpressible substrate, no observable output. Constructor itself is ported (`new(&KnowledgeGraph)`).
+- `- [≠]` S-216 `_call_with_retry` — CONFIRMED legitimate AS RETRY. Retry/backoff exists only to survive transient Zep network failures; an in-process `index_by_id`/petgraph lookup has no I/O and cannot transiently fail (absence → `None`/`[]`, not retried). Non-contractual, no observable difference. **AND the error-fallback it wrapped IS preserved**: `get_entity_with_context` returns `None` on bad/missing uuid (`entity_reader.rs:766,769`), `get_node_edges` returns `[]` on unparseable/missing uuid (`:617-619,636`) — except→None / except→[] contracts PORTED. The retry drop did NOT drop the fallback. ✓
+- `- [x]`-grade (clean, but blocked by unit FAIL) S-214 struct, S-217 `get_all_nodes` (5-key dict, summary="" / attributes={} [≠] legit, labels=[kind.to_string()], graph_id [≠]), S-218 `get_all_edges` (6-key dict, name=kind Display, uuid/fact/attributes empties [≠] legit) — these do NOT touch the enrich path and are individually correct. Left `- [~]` because the UNIT cannot PASS (rollup rule) until S-219/S-220/S-221 are fixed.
+- `- [~]` (FAIL) **S-219 `get_node_edges`** — self-loop double-count (2 vs 1). except→[] contract correct; shape correct; divergence on self-loop edge count.
+- `- [~]` (FAIL) **S-220 `filter_defined_entities`** — self-loop double-count in `related_edges`. Everything ELSE verified CORRECT: total_count=entity_count, filtered_count, entity_types HashSet membership, {Entity,Node}-skip ported verbatim (always-pass in teri — correct), defined_entity_types ∩ matching + first-match entity_type, Display-string match incl. Custom(name)→name, related_nodes dedup-by-uuid set, direction labels, bidirectional pair MATCHES. Only the self-loop case diverges.
+- `- [~]` (FAIL) **S-221 `get_entity_with_context`** — self-loop double-count in related_edges. except→None contract correct (bad + missing uuid → None, verified). Otherwise enrich shape matches.
+- `- [~]` (FAIL, inherited) **S-222 `get_entities_by_type`** — 1:1 delegation to `filter_defined_entities` is correct; fails only because its delegate (S-220) carries the self-loop divergence.
+
+### `[≠]` challenge (every field, against the no-downgrade rule)
+All field-level `[≠]`s CONFIRMED legitimate (genuinely inexpressible Zep-server/SDK artifacts, each with a verified consumer-side graceful fallback — none is a portable-feature skip):
+- `summary=""` (node + related_node) — Zep auto-generates per-entity summaries server-side at ingestion; teri `Entity{id,name,kind}` carries no summary and there is NO portable source to derive one faithfully (deriving from facts would fabricate; `fact` is itself empty). Consumer U-018 `_generate_profile_with_llm` falls back to `"A {type} named {name}"` (L261); `_build_entity_context` omits the summary line. Inexpressible. ✓
+- `attributes={}` (node + edge) — teri `Entity`/`Relation` have no KV attribute bag; Zep attributes are server-extracted. No portable source; consumer guards `if entity.attributes:` (L426) → skips block. Inexpressible. ✓
+- edge `fact=""` — Zep `fact` is an LLM-generated NL sentence produced during Zep ingestion; teri stores only `(kind,weight)`. Consumer reads `fact` first then falls back to `edge_name`+`direction` template (L439-450) — and teri DOES emit `edge_name`(=kind Display)+`direction`, so the observable "relationships" output is still produced via the same fallback MiroFish itself uses when fact is empty. Deriving `"{from} {kind} {to}"` would diverge from MiroFish's empty-fact→template path. Correctly kept `""`. ✓
+- edge `uuid=""` — read by NO consumer of `get_all_edges`/`get_node_edges` in MiroFish (dict-shape filler; Zep's own value is usually `""` for these reads); teri `Relation` has no uuid. Non-contractual; synthesizing one = fabricated observable with no reader. ✓
+- `graph_id` param dropped — Zep server-graph selector; the bound `&KnowledgeGraph` is the teri selector. Inexpressible. ✓
+
+So: zero disguised feature-skips among the `[≠]`s. The FAIL is **solely** the self-loop edge-count divergence in the enrich/edge-list path.
+
+### Additive accessor (Q6) — VERIFIED clean
+`KnowledgeGraph::get_entity_by_id(&self, id: Uuid) -> Option<&Entity>` (`graph/mod.rs:1056-1060`) reads the existing private `index_by_id` map (O(1)); adds a new pub fn only. NO change to `Entity`/`Relation`/`EntityKind`/`RelationKind`/`KnowledgeGraph` existing signatures or fields. Zero blast radius on verified types; 701 lib tests green. ✓
+
+### Result — **FAIL** (unit U-016 stays `- [~]`; S-219/S-220/S-221/S-222 stay `- [~]`)
+Single defect: self-loop edges are double-counted (outgoing+incoming) in `get_neighbor_relations`, diverging from MiroFish's exclusive `if/elif` (one entry, outgoing). Reachable via the guard-less extraction pipeline. Fix the accessor (or dedup at the reader boundary), add a self-loop test, re-verify. Everything else in U-016 — DTO mapping, counts, set membership, dedup-by-uuid, direction labels, bidirectional pairs, the except→None/[] error contracts, and every `[≠]` field — is verified correct.
+
+---
+
+## 2026-06-17 — U-016 RE-VERIFY (self-loop FAIL→fix→PASS) + U-018 no-regression — **PASS** (opus parity gate)
+
+### Context
+Prior cycle FAILED U-016: a self-loop `X→X` was double-counted in `get_neighbor_relations`
+(petgraph returns the edge in BOTH the Outgoing and Incoming directed passes), so all three
+reader paths emitted it twice (teri 2 vs MiroFish 1). MiroFish's exclusive if/elif
+(`zep_entity_reader.py:288-303`) classifies a single edge once — a self-loop hits the
+`if source==node` (outgoing) branch and never the `elif target==node` branch.
+
+### The fix (re-verified)
+`src/graph/mod.rs` `get_neighbor_relations`, Incoming pass (graph/mod.rs:348):
+`if edge.source() == *idx { continue; }` — skips a self-loop in the incoming pass so it is
+emitted ONCE, as outgoing. Regression test `self_loop_edge_emitted_once_as_outgoing`
+(`src/services/entity_reader.rs:990`) asserts across all three reader paths.
+
+### 1. Fix is correct & complete
+- **get_node_edges** (entity_reader.rs:623): self-loop → `edges.len()==1` (was 2). Source→MiroFish
+  `if source==node` outgoing-only. MATCH.
+- **filter_defined_entities** enrich (enrich_entity_node, entity_reader.rs:870): self-loop →
+  `related_edges.len()==1`, `direction=="outgoing"`, `target_node_uuid==self`. MATCH MiroFish
+  L288-303 (single outgoing entry, target=self).
+- **get_entity_with_context** (entity_reader.rs:764→785 enrich): self-loop → `related_edges.len()==1`,
+  `direction=="outgoing"`. MATCH.
+- All asserted by `self_loop_edge_emitted_once_as_outgoing` — PASS.
+
+### Guard fires ONLY for self-loops (independently proven)
+Temporary 4-case trace test (built, run PASS, then reverted — graph/mod.rs back to +0 vs the
+committed fix) over node X with: self-loop X→X, normal outgoing X→Out, normal incoming In→X,
+bidirectional X↔Bi. Result: `get_neighbor_relations(X)` returned exactly 5 entries:
+- self-loop: 1 outgoing, 0 incoming  (guard FIRED: source==X==idx in incoming pass)
+- X→Out: 1 outgoing, 0 incoming      (unchanged)
+- In→X: 0 outgoing, 1 incoming       (guard did NOT fire: source=In≠X; still emitted incoming)
+- X↔Bi: 1 outgoing AND 1 incoming    (guard did NOT fire on Bi→X: source=Bi≠X; both preserved)
+Proves a normal incoming edge A→X (A≠X) is NOT skipped and bidirectional pairs are intact.
+
+### 2. NO U-018 regression (get_neighbor_relations is SHARED) — CONFIRMED
+- **Call sites** (grep): `src/services/entity_reader.rs:623,870` (U-016) and
+  `src/agent/mod.rs:1253` (U-018 `PersonaGenerator::build_entity_context`, Part 2 related-edges).
+- **U-018 parity contract requires the self-loop counted ONCE, not twice.** MiroFish U-018
+  source `_build_entity_context` (`oasis_profile_generator.py:434-453`) iterates
+  `entity.related_edges` — and that list is itself produced by the SAME exclusive if/elif in
+  `filter_defined_entities` (`zep_entity_reader.py:288-303`), which emits a self-loop ONCE
+  (outgoing). So MiroFish U-018 sees the self-loop once. teri's old double-count was therefore
+  a regression AGAINST U-018's contract too; the fix brings U-018 to parity, and CANNOT regress
+  it (the fix only removes a spurious duplicate that MiroFish never produced).
+- teri U-018 `build_entity_context` consumes `get_neighbor_relations` directly (agent/mod.rs:1253)
+  and renders each entry via `_relation_line` (outgoing: `entity --[kind]--> (neighbor)`;
+  incoming: `(neighbor) --[kind]--> entity`). Post-fix a self-loop yields one outgoing line —
+  matching MiroFish's single outgoing `related_edges` entry rendered at L447-448.
+- **Tests**: all 104 `agent::` tests pass, incl. `test_generate_social_part2_outgoing_relation_in_prompt`
+  and `test_generate_social_part2_incoming_relation_in_prompt` (outgoing source=idx and incoming
+  source≠idx cases — both unchanged by the guard, confirming no U-018 directional regression).
+
+### 3. Rest of U-016 unchanged
+Edit was localized to `get_neighbor_relations` (+1 guard) + one regression test. The earlier-verified
+parts hold: `[≠]` fields (summary="", attributes={}, edge fact="", edge uuid="", edge attributes={}),
+the Entity/Node-skip filter (always-pass, ported verbatim), counts/entity_types/dedup-by-uuid,
+direction labels, bidirectional pairs, and the except→None/except→[] error contracts. The two `[≠]`
+rows S-215 (Zep api_key/client construction) and S-216 (`_call_with_retry`) survive the `[≠]`
+challenge: genuinely inexpressible (in-process petgraph read has no auth client) / non-contractual
+(no transient I/O to retry) — NOT a disguised feature-skip (no distinct observable output dropped;
+the except→None/[] fallback CONTRACTS are ported).
+
+### Baseline
+713 passed / 0 failed / 6 ignored (full `cargo test`); reader_tests 40, agent:: 104, graph:: 46 —
+all green. `cargo clippy --all-targets -- -D warnings`: No issues found.
+
+### Result — **PASS** (unit U-016 → `- [x]`)
+S-214, S-217, S-218, S-219, S-220, S-221, S-222 → `- [x]`; S-215, S-216 remain challenge-surviving
+`- [≠]`. All S-198..S-222 are now `[x]`/`[≠]` → rollup rule satisfied. U-018 verified NOT regressed
+(brought closer to parity). No downgrade.

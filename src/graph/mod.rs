@@ -339,6 +339,15 @@ impl KnowledgeGraph {
 
         // Incoming: neighbor --[rel]--> entity  (is_outgoing = false)
         for edge in self.inner.edges_directed(*idx, Direction::Incoming) {
+            // Skip self-loops here: a self-loop edge (source == target == idx) is returned by
+            // petgraph in BOTH the Outgoing and Incoming passes, but it must be emitted only
+            // ONCE — as outgoing — to match the exclusive if/elif classification of a single
+            // edge scan (MiroFish `zep_entity_reader.py:288-303`: `if source==node …elif
+            // target==node …`, where a self-loop hits the `if` and never the `elif`). Without
+            // this guard a self-loop is double-counted in every neighbor-relations consumer.
+            if edge.source() == *idx {
+                continue;
+            }
             if let (Some(neighbor), Some(rel)) =
                 (self.inner.node_weight(edge.source()), Some(edge.weight()))
             {
@@ -1044,6 +1053,19 @@ Document text:
 
     pub fn relation_count(&self) -> usize {
         self.inner.edge_count()
+    }
+
+    /// Look up an entity by its UUID.
+    ///
+    /// Reads the existing internal `index_by_id` map (O(1)). Added as a small additive
+    /// public accessor so `KnowledgeGraphEntityReader` (U-016 / DECISION-9 Q6) can resolve
+    /// related-node UUIDs without scanning `get_all_entities()`.
+    ///
+    /// Returns `None` if no entity with the given `id` exists.
+    pub fn get_entity_by_id(&self, id: Uuid) -> Option<&Entity> {
+        self.index_by_id
+            .get(&id)
+            .and_then(|idx| self.inner.node_weight(*idx))
     }
 
     /// Get the name-to-index mapping (primarily for testing)

@@ -17,7 +17,22 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 3   # RESUMED 2026-06-17 (6th resume, reset 0); c1=U-019(b); c2=U-019(c); c3=U-019(d) generate_config — U-019 COMPLETE
+cycles_this_session: 1   # RESUMED 2026-06-17 (7th resume, reset 0); c1=U-016 complete (ZepEntityReader→KnowledgeGraph adapter)
+cycles_total: 24
+# CYCLE1 (7th resume) 2026-06-17: U-016 COMPLETE — ZepEntityReader→KnowledgeGraph adapter (S-214..S-222) — opus
+#   FAIL→fix→PASS (DECISION-9, map-onto-substrate). src/services/entity_reader.rs: KnowledgeGraphEntityReader<'a>{
+#   graph:&KnowledgeGraph} (no api_key/Zep client — S-215 [≠]); get_all_nodes/get_all_edges/get_node_edges/
+#   filter_defined_entities/get_entity_with_context/get_entities_by_type. Additive KnowledgeGraph::get_entity_by_id
+#   (reads existing private index_by_id, zero blast radius). [≠] fields (each DECISION-9-recorded inexpressible +
+#   consumer graceful fallback verified): EntityNode.summary="" / attributes={} / related_edge.fact="" / edge uuid="" /
+#   edge attributes={} / related_node.summary="". S-216 _call_with_retry [≠] non-contractual (in-process petgraph, no
+#   transient I/O) BUT except→None/except→[] error contracts PORTED. {Entity,Node}-skip filter ported (always-pass
+#   no-op in teri). enrich uses get_neighbor_relations O(degree) (equiv MiroFish O(n·e) all_edges scan). GATE CAUGHT
+#   real downgrade: self-loop X→X double-counted (petgraph returns it in BOTH directed passes) vs MiroFish exclusive
+#   if/elif emits once-as-outgoing; reachable (add_relation has no self-loop guard). FIXED in shared
+#   get_neighbor_relations (skip edge.source()==idx in incoming pass) + regression test. opus confirmed the OLD
+#   double-count was ALSO a latent U-018 regression → fix brings U-018 closer to parity, 104 agent tests pass.
+#   S-214/217-222 [x], S-215/216 [≠]; U-016 UNIT [x] (all S-198..S-222 [x]/[≠]). 40 new tests, teri 713 green, clippy clean.
 cycles_total: 23
 # CYCLE3 (6th resume) 2026-06-17: U-019 sub-cycle (d) generate_config (S-439) — opus PASS. U-019 UNIT COMPLETE
 #   (73/73 symbols [x], zero [≠]). Added generate_config to SimulationConfigGenerator<L> in simulation_config.rs:

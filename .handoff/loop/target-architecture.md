@@ -501,3 +501,119 @@ pub fn build_graph_async<L: LlmClient + Clone + Send + Sync + 'static>(
 4. **`build_graph_async(llm, text, ontology, graph_name, chunk_size, chunk_overlap) -> task_id`** spawns `tokio::spawn(with_locale(locale, …))`, drives `set_ontology`→`build_with_progress`, milestones map 5/15/20/20-60/90/100 onto the REAL pipeline; create_graph(10)/wait_for_episodes(60-90) are `[≠]` (no Zep); result is teri-native `{graph_name, graph_info{node_count,edge_count,entity_types[]}, chunks_processed, graph:<serialized>}` (no Zep `graph_id`).
 5. **i18n: ADD NOTHING** — all 14 worker `progress.*` keys already exist in both locales (SWEEP-2); teri emits the ported subset, leaves the Zep-only keys present-but-unemitted.
 6. **Parity gate:** differential on the SET of entity type names (incl. Custom) + node/edge counts + the milestone progress sequence teri DOES emit; every `[≠]` above is challenged by the gate — they pass because each is Zep-server/SDK-inexpressible with no observable teri output, never a portable-feature skip.
+
+---
+
+## DECISION-9 — U-016 `ZepEntityReader` machinery (S-214..S-219) → `KnowledgeGraphEntityReader` over native petgraph
+
+Source: `backend/app/services/zep_entity_reader.py` L71-437. DTOs `EntityNode`/`FilteredEntities` (L22-68) already ported & parity-verified at `src/services/entity_reader.rs` — **do not redesign them**. This decision covers ONLY the reader methods `_call_with_retry`, `get_all_nodes`, `get_all_edges`, `get_node_edges`, `filter_defined_entities`, `get_entity_with_context`, `get_entities_by_type`.
+
+**Substrate confirmed (read of `src/graph/mod.rs`):** entity source is native `KnowledgeGraph` (petgraph), not Zep. `Entity{id:Uuid, name:String, kind:EntityKind}` — NO summary, NO attributes, single `kind`. `Relation{kind:RelationKind, weight:f32, valid_at}` — NO uuid, NO name, NO fact, NO attributes. Read surface: `get_all_entities()->Vec<&Entity>`, `get_all_edges()->Vec<(Uuid,Uuid,Relation)>` (`EdgeTriple`, endpoints carry **Entity.id**), `get_neighbor_relations(Uuid)->Result<Vec<(&Entity,&Relation,bool)>>` (bool = is_outgoing), `get_subgraph`, `entity_count()`, `get_entity(name)`. `index_by_id` exists internally but there is **no public `get_entity_by_id(Uuid)`** — see Q6.
+
+**Consumer evidence (the no-downgrade pivot — verified, not assumed):** the ONLY consumers of the reader's output are U-018 `oasis_profile_generator._build_entity_context` (L414-473) and U-019 `simulation_config_generator`. `_build_entity_context` reads, per related_edge, `fact` FIRST and falls back to `edge_name`+`direction` when `fact` is empty (L439-450); per related_node it reads `name`/`labels`/`summary`; it reads `entity.attributes` (L426). `entity.summary` feeds `_generate_profile_with_llm` (L243) and is the `persona` fallback `entity.summary or "A {type} named {name}"` (L261). So every "missing" Zep field has an EXPLICIT consumer-side graceful fallback — that is what makes a `[≠]` legal here (the observable persona/context output is still produced via the fallback path), and what tells us where a derive is preferable to an empty.
+
+### Q1 — Reader shape: borrowed struct over `&KnowledgeGraph`
+
+**DECISION: `pub struct KnowledgeGraphEntityReader<'a> { graph: &'a KnowledgeGraph }`** with `pub fn new(graph: &'a KnowledgeGraph) -> Self`. New file `src/services/entity_reader.rs` (extend the existing module — DTOs already live there). No `api_key`, no Zep client, no `graph_id` parameter on any method (the graph IS the bound reference).
+
+- Rationale: an in-process read borrows the graph; free functions would lose the `'a` cohesion and the obvious "this reader reads THIS graph" contract. `graph_id: str` on every Python method is a Zep server-graph selector — **`[≠]` inexpressible** (no remote graph handle); the bound `&KnowledgeGraph` is the teri selector.
+- `__init__(api_key)` + `ZEP_API_KEY` validation + `Zep(api_key=…)` client construction → **`[≠]` inexpressible** (Zep-auth for a network client; an in-process petgraph read has no auth, no client). Owner-rule: genuinely inexpressible, non-contractual (no observable output), not a feature skip.
+
+### Q2 — `EntityNode` field-mapping from teri `Entity` (the critical no-downgrade table)
+
+| EntityNode field | ← teri source | verdict | owner-rule justification |
+|---|---|---|---|
+| `uuid` | `entity.id.to_string()` | **PORT** | clean 1:1. |
+| `name` | `entity.name.clone()` | **PORT** | clean 1:1. |
+| `labels` | `vec![entity.kind.to_string()]` | **PORT (mapped)** | teri has a single `kind`, not a Vec. Map to a 1-element label vec carrying the Display token (built-ins lowercase e.g. `"person"`; `Custom` = PascalCase type name verbatim). Do **NOT** synthesize the Zep base `"Entity"`/`"Node"` labels — see Q3. The observable downstream use of `labels` is `get_entity_type()` (first non-`Entity`/`Node` label) and U-018's custom-label filter; with a 1-element real-kind vec both yield exactly that kind. Faithful: the *entity type* the consumer extracts is identical. |
+| `summary` | `String::new()` | **`[≠]` inexpressible — RECORDED with consumer impact** | teri's extraction (`build()`) genuinely produces no per-entity summary; Zep auto-generates it server-side during ingestion. There is **no portable source on `Entity`** to derive a faithful per-node summary from (deriving from relation facts would itself be synthetic, and `fact` is also `[≠]` — Q4). Consumer impact (MUST be recorded, not hidden): U-018 `_generate_profile_with_llm` receives `entity_summary=""`; the `persona` fallback becomes `"A {type} named {name}"` (L261); `_build_entity_context` simply omits the `### 实体属性`/summary-derived lines. The persona is still produced (graceful), at reduced input richness. This is a substrate gap, not a downgrade-by-laziness. **Porter MUST emit `summary=""` only WITH this ledger line, never silently.** |
+| `attributes` | `serde_json::Map::new()` (empty) | **`[≠]` inexpressible** | teri `Entity` has no attributes map; Zep attributes are server-extracted KV pairs. No portable source. Consumer (U-018 L426-432) guards `if entity.attributes:` → simply skips the attributes block. Non-emitting is the consumer's existing graceful path. Record alongside `summary`. |
+| `related_edges` | built from edges (Q4) | **PORT** | see Q4. |
+| `related_nodes` | built from edge endpoints (Q4) | **PORT** | see Q4. |
+
+### Q3 — The `{Entity,Node}`-only skip filter: **always-pass in teri (observable-equivalent)**
+
+MiroFish skips nodes whose only labels are `{Entity, Node}` (a node Zep created but never typed). teri entities ALWAYS carry a real `kind` (one of 6 built-ins or `Custom`), so `labels = [kind.to_string()]` NEVER reduces to only `{Entity,Node}` (none of the Display tokens equal the exact-case strings `"Entity"`/`"Node"` — built-ins are lowercase; `Custom` is a distinct ontology name). **DECISION: keep the filter code verbatim (port the `custom_labels = labels - {Entity,Node}; if not custom_labels: continue` logic), which in teri is simply always-pass.** Porting the logic (not deleting it) is correct: it is the faithful expression, it costs nothing, and it stays correct if a future label-set ever includes those tokens. The skip being a no-op is an observable *consequence* of teri's typed entities, not a dropped behavior — `filtered_count` == count-of-typed-entities in both systems. NOT a `[≠]`; it is a PORT whose branch is unreachable given teri's data.
+
+### Q4 — Edge field mapping (`related_edges` / `get_all_edges` / `get_node_edges`)
+
+teri `Relation` has no uuid/name/fact/attributes. The edge dicts MiroFish builds come in two shapes — the **full** dict (`get_all_edges`/`get_node_edges`: `{uuid,name,fact,source_node_uuid,target_node_uuid,attributes}`) and the **related_edges** dict (`{direction, edge_name, fact, target_node_uuid|source_node_uuid}`). Map per the consumer's read path (L439-450 reads `fact`→fallback `edge_name`+`direction`):
+
+| edge field | ← teri source | verdict | justification |
+|---|---|---|---|
+| `source_node_uuid` / `target_node_uuid` | endpoint `Entity.id.to_string()` (from `EdgeTriple`/`get_neighbor_relations`) | **PORT** | clean; endpoints are real entity ids. |
+| `edge_name` (related_edges) / `name` (full) | `relation.kind.to_string()` | **PORT (mapped)** | RelationKind Display (`"WorksFor"`, `"RelatedTo"`, … or `Custom` verbatim). This is exactly the fallback the consumer uses when `fact` is empty (L446-450). Faithful: the relation label the consumer renders is identical. |
+| `direction` (related_edges) | the `is_outgoing` bool from `get_neighbor_relations` → `"outgoing"`/`"incoming"` | **PORT** | 1:1 with MiroFish's source/target comparison; same string literals. |
+| `fact` | `String::new()` (empty) | **`[≠]` inexpressible** | Zep's `fact` is an LLM-generated natural-language sentence about the edge produced during Zep ingestion; teri stores only `(kind, weight)`. Consumer is graceful: empty `fact` → renders the `edge_name`-template line instead (L446-450), which teri DOES produce. So the observable "relationships" section is still emitted (via the fallback). **Porter emits `fact=""`; the `edge_name`/`direction` path carries the observable output.** (A derived `"{from} {kind} {to}"` sentence is *optional* and NOT required — the consumer's own fallback already covers it; do not invent a fact that diverges from MiroFish's empty-fact→template behavior. Keep `fact=""`.) |
+| `uuid` (full dict only) | `String::new()` | **`[≠]` non-contractual** | edge uuid is read by NO consumer of `get_all_edges`/`get_node_edges` in MiroFish (it is dict-shape filler); teri Relation has no uuid; synthesizing one would be a fabricated observable with no reader. Emit `""`. (Do NOT synthesize a deterministic uuid — there is no consumer to satisfy and it would be a divergence from MiroFish's `edge.uuid_ or ""` which is itself usually empty for these reads.) |
+| `attributes` (full dict only) | empty Map | **`[≠]` inexpressible** | same as node attributes; no source, no consumer reads it. |
+
+`related_nodes` entries `{uuid,name,labels,summary}` are built from the related entity via the SAME Entity→fields mapping as Q2 (so `summary=""` there too, consumer-graceful at L467-470: no summary → renders `**{name}**{label_str}` without the summary suffix).
+
+### Q5 — `filter_defined_entities` logic onto `KnowledgeGraph`
+
+Signature: `pub fn filter_defined_entities(&self, defined_entity_types: Option<&[String]>, enrich_with_edges: bool) -> FilteredEntities`. (No `graph_id`; Q1.)
+
+- Iterate `self.graph.get_all_entities()`; `total_count = graph.entity_count() as i64` (== all entities).
+- Per entity build `labels = [kind.to_string()]`; compute `custom_labels = labels - {Entity,Node}` (Q3: always == labels). `if custom_labels.is_empty() { continue }` (unreachable in teri, ported verbatim).
+- If `defined_entity_types` is `Some(types)`: `matching = custom_labels ∩ types`; `if matching.is_empty() { continue }`; `entity_type = matching[0]`. Else `entity_type = custom_labels[0]`. Match is against the **EntityKind Display string** (built-in lowercase token or Custom name) — so `get_entities_by_type("person")` matches `EntityKind::Person`, `get_entities_by_type("MediaOutlet")` matches `Custom("MediaOutlet")`. **Note for callers:** built-in matches require the lowercase Display token (Q-flag for parity: MiroFish matched Zep PascalCase labels; teri built-ins Display lowercase. This is the SAME divergence already accepted in DECISION-8 for `EntityKind::Display`; `Custom` names match verbatim. The parity gate compares against teri's own Display contract, consistent with DECISION-8.)
+- `entity_types_found: HashSet<String>` ← inserted `entity_type` per kept entity.
+- Build `EntityNode` (Q2 mapping). If `enrich_with_edges`: **use `get_neighbor_relations(entity.id)`** (NOT a full `get_all_edges` O(n·e) rescan) to produce `related_edges` (direction + edge_name + fact="" + the opposite-endpoint id) and the `related_node_uuids` set; then resolve each related uuid to its `{uuid,name,labels,summary}` via the entity lookup (Q6). **Equivalence proof:** MiroFish scans `all_edges` filtering `source==node.uuid` (→outgoing) / `target==node.uuid` (→incoming); `get_neighbor_relations` returns exactly the outgoing-then-incoming incident edges with the `is_outgoing` flag — same set, same direction labels, same opposite endpoints, but O(degree) per node instead of O(e). Output is identical; only the traversal cost differs (a strict efficiency improvement, allowed). `related_nodes` dedup: collect endpoint ids into a set first (matching MiroFish's `related_node_uuids` set semantics) before resolving, so a multi-edge pair yields one related_node.
+- `filtered_count = filtered_entities.len() as i64`. Return `FilteredEntities{entities, entity_types: entity_types_found, total_count, filtered_count}`.
+
+`get_entities_by_type(&self, entity_type: &str, enrich_with_edges: bool) -> Vec<EntityNode>` = `self.filter_defined_entities(Some(&[entity_type.to_string()]), enrich_with_edges).entities` (1:1 port of L413-435).
+
+### Q6 — Entity-by-id lookup (resolving related_node uuids & `get_entity_with_context`)
+
+`filter_defined_entities` resolves related-node uuids → entity, and `get_entity_with_context` takes an `entity_uuid`. teri exposes `get_entity(name)` and internal `index_by_id` but **no public `get_entity_by_id(Uuid)`**. **DECISION: add a small public accessor `pub fn get_entity_by_id(&self, id: Uuid) -> Option<&Entity>` to `KnowledgeGraph`** (reads existing `index_by_id`). This is **ADDITIVE** (new pub fn, reads an existing private field) — does NOT change `Entity`/`Relation`/any existing signature, zero blast radius on verified types, no existing caller affected. (Alternative — building an id→entity map inside the reader by scanning `get_all_entities` — is also acceptable and needs no graph change; pick the accessor for O(1) lookup and reuse by `get_entity_with_context`. Porter may choose the in-reader map if avoiding any graph edit is preferred — both are observ­ably identical. **Flagging the accessor as the recommended path; it is additive, not a type change.**)
+
+### Q7 — `get_entity_with_context(&self, entity_uuid: &str) -> Option<EntityNode>`
+
+Parse `entity_uuid` → `Uuid`; `get_entity_by_id` (Q6). **`if None → return None`** (parse failure OR missing id both yield `None`). Build the EntityNode with its edges via `get_neighbor_relations(id)` + related_nodes (same as Q5 enrich path). Wrap the whole body so any internal error → `None`.
+
+- **except→None contract: PORTED (contractual).** MiroFish wraps the Zep calls in `try/except → return None` (L409-411) and `if not node: return None` (L355). teri: a bad/unknown uuid → `None`, never a panic or `Err`. This is observable error behavior and IS preserved. (`get_all_nodes(graph_id)` re-fetch inside the Python version L362 is a Zep round-trip; teri already has the whole graph bound — just resolve ids directly. The `node_map` is the bound graph. No behavior lost.)
+
+### Q8 — `get_node_edges(&self, node_uuid: &str) -> Vec<Value>` (or `Vec<EdgeDict>`)
+
+Parse uuid; if missing/unparseable → **`Vec::new()`** (the `except → return []` contract, L211-213). Otherwise return the full-shape edge dicts (Q4) for that node's incident edges via `get_neighbor_relations`.
+
+- **except→[] contract: PORTED (contractual).** A missing node → empty vec, never an error.
+
+### Q9 — `_call_with_retry`: **`[≠]` non-contractual** (retry dropped); error-fallback **PORTED** (contractual)
+
+**Separate the two behaviors the Python conflates:**
+- **Retry/exponential-backoff** (3 attempts, delay 2.0×2, `time.sleep`): this exists ONLY to survive transient Zep network/API failures. An in-process petgraph read has **no I/O, no transient failure** — a `HashMap`/`petgraph` lookup either succeeds or the key is absent (and absence is handled by `None`/`[]`, not retried — retrying a missing uuid would loop pointlessly). **DECISION: `_call_with_retry` is `[≠]` inexpressible/non-contractual** — there is no fallible network call to wrap; retrying produces no different observable outcome. Do NOT port a retry loop, do NOT add artificial backoff. (Owner-rule: genuinely inexpressible — the failure mode it guards cannot occur in-process; non-contractual — no observable output depends on it.)
+- **The `except → None` / `except → []` FALLBACKS** that `_call_with_retry`'s callers wrap around it (Q7, Q8): these ARE observable error contracts and **ARE PORTED** (a bad uuid → None / empty, deterministically). The retry is dropped; the graceful-degradation outcome is kept. This is the precise split the unit-spec demanded.
+
+### Method signature summary (the porter's contract)
+
+```rust
+// src/services/entity_reader.rs  (extends the module that already holds EntityNode/FilteredEntities)
+pub struct KnowledgeGraphEntityReader<'a> { graph: &'a KnowledgeGraph }
+
+impl<'a> KnowledgeGraphEntityReader<'a> {
+    pub fn new(graph: &'a KnowledgeGraph) -> Self;
+    pub fn get_all_nodes(&self) -> Vec<Value>;                 // node dicts {uuid,name,labels,summary="",attributes={}}
+    pub fn get_all_edges(&self) -> Vec<Value>;                 // full edge dicts {uuid="",name,fact="",source_node_uuid,target_node_uuid,attributes={}}
+    pub fn get_node_edges(&self, node_uuid: &str) -> Vec<Value>;          // except→[] ; retry [≠]
+    pub fn filter_defined_entities(&self, defined_entity_types: Option<&[String]>, enrich_with_edges: bool) -> FilteredEntities;
+    pub fn get_entity_with_context(&self, entity_uuid: &str) -> Option<EntityNode>;   // except→None ; retry [≠]
+    pub fn get_entities_by_type(&self, entity_type: &str, enrich_with_edges: bool) -> Vec<EntityNode>;
+}
+// ADDITIVE on KnowledgeGraph (graph/mod.rs): pub fn get_entity_by_id(&self, id: Uuid) -> Option<&Entity>
+```
+(`get_all_nodes`/`get_all_edges` return `Vec<Value>` to preserve the Python dict-shape contract these methods promise; the in-reader code uses typed entities directly and only materializes dicts at these public boundaries. They have no MiroFish consumer beyond `filter_defined_entities` internally, but are ported as public per S-214/S-215.)
+
+### Blast-radius flag (read before the porter runs)
+
+- **NO change to the verified `Entity` / `Relation` / `EntityKind` / `RelationKind` types.** All field "gaps" (`summary`, `attributes`, `fact`, edge `uuid`) are emitted as empty/`[≠]` at the reader boundary, NOT by extending the verified types. The earlier-considered "extend `Entity` with a `summary` field" is **explicitly rejected** — teri's extraction produces no summary data to populate it, so the field would be uniformly empty (a no-op type change that touches a parity-verified struct for zero benefit). Recorded as `[≠]` instead.
+- **ONE additive change to `KnowledgeGraph`:** `get_entity_by_id` (new pub fn, reads existing `index_by_id`). Zero blast radius — no signature/field change, no existing caller affected. Porter may avoid even this by building an in-reader id→entity map. Either way the verified types are untouched.
+
+### DECISION-9 — 6-line actionable summary
+
+1. **`KnowledgeGraphEntityReader<'a>{ graph:&'a KnowledgeGraph }`** in `src/services/entity_reader.rs` (extends the DTO module); no api_key/client/`graph_id` — Zep-auth + graph_id are `[≠]` inexpressible. The bound `&KnowledgeGraph` is the selector.
+2. **EntityNode mapping:** `uuid←id.to_string()`, `name←name`, `labels←[kind.to_string()]` (PORT-mapped, 1-elem real kind); `summary←""` and `attributes←{}` are **`[≠]` inexpressible** — RECORDED with consumer impact (U-018 persona falls back to `"A {type} named {name}"`; context omits attr/summary lines — graceful, reduced richness, NOT silent).
+3. **Edge mapping:** `source/target_node_uuid←endpoint id`, `edge_name/name←kind.to_string()`, `direction←is_outgoing` are **PORT**; `fact←""` (`[≠]` Zep-LLM, consumer falls back to the edge_name template it already renders), edge `uuid←""`/`attributes←{}` (`[≠]` non-contractual, no reader). Keep `fact=""` — do NOT invent a fact.
+4. **`filter_defined_entities`** ports the `{Entity,Node}`-skip verbatim (always-pass in teri — typed entities — NOT a `[≠]`, a PORT with an unreachable branch); type-match against EntityKind Display (lowercase built-ins / Custom verbatim — same divergence DECISION-8 accepted); enrich via **`get_neighbor_relations`** (O(degree), provably the same set as MiroFish's O(n·e) `all_edges` scan — efficiency upgrade); `total_count=entity_count`, `filtered_count=kept`.
+5. **Retry vs error-contract split:** `_call_with_retry` is **`[≠]` non-contractual** (no in-process I/O can transiently fail; no observable difference) — NOT ported. The `except→None` (`get_entity_with_context`, incl. bad/unknown uuid) and `except→[]` (`get_node_edges`) fallbacks ARE observable contracts and **ARE PORTED**.
+6. **Blast radius:** verified `Entity`/`Relation`/`EntityKind`/`RelationKind` **UNCHANGED** (rejected extending `Entity` with `summary` — no data to fill it); ONE additive `KnowledgeGraph::get_entity_by_id(Uuid)->Option<&Entity>` recommended (reads existing `index_by_id`, zero blast radius), or an in-reader id-map if no graph edit is wanted. Parity gate: differential on the kept-EntityNode set, entity_types, related_edges/nodes context, total/filtered counts, and the None/[] error paths; each `[≠]` is Zep-server/SDK-inexpressible with a verified consumer-side graceful fallback — never a portable-feature skip.
