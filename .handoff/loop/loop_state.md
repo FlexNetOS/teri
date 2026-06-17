@@ -130,7 +130,7 @@ classes: port-fresh=17 extend-Y=6 reuse-Y=18 map-onto-substrate=13   # architect
 #   LLM_API_KEY; Zep/OASIS-path units are map-onto-substrate (verified as behavioral equivalence of the
 #   mapped teri path, not by running MiroFish's Zep/OASIS path which needs external creds).
 last_item: (none — DISCOVER complete)
-status: HAND OFF at cycle budget (3 ITERATE cycles total). U-015 + GAP-1 + GAP-2 + GAP-ACTION-TAXONOMY [x], 220 green. develop tip repair staged (9836238, not yet PR'd). evolution-find applied each loop: harness_hub PR #30/#31/#32 merged.
+status: HAND OFF (5th resume, 2026-06-17) at clean 2-cycle boundary — U-015 COMPLETE (S-189+S-192) + U-019 sub-cycle (a) data model [x]; teri 579 green, clippy --all-targets clean. Stopped before U-019 sub-cycle (b) because it is large + dependency-blocked on EntityNode (needs DECISION-9 architect call) — better started fresh. NEXT: port EntityNode (DECISION-9), then U-019 sub-cycle (b) LLM stages. HEAD=a0ec455 + handoff checkpoint. develop tip repair still staged (9836238, not yet PR'd).
 loop_iteration: 3 (ITERATE c3 Action taxonomy + eval) done; next = 4 (reuse-Y verify-only quick-wins, then extend-Y/port-fresh)
 next_iterate: reuse-Y verify-only quick-wins (18 units — differential verify teri's existing symbols vs MiroFish; mark [x] or reclassify extend-Y). Then U-013/text_processor, extend-Y, port-fresh (HTTP API, sim lifecycle, community adapters+social-sim, IPC, config-gen, ontology, Vue re-point).
 last_update: 2026-06-14T12:30:00Z
