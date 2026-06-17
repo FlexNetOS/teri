@@ -16,28 +16,28 @@
 
 ## U-001 — `backend/app/config.py:Config`
 
-- [ ] S-001 · `unit:U-001` · `const` · `project_root_env` · module-level path to .env file · `config.py:11`
-- [ ] S-002 · `unit:U-001` · `type` · `Config` · Flask config class · `config.py:20`
-- [ ] S-003 · `unit:U-001` · `field` · `Config.SECRET_KEY` · env `SECRET_KEY`, default `mirofish-secret-key` · `config.py:24`
-- [ ] S-004 · `unit:U-001` · `field` · `Config.DEBUG` · env `FLASK_DEBUG`, default True · `config.py:25`
-- [ ] S-005 · `unit:U-001` · `field` · `Config.JSON_AS_ASCII` · False — UTF-8 JSON · `config.py:28`
-- [ ] S-006 · `unit:U-001` · `field` · `Config.LLM_API_KEY` · env `LLM_API_KEY`, required · `config.py:31`
-- [ ] S-007 · `unit:U-001` · `field` · `Config.LLM_BASE_URL` · env `LLM_BASE_URL`, default openai v1 · `config.py:32`
-- [ ] S-008 · `unit:U-001` · `field` · `Config.LLM_MODEL_NAME` · env `LLM_MODEL_NAME`, default gpt-4o-mini · `config.py:33`
-- [ ] S-009 · `unit:U-001` · `field` · `Config.ZEP_API_KEY` · env `ZEP_API_KEY`, required · `config.py:36`
-- [ ] S-010 · `unit:U-001` · `field` · `Config.MAX_CONTENT_LENGTH` · 50MB · `config.py:39`
-- [ ] S-011 · `unit:U-001` · `field` · `Config.UPLOAD_FOLDER` · path to `uploads/` · `config.py:40`
-- [ ] S-012 · `unit:U-001` · `field` · `Config.ALLOWED_EXTENSIONS` · set {pdf,md,txt,markdown} · `config.py:41`
-- [ ] S-013 · `unit:U-001` · `field` · `Config.DEFAULT_CHUNK_SIZE` · 500 chars · `config.py:44`
-- [ ] S-014 · `unit:U-001` · `field` · `Config.DEFAULT_CHUNK_OVERLAP` · 50 chars · `config.py:45`
-- [ ] S-015 · `unit:U-001` · `field` · `Config.OASIS_DEFAULT_MAX_ROUNDS` · env `OASIS_DEFAULT_MAX_ROUNDS`, default 10 · `config.py:48`
-- [ ] S-016 · `unit:U-001` · `field` · `Config.OASIS_SIMULATION_DATA_DIR` · path to `uploads/simulations/` · `config.py:49`
-- [ ] S-017 · `unit:U-001` · `field` · `Config.OASIS_TWITTER_ACTIONS` · list of 6 action strings · `config.py:52`
-- [ ] S-018 · `unit:U-001` · `field` · `Config.OASIS_REDDIT_ACTIONS` · list of 13 action strings · `config.py:55`
-- [ ] S-019 · `unit:U-001` · `field` · `Config.REPORT_AGENT_MAX_TOOL_CALLS` · env, default 5 · `config.py:62`
-- [ ] S-020 · `unit:U-001` · `field` · `Config.REPORT_AGENT_MAX_REFLECTION_ROUNDS` · env, default 2 · `config.py:63`
-- [ ] S-021 · `unit:U-001` · `field` · `Config.REPORT_AGENT_TEMPERATURE` · env, default 0.5 · `config.py:64`
-- [ ] S-022 · `unit:U-001` · `method` · `Config.validate` · classmethod → list[str] of missing required vars · `config.py:67`
+- [≠] S-001 · `unit:U-001` · `const` · `project_root_env` · module-level path to .env file · `config.py:11` · **rust-target:** `[≠]` idiomatic-mapping: `dotenvy::dotenv().ok()` in `Config::load()` performs the same project-root `.env` discovery automatically; no path constant needed. `dotenvy` provides a SUPERSET (searches parent dirs, handles workspace root). No contractual observable output from this symbol; the `.env` loading side effect is fully covered.
+- [x] S-002 · `unit:U-001` · `type` · `Config` · Flask config class · `config.py:20` · **rust-target:** `Config` at `src/config.rs`; extend-Y of existing teri `Config`; all MiroFish fields merged in as additional struct fields; ported 2026-06-17
+- [ ] S-003 · `unit:U-001` · `field` · `Config.SECRET_KEY` · env `SECRET_KEY`, default `mirofish-secret-key` · `config.py:24` · **pending-U-002/U-003:** Flask HTTP session secret — meaningless without an HTTP session layer. Will be ported WITH U-002/U-003 (axum session middleware). Not silently dropped; recorded here.
+- [x] S-004 · `unit:U-001` · `field` · `Config.DEBUG` · env `FLASK_DEBUG`, default True · `config.py:25` · **rust-target:** `Config::debug: bool` at `src/config.rs`; env `FLASK_DEBUG`, default `true`; tested (default + env-override)
+- [ ] S-005 · `unit:U-001` · `field` · `Config.JSON_AS_ASCII` · False — UTF-8 JSON · `config.py:28` · **pending-U-002/U-003:** Flask JSON encoder flag — only meaningful in the Flask/axum HTTP response layer. Will be ported WITH U-002/U-003 (axum JSON response config). Not silently dropped; the value (UTF-8 non-ASCII serialization) is the default in axum/serde_json when configured correctly.
+- [x] S-006 · `unit:U-001` · `field` · `Config.LLM_API_KEY` · env `LLM_API_KEY`, required · `config.py:31` · **rust-target:** `Config.llm.api_key` at `src/config.rs`; pre-existing in teri; env `LLM_API_KEY`; validated in `validate_collect()` → "LLM_API_KEY is not set"
+- [x] S-007 · `unit:U-001` · `field` · `Config.LLM_BASE_URL` · env `LLM_BASE_URL`, default openai v1 · `config.py:32` · **rust-target:** `Config.llm.base_url` at `src/config.rs`; pre-existing in teri; env `LLM_BASE_URL`, default `https://api.openai.com/v1` — exact match
+- [x] S-008 · `unit:U-001` · `field` · `Config.LLM_MODEL_NAME` · env `LLM_MODEL_NAME`, default gpt-4o-mini · `config.py:33` · **rust-target:** `Config.llm.model` at `src/config.rs`; reads `LLM_MODEL_NAME` first (MiroFish env name), falls back to `LLM_MODEL` (teri legacy name), then default `"gpt-4o"`. **Default divergence:** MiroFish default is `"gpt-4o-mini"`, teri architect set `"gpt-4o"` — teri's default preserved; MiroFish users set `LLM_MODEL_NAME=gpt-4o-mini`. Tested: `LLM_MODEL_NAME` takes precedence over `LLM_MODEL`.
+- [x] S-009 · `unit:U-001` · `field` · `Config.ZEP_API_KEY` · env `ZEP_API_KEY`, required · `config.py:36` · **rust-target:** `Config::zep_api_key: Option<String>` at `src/config.rs`; env `ZEP_API_KEY`; validated in `validate_collect()` → "ZEP_API_KEY is not set"; tested (absent→None, env-set, validate with/without)
+- [x] S-010 · `unit:U-001` · `field` · `Config.MAX_CONTENT_LENGTH` · 50MB · `config.py:39` · **rust-target:** `Config::max_content_length: u64 = 50*1024*1024` at `src/config.rs`; fixed constant, not env-backed (matches source); tested
+- [x] S-011 · `unit:U-001` · `field` · `Config.UPLOAD_FOLDER` · path to `uploads/` · `config.py:40` · **rust-target:** `Config::upload_folder: String` at `src/config.rs`; env `UPLOAD_FOLDER`, default `"./uploads"` (inert until U-002/U-003 HTTP upload handler ported); tested default + env-override
+- [x] S-012 · `unit:U-001` · `field` · `Config.ALLOWED_EXTENSIONS` · set {pdf,md,txt,markdown} · `config.py:41` · **rust-target:** `Config::allowed_extensions: Vec<String>` at `src/config.rs`; sorted `Vec` (Set behavior preserved via contains checks; `HashSet` not `Serialize` without extra); exact 4 elements {pdf,md,txt,markdown}; tested
+- [x] S-013 · `unit:U-001` · `field` · `Config.DEFAULT_CHUNK_SIZE` · 500 chars · `config.py:44` · **rust-target:** `Config::default_chunk_size: usize = 500` at `src/config.rs`; fixed constant; tested
+- [x] S-014 · `unit:U-001` · `field` · `Config.DEFAULT_CHUNK_OVERLAP` · 50 chars · `config.py:45` · **rust-target:** `Config::default_chunk_overlap: usize = 50` at `src/config.rs`; fixed constant; tested
+- [x] S-015 · `unit:U-001` · `field` · `Config.OASIS_DEFAULT_MAX_ROUNDS` · env `OASIS_DEFAULT_MAX_ROUNDS`, default 10 · `config.py:48` · **rust-target:** `Config::oasis_default_max_rounds: u32` at `src/config.rs`; env `OASIS_DEFAULT_MAX_ROUNDS`, default 10; tested default + env-override
+- [x] S-016 · `unit:U-001` · `field` · `Config.OASIS_SIMULATION_DATA_DIR` · path to `uploads/simulations/` · `config.py:49` · **rust-target:** `Config::oasis_simulation_data_dir: String` at `src/config.rs`; env `OASIS_SIMULATION_DATA_DIR`, default `"./uploads/simulations"`; tested default
+- [x] S-017 · `unit:U-001` · `field` · `Config.OASIS_TWITTER_ACTIONS` · list of 6 action strings · `config.py:52` · **rust-target:** `Config::oasis_twitter_actions: Vec<String>` at `src/config.rs`; exact 6 strings in source order; tested count + all 6 values
+- [x] S-018 · `unit:U-001` · `field` · `Config.OASIS_REDDIT_ACTIONS` · list of 13 action strings · `config.py:55` · **rust-target:** `Config::oasis_reddit_actions: Vec<String>` at `src/config.rs`; all 13 strings in source order; TREND and REFRESH preserved as distinct (TREND is observable downstream — recorded as activity, not filtered); tested count + all 13 values + TREND-before-REFRESH order
+- [x] S-019 · `unit:U-001` · `field` · `Config.REPORT_AGENT_MAX_TOOL_CALLS` · env, default 5 · `config.py:62` · **rust-target:** `Config::report_agent_max_tool_calls: u32` at `src/config.rs`; env `REPORT_AGENT_MAX_TOOL_CALLS`, default 5; tested default + env-override
+- [x] S-020 · `unit:U-001` · `field` · `Config.REPORT_AGENT_MAX_REFLECTION_ROUNDS` · env, default 2 · `config.py:63` · **rust-target:** `Config::report_agent_max_reflection_rounds: u32` at `src/config.rs`; env `REPORT_AGENT_MAX_REFLECTION_ROUNDS`, default 2; tested default
+- [x] S-021 · `unit:U-001` · `field` · `Config.REPORT_AGENT_TEMPERATURE` · env, default 0.5 · `config.py:64` · **rust-target:** `Config::report_agent_temperature: f64` at `src/config.rs`; env `REPORT_AGENT_TEMPERATURE`, default 0.5; tested default + env-override
+- [x] S-022 · `unit:U-001` · `method` · `Config.validate` · classmethod → list[str] of missing required vars · `config.py:67` · **rust-target:** `Config::validate_collect() -> Vec<String>` at `src/config.rs` (direct MiroFish contract: collect-all errors, empty=pass); `Config::validate() -> Result<()>` extended to call `validate_collect()` first and join errors (ZEP_API_KEY now enforced alongside LLM_API_KEY); tested: both-missing (2 errors), only-ZEP-missing, only-LLM-missing, both-present (0 errors), validate() returns Err when ZEP missing
 
 ---
 

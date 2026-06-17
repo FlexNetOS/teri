@@ -17,9 +17,9 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 1
-cycles_total: 11
-HANDOFF: (active session, resumed 2026-06-17) — [≠]-audit parity gate CLEARED. S-360/361/048 PASS as ported (20e2e48); S-356 FAILED the gate (dropped related_edges Part 2) -> ported the fix (get_neighbor_relations + directional relation lines, 2 tests) -> re-verified PASS. All 4 [≠]-audit symbols now [x]; U-006 + U-018 rollups re-affirmed clean. 335 green (+2). Next: ITERATE on extend-Y (U-024 ReportAgent ReACT / U-001 AppConfig / U-012 TaskManager).
+cycles_this_session: 2
+cycles_total: 12
+HANDOFF: (active session, resumed 2026-06-17) — cycle1: [≠]-audit gate CLEARED (S-360/361/048 PASS as ported; S-356 FAILED→ported related_edges Part2→re-verified PASS; all 4 [x]). cycle2: U-001 AppConfig PARTIAL extend-Y — 20 fields PASS [x] + S-001 [≠]; S-003/S-005 pending-U-002/U-003 (no axum surface yet); unit stays [~]. Fixed porter's flaky env-tests via ENV_LOCK mutex. [!] OWNER-FLAG: LLM_MODEL_NAME default gpt-4o-mini(src) vs gpt-4o(teri). 362 green (+27). Next: U-002/U-003 (axum serve — rolls up U-001) OR U-012 TaskManager OR U-005 locale.
 ledger: parity 8/50 units verified [x] (U-004, U-006, U-008, U-009, U-013, U-015, U-018, U-048) + GAP-1/2/6/U015-1/ACTION-TAXONOMY resolved; [≠]-audit symbol ports S-360/361/356/048 all [x] parity-verified (opus gate, resume 2026-06-17)   # 335 green
 # [≠] RE-AUDIT DONE (owner-flagged): 47 [≠] re-challenged under tightened bar (harness PR #34). 4 disguised
 #   skips ported [~]; S-189->U-012 + S-192->U-014 reclassified pending; Zep-SaaS/jitter/REFRESH/json-superset keep.
@@ -27,7 +27,7 @@ ledger: parity 8/50 units verified [x] (U-004, U-006, U-008, U-009, U-013, U-015
 #   never "destination won't use it". U-018 to_reddit/twitter_format/to_dict were wrongly [≠]-skipped ->
 #   PORTED. U-004 rotating-file logging same error -> reclassify extend-Y, port next. Audit other [≠].
 # U-023 sweep TODO (tracked, not lost): gender 中文-normalization (S-371), truncated-JSON salvage (S-360/361).
-symbols: ~32/1087 [x] + ~18 [≠] of 1087 mapped   # +S-360/361/356/048 [x] ([≠]-audit ports parity-verified 2026-06-17); +S-TAX-001..019,021 [x] (social Action taxonomy); S-TAX-020 REFRESH [≠]
+symbols: ~52/1087 [x] + ~19 [≠] of 1087 mapped   # +U-001 S-002/S-004/S-006..S-022 [x] (20) + S-001 [≠]; S-003/S-005 pending-U-002/U-003; +S-360/361/356/048 [x] ([≠]-audit, 2026-06-17); +S-TAX-001..019,021 [x] (social Action taxonomy); S-TAX-020 REFRESH [≠]
 gaps_open: GAP-OQ3-EMBED [!] (embedding generation: shimmy has no /v1/embeddings); GAP-U015-1 [!] (build() large-doc chunking after U-013); GAP-SOCIAL-WORLDSTATE [!] (rich social-world-state timeline/posts/engagement deferred to U-022/028/029/030)
 action_taxonomy: Action::Social(SocialAction) — 12 OASIS types (Trend included; Like/Dislike carry TargetKind{Post,Comment}); REFRESH [≠] (FILTERED_ACTIONS). READY for U-022/028/029/030.
 # TRUE BASELINE CORRECTION: DISCOVER baseline.md claimed 142 tests GREEN on c894de8 — FALSE-GREEN.

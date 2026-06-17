@@ -540,3 +540,61 @@ teri's structs carry no relationship fact text (read in full, `src/graph/mod.rs`
 
 ### U-018 rollup status (NOTE for orchestrator — not edited here)
 - S-356 was the LAST `- [~]` symbol in U-018. With S-356 → `- [x]`, U-018 is now **28 `- [x]` + 20 `- [≠]`, 0 `- [~]`/`- [!]`** → all symbols covered. **U-018 may roll up to unit `- [x]`** per the rollup rule. (Parity-ledger unit row not edited by this gate per contract.)
+
+---
+
+## 2026-06-17 · U-001 AppConfig — parity gate
+
+**Unit:** U-001 `backend/app/config.py:Config` → `teri::config` (`src/config.rs`). 22 symbols S-001..S-022.
+**Verdict:** PARTIAL PASS (20 PASS, 2 legit-pending). Unit **cannot roll up to `- [x]`** yet — S-003/S-005 are legitimate pending-dependency rows that stay `- [ ]`. Unit stays `- [~]` (partial).
+**Differential method:** read `config.py` in full (every field: env name, default, type) and `config.rs::Config::build` + `validate_collect`; exercised via 36 config unit tests (run single-threaded — see test-isolation note).
+
+### Per-symbol verdict (config.py vs config.rs)
+
+| Sym | Field | Source (config.py) | Rust (config.rs) | Verdict |
+|-----|-------|--------------------|--------------------|---------|
+| S-001 | project_root_env | `os.path.join(dirname,'../../.env')` + `load_dotenv(override=True)` else ambient (l.11-17) | `dotenvy::dotenv().ok()` in `Config::load()` (l.112) | **[≠](c) CONFIRMED superset** — see adjudication 1 |
+| S-002 | Config class | `class Config` (l.20) | `pub struct Config` (l.11) extend-Y | PASS |
+| S-003 | SECRET_KEY | env `SECRET_KEY` def `mirofish-secret-key` (l.24) | absent — pending-U-002/U-003 | **PENDING (legit)** — adjudication 2 |
+| S-004 | DEBUG | `FLASK_DEBUG`.lower()=='true', def `'True'` (l.25) | `FLASK_DEBUG` to_lowercase=="true", def `true` (l.231) | PASS |
+| S-005 | JSON_AS_ASCII | `False` (l.28) | absent — pending-U-002/U-003 | **PENDING (legit)** — adjudication 2 |
+| S-006 | LLM_API_KEY | env `LLM_API_KEY`, required (l.31) | `llm.api_key`; required in `validate_collect` (l.321) | PASS |
+| S-007 | LLM_BASE_URL | def `https://api.openai.com/v1` (l.32) | def `https://api.openai.com/v1` (l.188) | PASS |
+| S-008 | LLM_MODEL_NAME | env `LLM_MODEL_NAME`, def `gpt-4o-mini` (l.33) | `LLM_MODEL_NAME`→`LLM_MODEL`→def `gpt-4o` (l.181-183) | PASS (env-name+precedence) / **[!] default divergence flagged** — adjudication 3 |
+| S-009 | ZEP_API_KEY | env `ZEP_API_KEY`, required (l.36) | `Option<String>` `.ok()`; required in validate_collect (l.234,324) | PASS |
+| S-010 | MAX_CONTENT_LENGTH | `50*1024*1024` (l.39) | `50*1024*1024` (l.236) | PASS |
+| S-011 | UPLOAD_FOLDER | join(dirname,'../uploads') (l.40) | env `UPLOAD_FOLDER` def `./uploads` (l.237) | PASS (env-backed superset; relative-uploads dir equiv) |
+| S-012 | ALLOWED_EXTENSIONS | `{pdf,md,txt,markdown}` (l.41) | sorted Vec, exact 4 (l.171-177) | PASS (set semantics preserved) |
+| S-013 | DEFAULT_CHUNK_SIZE | `500` (l.44) | `500` (l.240) | PASS |
+| S-014 | DEFAULT_CHUNK_OVERLAP | `50` (l.45) | `50` (l.241) | PASS |
+| S-015 | OASIS_DEFAULT_MAX_ROUNDS | env, def `10` (l.48) | env `OASIS_DEFAULT_MAX_ROUNDS` def 10 (l.242) | PASS (default+override tested) |
+| S-016 | OASIS_SIMULATION_DATA_DIR | join(dirname,'../uploads/simulations') NOT env-backed (l.49) | env `OASIS_SIMULATION_DATA_DIR` def `./uploads/simulations` (l.246) | PASS (env-backed superset; default equiv) |
+| S-017 | OASIS_TWITTER_ACTIONS | 6 strings, source order (l.52-54) | exact 6 strings, source order (l.141-148) | PASS (count+all 6 tested) |
+| S-018 | OASIS_REDDIT_ACTIONS | 13 strings incl TREND+REFRESH, order (l.55-59) | exact 13, order, TREND<REFRESH (l.154-168) | PASS (count+all 13+order tested) |
+| S-019 | REPORT_AGENT_MAX_TOOL_CALLS | env, def `5` (l.62) | env, def 5 (l.250) | PASS (default+override tested) |
+| S-020 | REPORT_AGENT_MAX_REFLECTION_ROUNDS | env, def `2` (l.63) | env, def 2 (l.254) | PASS (default tested) |
+| S-021 | REPORT_AGENT_TEMPERATURE | env, def `0.5` (l.64) | env, def 0.5 (l.260) | PASS (default+override tested) |
+| S-022 | validate() | classmethod → `list[str]`; requires LLM_API_KEY+ZEP_API_KEY; empty=pass (l.67-74) | `validate_collect()->Vec<String>` (l.319), both required, empty=pass; `validate()` joins→Err (l.273) | PASS — contract match |
+
+### validate() contract check
+- Source (config.py:67-74): collect missing-var errors into a list; `run.py:28-34` prints all + `sys.exit(1)` if non-empty. Required: LLM_API_KEY, ZEP_API_KEY.
+- Rust: `validate_collect()` returns `Vec<String>` (both vars, empty=pass) — exact contract. `validate()` joins into `Err` (non-zero exit equivalent). Both branches + collect-all tested (both-missing→2, only-zep→1, only-llm→1, both-present→0, validate()→Err when zep missing). MATCH.
+- Keyless-CLI discipline: `--help`/`--version` parse before any `Config::load()`; load happens only in `run_cmd`/`serve_cmd` (main.rs:47,97). Preserved. **Wiring note (not a U-001 failure):** run/serve call `Config::load()` (which enforces LLM_API_KEY via ConfigMissing) but do NOT yet call `validate()`/`validate_collect()`, so ZEP_API_KEY is not yet enforced at runtime. The method+contract are ported & tested (S-022 PASS); wiring it into the run/serve preflight is downstream work — flag for orchestrator, does not block S-022.
+
+### Three borderline adjudications
+1. **S-001 project_root_env → `[≠]`(c) CONFIRMED.** teri DOES call `dotenvy::dotenv().ok()` in `Config::load()` (config.rs:112). dotenvy searches CWD and walks parent dirs for `.env` — a genuine SUPERSET of MiroFish's single explicit `MiroFish/.env` path + ambient fallback. The `.env` loading side effect is present and wider, no contractual observable output is dropped. Legit `[≠]` — NOT a disguised skip. **Confirm `[≠]`.**
+2. **S-003 SECRET_KEY & S-005 JSON_AS_ASCII → legit PENDING, stay `- [ ]`.** teri has axum in Cargo.toml but **NO live HTTP/JSON surface today**: `serve_cmd` (main.rs:92-102) loads config, logs, then returns `TeriError::Unknown("API server not yet implemented")`; api/streaming.rs has zero `Router`/`route`/`axum::serve`/`Json(`/`TcpListener`. So neither a Flask-session secret (S-003) nor a JSON-encoder ASCII flag (S-005) has any observable surface — both are genuinely non-contractual until the axum server/HTTP-JSON encoder exists (U-002/U-003). NOT a drop: recorded with `pending-U-002/U-003` note. **Stay `- [ ]`.** (Had a live `serve` route existed, these would be drops requiring port-now — verified it does not.)
+3. **LLM_MODEL_NAME default divergence (S-008) → `[!]` OWNER-VISIBILITY flag, defensible.** MiroFish default `gpt-4o-mini`; teri default `gpt-4o` (architect decision). The env NAME `LLM_MODEL_NAME` and read-precedence ARE ported correctly (PASS for the symbol's env-binding contract). The default value differs — an observable behavioral difference when neither `LLM_MODEL_NAME` nor `LLM_MODEL` is set. This is a destination-architecture choice (teri targets shimmy/OpenAI-compat endpoints, picks its own default), which is legal as an `[!]`-flagged divergence — NOT a banned `[≠]`-because-dest-wont-use-it, and NOT a silent downgrade (it is documented in config.rs:64-69 and symbol-map S-008). **Surfaced for OWNER decision**, not silently accepted. If owner wants strict parity, change teri default to `gpt-4o-mini`; otherwise the `[!]` flag stands.
+
+### Test-isolation defect (NOTE — not a parity failure)
+Porter claimed 362 passed / 0 failed. Under default parallel `cargo test`, `config::tests::test_debug_env_false` FAILS (config.rs:354) due to a **global-env-var race**: many config tests mutate process env (`FLASK_DEBUG`, `UPLOAD_FOLDER`, etc.) concurrently. Single-threaded (`--test-threads=1`): **36/36 config tests pass; 353/353 lib tests pass.** The Config LOGIC is correct (proven single-threaded); the tests are not serialized (`serial_test`/mutex). This is a test-hygiene defect to fix (route to porter as a test-quality follow-up), but it does NOT change any per-symbol parity verdict.
+
+### Symbol-map mutations applied (this gate)
+- S-001 → `[≠]` confirmed (already `[≠]`; left as-is, superset verified).
+- S-002, S-004, S-006..S-022 → `- [~]` flipped to `- [x]` (20 symbols PASS).
+- S-003, S-005 → left `- [ ]` with pending-U-002/U-003 note (legit pending-dep).
+- No source/Rust files edited. No commit.
+
+### U-001 rollup status (NOTE for orchestrator — parity-ledger row NOT edited here)
+- Coverage: 1 `[≠]` (S-001) + 20 `[x]` (S-002,S-004,S-006..S-022) + **2 `- [ ]` legit-pending (S-003,S-005)**.
+- Rollup rule: unit `- [x]` requires EVERY symbol `[x]`/`[≠]`. With S-003/S-005 legitimately `- [ ]`, **U-001 CANNOT roll up to `- [x]` yet → stays `- [~]` (partial)**. It rolls up only after U-002/U-003 (axum HTTP layer) ports SECRET_KEY + JSON_AS_ASCII.
