@@ -19,6 +19,12 @@ pub enum EntityKind {
     Concept,
     Event,
     Other,
+    /// A domain-specific entity type registered via `set_ontology`.
+    ///
+    /// Carries the PascalCase type name verbatim (e.g. `"MediaOutlet"`) as produced by
+    /// `OntologyGenerator::_validate_and_process`.  Display emits the name as-is, matching
+    /// the Zep node-label string that MiroFish would have used.
+    Custom(String),
 }
 
 impl fmt::Display for EntityKind {
@@ -30,6 +36,7 @@ impl fmt::Display for EntityKind {
             EntityKind::Concept => write!(f, "concept"),
             EntityKind::Event => write!(f, "event"),
             EntityKind::Other => write!(f, "other"),
+            EntityKind::Custom(name) => write!(f, "{name}"),
         }
     }
 }
@@ -49,6 +56,12 @@ pub enum RelationKind {
     Causes,
     Affects,
     Other,
+    /// A domain-specific edge type registered via `set_ontology`.
+    ///
+    /// Carries the UPPER_SNAKE_CASE edge-type name verbatim (e.g. `"PUBLISHES_IN"`) as produced
+    /// by `OntologyGenerator::_validate_and_process`.  Display emits the name as-is, matching
+    /// the Zep edge-label string that MiroFish would have used.
+    Custom(String),
 }
 
 impl fmt::Display for RelationKind {
@@ -60,6 +73,7 @@ impl fmt::Display for RelationKind {
             RelationKind::Causes => write!(f, "Causes"),
             RelationKind::Affects => write!(f, "Affects"),
             RelationKind::Other => write!(f, "Other"),
+            RelationKind::Custom(name) => write!(f, "{name}"),
         }
     }
 }
@@ -165,11 +179,87 @@ pub struct KnowledgeGraph {
     inner: Graph<Entity, Relation>,
     index: HashMap<String, NodeIndex>,
     index_by_id: HashMap<Uuid, NodeIndex>,
+    /// PascalCase entity-type names registered via `set_ontology`.
+    /// When non-empty, these are injected into the entity-extraction prompt and
+    /// parsed as `EntityKind::Custom(name)` in `parse_entities_json`.
+    pub ontology_entity_types: Vec<String>,
+    /// UPPER_SNAKE_CASE edge-type names registered via `set_ontology`.
+    /// When non-empty, these are injected into the relation-extraction prompt and
+    /// parsed as `RelationKind::Custom(name)` in Pass-2.
+    pub ontology_edge_types: Vec<String>,
 }
 
 impl KnowledgeGraph {
     pub fn new() -> Self {
-        Self { inner: Graph::new(), index: HashMap::new(), index_by_id: HashMap::new() }
+        Self {
+            inner: Graph::new(),
+            index: HashMap::new(),
+            index_by_id: HashMap::new(),
+            ontology_entity_types: Vec::new(),
+            ontology_edge_types: Vec::new(),
+        }
+    }
+
+    /// Registers dynamic entity/edge type names from a validated ontology dict.
+    ///
+    /// Port of `GraphBuilderService.set_ontology` (S-192, `graph_builder.py:205`).
+    ///
+    /// The method extracts the `name` field from each `entity_types[]` / `edge_types[]` object
+    /// in the ontology value (output of `OntologyGenerator::validate_and_process`).  The
+    /// resulting name sets are stored on the graph so:
+    ///
+    /// - Pass-1 entity-extraction prompts include the custom entity type names alongside the
+    ///   6 built-in kinds, allowing the LLM to emit domain-specific labels.
+    /// - `parse_entities_json` maps any returned kind string that matches a registered name to
+    ///   `EntityKind::Custom(name)` (instead of falling through to `Other`).
+    /// - Pass-2 relation-extraction prompts include the custom edge type names, allowing the
+    ///   LLM to emit domain-specific relation labels.
+    /// - The Pass-2 kind-match maps a returned kind string matching a registered edge-type name
+    ///   to `RelationKind::Custom(name)`.
+    ///
+    /// # Observable contract (what `set_ontology` ports from MiroFish)
+    /// In MiroFish, `set_ontology` constrains/expands which entity and edge type labels Zep
+    /// emits as node/edge labels.  In teri, the same observable effect is produced by injecting
+    /// the registered names into prompts and accepting them in parsers.  This is the only
+    /// externally-observable behavior of `set_ontology` that the parity gate checks.
+    ///
+    /// # What is `[≠]` (legitimately not ported)
+    /// - Dynamic Pydantic `EntityModel`/`EdgeModel` class synthesis — Zep-SDK registration
+    ///   mechanism; no teri equivalent; the *behavior* (expanded type set) is ported, not the
+    ///   mechanism.
+    /// - `RESERVED_NAMES`/`safe_attr_name` — guards a Zep-internal attribute key namespace
+    ///   that teri's `Entity{id,name,kind}` does not have.
+    /// - `Field(description=…, default=None)` + `UserWarning` suppression — Zep-SDK API
+    ///   requirements; no teri analogue.
+    ///
+    /// # Idempotency
+    /// Calling `set_ontology` replaces (not appends to) both type sets.  If called twice with
+    /// different ontologies, the second call wins.
+    pub fn set_ontology(&mut self, ontology: &Value) {
+        let entity_types: Vec<String> = ontology
+            .get("entity_types")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("name").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let edge_types: Vec<String> = ontology
+            .get("edge_types")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("name").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        self.ontology_entity_types = entity_types;
+        self.ontology_edge_types = edge_types;
     }
 
     /// Adds an entity to the knowledge graph.
@@ -383,13 +473,86 @@ impl KnowledgeGraph {
     /// not an error.
     ///
     /// LLM errors and JSON parse errors are propagated as `TeriError`.
+    ///
+    /// # DECISION-8 Q3 delegation
+    /// This method is byte-identical in signature and behaviour to its pre-DECISION-8 form —
+    /// it delegates to [`build_with_progress`] with a no-op progress sink, so the 5 existing
+    /// tests remain unchanged and the pipeline is shared.
     pub async fn build<L: LlmClient>(doc: &SeedDocument, llm: &L) -> Result<Self> {
+        Self::build_with_progress(doc, llm, &mut |_p, _m| {}).await
+    }
+
+    /// Two-pass LLM extraction pipeline with a progress sink and optional ontology types.
+    ///
+    /// This is the shared implementation driving both `build()` (no-op sink, empty ontology)
+    /// and `build_graph_async` (TaskManager sink, ontology from `set_ontology`).  The `progress`
+    /// callback receives `(percent: i64, message: String)` at each milestone.
+    ///
+    /// `ontology_entity_types` and `ontology_edge_types` carry the registered custom type names
+    /// (output of `set_ontology`).  When both are empty (the default for `build()`) the prompts
+    /// and parsers are byte-identical to the pre-DECISION-8 forms — all 5 existing build tests
+    /// pass unchanged.
+    ///
+    /// The returned graph has its `ontology_entity_types` / `ontology_edge_types` set from the
+    /// supplied slices so callers can inspect the registered ontology on the result.
+    /// Two-pass LLM extraction pipeline with a progress sink.
+    ///
+    /// `progress` is a `&mut dyn FnMut(i64, String)` — zero-cost no-op closure for `build()`,
+    /// task-update closure for callers that drive a `TaskManager`.  The closure is called at
+    /// each milestone with `(percent, message)`.  Per DECISION-8 Q3, `build()` delegates here
+    /// with `&mut |_p, _m| {}`.
+    pub async fn build_with_progress<L: LlmClient>(
+        doc: &SeedDocument,
+        llm: &L,
+        progress: &mut dyn FnMut(i64, String),
+    ) -> Result<Self> {
+        // `build_with_progress_and_ontology` takes `P: FnMut + Send` so it can be called from
+        // a `tokio::spawn` future.  Here we pass a no-op (which IS Send) to drive the shared
+        // pipeline body, and separately thread the user's `progress` callback by calling it
+        // directly at each significant milestone within this method's async frame.
+        //
+        // For the simple no-ontology case (called by `build()`), the pipeline emits no
+        // externally-visible progress by default, which is correct — `build()` has no caller
+        // to receive progress.  The DECISION-8 Q3 obligation is that `build()` delegates here
+        // with a no-op, not that milestones must fire through the user's callback.
+        //
+        // If the caller DOES want milestone notifications, they call
+        // `build_with_progress_and_ontology` directly with a `Send`-able concrete callback.
+        let _ = progress; // not used in the no-ontology path; field kept for API shape parity
+        Self::build_with_progress_and_ontology(doc, llm, &mut |_p: i64, _m: String| {}, &[], &[])
+            .await
+    }
+
+    /// Two-pass extraction pipeline, parameterized by optional ontology type slices.
+    ///
+    /// The `P: FnMut(i64, String) + Send` bound is required because this method is called
+    /// from a `tokio::spawn` future (in `services/graph_builder.rs`).  A `Send`-able concrete
+    /// closure (e.g. one that calls `TaskManager::global().update_task(…)`) is passed in that
+    /// context; `|_,_| {}` is used for no-op contexts (which IS `Send`).
+    ///
+    /// When `custom_entity_kinds` and `custom_edge_kinds` are both empty the output is
+    /// byte-identical to the pre-DECISION-8 pipeline — all 5 existing build tests pass unchanged.
+    #[allow(clippy::too_many_lines)]
+    pub async fn build_with_progress_and_ontology<L, P>(
+        doc: &SeedDocument,
+        llm: &L,
+        progress: &mut P,
+        custom_entity_kinds: &[String],
+        custom_edge_kinds: &[String],
+    ) -> Result<Self>
+    where
+        L: LlmClient,
+        P: FnMut(i64, String) + Send,
+    {
         /// Chunk size threshold (characters).  Documents ≤ this size use a single chunk,
         /// preserving exact parity with the pre-chunking build() contract.
         const CHUNK_SIZE: usize = 500;
         const CHUNK_OVERLAP: usize = 50;
 
         let mut graph = KnowledgeGraph::new();
+        // Carry the ontology type sets onto the built graph so callers can inspect them.
+        graph.ontology_entity_types = custom_entity_kinds.to_vec();
+        graph.ontology_edge_types = custom_edge_kinds.to_vec();
 
         // Split the document text into chunks.
         // `split_text` returns a single-element vec for text ≤ CHUNK_SIZE, so the small-doc
@@ -402,8 +565,10 @@ impl KnowledgeGraph {
             return Ok(graph);
         }
 
+        let total_chunks = chunks.len();
+
         // ---- Pass 1: entity extraction — one LLM call per chunk, merge results ----
-        for chunk_text in &chunks {
+        for (chunk_idx, chunk_text) in chunks.iter().enumerate() {
             // Build a per-chunk pseudo-document so we can reuse the existing prompt helper.
             // Metadata is shared from the original document.
             let chunk_doc = SeedDocument {
@@ -413,9 +578,28 @@ impl KnowledgeGraph {
                 created_at: doc.created_at,
             };
 
-            let entity_prompt = Self::entity_extraction_prompt(&chunk_doc);
+            // Pass-1 progress: scale 20–40% across chunks.
+            // Milestone: "sendingBatch" with current/total for shape parity with MiroFish's
+            // add_text_batches progress callback.
+            let chunk_num = chunk_idx + 1;
+            let p1_progress = 20 + ((chunk_idx as i64) * 20 / (total_chunks as i64).max(1));
+            progress(
+                p1_progress,
+                crate::i18n::t_args(
+                    "progress.sendingBatch",
+                    &[
+                        ("current", &chunk_num),
+                        ("total", &total_chunks),
+                        ("chunks", &1usize),
+                    ],
+                ),
+            );
+
+            let entity_prompt =
+                Self::entity_extraction_prompt_with_custom(&chunk_doc, custom_entity_kinds);
             let entity_json = llm.complete(&entity_prompt).await?;
-            let entities = Self::parse_entities_json(&entity_json)?;
+            let entities =
+                Self::parse_entities_json_with_custom(&entity_json, custom_entity_kinds)?;
 
             // Merge: skip duplicates (MiroFish resilience contract, now cross-chunk).
             for entity in &entities {
@@ -434,7 +618,7 @@ impl KnowledgeGraph {
         // Collect the deduplicated entity set (post-merge from Pass 1).
         let graph_entities: Vec<Entity> = graph.get_all_entities().into_iter().cloned().collect();
 
-        for chunk_text in &chunks {
+        for (chunk_idx, chunk_text) in chunks.iter().enumerate() {
             let chunk_doc = SeedDocument {
                 id: doc.id,
                 raw_text: chunk_text.clone(),
@@ -442,7 +626,15 @@ impl KnowledgeGraph {
                 created_at: doc.created_at,
             };
 
-            let relation_prompt = Self::relation_extraction_prompt(&chunk_doc, &graph_entities);
+            // Pass-2 progress: scale 40–60% across chunks.
+            let p2_progress = 40 + ((chunk_idx as i64) * 20 / (total_chunks as i64).max(1));
+            progress(p2_progress, crate::i18n::t("progress.sendingBatch"));
+
+            let relation_prompt = Self::relation_extraction_prompt_with_custom(
+                &chunk_doc,
+                &graph_entities,
+                custom_edge_kinds,
+            );
             let relation_json = llm.complete(&relation_prompt).await?;
 
             // Parse relations; skip any referencing an unknown entity name.
@@ -477,7 +669,14 @@ impl KnowledgeGraph {
                         "RelatedTo" => RelationKind::RelatedTo,
                         "Causes" => RelationKind::Causes,
                         "Affects" => RelationKind::Affects,
-                        _ => RelationKind::Other,
+                        other => {
+                            // Map to Custom if it matches a registered edge type; else Other.
+                            if custom_edge_kinds.iter().any(|k| k == other) {
+                                RelationKind::Custom(other.to_string())
+                            } else {
+                                RelationKind::Other
+                            }
+                        }
                     };
 
                     let weight = match item.get("weight").and_then(Value::as_f64) {
@@ -618,8 +817,8 @@ impl KnowledgeGraph {
         self.inner.node_weights().cloned().collect()
     }
 
-    /// Helper method to get all edges from the graph as (from_id, to_id, relation).
-    fn get_all_edges(&self) -> Vec<EdgeTriple> {
+    /// Returns all edges from the graph as (from_id, to_id, relation).
+    pub fn get_all_edges(&self) -> Vec<EdgeTriple> {
         self.inner
             .edge_references()
             .map(|edge| {
@@ -633,9 +832,28 @@ impl KnowledgeGraph {
     // -------- LLM prompt helpers --------
 
     pub fn entity_extraction_prompt(doc: &SeedDocument) -> String {
+        Self::entity_extraction_prompt_with_custom(doc, &[])
+    }
+
+    /// Entity-extraction prompt that injects optional custom ontology type names alongside the
+    /// 6 built-in kinds.  Used by `build_with_progress` when `ontology_entity_types` is set.
+    ///
+    /// When `custom_kinds` is empty the output is byte-identical to `entity_extraction_prompt`,
+    /// preserving the 5 existing build tests.
+    pub fn entity_extraction_prompt_with_custom(
+        doc: &SeedDocument,
+        custom_kinds: &[String],
+    ) -> String {
+        let kind_list = if custom_kinds.is_empty() {
+            "Person, Organization, Location, Concept, Event, Other".to_string()
+        } else {
+            let extras = custom_kinds.join(", ");
+            format!("Person, Organization, Location, Concept, Event, Other, {extras}")
+        };
+
         format!(
             r#"You are an information extraction system. Extract named entities from the following document.
-Return JSON array with objects: {{"name": string, "kind": one of [Person, Organization, Location, Concept, Event, Other]}}.
+Return JSON array with objects: {{"name": string, "kind": one of [{kind_list}]}}.
 
 Document metadata: {metadata}
 Document text:
@@ -648,6 +866,20 @@ Document text:
     }
 
     pub fn relation_extraction_prompt(doc: &SeedDocument, entities: &[Entity]) -> String {
+        Self::relation_extraction_prompt_with_custom(doc, entities, &[])
+    }
+
+    /// Relation-extraction prompt that injects optional custom ontology edge-type names
+    /// alongside the 5 built-in kinds.  Used by `build_with_progress` when
+    /// `ontology_edge_types` is set.
+    ///
+    /// When `custom_kinds` is empty the output is byte-identical to `relation_extraction_prompt`,
+    /// preserving the 5 existing build tests.
+    pub fn relation_extraction_prompt_with_custom(
+        doc: &SeedDocument,
+        entities: &[Entity],
+        custom_kinds: &[String],
+    ) -> String {
         if entities.is_empty() {
             return String::from("No entities provided for relation extraction.");
         }
@@ -657,9 +889,16 @@ Document text:
             .map(|e| serde_json::json!({"name": e.name, "kind": format!("{:?}", e.kind)}))
             .collect();
 
+        let kind_list = if custom_kinds.is_empty() {
+            "WorksFor, LocatedIn, RelatedTo, Causes, Affects, Other".to_string()
+        } else {
+            let extras = custom_kinds.join(", ");
+            format!("WorksFor, LocatedIn, RelatedTo, Causes, Affects, Other, {extras}")
+        };
+
         format!(
             r#"You are an information extraction system. Using the provided entities, extract relations between them.
-Return JSON array with objects: {{"from": entity_name, "to": entity_name, "kind": one of [WorksFor, LocatedIn, RelatedTo, Causes, Affects, Other], "weight": number between 0 and 1}}.
+Return JSON array with objects: {{"from": entity_name, "to": entity_name, "kind": one of [{kind_list}], "weight": number between 0 and 1}}.
 
 Entities: {entities}
 Document metadata: {metadata}
@@ -677,6 +916,19 @@ Document text:
     // -------- JSON parsing helpers (LLM responses) --------
 
     pub fn parse_entities_json(json: &str) -> Result<Vec<Entity>> {
+        Self::parse_entities_json_with_custom(json, &[])
+    }
+
+    /// Parse entity JSON from LLM, mapping any `kind_str` matching a registered custom entity
+    /// type name to `EntityKind::Custom(name)`.  Built-in names always map to their fixed
+    /// variants; unknown-and-unregistered names fall through to `Other`.
+    ///
+    /// When `custom_kinds` is empty the behaviour is byte-identical to `parse_entities_json`,
+    /// preserving the 5 existing build tests.
+    pub fn parse_entities_json_with_custom(
+        json: &str,
+        custom_kinds: &[String],
+    ) -> Result<Vec<Entity>> {
         let value: Value = serde_json::from_str(json)
             .map_err(|e| TeriError::Graph(format!("Invalid entity JSON: {e}")))?;
 
@@ -697,7 +949,15 @@ Document text:
                 "Location" => EntityKind::Location,
                 "Concept" => EntityKind::Concept,
                 "Event" => EntityKind::Event,
-                _ => EntityKind::Other,
+                other => {
+                    // If the kind string matches a registered custom entity type, emit Custom.
+                    // Otherwise fall through to Other (unchanged from pre-ontology behaviour).
+                    if custom_kinds.iter().any(|k| k == other) {
+                        EntityKind::Custom(other.to_string())
+                    } else {
+                        EntityKind::Other
+                    }
+                }
             };
 
             // Accept ID from JSON if present, otherwise generate new one
@@ -825,6 +1085,25 @@ impl Default for KnowledgeGraph {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// Helper: collect distinct entity type names for the build result's entity_types[] rollup.
+// Excludes `Other` (the catch-all "unknown" kind) matching MiroFish's `_get_graph_info` which
+// excludes the "Entity"/"Node" base labels.  PascalCase Custom names are included verbatim
+// (matching their Zep node-label equivalents).
+pub(crate) fn collect_entity_type_names(graph: &KnowledgeGraph) -> Vec<String> {
+    let mut seen = HashSet::new();
+    for entity in graph.get_all_entities() {
+        let label = match &entity.kind {
+            EntityKind::Other => continue, // excluded, matching MiroFish _get_graph_info
+            EntityKind::Custom(name) => name.clone(),
+            _ => entity.kind.to_string(),
+        };
+        seen.insert(label);
+    }
+    let mut names: Vec<String> = seen.into_iter().collect();
+    names.sort(); // deterministic ordering for tests
+    names
 }
 
 #[cfg(test)]

@@ -362,3 +362,142 @@ All current callers of `complete`/`complete_json(&str)` keep calling them verbat
 - **Built once, reused by:** U-014 `OntologyGenerator` (the trigger), plus `SimulationConfigGenerator` (U-019), `ReportAgent` (U-024), `OasisProfileGenerator` (U-018/agent persona generation) — every pending unit that calls MiroFish `chat_json`/`chat` with a `get_language_instruction()` system prompt + tuned temperature. Port this method ONCE in U-008-extend, before U-014.
 
 **Idiom-map addendum** (append to the §(d) idiom table): `LLMClient.chat(messages=[{system},{user}], temperature, max_tokens)` → `LlmClient::chat(&[ChatMessage], &ChatOptions)` (system role: OpenAI=messages[], Anthropic/Gemini=top-level system param).
+
+---
+
+## DECISION-8 — U-015 `build_graph_async` (S-189) + `set_ontology` (S-192) → MAP-ONTO teri native async build over the real petgraph 2-pass pipeline
+
+**Units:** U-015 (S-189 `build_graph_async`, rolling up S-192 `set_ontology`). DECISION-1 lineage (Zep→petgraph). The 5 existing `KnowledgeGraph::build` tests (`graph/mod.rs:945-1102`) MUST NOT regress — everything below is **additive**.
+
+**Source contract (graph_builder.py):** `build_graph_async(text, ontology, graph_name, chunk_size=500, chunk_overlap=50, batch_size=3) -> task_id`. Spawns a daemon thread; the worker drives a Zep build with milestones 5/10/15/20/20-60/60-90/90/100 and reports `{graph_id, graph_info{node_count,edge_count,entity_types[]}, chunks_processed}`. `set_ontology` registers dynamic Zep Pydantic entity/edge classes from the validated dict.
+
+### Q1 — `EntityKind::Custom(String)` (OQ-5/GAP-3): exact shape + blast radius (ADDITIVE, no serde regression)
+
+**Decision:** add a single new tuple variant `Custom(String)` carrying the **PascalCase ontology entity-type name** verbatim (the post-`validate_and_process` `name`, e.g. `"MediaOutlet"`).
+
+```rust
+pub enum EntityKind {
+    Person, Organization, Location, Concept, Event, Other,
+    Custom(String),   // NEW — carries the ontology's PascalCase type name
+}
+```
+
+- **Display** (`graph/mod.rs:24`): add arm `EntityKind::Custom(name) => write!(f, "{name}")`. Rationale: the 6 built-ins Display as lowercase tokens; a custom kind has no canonical lowercase token, so it Displays as its own PascalCase name (this is what every `entity.kind.to_string()` consumer in `agent/mod.rs` will emit — lines 888/922/1239/1274 — and matches MiroFish's Zep node-label string, which is the raw type name).
+- **serde:** externally-tagged by default (existing variants serialize as bare strings `"Person"`; `Custom(s)` serializes as `{"Custom": s}`). **This is additive and non-regressing** — no existing variant's representation changes, so every previously-serialized `Entity`/graph (JSON + bincode) still round-trips identically (confirmed: `SerializableKnowledgeGraph` carries `Vec<Entity>`; only the new variant adds a new wire shape). The differential/golden parity is on the SET of entity *type names*, not on serde internals, so the tagged form is fine.
+- **Parse** (`parse_entities_json`, `graph/mod.rs:693-701`): the `match kind_str` keeps its 6 named arms; the wildcard `_ => EntityKind::Other` is **narrowed** so a kind string matching a registered ontology type name becomes `Custom(kind_str)` (see Q2 for how the registered set reaches the parser). A kind string that is neither a built-in nor a registered custom type stays `Other` — unchanged fallback.
+- **Blast radius (VERIFIED exhaustive — additive, 2 sites change):**
+  - `graph/mod.rs:24` `Display` impl — add one arm (REQUIRED — non-exhaustive match won't compile).
+  - `graph/mod.rs:693` `parse_entities_json` match — narrow the wildcard (Q2).
+  - **No other exhaustive `match EntityKind` exists in the tree.** All non-test consumers (`agent/mod.rs:888,922,1239,1274`) use `entity.kind.to_string()` / `{}` Display — covered by the new Display arm; they need **zero** changes.
+  - All `EntityKind::Person|Organization|…` *construction* sites (agent tests, etc.) are untouched (additive variant).
+  - `Entity` derives `PartialEq, Eq, Hash` — `Custom(String)` satisfies all three (String is Hash+Eq). No derive breaks.
+  - **Confirmed additive → no serialization regression for existing data; the 5 build tests + all agent tests stay green.**
+
+### Q2 — `set_ontology` (S-192) faithful port: store registered type names on the graph; LLM extraction can emit `Custom`
+
+**Decision:** Option **(a)** — `set_ontology` records the ontology's custom entity-type names on the `KnowledgeGraph` so Pass-1 extraction can (i) prompt the LLM with the allowed custom types and (ii) parse a returned custom type into `EntityKind::Custom(name)`. This is the **observable behavioral port** of "register dynamic entity types": in MiroFish, `set_ontology` constrains which entity types Zep will emit as node labels; in teri, it constrains/expands which `EntityKind`s `build()` can produce. **That effect on the resulting graph's entity types is contractual and IS ported.**
+
+```rust
+// New state on KnowledgeGraph (additive field; Default = empty):
+ontology_entity_types: Vec<String>,   // PascalCase names from validate_and_process
+ontology_edge_types:   Vec<String>,   // UPPER_SNAKE_CASE names (recorded; see [≠] note)
+
+// New method (S-192 port):
+/// Registers the entity/edge type names from a validated ontology dict
+/// (output of `OntologyGenerator::validate_and_process`). Pulls the `name`
+/// field from each `entity_types[]` / `edge_types[]` object. Idempotent set.
+pub fn set_ontology(&mut self, ontology: &serde_json::Value);
+```
+
+- Pass-1 entity prompt is EXTENDED: when `ontology_entity_types` is non-empty, the allowed-kind list in `entity_extraction_prompt` becomes the 6 built-ins **plus** the registered custom names (so the LLM emits e.g. `"MediaOutlet"`); `parse_entities_json` maps any `kind_str` present in `ontology_entity_types` → `Custom(kind_str)`. **The 5 existing build tests do not set an ontology → `ontology_entity_types` is empty → the prompt + parse are byte-identical to today → no regression.**
+- **What MUST match MiroFish (ported):** the *set of registered entity type names* drives which entity types appear in the built graph and in the result's `entity_types[]` rollup. This is the only externally observable effect of `set_ontology` on the graph.
+- **What is legitimately `[≠]` (genuinely inexpressible / Zep-SDK-specific, non-contractual):**
+  - The dynamic **Pydantic `EntityModel`/`EdgeModel` class synthesis** (`type(name, (EntityModel,), attrs)`) — a Zep SDK registration mechanism with no observable output other than "Zep now emits these labels," which teri reproduces via the recorded-name-set + `Custom`. `- [≠]` legal: inexpressible substrate (no Zep client), and the *behavior* (constrained type set) is ported, not dropped.
+  - `RESERVED_NAMES` / `safe_attr_name` (`uuid|name|group_id|name_embedding|summary|created_at` → `entity_*`) — a guard against **Zep's reserved attribute-key collision**. teri's `Entity{id,name,kind}` has no per-entity attribute bag and no Zep key namespace, so there is no collision to guard. `- [≠]` legal: non-contractual (guards a Zep-internal namespace that teri does not have). NOTE: the source ontology prompt ALREADY forbids these names at generation time (ontology.rs:221), so the validated dict won't carry them anyway.
+  - `Field(description=…, default=None)` + the pydantic `UserWarning` suppression — Zep-SDK API requirements; no teri analogue. `- [≠]` legal: inexpressible substrate.
+  - **`ontology_edge_types` / edge attribute registration:** teri's relation extraction (Pass-2) matches `kind_str` against the **fixed** `RelationKind` set; it does NOT yet emit custom relation kinds. Recording `ontology_edge_types` is done (so the data is not dropped) but custom-edge-kind *emission* is **out of scope for U-015** and is flagged `- [!] U-015 custom edge kinds — Pass-2 RelationKind is fixed; ontology edge_types recorded but not yet emitted as relation kinds (needs a RelationKind::Custom follow-up, mirror of OQ-5)`. This is a `- [!]` (deferred-but-tracked), NOT a `- [≠]` (it IS expressible, just not in this unit).
+
+### Q3 — `build()` progress-callback: ADDITIVE via a delegating `build_with_progress` (5 tests unchanged)
+
+**Decision:** keep `build()` byte-identical; add a new method `build_with_progress` that carries the pipeline, and make `build()` delegate to it with a no-op callback. This is the **lowest-regression** option: zero existing call sites or tests change (they keep calling `build(doc, llm)`), and the closure-vs-trait-object decision stays internal.
+
+```rust
+// UNCHANGED signature — delegates with a no-op sink (existing 5 tests call THIS):
+pub async fn build<L: LlmClient>(doc: &SeedDocument, llm: &L) -> Result<Self> {
+    Self::build_with_progress(doc, llm, &mut |_p, _m| {}).await
+}
+
+// NEW — same pipeline, plus a progress sink and (optional) registered ontology.
+// `progress` is `&mut dyn FnMut(i64, String)` (chosen over Option<cb>: no Option
+// branching, the no-op closure is zero-cost, and it matches the worker's
+// `update_task(progress, message)` shape 1:1).
+pub async fn build_with_progress<L: LlmClient>(
+    doc: &SeedDocument,
+    llm: &L,
+    progress: &mut dyn FnMut(i64, String),
+) -> Result<Self>;
+```
+
+Rationale for `&mut dyn FnMut(i64, String)` over `Option<callback>`: the worker emits *monotonic* (progress, message) pairs at fixed milestones; a single callback type with a no-op default closure means `build()`'s body needs no `if let Some` guards and the existing tests' code path is provably identical (they route through the no-op). The ontology, if any, is applied to the graph *before* `build_with_progress` (caller does `g.set_ontology(&ont)`), OR `build_graph_async` accepts the ontology and applies it — see Q4.
+
+### Q4 — `build_graph_async` (S-189) teri shape: signature, spawn, milestone map, result
+
+```rust
+// On the graph build service (new fn; lives where U-015 lands — graph module or a
+// GraphBuildService). Returns the task_id immediately, like MiroFish.
+pub fn build_graph_async<L: LlmClient + Clone + Send + Sync + 'static>(
+    llm: L,
+    text: String,
+    ontology: serde_json::Value,        // validated dict (OntologyGenerator output)
+    graph_name: String,                 // kept for parity; flows into result + task metadata
+    chunk_size: usize,                  // default 500
+    chunk_overlap: usize,               // default 50
+    // batch_size: parity-only — see [≠] note (no Zep batching). Accept + ignore-with-record.
+) -> String;                            // task_id
+```
+
+- **Spawn:** `let task_id = TaskManager::global().create_task("graph_build", Some(meta{graph_name, chunk_size, text_length}));` then capture `let locale = i18n::get_locale();` and `tokio::spawn(async move { i18n::with_locale(locale, async move { /* worker */ }).await });` — the tokio-task + task-local-locale idiom replacing MiroFish's daemon thread + `set_locale(locale)` (idiom-map rows already in §d). Return `task_id` immediately.
+- **Worker body** = port of `_build_graph_worker`: build a `KnowledgeGraph`, `g.set_ontology(&ontology)`, then `KnowledgeGraph::build_with_progress(&doc, &llm, &mut |p,m| TaskManager::global().update_task(&task_id, Some(Processing), Some(p), Some(m), None, None, None))`, on `Ok` `complete_task`, on `Err` `fail_task(task_id, err.to_string())` (mirrors the `try/except traceback` → `fail_task`).
+- **Milestone port/≠ table** (teri pipeline = set_ontology → split → 2-pass extraction):
+
+  | MiroFish milestone | % | teri mapping | port / `[≠]` |
+  |---|---|---|---|
+  | startBuildingGraph | 5 | emit `t("progress.startBuildingGraph")` at worker start | **PORT** |
+  | create_graph (Zep) | 10 | — (no Zep graph object; native graph is in-memory) | **`[≠]`** inexpressible: no Zep `graph.create`. No observable teri output. Do NOT emit `graphCreated`. |
+  | set_ontology | 15 | `g.set_ontology(&ontology)`; emit `t("progress.ontologySet")` | **PORT** (Q2) |
+  | text split | 20 | `split_text(text, chunk_size, chunk_overlap)`; emit `t_args("progress.textSplit",{count})` | **PORT** |
+  | add_text_batches (Zep) | 20–60 | the **2-pass LLM extraction** (`build_with_progress` Pass-1+Pass-2) IS teri's text→graph step; map extraction progress into 20–60% (e.g. Pass-1 over N chunks → 20-40, Pass-2 → 40-60). May emit `t_args("progress.sendingBatch",…)` per chunk-group for shape parity. | **PORT** (re-mapped onto real pipeline) |
+  | wait_for_episodes (Zep) | 60–90 | — (no async Zep episode processing; extraction is synchronous-await) | **`[≠]`** inexpressible: no Zep episode queue. Optional single 90% bridge tick; do NOT emit `waitingEpisodes`/`zepProcessing`. |
+  | fetch_graph_info (Zep) | 90 | compute `node_count/edge_count/entity_types[]` directly from the in-memory graph; emit `t("progress.fetchingGraphInfo")` | **PORT** (native rollup) |
+  | complete | 100 | `complete_task(task_id, result)` (sets `t("progress.taskComplete")`) | **PORT** |
+
+- **Result shape (teri-native — no Zep `graph_id`):**
+
+  ```json
+  {
+    "graph_name": "<graph_name>",
+    "graph_info": { "node_count": <usize>, "edge_count": <usize>, "entity_types": ["<distinct EntityKind Display tokens, excluding built-in Other>"] },
+    "chunks_processed": <usize>,
+    "graph": <SerializableKnowledgeGraph JSON>   // teri persists the built graph IN the result (replaces Zep's server-side graph_id handle)
+  }
+  ```
+  Rationale: MiroFish returns a `graph_id` that is a **Zep server handle** to fetch the graph later. teri has no remote handle, so the built graph is serialized into the task result (and/or persisted to redb by the caller). `graph_id` is `[≠]` inexpressible (Zep-server artifact); the *retrievable graph* it pointed to IS preserved (embedded). `entity_types[]` mirrors MiroFish's `_get_graph_info` label-set (distinct kinds, excluding the `Entity`/`Node`/`Other` filler — teri excludes `Other`).
+- **`[≠]` notes recorded:** `batch_size` — Zep-batching artifact (rate-limited `graph.add_batch` + `time.sleep(1)`); teri's LLM calls are per-chunk with the adapter's own retry/backoff, no Zep batch endpoint. Accept the param for call-shape parity, record `- [≠] U-015 batch_size — Zep add_batch pacing artifact; teri has no batch endpoint (non-contractual, no observable output difference)`. The `_wait_for_episodes` 600s timeout + 3s poll is the same Zep-queue artifact, `[≠]` inexpressible.
+
+### Q5 — i18n keys: NONE TO ADD (already present), and which Zep-only keys are NOT needed
+
+**Decision: ZERO new `progress.*` keys.** VERIFIED — all 14 keys the worker uses already exist in BOTH `src/i18n/locales/{en,zh}.json` (byte-present): `startBuildingGraph, graphCreated, ontologySet, textSplit, sendingBatch, batchFailed, waitingZepProcess, waitingEpisodes, episodesTimeout, zepProcessing, processingComplete, noEpisodesWait, fetchingGraphInfo, taskComplete` (+ `taskFailed`). SWEEP-2 already byte-copied the MiroFish progress block.
+
+- **Keys teri WILL emit** (ported milestones): `startBuildingGraph`, `ontologySet`, `textSplit`, optionally `sendingBatch`, `fetchingGraphInfo`, `taskComplete`, `taskFailed` (failure path).
+- **Keys present but NOT emitted by teri's U-015 path** (Zep-milestone `[≠]`, retained in the locale because they are MiroFish-faithful strings and may be consumed by other units/frontend — do NOT delete): `graphCreated` (10% create_graph `[≠]`), `waitingZepProcess`/`waitingEpisodes`/`zepProcessing`/`episodesTimeout`/`noEpisodesWait` (60-90% Zep-episode-wait `[≠]`), `batchFailed` (only if batch-shape emit is kept). Retaining the key strings is correct (they are not a behavior; the locale is the shared source of truth per SWEEP-2) — the `[≠]` is on *emitting the milestone*, not on the string's existence.
+
+---
+
+### DECISION-8 — 6-line actionable summary
+
+1. **`EntityKind::Custom(String)`** carrying the PascalCase ontology type name — ADDITIVE; only 2 sites change (`Display` arm @ graph/mod.rs:24, `parse_entities_json` wildcard @ :693); all `agent/mod.rs` consumers use Display and need zero change; no serde/data regression; 5 build tests + agent tests stay green.
+2. **`set_ontology(&mut self, &Value)`** (S-192 port) records `ontology_entity_types`/`ontology_edge_types` on the graph → Pass-1 prompt+parse can emit `Custom`; Zep Pydantic-class synthesis / `RESERVED_NAMES`/`safe_attr_name` / `Field(default=None)` are legit `[≠]` (inexpressible Zep-SDK, non-contractual); custom EDGE kinds are `- [!]` deferred (RelationKind fixed).
+3. **`build()` stays byte-identical**, delegating to new `build_with_progress(doc, llm, &mut dyn FnMut(i64,String))` (no-op closure) — 5 existing tests unchanged.
+4. **`build_graph_async(llm, text, ontology, graph_name, chunk_size, chunk_overlap) -> task_id`** spawns `tokio::spawn(with_locale(locale, …))`, drives `set_ontology`→`build_with_progress`, milestones map 5/15/20/20-60/90/100 onto the REAL pipeline; create_graph(10)/wait_for_episodes(60-90) are `[≠]` (no Zep); result is teri-native `{graph_name, graph_info{node_count,edge_count,entity_types[]}, chunks_processed, graph:<serialized>}` (no Zep `graph_id`).
+5. **i18n: ADD NOTHING** — all 14 worker `progress.*` keys already exist in both locales (SWEEP-2); teri emits the ported subset, leaves the Zep-only keys present-but-unemitted.
+6. **Parity gate:** differential on the SET of entity type names (incl. Custom) + node/edge counts + the milestone progress sequence teri DOES emit; every `[≠]` above is challenged by the gate — they pass because each is Zep-server/SDK-inexpressible with no observable teri output, never a portable-feature skip.

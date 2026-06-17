@@ -825,3 +825,47 @@ plus the full suite. Did NOT take the porter report on faith.
 
 ### Constraints honored
 - No source/Rust impl files edited. Only symbol-map S-098..S-137 flipped to `[x]` and this verdict appended.
+
+---
+
+## 2026-06-17 · U-015 completion · S-189 `build_graph_async` + S-192 `set_ontology` (+ EntityKind/RelationKind::Custom)
+
+**Verdict: PASS** (differential + structural). Unit U-015 → all symbols `- [x]`/`- [≠]`; rollup satisfied.
+**Verifier:** rust-port-parity-verifier (opus). **Build precondition:** 550 lib tests pass, 0 failed; clippy `--all-targets -D warnings` clean.
+
+**Type:** map-onto-substrate (DECISION-1/DECISION-8). Zep SaaS path is not runnable here; this is behavioral-equivalence of the mapped native petgraph pipeline, verified by reading both sides + running the teri differential tests (15 graph_builder, 46 graph, incl. 6 build tests).
+
+### S-189 `build_graph_async` → `services/graph_builder.rs::build_graph_async` — PASS
+Source: `graph_builder.py:54-98` (build_graph_async) + `:100-191` (_build_graph_worker). Rust: `src/services/graph_builder.rs:84` (async fn) + `:130` (worker) + `:164` (worker_inner).
+- **Spawn contract** (graph_builder.rs:96-122): creates `graph_build` task with metadata `{graph_name, chunk_size, text_length}` (matches py:78-85), captures `i18n::get_locale()` before spawn (matches py:88 `get_locale()`), `tokio::spawn(i18n::with_locale(locale, …))` (idiom thread+`set_locale`→task-local), returns task_id immediately. **Proven** by `test_build_graph_async_returns_task_id_immediately` (real spawn; task_id non-empty + in registry as `graph_build`).
+- **Worker lifecycle** = port of `_build_graph_worker` try/except: PROCESSING@5% → … → `complete_task` (Completed + `progress.taskComplete`) on Ok; `fail_task(err.to_string())` (Failed + `progress.taskFailed` + error string) on any Err. **Proven** by `test_build_graph_worker_inner_completes_with_result` (COMPLETED + result shape) and `test_build_graph_worker_inner_llm_failure_returns_err` (Err→fail_task→FAILED, error string propagates). `build_graph_worker` (spawn target, :130) calls the SAME `build_graph_worker_inner` (:141) the tests drive — coverage REFACTORED, not lost (scrutiny point #5 cleared).
+- **Milestone parity** (5/15/20/20-60/90/100): emitted via TaskManager; keys present in both locales with matching placeholders (`textSplit{count}`, `sendingBatch{current/total/chunks}`). 60% `waitingZepProcess` bridge correctly NOT emitted.
+- **Result shape:** `{graph_name, graph_info{node_count,edge_count,entity_types[]}, chunks_processed, graph:<serialized>}`. `graph_info` mirrors MiroFish `_get_graph_info.to_dict()`; the embedded `graph` is a STRICT SUPERSET of MiroFish's `graph_id` handle (the retrievable graph the handle pointed to is preserved inline, not dropped).
+
+### `[≠]` challenge — all three SURVIVE (genuinely Zep-inexpressible / non-contractual)
+- **10% create_graph (S-191):** `client.graph.create()` = Zep SaaS server-object creation returning a server `graph_id` handle. teri has no Zep client (DECISION-1); graph is in-memory; no remote object, no handle. `graphCreated{graphId}` is a pure Zep artifact. **Inexpressible substrate; no teri output dropped.** Legitimate `[≠]`.
+- **60-90% wait_for_episodes (S-194):** polls Zep's async episode-processing queue (3s poll/600s timeout). teri extraction is synchronous-await — no async server queue. **Inexpressible substrate.** Legitimate `[≠]`.
+- **`_batch_size` (S-193):** `add_text_batches` batches into `graph.add_batch` network calls with `time.sleep(1)` rate-limiting. teri makes per-chunk LLM calls with adapter retry/backoff — no Zep batch endpoint. Param accepted for call-shape parity, ignored. **Non-contractual** (no observable output difference; pure network-pacing artifact). Legitimate `[≠]`.
+None is a disguised portable-feature skip: each maps onto "no Zep client," not "teri won't use it." `graph_id` drop is compensated by embedding the graph (superset).
+
+### S-192 `set_ontology` → `KnowledgeGraph::set_ontology` — PASS (NOT inert — scrutiny point #1 cleared)
+Source: `graph_builder.py:205-292`. Rust: `src/graph/mod.rs:238`. Records `ontology_entity_types` + `ontology_edge_types` (name field from each `entity_types[]`/`edge_types[]`); idempotent (second call replaces).
+**The recorded names DO reach the build output for BOTH entities AND edges** (verified end-to-end):
+- entity prompt: `entity_extraction_prompt_with_custom` injects names into kind_list (graph/mod.rs:850).
+- entity parser: `parse_entities_json_with_custom` maps registered name → `Custom` (`:955`); built-in name still maps to built-in (`:947-951`); unknown-unregistered → `Other` (`:957`).
+- edge prompt: `relation_extraction_prompt_with_custom` injects edge names (`:895`).
+- edge parser: inline Pass-2 match maps registered edge name → `RelationKind::Custom` (`:672-679`); built-in edge name still built-in; else `Other`.
+**Differential proof** `test_build_with_custom_relation_kind_emits_custom_variant`: ontology `{MediaOutlet, COVERS_TOPIC}` → graph emits `EntityKind::Custom("MediaOutlet")` + `RelationKind::Custom("COVERS_TOPIC")`. Built-in-still-wins proven by `test_parse_entities_builtin_kind_still_maps_to_builtin` (Person→Person) and `test_relation_kind_builtins_unchanged`. NOT a silent no-op.
+NOTE: worker re-extracts names inline (graph_builder.rs:192-212) rather than calling `graph.set_ontology()` then reading fields — functionally identical extraction logic; passes the same `(entity_types, edge_types)` slices into `build_with_progress_and_ontology`. Owner override of DECISION-8 item #2 applied: `RelationKind::Custom` added (custom EDGE emission no longer deferred; the prior `- [!]` is resolved, not outstanding).
+**Zep-SDK `[≠]` items SURVIVE:** Pydantic `EntityModel`/`EdgeModel` synthesis (inexpressible — no Zep client; behavior=type-set-constraint IS ported), `RESERVED_NAMES`/`safe_attr_name` (non-contractual — guards a Zep key namespace teri's `Entity{id,name,kind}` lacks), `Field(default=None)`/UserWarning suppression (inexpressible Zep-SDK API). None is a portable-feature skip.
+
+### EntityKind::Custom / RelationKind::Custom additions — PASS (additive, no regression)
+- Additive tuple variant on each enum (graph/mod.rs:27, :64). Display arm added (`:39`, `:76`) → emits PascalCase/UPPER_SNAKE name verbatim. **2 match sites narrowed** (entity parser `:952`, Pass-2 edge match `:672`) — `_ => Other` became `other => {Custom if registered else Other}`; no existing arm swallowed. Standalone `parse_relations_json` (`:1013`) keeps `_ => Other` (not on U-015 build path; receives no custom kinds — correct).
+- **No serde regression (independently verified by injected round-trip test):** existing variants serialize as bare strings (`"Person"`, `"WorksFor"`); `Custom` as `{"Custom":"X"}`; a previously-serialized `"Organization"` deserializes identically. Existing JSON/bincode graphs round-trip unchanged.
+- **No other exhaustive `match EntityKind/RelationKind`** exists outside graph/mod.rs (grep-confirmed); all agent consumers (agent/mod.rs:888,922,933,1239,1274,1299) use `.to_string()`/Display — zero changes needed (architect blast-radius confirmed).
+
+### No-regression to verified code (scrutiny point #4 cleared)
+- `build<L>` signature byte-identical (`:481`); body refactored to delegate `build_with_progress`→`build_with_progress_and_ontology(…, &[], &[])`. With empty ontology slices, prompts/parsers are byte-identical to HEAD's inline body (the `_with_custom` fns delegate to the same logic). **6 build tests pass unchanged** (from_seed/empty/dup/unknown-ref/llm-error + multi-chunk). 550 lib tests green.
+
+### Symbols verified (U-015): 19/19 → all `- [x]`/`- [≠]`
+S-189 `[x]`, S-192 `[x]`, S-190 `[x]` (prior). `[≠]`: S-181..S-188, S-191, S-193, S-194, S-195, S-196, S-197 (Zep-SaaS-specific, DECISION-1 scope; each independently confirmed inexpressible/non-contractual). EntityKind/RelationKind::Custom additions PASS. Rollup satisfied → U-015 `- [x]`.

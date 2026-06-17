@@ -17,8 +17,24 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 1   # RESUMED 2026-06-17 (4th resume, reset 0); c1=U-008-extend(DECISION-7)+U-014 OntologyGenerator
-cycles_total: 18
+cycles_this_session: 1   # RESUMED 2026-06-17 (5th resume, reset 0); c1=U-015 completion (S-189 build_graph_async + S-192 set_ontology)
+cycles_total: 19
+# CYCLE1 (5th resume) 2026-06-17: U-015 COMPLETE — S-189 build_graph_async + S-192 set_ontology (rollup) — opus PASS.
+#   DECISION-8 (architect, map-onto teri's native async build over the petgraph 2-pass pipeline). New src/services/
+#   graph_builder.rs: build_graph_async(text,ontology,graph_name,chunk params)->task_id (TaskManager::create_task
+#   graph_build + metadata{graph_name,chunk_size,text_length}; capture locale via i18n::get_locale; tokio::spawn(
+#   with_locale(...)) driving build_with_progress; complete_task w/ teri-native superset result {graph_name,graph_info,
+#   chunks_processed,graph:<serialized>}; fail_task on Err). build() byte-IDENTICAL (delegates to build_with_progress->
+#   build_with_progress_and_ontology w/ no-op callback; 6 build tests unchanged). OWNER NO-DOWNGRADE OVERRIDE of
+#   DECISION-8 #2: architect deferred custom RELATION kinds as [!]; overridden -> ported RelationKind::Custom(String)
+#   SYMMETRIC w/ EntityKind::Custom(String) (set_ontology registers BOTH entity+edge types in MiroFish). set_ontology
+#   (&mut self,&Value) records BOTH entity+edge ontology type-name sets, wired into extraction PROMPTS + PARSERS
+#   (entity_extraction_prompt_with_custom/relation_extraction_prompt_with_custom/parse_entities_json_with_custom) ->
+#   NOT inert (opus verified end-to-end: {MediaOutlet,COVERS_TOPIC}->Custom variants, built-in Person/WorksFor still
+#   map to built-ins, unknown-unregistered->Other). Custom variants additive (externally-tagged serde, no wire-form
+#   regression — opus round-trip tested). 3 [≠] legit (create_graph 10%/wait_for_episodes 60-90%/fetch_graph_info 90%
+#   = Zep-SaaS inexpressible; batch_size non-contractual). i18n progress.* keys all pre-existed (SWEEP-2). 15 new
+#   tests, teri 560 green, clippy --all-targets clean.
 # CYCLE1 (4th resume) 2026-06-17: U-008-extend (DECISION-7) + U-014 OntologyGenerator — opus PASS/PASS.
 #   PART1 U-008-extend (extend-Y, additive superset, the faithful full-signature port of S-058/S-059): added
 #   chat/chat_json(&[ChatMessage],&ChatOptions) + ChatRole/ChatMessage/ChatOptions to LlmClient, impl on all 3
