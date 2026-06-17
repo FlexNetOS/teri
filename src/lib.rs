@@ -11,6 +11,7 @@ pub mod preflight;
 pub mod report;
 pub mod seed;
 pub mod sim;
+pub mod task;
 
 pub use config::Config;
 pub use error::{Result, TeriError};

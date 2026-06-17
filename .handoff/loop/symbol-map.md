@@ -208,35 +208,35 @@
 
 ## U-012 — `backend/app/models/task.py`
 
-- [ ] S-138 · `unit:U-012` · `type` · `TaskStatus` · enum: PENDING/PROCESSING/COMPLETED/FAILED · `task.py:16`
-- [ ] S-139 · `unit:U-012` · `variant` · `TaskStatus.PENDING` · `task.py:18`
-- [ ] S-140 · `unit:U-012` · `variant` · `TaskStatus.PROCESSING` · `task.py:19`
-- [ ] S-141 · `unit:U-012` · `variant` · `TaskStatus.COMPLETED` · `task.py:20`
-- [ ] S-142 · `unit:U-012` · `variant` · `TaskStatus.FAILED` · `task.py:21`
-- [ ] S-143 · `unit:U-012` · `type` · `Task` · dataclass with to_dict · `task.py:25`
-- [ ] S-144 · `unit:U-012` · `field` · `Task.task_id` · `task.py:27`
-- [ ] S-145 · `unit:U-012` · `field` · `Task.task_type` · `task.py:28`
-- [ ] S-146 · `unit:U-012` · `field` · `Task.status` · `task.py:29`
-- [ ] S-147 · `unit:U-012` · `field` · `Task.created_at` · `task.py:30`
-- [ ] S-148 · `unit:U-012` · `field` · `Task.updated_at` · `task.py:31`
-- [ ] S-149 · `unit:U-012` · `field` · `Task.progress` · `task.py:32`
-- [ ] S-150 · `unit:U-012` · `field` · `Task.message` · `task.py:33`
-- [ ] S-151 · `unit:U-012` · `field` · `Task.result` · `task.py:34`
-- [ ] S-152 · `unit:U-012` · `field` · `Task.error` · `task.py:35`
-- [ ] S-153 · `unit:U-012` · `field` · `Task.metadata` · `task.py:36`
-- [ ] S-154 · `unit:U-012` · `field` · `Task.progress_detail` · `task.py:37`
-- [ ] S-155 · `unit:U-012` · `method` · `Task.to_dict` · `task.py:39`
-- [ ] S-156 · `unit:U-012` · `type` · `TaskManager` · singleton, thread-safe in-memory registry · `task.py:56`
-- [ ] S-157 · `unit:U-012` · `field` · `TaskManager._instance` · singleton ref · `task.py:62`
-- [ ] S-158 · `unit:U-012` · `field` · `TaskManager._lock` · threading.Lock · `task.py:63`
-- [ ] S-159 · `unit:U-012` · `method` · `TaskManager.__new__` · double-checked locking · `task.py:65`
-- [ ] S-160 · `unit:U-012` · `method` · `TaskManager.create_task` · uuid task_id · `task.py:75`
-- [ ] S-161 · `unit:U-012` · `method` · `TaskManager.get_task` · returns Optional[Task] · `task.py:103`
-- [ ] S-162 · `unit:U-012` · `method` · `TaskManager.update_task` · `task.py:108`
-- [ ] S-163 · `unit:U-012` · `method` · `TaskManager.complete_task` · `task.py:147`
-- [ ] S-164 · `unit:U-012` · `method` · `TaskManager.fail_task` · `task.py:157`
-- [ ] S-165 · `unit:U-012` · `method` · `TaskManager.list_tasks` · `task.py:166`
-- [ ] S-166 · `unit:U-012` · `method` · `TaskManager.cleanup_old_tasks` · removes completed/failed > max_age_hours · `task.py:174`
+- [x] S-138 · `unit:U-012` · `type` · `TaskStatus` · enum: PENDING/PROCESSING/COMPLETED/FAILED · `task.py:16`
+- [x] S-139 · `unit:U-012` · `variant` · `TaskStatus.PENDING` · `task.py:18`
+- [x] S-140 · `unit:U-012` · `variant` · `TaskStatus.PROCESSING` · `task.py:19`
+- [x] S-141 · `unit:U-012` · `variant` · `TaskStatus.COMPLETED` · `task.py:20`
+- [x] S-142 · `unit:U-012` · `variant` · `TaskStatus.FAILED` · `task.py:21`
+- [x] S-143 · `unit:U-012` · `type` · `Task` · dataclass with to_dict · `task.py:25`
+- [x] S-144 · `unit:U-012` · `field` · `Task.task_id` · `task.py:27`
+- [x] S-145 · `unit:U-012` · `field` · `Task.task_type` · `task.py:28`
+- [x] S-146 · `unit:U-012` · `field` · `Task.status` · `task.py:29`
+- [x] S-147 · `unit:U-012` · `field` · `Task.created_at` · `task.py:30`
+- [x] S-148 · `unit:U-012` · `field` · `Task.updated_at` · `task.py:31`
+- [x] S-149 · `unit:U-012` · `field` · `Task.progress` · `task.py:32`
+- [x] S-150 · `unit:U-012` · `field` · `Task.message` · `task.py:33`
+- [x] S-151 · `unit:U-012` · `field` · `Task.result` · `task.py:34`
+- [x] S-152 · `unit:U-012` · `field` · `Task.error` · `task.py:35`
+- [x] S-153 · `unit:U-012` · `field` · `Task.metadata` · `task.py:36`
+- [x] S-154 · `unit:U-012` · `field` · `Task.progress_detail` · `task.py:37`
+- [x] S-155 · `unit:U-012` · `method` · `Task.to_dict` · `task.py:39` · **PARITY PASS 2026-06-17 (re-verify):** `python_isoformat` (task.rs:51-57) now emits `%Y-%m-%dT%H:%M:%S` when `timestamp_subsec_micros()==0` else `%Y-%m-%dT%H:%M:%S%.6f`, matching Python `datetime.isoformat()` (verified empirically: whole-sec→`2024-01-01T12:30:45`; µs→`...45.123456`, always 6 zero-padded digits, never 3-digit millis; no tz suffix). Test `test_python_isoformat_matches_datetime_isoformat` (task.rs:441) asserts BOTH cases + no `+`/`Z` suffix. Field names/order/status-string all match. Prior FAIL (always-`.000000`) resolved.
+- [x] S-156 · `unit:U-012` · `type` · `TaskManager` · singleton, thread-safe in-memory registry · `task.py:56`
+- [x] S-157 · `unit:U-012` · `field` · `TaskManager._instance` · singleton ref · `task.py:62`
+- [x] S-158 · `unit:U-012` · `field` · `TaskManager._lock` · threading.Lock · `task.py:63`
+- [x] S-159 · `unit:U-012` · `method` · `TaskManager.__new__` · double-checked locking · `task.py:65`
+- [x] S-160 · `unit:U-012` · `method` · `TaskManager.create_task` · uuid task_id · `task.py:75`
+- [x] S-161 · `unit:U-012` · `method` · `TaskManager.get_task` · returns Optional[Task] · `task.py:103`
+- [x] S-162 · `unit:U-012` · `method` · `TaskManager.update_task` · `task.py:108`
+- [~] S-163 · `unit:U-012` · `method` · `TaskManager.complete_task` · `task.py:147` · **PENDING-U-005 (re-verify 2026-06-17): silent-narrowing violation RESOLVED; legitimate pending-dependency remains.** Status=COMPLETED/progress=100/result all correct. `message` comes from `t('progress.taskComplete')` (task.py:153) — locale-parameterized over 7 locales. teri emits zh default `"任务完成"` via `MSG_TASK_COMPLETE` (task.rs:43, ==locales/zh.json `progress.taskComplete`). The prior FAIL was that the code FRAMED this as faithful; now task.rs:14-23,35-45 HONESTLY record it as a **TEMPORARY pending-U-005 placeholder (NOT faithful)** with explicit instruction to route through `t()` when U-005 (S-036..S-042) lands. Correctly-recorded pending dependency (U-001/SECRET_KEY→U-002 precedent), NOT a silent skip — stays `[~]`, flips `[x]` only when U-005 lands and `message` routes through `t()`.
+- [~] S-164 · `unit:U-012` · `method` · `TaskManager.fail_task` · `task.py:157` · **PENDING-U-005 (re-verify 2026-06-17): silent-narrowing violation RESOLVED; legitimate pending-dependency remains.** Status=FAILED/error correct; correctly does NOT set progress=100. `message` from `t('progress.taskFailed')` (task.py:162) — locale-parameterized. teri emits zh default `"任务失败"` via `MSG_TASK_FAILED` (task.rs:45, ==locales/zh.json `progress.taskFailed`). Code now HONESTLY frames this as a TEMPORARY pending-U-005 placeholder (NOT faithful) with route-through-`t()` instruction (task.rs:14-23,35-45). Correctly-recorded pending dependency, NOT a silent skip — stays `[~]`, flips `[x]` only when U-005 lands and `message` routes through `t()`.
+- [x] S-165 · `unit:U-012` · `method` · `TaskManager.list_tasks` · `task.py:166`
+- [x] S-166 · `unit:U-012` · `method` · `TaskManager.cleanup_old_tasks` · removes completed/failed > max_age_hours · `task.py:174`
 
 ---
 

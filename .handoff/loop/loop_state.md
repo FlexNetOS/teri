@@ -17,8 +17,14 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 2
-cycles_total: 12
+cycles_this_session: 3
+cycles_total: 13
+# CYCLE3 2026-06-17: U-012 TaskManager port-fresh PARTIAL — 27/29 symbols [x]; src/task.rs (TaskStatus/Task/to_dict/
+#   singleton OnceLock+parking_lot/create/get/update/complete/fail/list/cleanup). Gate caught real bug S-155
+#   (Python isoformat omits .000000 when µs==0) -> fixed via python_isoformat(). S-163/S-164 message stay [~]
+#   pending-U-005 (MiroFish uses t('progress.task*'); zh placeholder until locale subsystem lands — NOT silent skip).
+#   Unit [~] partial, rolls up when U-005. Unblocks S-189->U-012. 399 green. ALSO this session: shimmy /v1/embeddings
+#   (FlexNetOS/shimmy#6 MERGED) + teri EmbeddingClient -> GAP-OQ3-EMBED RESOLVED. + owner LLM_MODEL_NAME resolved.
 HANDOFF: (active session, resumed 2026-06-17) — cycle1: [≠]-audit gate CLEARED (S-360/361/048 PASS as ported; S-356 FAILED→ported related_edges Part2→re-verified PASS; all 4 [x]). cycle2: U-001 AppConfig PARTIAL extend-Y — 20 fields PASS [x] + S-001 [≠]; S-003/S-005 pending-U-002/U-003 (no axum surface yet); unit stays [~]. Fixed porter's flaky env-tests via ENV_LOCK mutex. OWNER-RESOLVED LLM_MODEL_NAME: shimmy replaces Ollama -> default model=OpenThinker3-7B + base_url=shimmy local 11435/v1 (Gemma-4-12B documented alt). 364 green (+2). Next: U-002/U-003 (axum serve — rolls up U-001) OR U-012 TaskManager OR U-005 locale.
 ledger: parity 8/50 units verified [x] (U-004, U-006, U-008, U-009, U-013, U-015, U-018, U-048) + GAP-1/2/6/U015-1/ACTION-TAXONOMY resolved; [≠]-audit symbol ports S-360/361/356/048 all [x] parity-verified (opus gate, resume 2026-06-17)   # 335 green
 # [≠] RE-AUDIT DONE (owner-flagged): 47 [≠] re-challenged under tightened bar (harness PR #34). 4 disguised

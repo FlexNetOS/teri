@@ -598,3 +598,108 @@ Porter claimed 362 passed / 0 failed. Under default parallel `cargo test`, `conf
 ### U-001 rollup status (NOTE for orchestrator — parity-ledger row NOT edited here)
 - Coverage: 1 `[≠]` (S-001) + 20 `[x]` (S-002,S-004,S-006..S-022) + **2 `- [ ]` legit-pending (S-003,S-005)**.
 - Rollup rule: unit `- [x]` requires EVERY symbol `[x]`/`[≠]`. With S-003/S-005 legitimately `- [ ]`, **U-001 CANNOT roll up to `- [x]` yet → stays `- [~]` (partial)**. It rolls up only after U-002/U-003 (axum HTTP layer) ports SECRET_KEY + JSON_AS_ASCII.
+
+---
+
+## 2026-06-17 · U-012 TaskManager — parity gate
+
+**Verdict: FAIL (unit `- [~]` partial).** Differentially verified `task.py:TaskManager` → `src/task.rs`. 27/27 module tests pass; 27 of 29 symbols PASS. Two symbols held: **S-163/S-164 (i18n narrowing → pending-U-005, NOT flagged by porter)** and **S-155 (to_dict timestamp microsecond==0 divergence)**.
+
+### Per-symbol table (source line → rust line, evidence)
+
+| Sym | Behavior | Source | Rust | Verdict |
+|-----|----------|--------|------|---------|
+| S-138 | `TaskStatus` enum (str,Enum) | task.py:16 | task.rs:48 | PASS — 4 variants, serde `rename_all=lowercase` |
+| S-139 | PENDING="pending" | task.py:18 | task.rs:63 | PASS — `as_str`+serde test (line 426/435) |
+| S-140 | PROCESSING="processing" | task.py:19 | task.rs:64 | PASS |
+| S-141 | COMPLETED="completed" | task.py:20 | task.rs:65 | PASS |
+| S-142 | FAILED="failed" | task.py:21 | task.rs:66 | PASS |
+| S-143 | `Task` dataclass+to_dict | task.py:25 | task.rs:96 | PASS — struct present |
+| S-144 | task_id:str | task.py:27 | task.rs:97 | PASS |
+| S-145 | task_type:str | task.py:28 | task.rs:98 | PASS |
+| S-146 | status:TaskStatus | task.py:29 | task.rs:99 | PASS |
+| S-147 | created_at:datetime | task.py:30 | task.rs:101 | PASS (DateTime<Utc>) |
+| S-148 | updated_at:datetime | task.py:31 | task.rs:103 | PASS |
+| S-149 | progress:int=0 | task.py:32 | task.rs:105 | PASS (i64, default 0) |
+| S-150 | message:str="" | task.py:33 | task.rs:107 | PASS (default "") |
+| S-151 | result:Optional[Dict]=None | task.py:34 | task.rs:109 | PASS (Option<Value>) |
+| S-152 | error:Optional[str]=None | task.py:35 | task.rs:111 | PASS |
+| S-153 | metadata:Dict=field({}) | task.py:36 | task.rs:113 | PASS (HashMap, default {}) |
+| S-154 | progress_detail:Dict=field({}) | task.py:37 | task.rs:115 | PASS |
+| **S-155** | **to_dict() JSON shape** | task.py:39 | task.rs:143 | **FAIL — timestamp microsecond==0 divergence (below). Field names/order/status-string/metadata all match.** |
+| S-156 | TaskManager singleton | task.py:56 | task.rs:174 | PASS — OnceLock idiom-map |
+| S-157 | _instance (singleton ref) | task.py:62 | task.rs:178 | PASS — `static TASK_MANAGER: OnceLock` |
+| S-158 | _lock (threading.Lock) | task.py:63 | task.rs:175 | PASS — parking_lot::Mutex (non-poisoning; equivalent observable) |
+| S-159 | __new__ double-checked lock | task.py:65 | task.rs:185 | PASS — `global()`+`get_or_init`; test `global_returns_same_instance` (820) + `global_registry_is_shared` (826) prove one shared registry |
+| S-160 | create_task → uuid | task.py:75 | task.rs:206 | PASS — uuid v4, PENDING, metadata or {}; unique-id + concurrency tests |
+| S-161 | get_task → Optional | task.py:103 | task.rs:240 | PASS — Some/None, clone-out-of-lock |
+| S-162 | update_task partial | task.py:108 | task.rs:267 | PASS — all 6 optionals, None=unchanged, updated_at always bumped, nonexistent=noop (tests 562/592/609) |
+| **S-163** | **complete_task** | task.py:147 | task.rs:312 | **HELD — pending-U-005 (i18n narrowing, below). Status/progress=100/result correct.** |
+| **S-164** | **fail_task** | task.py:157 | task.rs:337 | **HELD — pending-U-005 (i18n narrowing, below). Status/error correct; correctly does NOT set progress=100.** |
+| S-165 | list_tasks sorted desc | task.py:166 | task.rs:363 | PASS — `reverse=True` → `b.cmp(a)`; filter; newest-first test (707) proves order |
+| S-166 | cleanup_old_tasks | task.py:174 | task.rs:391 | PASS — `created_at < cutoff` strict `<` matched; COMPLETED/FAILED only; PENDING/PROCESSING survive (test 738); boundary test (796) proves strict `<` |
+
+### i18n adjudication (THE key call) — task.py evidence
+
+**MiroFish uses `t(key)`, NOT a literal.** task.py:13 `from ..utils.locale import t`; task.py:153 `message=t('progress.taskComplete')`; task.py:162 `message=t('progress.taskFailed')`. `t()` (locale.py:35) resolves per-locale: default locale is `zh` (locale.py:30-32,37), but it supports 7 locales (zh/en/es/fr/pt/ru/de per locales/languages.json). Under `en` the message becomes "Task complete"/"Task failed" (locales/en.json:415-416); under de/fr/etc. it differs. The `message` field flows into `to_dict()` and `list_tasks()` → **observable, locale-varying output.**
+
+**Porter hard-coded the zh defaults** (task.rs:35-37 `MSG_TASK_COMPLETE="任务完成"`, `MSG_TASK_FAILED="任务失败"`). The constants' VALUES are correct (exact match to locales/zh.json:415-416). BUT the port drops the locale parameterization — it always emits zh regardless of locale. That is a **NARROWING of an observable feature**, not a faithful port.
+
+**The defect:** the porter's doc comment (task.rs:14-19) frames this as faithful ("the same literal strings are used as constants so the serialised output matches the Python default exactly") and does **NOT** flag a pending-dependency on U-005 (the locale subsystem, S-036..S-042, all `- [ ]`, unported). Per owner directive + established precedent (SECRET_KEY→U-002 S-003; S-189 reclassified `[≠]`→pending-U-012), a dropped-but-portable feature is acceptable ONLY as an explicit **pending-U-005** flag (code comment + symbol-map note). A silently-hard-coded default with a "matches exactly" comment is the banned silent-skip → **S-163/S-164 HELD `- [ ]` with pending-U-005 note** until: (a) the code comment is corrected to state locale parameterization is deferred to U-005, and (b) once U-005 lands, `message` routes through teri's `t()`.
+
+### Timestamp-format verdict (S-155) — observable divergence
+
+Python `datetime.isoformat()` **omits the fractional part when microsecond==0** (verified: `datetime(2024,1,1,12,30,45,0).isoformat()` → `2024-01-01T12:30:45`, no `.000000`); emits exactly 6 digits otherwise. Teri uses `%Y-%m-%dT%H:%M:%S%.6f` (task.rs:148-149) which **always emits 6 fractional digits** → `...45.000000` where Python emits `...45`. For a timestamp landing on a whole second, `to_dict`/`list_tasks` output diverges by the trailing `.000000`. Narrow (timing-dependent) but a real serialization-shape gap under the no-downgrade directive. Microsecond-present case, field names, field order, status-as-string, and naive-no-tz (Python `datetime.now()` has no tz suffix; teri formats UTC without offset → shape matches) all CORRECT. Fix: chrono `%.f` (variable, trims trailing zeros) is closer to Python; exact `isoformat()` parity needs conditional formatting (omit fraction iff microsecond==0). **S-155 FAIL** until the microsecond==0 case matches.
+
+### Singleton idiom-map — PASS
+OnceLock<TaskManager> + parking_lot::Mutex<HashMap> genuinely preserves "one shared registry per process": `global_returns_same_instance_across_calls` (820, pointer-equality) + `global_registry_is_shared_across_calls` (826, task created via tm1 visible via tm2). Concurrency smoke tests (846/864) prove thread-safe create/update. parking_lot non-poisoning is an acceptable observable-equivalent of threading.Lock.
+
+### Tests assessment
+27/27 genuinely behavioral (not compile-only): serde roundtrip asserts exact `"pending"` etc.; to_dict asserts all 11 keys + types + values; cleanup asserts PENDING/PROCESSING survive + strict-`<` boundary; sort asserts newest-first by id; singleton asserts pointer-equality + cross-handle visibility. GAP: no test asserts the microsecond==0 timestamp case (the divergence is untested), and no test asserts non-zh locale output (the narrowing is untested — tests only assert the zh constant).
+
+### U-012 rollup status (NOTE for orchestrator — parity-ledger row NOT edited here)
+- Coverage: **27 `[x]`** (S-138..S-162, S-165, S-166) + **3 `- [ ]` held** (S-155 timestamp defect; S-163/S-164 pending-U-005).
+- Rollup rule: unit `- [x]` requires EVERY symbol `[x]`/`[≠]`. With S-155/S-163/S-164 held `- [ ]`, **U-012 CANNOT roll up → stays `- [~]` (partial). Do NOT commit as done.**
+- Route back to porter: (1) fix S-155 timestamp microsecond==0 formatting; (2) re-flag S-163/S-164 as pending-U-005 (correct the code comment + add symbol-map pending note); message routes through `t()` once U-005 lands.
+
+### Constraints honored
+- No source/Rust files edited. No commit. Only symbol-map `[x]` flips + this verdict appended.
+
+---
+
+## 2026-06-17 · U-012 re-verify (S-155 fix + S-163/S-164 pending-U-005)
+
+Re-verification of the 3 symbols held last cycle. Verifier role: differential gate, fail-closed.
+
+### S-155 (`Task.to_dict` timestamp) — **PASS** (FAIL→[x])
+Prior FAIL: teri always emitted `%.6f` (`...:45.000000`); Python `datetime.isoformat()` omits the fraction entirely when µs==0.
+
+Fix verified in `src/task.rs:51-57` — `python_isoformat()` branches on `dt.timestamp_subsec_micros()==0`:
+- µs==0 → `%Y-%m-%dT%H:%M:%S`
+- µs!=0 → `%Y-%m-%dT%H:%M:%S%.6f`
+`to_dict` (task.rs:168-169) uses it for both `created_at`/`updated_at`.
+
+Differential evidence — Python `datetime.isoformat()` run directly:
+| input | Python isoformat | teri python_isoformat |
+|-------|------------------|------------------------|
+| `2024-01-01 12:30:45` (µs=0) | `2024-01-01T12:30:45` | `2024-01-01T12:30:45` ✓ |
+| `…45.123456` (µs=123456) | `2024-01-01T12:30:45.123456` | `2024-01-01T12:30:45.123456` ✓ |
+| `…45` µs=123000 | `…45.123000` | `…45.123000` (chrono `%.6f` zero-pads 6 digits) ✓ |
+| `…45` µs=1 | `…45.000001` | `…45.000001` ✓ |
+
+Confirmed Python emits EITHER 0 OR 6 fractional digits — never a 3-digit-millis form; chrono's `%.6f` is fixed-6-digit, so teri matches that exactly (not a 3-digit form). No `+`/`Z` tz suffix on either side (Python naive datetime; teri formats without offset).
+
+Test `test_python_isoformat_matches_datetime_isoformat` (task.rs:441-456) genuinely asserts BOTH branches: whole-sec `== "2024-01-01T12:30:45"` (no fraction) AND sub-sec `== "2024-01-01T12:30:45.123456"`, plus `!contains('+')` and `!ends_with('Z')`. Orchestrator: 399 tests pass, clippy --all-targets clean. → **S-155 = `- [x]`**.
+
+### S-163 / S-164 (`complete_task` / `fail_task` message) — confirmed correctly recorded **pending-U-005**, REMAIN `- [~]`
+Source: MiroFish sets `message` from `t('progress.taskComplete')` / `t('progress.taskFailed')` (task.py:153,162) — locale-parameterized over 7 locales (default zh). teri emits the zh default via `MSG_TASK_COMPLETE`/`MSG_TASK_FAILED` (task.rs:43,45); values match `locales/zh.json` (`progress.taskComplete`=`任务完成`, `progress.taskFailed`=`任务失败`) — verified by reading the source locale file.
+
+The prior HOLD reason (code FRAMED the hard-coded zh string as "faithful"/"matches exactly" = banned silent-narrowing) is **RESOLVED**: module doc (task.rs:14-23) and the constant comments (task.rs:34-45) now HONESTLY frame the strings as a **TEMPORARY pending-U-005 placeholder, explicitly "NOT a faithful port"**, with the instruction to route `message` through teri's `t()` when U-005 (S-036..S-042) lands. The `complete_task`/`fail_task` doc-comments still say "localised message" (accurate — the contract IS a locale lookup).
+
+This is the correctly-recorded pending-dependency pattern (U-001/SECRET_KEY→U-002 precedent), NOT a silent skip and NOT a disguised `[≠]`: the locale parameterization is genuinely not portable until the locale subsystem (U-005) exists. → S-163/S-164 **stay `- [~]` with pending-U-005 notes** (added to symbol-map). Do NOT flip to `[x]`.
+
+### U-012 rollup
+With S-155 → `[x]`, U-012 is now **27 `[x]` + 2 `[~]`** (S-163/S-164 pending-U-005). The unit **stays `- [~]` (partial)** in the parity ledger — it rolls up to `- [x]` only when U-005 lands and `complete_task`/`fail_task` route their `message` through `t()`. Parity-ledger unit row NOT edited (per instruction).
+
+### Constraints honored
+- No source/Rust files edited. No commit. Only S-155 `[x]` flip + S-163/S-164 pending-U-005 notes + this verdict appended.
