@@ -100,6 +100,19 @@ fn translations() -> &'static HashMap<String, Value> {
     })
 }
 
+/// Returns `true` if `locale` is a key in the embedded translations map.
+///
+/// Use this to validate an incoming locale string against the actual embedded set
+/// rather than a hardcoded list.  When a new locale file is added under
+/// `i18n/locales/` and wired into [`translations`], this predicate automatically
+/// covers it — no second site to update.
+///
+/// Mirrors the membership test in `locale.py:31`:
+/// `return raw if raw in _translations else 'zh'`
+pub fn is_supported_locale(locale: &str) -> bool {
+    translations().contains_key(locale)
+}
+
 /// Parsed language registry: 7 entries (zh/en/es/fr/pt/ru/de).
 /// Mirrors Python's `_languages` dict loaded from `languages.json`.
 fn languages() -> &'static Value {

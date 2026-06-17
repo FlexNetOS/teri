@@ -21,8 +21,10 @@ enum Commands {
     },
     /// Start the REST API server
     Serve {
-        #[arg(short, long, default_value = "0.0.0.0:8080")]
-        addr: String,
+        /// Bind address (e.g. "0.0.0.0:8080"). When not set, FLASK_HOST (default "0.0.0.0")
+        /// and FLASK_PORT (default 5001) are used — faithful to MiroFish's env contract.
+        #[arg(short, long)]
+        addr: Option<String>,
     },
 }
 
@@ -93,11 +95,24 @@ async fn serve_cmd() -> Result<()> {
     let cli = Cli::parse();
     let Commands::Serve { addr } = cli.command else { unreachable!() };
 
-    let config =
-        Config::load().map_err(|e| TeriError::Config(format!("Configuration error: {e}")))?;
+    // FIX-1.2 style: friendly guidance toward envctl when config is missing.
+    let config = match Config::load() {
+        Ok(c) => c,
+        Err(e) if e.config_missing() => {
+            eprintln!(
+                "teri: configuration unavailable — key may not be set.\n\
+                 If using envctl: `envctl run -- teri serve`\n\
+                 Otherwise set LLM_API_KEY or create a teri config file.\n\nError: {e}"
+            );
+            return Err(e);
+        }
+        Err(e) => return Err(e),
+    };
 
+    // init_logging once — process-global (faithful to create_app calling setup_logger
+    // once at app-factory time; teri does it in the entrypoint instead).
     init_logging(&config.logging.level)?;
 
-    tracing::info!("Starting API server on {addr}");
-    Err(TeriError::Unknown("API server not yet implemented".to_string()))
+    // Delegate to teri::server::serve which carries the full U-002/U-003 logic.
+    teri::server::serve(config, addr.as_deref()).await
 }

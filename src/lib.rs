@@ -12,6 +12,7 @@ pub mod models;
 pub mod preflight;
 pub mod report;
 pub mod seed;
+pub mod server;
 pub mod sim;
 pub mod task;
 

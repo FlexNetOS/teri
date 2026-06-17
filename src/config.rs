@@ -18,6 +18,11 @@ pub struct Config {
     /// optional verbose mode; the `FLASK_DEBUG` env name is preserved for source parity so that
     /// the same `.env` file works against both runtimes.
     pub debug: bool,
+    /// MiroFish U-001 (S-003): Flask SECRET_KEY (env `SECRET_KEY`, default
+    /// `"mirofish-secret-key"`).  Loaded and made available on ApiState, matching Flask's
+    /// `app.config` behaviour.  Like MiroFish, teri does not actively use this for signing
+    /// (no session/CSRF/flash usage in MiroFish) — it is loaded but passive.
+    pub secret_key: String,
     /// MiroFish U-001: Zep API key (env `ZEP_API_KEY`, required by validate()).
     pub zep_api_key: Option<String>,
     /// MiroFish U-001: maximum HTTP upload body size in bytes (50 MB; not env-backed in source —
@@ -238,6 +243,10 @@ impl Config {
             },
             // MiroFish U-001 fields below.
             debug: std::env::var("FLASK_DEBUG").map(|v| v.to_lowercase() == "true").unwrap_or(true),
+            // MiroFish U-001 (S-003): SECRET_KEY — env-backed with same name and default as source.
+            // config.py:24: SECRET_KEY = os.environ.get('SECRET_KEY', 'mirofish-secret-key')
+            secret_key: std::env::var("SECRET_KEY")
+                .unwrap_or_else(|_| "mirofish-secret-key".to_string()),
             zep_api_key: std::env::var("ZEP_API_KEY").ok(),
             // 50 MB — constant in MiroFish (50 * 1024 * 1024).
             max_content_length: 50 * 1024 * 1024,
@@ -307,6 +316,18 @@ impl Config {
         }
 
         Ok(())
+    }
+
+    /// Build a minimal Config for use in tests where a real API key is not available.
+    ///
+    /// Sets a dummy api_key and zep_api_key so validation passes; all other values
+    /// use the same defaults as `build()`. Tests that need specific env-var behaviour
+    /// should guard with ENV_LOCK and set/remove vars around Config::build() directly.
+    #[cfg(test)]
+    pub fn build_test() -> Self {
+        let mut c = Self::build(Some("test-llm-key"));
+        c.zep_api_key = Some("test-zep-key".to_string());
+        c
     }
 
     /// MiroFish-parity validation (U-001 `Config.validate()` classmethod port).
