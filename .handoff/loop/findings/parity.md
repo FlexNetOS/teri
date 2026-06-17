@@ -468,3 +468,75 @@ Re-challenged every `- [≠]` row under the tightened test: `[≠]` legal ONLY a
 - S-371 retained `- [≠]` with an added re-flag (port-with-OASIS-export dependency).
 - S-355 retained `- [≠]` (Zep-SaaS-search half only).
 - All other `[≠]` rows: KEEP confirmed (table above), unchanged.
+
+---
+
+## 2026-06-17 · [≠]-audit ports — parity gate (resume)
+
+Re-run of the differential parity gate for the 4 `[≠]`-audit ports committed GREEN at `20e2e48`
+(the prior verifier was interrupted by session budget; rows were left `- [~]`). Method: read each
+MiroFish source symbol at the cited file:line, read the teri port (`src/agent/mod.rs`, `src/llm.rs`),
+enumerate every contract branch in the source, and confirm the Rust handles each — preferring
+executable differential checks (the existing unit tests, all GREEN). Fail-closed: a symbol PASSES
+only when every contract branch matches with NO downgrade and NO dropped branch.
+
+### Verdict table
+
+| Symbol | Verdict | Evidence (source vs teri) — branches checked |
+|--------|---------|----------------------------------------------|
+| **S-360** `_fix_truncated_json` | **PASS** | src `oasis_profile_generator.py:583-604` vs teri `src/agent/mod.rs:969-995`. Branches: (a) strip — `.strip()`↔`.trim()`✔; (b) unbalanced-brace/bracket count via `count('{')-count('}')`↔`filter(=='{').count() - filter(=='}').count()`✔; (c) dangling-string close — Python `content[-1] not in '",}]'` (chars `"` `,` `}` `]`) ↔ Rust `last != '"' && != ',' && != '}' && != ']'` — **exact char-set match**✔; (d) close brackets THEN braces (inner-before-outer, `']'*open_brackets` then `'}'*open_braces`)↔`for 0..max(0) push ']'` then `'}'`✔; (e) `.max(0)` guards negative (over-closed) counts — Python `'x'*n` with n≤0 yields `""` (same no-op)✔. Tests (4 GREEN): closes-open-brace, closes-dangling-string+brace, closes-array+brace, valid-input-unchanged. No divergence. |
+| **S-361** `_try_fix_json` | **PASS** | src `oasis_profile_generator.py:606-670` vs teri `src/agent/mod.rs:1013-1218`. All 7 steps matched: (1) `fix_truncated_json` first✔; (2) extract first `{…}` — Python `re.search(r'\{[\s\S]*\}')` (greedy to last `}`) vs teri brace-depth scan to the *matching* `}` — **noted divergence**: Python greedily takes to the LAST `}`, teri stops at the first balanced close. Non-downgrading: teri's is *stricter/safer* (extracts a well-formed object), and when the outer object IS balanced both yield the same string; when trailing garbage with extra `}` exists, teri's is the correct salvage. No observable contract loss for the bio/persona recovery the symbol guarantees; (3) normalize newlines inside string values — Python `fix_string_newlines` (replace `\n`/`\r`→space, `\s+`→single) applied only inside `"…"` regions ↔ teri `normalize_json_string_newlines` walks quoted regions, replaces CR/LF→space, `split_whitespace().join(" ")`✔; (4) parse + set `_fixed=true`✔; (5) strip control chars `[\x00-\x1f\x7f-\x9f]`→space + collapse `\s+` then retry ↔ teri `strip_control_chars` (`cp<=0x1f \|\| 0x7f..=0x9f`)✔; (6) field-level salvage — **bio uses CLOSED-quote pattern** `r'"bio"\s*:\s*"([^"]*)"'`↔`extract_json_string_field` (requires closing `"`), **persona uses OPEN/partial pattern** `r'"persona"\s*:\s*"([^"]*)'`↔`extract_json_string_field_partial` (closing `"` optional) — **exact match of the asymmetry**✔; guard `if bio_match or persona_match`↔`has_bio_match \|\| has_persona_match`✔; (7) complete failure: Python returns a base dict, teri returns `None` — **noted divergence, non-downgrading**: teri's `None` routes `generate_social` into `generate_social_rule_based`, which produces the SAME base bio/persona defaults Python's step-7 dict would (rule-based fallback is the teri analogue of step-7's "基础结构"). Observable output equivalent. Tests (6 GREEN): salvage-truncated, all-fields-truncation, garbage→None, field-extraction-from-broken-JSON, salvage-path-taken (UNIQUE_LLM_SIGNATURE proves LLM-source over rule-based), genuine-garbage→rule-based. |
+| **S-356** `_build_entity_context` (in-process half) | **FAIL** | src `oasis_profile_generator.py:414-473` vs teri `src/agent/mod.rs:1232-1250`. The PORT-NOW contract (parity.md:462, this task) is **parts 1-3 = attributes + related_edges + related_nodes**. teri's `build_entity_context` emits **Part 1 (attributes, mapped to name+kind — OK, teri's `Entity` has no attribute dict, a legit data-model mapping) + Part 3 (related_nodes, neighbor name+kind via `get_neighbors`)** but **DROPS Part 2 (`related_edges` → the `### 相关事实和关系` relationship/fact section, src:434-453)**. Part 2 emits per-edge `fact` lines and, absent a fact, directional `name --[edge_name]--> (相关实体)` / `(相关实体) --[edge_name]--> name` relationship lines. The relation IS available in teri's in-process graph (`Relation.kind`: WorksFor/LocatedIn/RelatedTo/Causes/Affects/Other, `src/graph/mod.rs:44-55`) — but `get_neighbors` returns only `Vec<&Entity>` (`src/graph/mod.rs:190`), discarding the edge, and `build_entity_context` never assembles a relationship-facts section into the prompt. This is a **NARROWING of the explicitly-flagged enrichment contract** — a disguised partial-skip of a portable, observable behavior (the relationship-kind context is distinct prompt output that demonstrably enriches the LLM). The `existing_facts` dedup set (src:435/445) is moot once Part 2 is restored against the Zep half (S-355 stays `[≠]`), so only the in-process Part-2 assembly need port. Backward-compat `None` fallback + no-neighbor flat fallback (Part 3) are correct. Tests cover enrichment-present / none / no-neighbor, but **none asserts a relationship/edge line in the prompt** — the missing branch is unproven AND, on inspection, genuinely absent. Stays `- [~]`. |
+| **S-048** `call_batch_with_retry` | **PASS** | src `retry.py:195-237` vs teri `src/llm.rs:143-192`. Branches: (a) per-item loop calling `call_with_retry` per item — teri inlines the per-adapter retry loop (`max_retries+1` attempts, exhaust→Err), faithful to `RetryableAPIClient.call_with_retry` (retry.py:149-193)✔; (b) success → push to `results` in input order✔; (c) exhausted-retries failure → `BatchFailure{index, error}` (retry.py:228 `{index, item, error}`) — **`item` field omitted**: documented (b) non-contractual mapping (Rust `Fn`-factory closures are consumed on call; the `index` lets the caller recover the input from its own slice — all recovery info preserved, no observable loss)✔; (d) `continue_on_failure=true` → record failure + continue (retry.py:227-232)✔; (e) `continue_on_failure=false` → abort with `Err(e)` (retry.py:233-234 `raise`)✔; (f) `F: Fn()->Fut` (not `FnOnce`) so the op is re-invokable each retry✔. Back-off jitter omitted — pre-existing `[≠]` matching teri's adapter retry contract (stochastic, non-contractual). Tests (5 GREEN): empty, all-succeed, one-fails-continue-true (index=1, error carried), one-fails-continue-false (Err + error propagates, later op never runs), fail-then-succeed-via-retry (AtomicUsize proves exactly 2 calls). |
+
+### Result
+- **3 PASS** → S-360, S-361, S-048 flipped `- [~]` → `- [x]` in symbol-map.md.
+- **1 FAIL** → S-356 stays `- [~]`. **Missing behavior for the next porter cycle:** port `_build_entity_context` **Part 2 (`related_edges` → relationship/fact section)**. Concretely: in `build_entity_context` (src/agent/mod.rs:1232), after Part 1 and before/with Part 3, emit a `### Related Facts and Relationships` section built from the entity's edges. Since `get_neighbors` returns only entities, add an edge-aware accessor (e.g. `KnowledgeGraph::get_neighbor_relations(id) -> Vec<(&Entity, &Relation)>` or expose edges) and emit one line per edge — mirror MiroFish: a `fact` line if present, else a directional `name --[RelationKind]--> (neighbor)` / reversed line by edge direction. Add a test asserting a relationship/edge line appears in the captured prompt. Zep half (S-355) remains `[≠]`.
+
+### Symbol-map mutations applied (this gate)
+- S-360 → `- [x]` (PASS); S-361 → `- [x]` (PASS); S-048 → `- [x]` (PASS).
+- S-356 → kept `- [~]` (FAIL: dropped Part 2 related_edges enrichment — narrowing).
+- No other rows touched. No source or Rust files edited. No commit (orchestrator commits).
+
+---
+
+## 2026-06-17 · S-356 re-verify (U-018) — `_build_entity_context` Part 2 (related_edges)
+
+**Verdict: PASS** (re-verify of prior FAIL). Part 2 (`### Related Facts and Relationships`) is now ported, differential-verified branch-by-branch, and the open fact-branch question is adjudicated **(a) faithful mapping** — the fact line is a Zep-server artifact with no in-process analogue, not a dropped portable branch.
+
+**Fact-branch adjudication: (a) — Zep-server-derived, non-droppable, S-355-class.**
+MiroFish evidence for where edge `fact` originates:
+- `oasis_profile_generator.py:438-451` iterates `entity.related_edges`; `fact = edge.get("fact","")`.
+- `related_edges` is populated ONLY in `zep_entity_reader.py` (`:284-305`, `:366-405`), where each edge dict's `"fact": edge["fact"]` comes from `get_node_edges()`.
+- `get_node_edges` (`zep_entity_reader.py:182`) calls `self.client.graph.node.get_entity_edges(node_uuid=...)` and reads `edge.fact` off the Zep SDK edge object.
+- → `fact` is a **Zep-server-generated, LLM-extracted edge fact** produced server-side on ingestion. It is NOT derived from any in-process data teri also holds. Exactly the same provenance as the S-355 Zep-search half ([≠] sub-rule (b)).
+
+teri's structs carry no relationship fact text (read in full, `src/graph/mod.rs`):
+- `Entity { id, name, kind }` — no fact/summary/description/context field.
+- `Relation { kind, weight, valid_at }` — no fact/summary/description/context field. `kind` is an enum (emitted by the directional line); `valid_at` is temporal, not a fact.
+- → There is genuinely nothing to drop. The `fact` branch is correctly inert (commented-out, can never fire). The directional line IS the complete in-process contract. The commented fact-branch + helper seam is documentation of the [≠] boundary, not a disguised skip — the source behavior it omits has **no in-process observable to produce**.
+
+**Direction handling — matches MiroFish exactly:**
+- Outgoing (`direction=="outgoing"`): Python `- {entity.name} --[{edge_name}]--> (相关实体)` → teri `- {entity} --[{kind}]--> ({neighbor})`. ✓
+- Incoming (else): Python `- (相关实体) --[{edge_name}]--> {entity.name}` → teri `- ({neighbor}) --[{kind}]--> {entity}`. ✓
+- `get_neighbor_relations` walks `edges_directed(Outgoing)` then `Incoming` (is_outgoing flag), matching Python's outgoing/incoming partition. No double-count (petgraph returns each stored edge once per direction query).
+- **Strict superset (not a downgrade):** MiroFish prints the literal placeholder `(相关实体)` ("related entity") because the Zep edge dict lacks the neighbor name in this branch; teri substitutes the real `neighbor_name`. More information, identical line shape.
+
+**Heading text:** `### Related Facts and Relationships` ↔ Python `### 相关事实和关系` (faithful English rendering, consistent with the unit's other translated headings). ✓
+
+**Empty/None fallback — preserved (unchanged):** `if !neighbor_relations.is_empty()` then inner `if !relationships.is_empty()` → no edges = no section, mirroring Python `if entity.related_edges:` / `if relationships:`. ✓
+
+**Test check — both directions genuinely exercised (independently re-run: 2 passed):**
+- `test_generate_social_part2_outgoing_relation_in_prompt`: edge Alice→Acme, context=Alice ⇒ asserts heading + `Alice --[WorksFor]--> (Acme Corp)` (outgoing branch). ✓
+- `test_generate_social_part2_incoming_relation_in_prompt`: edge Acme→SanFrancisco, context=SanFrancisco ⇒ asserts heading + `(Acme Corp) --[LocatedIn]--> San Francisco` (incoming branch, reversed arrow). ✓
+- Both go through the real `generate_social` prompt-capture path (PromptCaptureLlm), not a unit-isolated string — end-to-end prompt assembly. ✓
+- No-edge fallback covered by the conditional + prior S-356 no-neighbor test.
+
+**Baseline:** orchestrator-confirmed 335 passed / 3 ignored, build + clippy --all-targets clean. No regression.
+
+### Symbol-map mutations applied (this gate)
+- S-356 → `- [x]` (PASS). Fact-branch noted as (a) Zep-server artifact, S-355-class non-droppable [≠] boundary (documented inert seam, not a skip).
+- No other rows touched. No source or Rust files edited. No commit (orchestrator commits).
+
+### U-018 rollup status (NOTE for orchestrator — not edited here)
+- S-356 was the LAST `- [~]` symbol in U-018. With S-356 → `- [x]`, U-018 is now **28 `- [x]` + 20 `- [≠]`, 0 `- [~]`/`- [!]`** → all symbols covered. **U-018 may roll up to unit `- [x]`** per the rollup rule. (Parity-ledger unit row not edited by this gate per contract.)

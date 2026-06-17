@@ -17,17 +17,17 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 10
-cycles_total: 10
-HANDOFF: SESSION BUDGET EXHAUSTED 2026-06-14 — see HANDOFF.md (authoritative). FIRST next-session action = re-run the parity gate for the [≠]-audit ports S-360/361/356/048 (committed green 20e2e48, parity-pending [~]). NO ScheduleWakeup armed (owner ended session).
-ledger: parity 8/50 units verified [x] (U-004, U-006, U-008, U-009, U-013, U-015, U-018, U-048) + GAP-1/2/6/U015-1/ACTION-TAXONOMY resolved; +4 [≠]-audit symbol ports [~] parity-pending (S-360/361 JSON-salvage, S-356 graph-enrichment, S-048 batch-retry)   # 333 green
+cycles_this_session: 1
+cycles_total: 11
+HANDOFF: (active session, resumed 2026-06-17) — [≠]-audit parity gate CLEARED. S-360/361/048 PASS as ported (20e2e48); S-356 FAILED the gate (dropped related_edges Part 2) -> ported the fix (get_neighbor_relations + directional relation lines, 2 tests) -> re-verified PASS. All 4 [≠]-audit symbols now [x]; U-006 + U-018 rollups re-affirmed clean. 335 green (+2). Next: ITERATE on extend-Y (U-024 ReportAgent ReACT / U-001 AppConfig / U-012 TaskManager).
+ledger: parity 8/50 units verified [x] (U-004, U-006, U-008, U-009, U-013, U-015, U-018, U-048) + GAP-1/2/6/U015-1/ACTION-TAXONOMY resolved; [≠]-audit symbol ports S-360/361/356/048 all [x] parity-verified (opus gate, resume 2026-06-17)   # 335 green
 # [≠] RE-AUDIT DONE (owner-flagged): 47 [≠] re-challenged under tightened bar (harness PR #34). 4 disguised
 #   skips ported [~]; S-189->U-012 + S-192->U-014 reclassified pending; Zep-SaaS/jitter/REFRESH/json-superset keep.
 # NO-DOWNGRADE CORRECTION (owner-flagged): [≠] is for genuinely-inexpressible/non-contractual ONLY,
 #   never "destination won't use it". U-018 to_reddit/twitter_format/to_dict were wrongly [≠]-skipped ->
 #   PORTED. U-004 rotating-file logging same error -> reclassify extend-Y, port next. Audit other [≠].
 # U-023 sweep TODO (tracked, not lost): gender 中文-normalization (S-371), truncated-JSON salvage (S-360/361).
-symbols: ~28/1087 [x] + ~18 [≠] of 1087 mapped   # +S-TAX-001..019,021 [x] (social Action taxonomy); S-TAX-020 REFRESH [≠]
+symbols: ~32/1087 [x] + ~18 [≠] of 1087 mapped   # +S-360/361/356/048 [x] ([≠]-audit ports parity-verified 2026-06-17); +S-TAX-001..019,021 [x] (social Action taxonomy); S-TAX-020 REFRESH [≠]
 gaps_open: GAP-OQ3-EMBED [!] (embedding generation: shimmy has no /v1/embeddings); GAP-U015-1 [!] (build() large-doc chunking after U-013); GAP-SOCIAL-WORLDSTATE [!] (rich social-world-state timeline/posts/engagement deferred to U-022/028/029/030)
 action_taxonomy: Action::Social(SocialAction) — 12 OASIS types (Trend included; Like/Dislike carry TargetKind{Post,Comment}); REFRESH [≠] (FILTERED_ACTIONS). READY for U-022/028/029/030.
 # TRUE BASELINE CORRECTION: DISCOVER baseline.md claimed 142 tests GREEN on c894de8 — FALSE-GREEN.

@@ -4,6 +4,7 @@ use crate::seed::SeedDocument;
 use crate::seed::text_processor;
 use petgraph::graph::{Graph, NodeIndex};
 use petgraph::visit::EdgeRef;
+use petgraph::Direction;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -48,6 +49,19 @@ pub enum RelationKind {
     Causes,
     Affects,
     Other,
+}
+
+impl fmt::Display for RelationKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RelationKind::WorksFor => write!(f, "WorksFor"),
+            RelationKind::LocatedIn => write!(f, "LocatedIn"),
+            RelationKind::RelatedTo => write!(f, "RelatedTo"),
+            RelationKind::Causes => write!(f, "Causes"),
+            RelationKind::Affects => write!(f, "Affects"),
+            RelationKind::Other => write!(f, "Other"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +211,54 @@ impl KnowledgeGraph {
             self.inner.neighbors(*idx).filter_map(|n| self.inner.node_weight(n)).collect();
 
         Ok(neighbors)
+    }
+
+    /// Returns each neighbor of `entity_id` together with the connecting `Relation` and a
+    /// direction flag (`true` = outgoing: entity → neighbor; `false` = incoming: neighbor → entity).
+    ///
+    /// This is the edge-aware counterpart to `get_neighbors` and powers Part 2 of
+    /// `build_entity_context` (the "Related Facts and Relationships" section).  It mirrors
+    /// MiroFish's `_build_entity_context` lines 434–453, which iterate `entity.related_edges`
+    /// carrying `edge_name` + `direction` + optional `fact`.
+    ///
+    /// Outgoing edges are visited first (Direction::Outgoing), then incoming
+    /// (Direction::Incoming).  petgraph's `edges_directed` returns each stored edge once per
+    /// direction query, so there is no double-counting.
+    ///
+    /// # Errors
+    /// Returns an error if `entity_id` is not in the graph.
+    pub fn get_neighbor_relations(
+        &self,
+        entity_id: Uuid,
+    ) -> Result<Vec<(&Entity, &Relation, bool)>> {
+        let idx = self
+            .index_by_id
+            .get(&entity_id)
+            .ok_or_else(|| TeriError::Graph(format!("Entity not found: {entity_id}")))?;
+
+        let mut result = Vec::new();
+
+        // Outgoing: entity --[rel]--> neighbor  (is_outgoing = true)
+        for edge in self.inner.edges_directed(*idx, Direction::Outgoing) {
+            if let (Some(neighbor), Some(rel)) = (
+                self.inner.node_weight(edge.target()),
+                Some(edge.weight()),
+            ) {
+                result.push((neighbor, rel, true));
+            }
+        }
+
+        // Incoming: neighbor --[rel]--> entity  (is_outgoing = false)
+        for edge in self.inner.edges_directed(*idx, Direction::Incoming) {
+            if let (Some(neighbor), Some(rel)) = (
+                self.inner.node_weight(edge.source()),
+                Some(edge.weight()),
+            ) {
+                result.push((neighbor, rel, false));
+            }
+        }
+
+        Ok(result)
     }
 
     pub fn get_subgraph(&self, entity_id: Uuid, depth: usize) -> Result<KnowledgeGraph> {

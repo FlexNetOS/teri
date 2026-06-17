@@ -1,5 +1,5 @@
 use crate::error::{Result, TeriError};
-use crate::graph::{Entity, KnowledgeGraph};
+use crate::graph::{Entity, KnowledgeGraph, Relation};
 use crate::llm::LlmClient;
 use crate::sim::{Action, SocialAction, TargetKind, WorldState};
 use chrono::Utc;
@@ -1223,6 +1223,7 @@ impl PersonaGenerator {
     /// Ports the IN-PROCESS parts (1–3) of `OasisProfileGenerator._build_entity_context`
     /// (oasis_profile_generator.py:414):
     /// - Part 1: entity attributes (name + kind used as "attributes" in teri's Entity model)
+    /// - Part 2: related edges — relationship/fact lines (S-356, was previously dropped)
     /// - Part 3: related nodes (neighbor names + kinds from `KnowledgeGraph::get_neighbors`)
     ///
     /// The Zep-search half (part 4, `_search_zep_for_entity`) is `[≠]` (S-355) and is not
@@ -1234,8 +1235,36 @@ impl PersonaGenerator {
 
         // Part 1: entity attributes — in teri's Entity model, the main attributes are
         // `name` and `kind`; we surface them as a context section.
+        // Mirrors _build_entity_context:425-432.
         let attrs = format!("- name: {}\n- kind: {}", entity.name, entity.kind);
         context_parts.push(format!("### Entity Attributes\n{}", attrs));
+
+        // Part 2: related edges — relationship/fact lines.
+        // Mirrors _build_entity_context:434-453: iterate `entity.related_edges`; for each edge
+        // emit a fact line if the relation carries a fact, else a directional arrow line.
+        //
+        // In teri, `Relation` carries no free-text fact field (facts are derived from entity
+        // summaries passed in by the caller), so this section always emits directional lines:
+        //   - outgoing: entity --[RelationKind]--> (neighbor)
+        //   - incoming: (neighbor) --[RelationKind]--> entity
+        //
+        // The `_fact_for_relation` helper is called with the relation to allow future enrichment.
+        // `existing_facts` dedup set from MiroFish is not needed here (no free-text facts).
+        let neighbor_relations = graph.get_neighbor_relations(entity.id).unwrap_or_default();
+        if !neighbor_relations.is_empty() {
+            let relationships: Vec<String> = neighbor_relations
+                .iter()
+                .filter_map(|(neighbor, rel, is_outgoing)| {
+                    Self::_relation_line(&entity.name, neighbor.name.as_str(), rel, *is_outgoing)
+                })
+                .collect();
+            if !relationships.is_empty() {
+                context_parts.push(format!(
+                    "### Related Facts and Relationships\n{}",
+                    relationships.join("\n")
+                ));
+            }
+        }
 
         // Part 3: related nodes (neighbor names + kinds from the graph)
         // Mirrors `entity.related_nodes` iteration in _build_entity_context:456-472.
@@ -1247,6 +1276,37 @@ impl PersonaGenerator {
         }
 
         context_parts.join("\n\n")
+    }
+
+    /// Formats one relationship line for Part 2 of `build_entity_context`.
+    ///
+    /// Mirrors MiroFish's `_build_entity_context` lines 443–450:
+    /// - If the relation carries a fact/summary, emit `- <fact>` (future: extend `Relation`).
+    /// - Else emit a directional arrow line using `edge_name` (the `RelationKind` display name)
+    ///   and the edge's direction relative to `entity_name`.
+    ///
+    /// Returns `None` when there is nothing to emit (currently unused; ensures the `filter_map`
+    /// call site is forward-compatible if we add a "skip" condition later).
+    fn _relation_line(
+        entity_name: &str,
+        neighbor_name: &str,
+        rel: &Relation,
+        is_outgoing: bool,
+    ) -> Option<String> {
+        // When Relation gains a `fact` field this branch becomes active:
+        // if let Some(fact) = &rel.fact { return Some(format!("- {}", fact)); }
+
+        let edge_name = format!("{}", rel.kind);
+        let line = if is_outgoing {
+            // entity --[RelationKind]--> (neighbor)
+            // Mirrors Python: f"- {entity.name} --[{edge_name}]--> (相关实体)"
+            format!("- {} --[{}]--> ({})", entity_name, edge_name, neighbor_name)
+        } else {
+            // (neighbor) --[RelationKind]--> entity
+            // Mirrors Python: f"- (相关实体) --[{edge_name}]--> {entity.name}"
+            format!("- ({}) --[{}]--> {}", neighbor_name, edge_name, entity_name)
+        };
+        Some(line)
     }
 
     /// Generate a social-media profile for an entity, returning a `SocialProfile`.
@@ -3828,5 +3888,170 @@ mod tests {
         // Rule-based student path kicks in
         assert_eq!(sp.age, Some(22));
         assert_eq!(sp.mbti.as_deref(), Some("INFP"));
+    }
+
+    // ===== Part 2 (related edges) tests for build_entity_context / generate_social =====
+
+    /// When an entity has an outgoing edge (entity → neighbor), `build_entity_context` must
+    /// emit a "### Related Facts and Relationships" section containing a directional arrow line:
+    ///   - entity --[RelationKind]--> (neighbor)
+    ///
+    /// Mirrors MiroFish `_build_entity_context`:443–448 outgoing branch.
+    #[tokio::test]
+    async fn test_generate_social_part2_outgoing_relation_in_prompt() {
+        struct PromptCaptureLlm {
+            captured: std::sync::Arc<std::sync::Mutex<String>>,
+        }
+        #[async_trait]
+        impl LlmClient for PromptCaptureLlm {
+            async fn complete(&self, prompt: &str) -> Result<String> {
+                *self.captured.lock().unwrap() = prompt.to_string();
+                Ok("{}".to_string())
+            }
+            async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+                Err(TeriError::Llm("not implemented".to_string()))
+            }
+            async fn stream(
+                &self,
+                _: &str,
+            ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>>
+            {
+                Err(TeriError::Llm("not implemented".to_string()))
+            }
+        }
+
+        let mut graph = KnowledgeGraph::new();
+        let alice = Entity {
+            id: uuid::Uuid::new_v4(),
+            name: "Alice".to_string(),
+            kind: EntityKind::Person,
+        };
+        let acme = Entity {
+            id: uuid::Uuid::new_v4(),
+            name: "Acme Corp".to_string(),
+            kind: EntityKind::Organization,
+        };
+        let alice_idx = graph.add_entity(alice.clone()).expect("add Alice");
+        let acme_idx = graph.add_entity(acme).expect("add Acme");
+        // Outgoing: Alice --[WorksFor]--> Acme Corp
+        graph.add_relation(
+            alice_idx,
+            acme_idx,
+            crate::graph::Relation::new(crate::graph::RelationKind::WorksFor, 0.9)
+                .expect("valid relation"),
+        );
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let mock_llm = PromptCaptureLlm { captured: captured.clone() };
+        let generator = PersonaGenerator::new();
+
+        generator
+            .generate_social(
+                "Alice",
+                "person",
+                "A researcher",
+                Platform::Reddit,
+                &mock_llm,
+                Some((&graph, &alice)),
+            )
+            .await
+            .expect("generate_social must succeed");
+
+        let prompt = captured.lock().unwrap().clone();
+
+        // Part 2 heading must appear
+        assert!(
+            prompt.contains("### Related Facts and Relationships"),
+            "prompt must include '### Related Facts and Relationships'; got: {}",
+            &prompt[..prompt.len().min(800)]
+        );
+        // Outgoing directional line: Alice --[WorksFor]--> (Acme Corp)
+        assert!(
+            prompt.contains("Alice --[WorksFor]--> (Acme Corp)"),
+            "prompt must include outgoing arrow line; got: {}",
+            &prompt[..prompt.len().min(800)]
+        );
+    }
+
+    /// When an entity has an INCOMING edge (neighbor → entity), `build_entity_context` must
+    /// emit the reversed directional arrow line:
+    ///   - (neighbor) --[RelationKind]--> entity
+    ///
+    /// Mirrors MiroFish `_build_entity_context`:449–450 incoming branch.
+    #[tokio::test]
+    async fn test_generate_social_part2_incoming_relation_in_prompt() {
+        struct PromptCaptureLlm {
+            captured: std::sync::Arc<std::sync::Mutex<String>>,
+        }
+        #[async_trait]
+        impl LlmClient for PromptCaptureLlm {
+            async fn complete(&self, prompt: &str) -> Result<String> {
+                *self.captured.lock().unwrap() = prompt.to_string();
+                Ok("{}".to_string())
+            }
+            async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+                Err(TeriError::Llm("not implemented".to_string()))
+            }
+            async fn stream(
+                &self,
+                _: &str,
+            ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>>
+            {
+                Err(TeriError::Llm("not implemented".to_string()))
+            }
+        }
+
+        let mut graph = KnowledgeGraph::new();
+        let city = Entity {
+            id: uuid::Uuid::new_v4(),
+            name: "San Francisco".to_string(),
+            kind: EntityKind::Location,
+        };
+        let company = Entity {
+            id: uuid::Uuid::new_v4(),
+            name: "Acme Corp".to_string(),
+            kind: EntityKind::Organization,
+        };
+        let city_idx = graph.add_entity(city.clone()).expect("add city");
+        let company_idx = graph.add_entity(company.clone()).expect("add company");
+        // Incoming to city: Acme Corp --[LocatedIn]--> San Francisco
+        graph.add_relation(
+            company_idx,
+            city_idx,
+            crate::graph::Relation::new(crate::graph::RelationKind::LocatedIn, 0.8)
+                .expect("valid relation"),
+        );
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let mock_llm = PromptCaptureLlm { captured: captured.clone() };
+        let generator = PersonaGenerator::new();
+
+        // We query from the city's perspective — edge is INCOMING to city
+        generator
+            .generate_social(
+                "San Francisco",
+                "location",
+                "A vibrant city",
+                Platform::Reddit,
+                &mock_llm,
+                Some((&graph, &city)),
+            )
+            .await
+            .expect("generate_social must succeed");
+
+        let prompt = captured.lock().unwrap().clone();
+
+        // Part 2 heading must appear
+        assert!(
+            prompt.contains("### Related Facts and Relationships"),
+            "prompt must include '### Related Facts and Relationships'; got: {}",
+            &prompt[..prompt.len().min(800)]
+        );
+        // Incoming directional line: (Acme Corp) --[LocatedIn]--> San Francisco
+        assert!(
+            prompt.contains("(Acme Corp) --[LocatedIn]--> San Francisco"),
+            "prompt must include incoming arrow line; got: {}",
+            &prompt[..prompt.len().min(800)]
+        );
     }
 }
