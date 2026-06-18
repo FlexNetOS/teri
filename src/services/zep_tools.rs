@@ -8,8 +8,10 @@
 //! - `interview_agents`: Agent selection and interview orchestration
 
 use crate::error::{Result, TeriError};
+use crate::graph::{KnowledgeGraph, EdgeTriple};
 use crate::llm::LlmClient;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// Search result from graph search operations.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -345,43 +347,57 @@ impl<L: LlmClient + Send + Sync + 'static> ZepToolsService<L> {
         &mut self,
         _graph_id: &str,
         query: &str,
-        _limit: i64,
-        _scope: Option<&str>,
+        limit: i64,
+        scope: Option<&str>,
     ) -> Result<SearchResult> {
-        let facts = Vec::new();
-        let edges_result = Vec::new();
-        let nodes_result = Vec::new();
-
-        // Extract query keywords (simple split on whitespace after punctuation removal)
+        // Extract query keywords
         let query_lower = query.to_lowercase();
-        let _keywords: Vec<String> = query_lower
+        let keywords: Vec<String> = query_lower
             .replace(',', " ")
+            .replace('，', " ")
             .split_whitespace()
             .filter(|w| w.len() > 1)
             .map(|s| s.to_string())
             .collect();
 
-        // Match score function - unused for now (placeholder for future implementation)
-        #[allow(dead_code)]
-        fn match_score(_text: &str, _query_lower: &str, _keywords: &[String]) -> i64 {
-            0
+        fn match_score(text: &str, query_lower: &str, keywords: &[String]) -> i64 {
+            if text.is_empty() {
+                return 0;
+            }
+            let text_lower = text.to_lowercase();
+            // Exact match of entire query
+            if query_lower.contains(&text_lower) || text_lower.contains(query_lower) {
+                return 100;
+            }
+            // Keyword matching
+            let mut score = 0;
+            for keyword in keywords {
+                if text_lower.contains(keyword) {
+                    score += 10;
+                }
+            }
+            score
         }
 
-        let scope = _scope.unwrap_or("edges");
+        // Note: This method receives graph_id as a parameter, but teri's KnowledgeGraph
+        // is not keyed by graph_id (unlike Zep Cloud). In teri, there's typically one
+        // active graph per simulation. We use get_all_entities/get_all_edges which
+        // work on the current graph context.
+        //
+        // For a proper implementation with multiple graphs, we'd need to store the
+        // KnowledgeGraph reference in ZepToolsService.
 
-        if scope == "edges" || scope == "both" {
-            // Get all edges and match - placeholder
-            // Would call KnowledgeGraphEntityReader::get_all_edges
+        let scope = scope.unwrap_or("edges");
+        let limit_usize = limit as usize;
 
-            // For now, return empty result
-        }
+        let mut facts: Vec<String> = Vec::new();
+        let mut edges_result: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
+        let mut nodes_result: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
 
-        if scope == "nodes" || scope == "both" {
-            // Get all nodes and match - placeholder
-            // Would call KnowledgeGraphEntityReader::get_all_entities
-
-            // For now, return empty result
-        }
+        // The actual graph access would happen here via a KnowledgeGraph reference.
+        // For now, we return an empty result since we don't have access to the
+        // actual graph instance in this context. In real usage, you'd pass the
+        // graph reference when creating ZepToolsService or call through a context.
 
         let count = facts.len() as i64;
         Ok(SearchResult {
@@ -395,7 +411,9 @@ impl<L: LlmClient + Send + Sync + 'static> ZepToolsService<L> {
 
     /// Get all nodes from the graph.
     pub async fn get_all_nodes(&mut self, _graph_id: &str) -> Result<Vec<NodeInfo>> {
-        // Placeholder for now - would call KnowledgeGraphEntityReader::get_all_entities
+        // Note: This would call KnowledgeGraph::get_all_entities() in a real implementation
+        // where we have access to the graph instance. Currently returns empty as we don't
+        // store a reference to KnowledgeGraph in this struct.
         Ok(Vec::new())
     }
 
@@ -405,7 +423,7 @@ impl<L: LlmClient + Send + Sync + 'static> ZepToolsService<L> {
         _graph_id: &str,
         _include_temporal: bool,
     ) -> Result<Vec<EdgeInfo>> {
-        // Placeholder for now - would call KnowledgeGraphEntityReader::get_all_edges
+        // Note: This would call KnowledgeGraph::get_all_edges() in a real implementation
         Ok(Vec::new())
     }
 
@@ -564,5 +582,21 @@ mod tests {
             expired_at: Some("2024-01-01".to_string()),
         };
         assert!(edge.is_expired());
+    }
+
+    #[test]
+    fn test_edge_info_is_invalid() {
+        let edge = EdgeInfo {
+            source_node_uuid: "".into(),
+            target_node_uuid: "b".into(),
+            name: "TEST".into(),
+            fact: "fact".into(),
+            uuid: "".into(),
+            created_at: None,
+            valid_at: None,
+            invalid_at: None,
+            expired_at: None,
+        };
+        assert!(edge.is_invalid());
     }
 }
