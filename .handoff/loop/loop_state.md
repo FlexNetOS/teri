@@ -356,3 +356,14 @@ next_iterate: U-022 [x] complete → U-017 port-fresh full implementation
 # All 51 tests pass. Clippy clean. The module is properly exported in lib.rs via `pub mod seed`.
 # U-013 UNIT [x] (all symbols already ported). NEXT: U-021 or U-020 based on merge ledger order.
 
+
+# CYCLE 6 (NEW SESSION 2026-06-18, 6th resume): U-023 prepare_simulation VERIFIED — opus PASS. All tests pass:
+# - prepare_simulation_missing_id_returns_err
+# - prepare_simulation_zero_entities_returns_ok_with_failed_status
+# - prepare_simulation_happy_path_reddit_only
+# - prepare_simulation_happy_path_twitter_only
+# - prepare_simulation_both_platforms
+# - prepare_simulation_with_custom_entity_types
+# - prepare_simulation_progress_callback_called
+# U-023 UNIT [x] (all sub-cycles complete). teri 997 green, clippy clean. NEXT: U-021 or U-020 based on merge ledger order.
+
