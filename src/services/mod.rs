@@ -9,4 +9,5 @@ pub mod graph_memory;
 pub mod oasis_profile_export;
 pub mod ontology;
 pub mod simulation_config;
+pub mod simulation_ipc;
 pub mod simulation_manager;

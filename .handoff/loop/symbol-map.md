@@ -569,30 +569,30 @@
 
 ## U-020 — `backend/app/services/simulation_ipc.py`
 
-- [ ] S-453 · `unit:U-020` · `type` · `CommandType` · enum: INTERVIEW/BATCH_INTERVIEW/CLOSE_ENV · `simulation_ipc.py:25`
-- [ ] S-454 · `unit:U-020` · `variant` · `CommandType.INTERVIEW` · `simulation_ipc.py:27`
-- [ ] S-455 · `unit:U-020` · `variant` · `CommandType.BATCH_INTERVIEW` · `simulation_ipc.py:28`
-- [ ] S-456 · `unit:U-020` · `variant` · `CommandType.CLOSE_ENV` · `simulation_ipc.py:29`
-- [ ] S-457 · `unit:U-020` · `type` · `CommandStatus` · enum: PENDING/PROCESSING/COMPLETED/FAILED · `simulation_ipc.py:32`
-- [ ] S-458 · `unit:U-020` · `variant` · `CommandStatus.PENDING` · `simulation_ipc.py:34`
-- [ ] S-459 · `unit:U-020` · `variant` · `CommandStatus.PROCESSING` · `simulation_ipc.py:35`
-- [ ] S-460 · `unit:U-020` · `variant` · `CommandStatus.COMPLETED` · `simulation_ipc.py:36`
-- [ ] S-461 · `unit:U-020` · `variant` · `CommandStatus.FAILED` · `simulation_ipc.py:37`
-- [ ] S-462 · `unit:U-020` · `type` · `IPCCommand` · dataclass with to_dict/from_dict · `simulation_ipc.py:41`
-- [ ] S-463 · `unit:U-020` · `field` · `IPCCommand.command_id` · `simulation_ipc.py:43`
-- [ ] S-464 · `unit:U-020` · `field` · `IPCCommand.command_type` · `simulation_ipc.py:44`
-- [ ] S-465 · `unit:U-020` · `field` · `IPCCommand.args` · `simulation_ipc.py:45`
-- [ ] S-466 · `unit:U-020` · `field` · `IPCCommand.timestamp` · `simulation_ipc.py:46`
-- [ ] S-467 · `unit:U-020` · `method` · `IPCCommand.to_dict` · `simulation_ipc.py:48`
-- [ ] S-468 · `unit:U-020` · `method` · `IPCCommand.from_dict` · `simulation_ipc.py:57`
-- [ ] S-469 · `unit:U-020` · `type` · `IPCResponse` · dataclass with to_dict/from_dict · `simulation_ipc.py:67`
-- [ ] S-470 · `unit:U-020` · `field` · `IPCResponse.command_id` · `simulation_ipc.py:69`
-- [ ] S-471 · `unit:U-020` · `field` · `IPCResponse.status` · `simulation_ipc.py:70`
-- [ ] S-472 · `unit:U-020` · `field` · `IPCResponse.result` · `simulation_ipc.py:71`
-- [ ] S-473 · `unit:U-020` · `field` · `IPCResponse.error` · `simulation_ipc.py:72`
-- [ ] S-474 · `unit:U-020` · `field` · `IPCResponse.timestamp` · `simulation_ipc.py:73`
-- [ ] S-475 · `unit:U-020` · `method` · `IPCResponse.to_dict` · `simulation_ipc.py:75`
-- [ ] S-476 · `unit:U-020` · `method` · `IPCResponse.from_dict` · `simulation_ipc.py:85`
+- [x] S-453 · `unit:U-020` · `type` · `CommandType` · enum: INTERVIEW/BATCH_INTERVIEW/CLOSE_ENV · `simulation_ipc.py:25` → `teri::services::simulation_ipc::CommandType`
+- [x] S-454 · `unit:U-020` · `variant` · `CommandType.INTERVIEW` · `simulation_ipc.py:27` → `CommandType::Interview` (serde→"interview")
+- [x] S-455 · `unit:U-020` · `variant` · `CommandType.BATCH_INTERVIEW` · `simulation_ipc.py:28` → `CommandType::BatchInterview` (serde→"batch_interview")
+- [x] S-456 · `unit:U-020` · `variant` · `CommandType.CLOSE_ENV` · `simulation_ipc.py:29` → `CommandType::CloseEnv` (serde→"close_env")
+- [x] S-457 · `unit:U-020` · `type` · `CommandStatus` · enum: PENDING/PROCESSING/COMPLETED/FAILED · `simulation_ipc.py:32` → `teri::services::simulation_ipc::CommandStatus`
+- [x] S-458 · `unit:U-020` · `variant` · `CommandStatus.PENDING` · `simulation_ipc.py:34` → `CommandStatus::Pending` (serde→"pending")
+- [x] S-459 · `unit:U-020` · `variant` · `CommandStatus.PROCESSING` · `simulation_ipc.py:35` → `CommandStatus::Processing` (serde→"processing")
+- [x] S-460 · `unit:U-020` · `variant` · `CommandStatus.COMPLETED` · `simulation_ipc.py:36` → `CommandStatus::Completed` (serde→"completed")
+- [x] S-461 · `unit:U-020` · `variant` · `CommandStatus.FAILED` · `simulation_ipc.py:37` → `CommandStatus::Failed` (serde→"failed")
+- [x] S-462 · `unit:U-020` · `type` · `IPCCommand` · dataclass with to_dict/from_dict · `simulation_ipc.py:41` → `teri::services::simulation_ipc::IPCCommand`
+- [x] S-463 · `unit:U-020` · `field` · `IPCCommand.command_id` · `simulation_ipc.py:43` → `IPCCommand::command_id: String`
+- [x] S-464 · `unit:U-020` · `field` · `IPCCommand.command_type` · `simulation_ipc.py:44` → `IPCCommand::command_type: CommandType`
+- [x] S-465 · `unit:U-020` · `field` · `IPCCommand.args` · `simulation_ipc.py:45` → `IPCCommand::args: serde_json::Map<String, Value>`
+- [x] S-466 · `unit:U-020` · `field` · `IPCCommand.timestamp` · `simulation_ipc.py:46` → `IPCCommand::timestamp: String` (default=python_isoformat_local())
+- [x] S-467 · `unit:U-020` · `method` · `IPCCommand.to_dict` · `simulation_ipc.py:48` → `IPCCommand::to_dict(&self) -> Value` (4-key ordered map; command_type=.value string)
+- [x] S-468 · `unit:U-020` · `method` · `IPCCommand.from_dict` · `simulation_ipc.py:57` → `IPCCommand::from_dict(data: &Value) -> Result<Self>` (command_id/command_type required; args/timestamp tolerant)
+- [x] S-469 · `unit:U-020` · `type` · `IPCResponse` · dataclass with to_dict/from_dict · `simulation_ipc.py:67` → `teri::services::simulation_ipc::IPCResponse`
+- [x] S-470 · `unit:U-020` · `field` · `IPCResponse.command_id` · `simulation_ipc.py:69` → `IPCResponse::command_id: String`
+- [x] S-471 · `unit:U-020` · `field` · `IPCResponse.status` · `simulation_ipc.py:70` → `IPCResponse::status: CommandStatus`
+- [x] S-472 · `unit:U-020` · `field` · `IPCResponse.result` · `simulation_ipc.py:71` → `IPCResponse::result: Option<Map<String, Value>>`
+- [x] S-473 · `unit:U-020` · `field` · `IPCResponse.error` · `simulation_ipc.py:72` → `IPCResponse::error: Option<String>`
+- [x] S-474 · `unit:U-020` · `field` · `IPCResponse.timestamp` · `simulation_ipc.py:73` → `IPCResponse::timestamp: String` (default=python_isoformat_local())
+- [x] S-475 · `unit:U-020` · `method` · `IPCResponse.to_dict` · `simulation_ipc.py:75` → `IPCResponse::to_dict(&self) -> Value` (5-key ordered; status=.value; result/error=null not omitted)
+- [x] S-476 · `unit:U-020` · `method` · `IPCResponse.from_dict` · `simulation_ipc.py:85` → `IPCResponse::from_dict(data: &Value) -> Result<Self>` (command_id/status required; result/error/timestamp tolerant)
 - [ ] S-477 · `unit:U-020` · `type` · `SimulationIPCClient` · file-based IPC client · `simulation_ipc.py:95`
 - [ ] S-478 · `unit:U-020` · `method` · `SimulationIPCClient.__init__` · `simulation_ipc.py:102`
 - [ ] S-479 · `unit:U-020` · `method` · `SimulationIPCClient.send_command` · writes cmd JSON, polls response dir, 0.5s interval, timeout raises TimeoutError · `simulation_ipc.py:117`

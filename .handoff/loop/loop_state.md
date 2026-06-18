@@ -17,7 +17,14 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 3   # RESUMED 2026-06-17 (10th resume, reset 0); baseline re-verified 797 green. CYCLE BUDGET (3) reached → HAND OFF.
+cycles_this_session: 1   # RESUMED 2026-06-17 (11th resume, reset 0); baseline re-verified 880 green.
+# CYCLE1 (11th resume) 2026-06-17: U-020 sub-cycle (a) IPC protocol types (S-453..S-476, 24/24 [x]) — opus PASS
+#   (DECISION-15). NEW src/services/simulation_ipc.rs: CommandType (interview/batch_interview/close_env), CommandStatus
+#   (pending/processing/completed/failed), IPCCommand + IPCResponse with to_dict/from_dict. PURE PORT byte-exact:
+#   .value lowercase strings, 4-key/5-key to_dict EXACT insertion order (preserve_order), result/error=None→JSON null
+#   never omitted, required-vs-tolerant from_dict split matches Python (command_id/command_type/status required→Err;
+#   args/timestamp/result/error tolerant). No [≠] (file-transport [≠] deferred to b). 21 tests, 903 green, clippy clean.
+#   U-020 STAYS [~] (sub-cycle b SimulationIPCClient/Server S-477..S-492 = in-process channel map-onto, needs architect).
 # CYCLE3 (10th resume) 2026-06-17: U-021 sub-cycle (c) ZepGraphMemoryManager (S-531..S-539, 9/9 [x]) — opus PASS →
 #   U-021 COMPLETE (all S-493..S-539). GraphMemoryManager<L>: class-singleton→instance struct (forced: generic statics
 #   impossible, LlmClient not dyn-safe; observable one-registry+idempotent-stop_all contract preserved). stop_all

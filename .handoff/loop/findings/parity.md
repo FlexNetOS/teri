@@ -1704,3 +1704,32 @@ S-531 `- [x]` · S-532 `- [x]` · S-533 `- [x]` · S-534 `- [x]` · S-535 `- [x]
 ### VERDICT: **PASS** — and **U-021 COMPLETE**
 
 Sub-cycle (a) S-493..S-514 = `[x]` (verified prior). Sub-cycle (b) S-515..S-530 = 13 `[x]` + 3 `[≠]` (verified above, parity-clean). Sub-cycle (c) S-531..S-539 = 9 `[x]` (this block). **All S-493..S-539 are now `[x]`/`[≠]` (every `[≠]` survived the challenge). The unit ledger U-021 may flip `- [x]` and commit.** No ledger/symbol-map edits made here beyond this parity.md trail (per instruction).
+
+---
+
+## 2026-06-17 · U-020 sub-cycle (a) · IPC protocol types (`CommandType`/`CommandStatus`/`IPCCommand`/`IPCResponse`) — S-453..S-476
+
+**Verdict: PASS** — PURE PORT, byte-exact JSON parity verified line-by-line against `simulation_ipc.py` L25-92 + by running tests. 24/24 symbols (S-453..S-476) → `- [x]`. No `- [≠]` in this sub-cycle (transport `[≠]` belongs to sub-cycle b). U-020 stays `- [~]` (sub-cycle b Client/Server not yet ported).
+
+**Method:** read both sides in full + DECISION-15 + symbol-map rows; ran `cargo test simulation_ipc` (21 unit pass, 0 fail) + `cargo test --doc simulation_ipc` (2 doctests pass). Module wired: `lib.rs:16 pub mod services` → `services/mod.rs:12 pub mod simulation_ipc`. `serde_json` has `preserve_order` (Cargo.toml:35) — confirmed by-reading AND the key-order tests pass by-running.
+
+**Differential verification (source-line → rust):**
+
+1. **Enum `.value` strings — PASS.** `CommandType` py L27-29 `"interview"`/`"batch_interview"`/`"close_env"` ; `CommandStatus` py L34-37 `"pending"`/`"processing"`/`"completed"`/`"failed"`. Rust uses `#[serde(rename_all="snake_case")]` AND an explicit `as_str()` (rs L75-81, L116-123). Both serde serialization (`command_type_serde_all_variants`, `command_status_serde_all_variants` assert exact quoted lowercase strings, NOT `"Interview"` Debug) AND `as_str()`/to_dict emission verified. Round-trip parse asserted in the serde tests. `to_dict` uses `.as_str()` (rs L167, L291), not enum Debug. **By-running + by-reading.**
+
+2. **to_dict key order + null-not-omitted — PASS.** `IPCCommand::to_dict` (rs L159-175) builds `Map::new()` + 4 sequential inserts → `command_id, command_type, args, timestamp` (py L49-54 exact order). `IPCResponse::to_dict` (rs L283-313) → 5 inserts `command_id, status, result, error, timestamp` (py L76-81). result/error `None` → `Value::Null` (rs L294-308), key ALWAYS present. Tests assert: `obj.len()==4`/`==5`, `obj.keys()` exact ordered vec, AND `serialised.contains("\"result\":null")` / `"\"error\":null"` (ipc_response_to_dict_null_not_omitted L617-656), AND serialised-string key order (ipc_command_to_dict_serialised_key_order, ipc_response_to_dict_serialised_key_order). preserve_order confirmed driving real Map ordering. **By-running + by-reading.**
+
+3. **from_dict required-vs-tolerant split — PASS, matches Python exactly.**
+   - `IPCCommand::from_dict` (rs L187-241): `command_id` REQUIRED → `.get(...).ok_or_else(Err)` mirrors py L59 `data["command_id"]` (KeyError). `command_type` REQUIRED + unknown-string → `Err` mirrors py L60 `CommandType(...)` (ValueError). `args` tolerant `.unwrap_or_default()` → `{}` mirrors py L61 `.get("args",{})`. `timestamp` tolerant → `python_isoformat_local()` mirrors py L62 `.get("timestamp", now)`. Tests cover: missing command_id → Err, unknown command_type → Err, absent args → empty map, absent timestamp → non-empty default, all-fields, round-trip.
+   - `IPCResponse::from_dict` (rs L328-390): command_id + status REQUIRED (py L87-88); result/error `.get(...)` → `None` mirrors py L89-90 `.get("result")`/`.get("error")`; JSON `null` ALSO → `None` (`.and_then(as_object/as_str)` drops null) — asserted by `ipc_response_from_dict_null_result_is_none` L707-718. timestamp default now. Tests cover missing command_id → Err, unknown status → Err, absent + null optional fields → None.
+   - **Faithful error mapping:** porter returns `TeriError::Sim` on missing/bad. Sibling `Project::from_dict` (project.rs:242-267) uses the SAME required-`.get().ok_or_else(Err)` / tolerant-`.unwrap_or` pattern (it uses `TeriError::Config` because it is a config/model concern; `TeriError::Sim` is the correct sibling for a `services/` simulation type). The required-vs-tolerant boundary is identical to the established teri from_dict pattern. A Rust port that made `args` required or `command_id` tolerant would be a divergence — neither occurred.
+
+4. **timestamp default — PASS.** Both default to `crate::models::project::python_isoformat_local` (rs L44, L233, L381) — the SAME `pub(crate)` helper teri uses for `datetime.now().isoformat()` (project.rs:50-58: local naive, microseconds omitted when zero, no TZ). Not a divergent format.
+
+5. **args/result types — PASS, no narrowing.** Python `Dict[str,Any]` → `serde_json::Map<String,Value>` (rs L147, S-465). `Optional[Dict]` → `Option<Map<String,Value>>` (rs L266, S-472). `Optional[str]` → `Option<String>` (rs L268). The `result`/`args`/`error` producers in the source (`send_success` typed `result: Dict[str,Any]`, py L380) only ever emit dict/str — a non-dict `result` is outside the protocol contract (would be a producer bug in Python too), so `.and_then(as_object)` collapsing a non-object to None is faithful to the contractual dict-or-null shape, NOT a narrowing of any value the protocol produces. (Producers live in sub-cycle b; the contract boundary here is dict-or-null.)
+
+**DECISION-15 alignment:** sub-cycle (a) is declared a PURE PORT, transport-agnostic, NO substrate decision. All five differential dimensions above match the DECISION-15 spec (4-key/5-key order, null-not-omitted, ensure_ascii=False ⇒ serde default non-escaping, python_isoformat_local, preserve_order). The file-transport `[≠]` is explicitly deferred to sub-cycle (b) — none of it leaks into (a).
+
+**Symbols (24/24 → `- [x]`):** S-453 S-454 S-455 S-456 S-457 S-458 S-459 S-460 S-461 S-462 S-463 S-464 S-465 S-466 S-467 S-468 S-469 S-470 S-471 S-472 S-473 S-474 S-475 S-476 — all `- [x]`, zero `- [~]`, zero `- [≠]`.
+
+### VERDICT: **PASS** — sub-cycle (a) done. S-453..S-476 = `[x]`. **U-020 stays `- [~]`** (sub-cycle b `SimulationIPCClient`/`SimulationIPCServer` S-477..S-492 remains). Symbol-map updated for these 24 symbols only; unit ledger NOT flipped.

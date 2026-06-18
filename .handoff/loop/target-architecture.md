@@ -1034,3 +1034,37 @@ stats (5 counters)                      Arc<Mutex<UpdaterStats>> OR AtomicU64 se
 4. U-050: `start()` captures `get_locale()` then `spawn(with_locale(locale, worker))`.
 5. `[≠]`: SEND_INTERVAL (network rate-limit), literal MAX_RETRIES retry-loop (network-transient; failed_count+continue-on-error IS ported), ZEP_API_KEY check (keyless substrate), Zep coreference entity-resolution (no resolution model; no entity dropped). PORTED (not `[≠]`): platform display names (log output), get_stats, all 5 counters, event_type skip.
 6. All in `src/services/graph_memory.rs` (+ graph method in `src/graph/mod.rs`); ONE cycle (split b1/b2 only if the graph refactor fights the borrow checker).
+
+---
+
+## DECISION-15 — U-020 `simulation_ipc.py` (S-453..S-492) → 2 sub-cycles (map-onto-substrate: subprocess-file-IPC → in-process)
+
+**Substrate context (LOCKED):** OASIS Python subprocess sim → teri native in-process `SimEngine` (`src/sim`). MiroFish's
+IPC is file-based ONLY because it bridges two OS PROCESSES (Flask writes command JSON to `ipc_commands/`, the sim
+subprocess polls + replies in `ipc_responses/`, liveness via `env_status.json`). teri has NO second process → the file
+*transport* is a subprocess artifact with no in-process analog (same class as Zep-network→petgraph U-007/U-016).
+But the **command/response PROTOCOL** (CommandType, the interview/batch_interview/close_env arg shapes, IPCResponse
+status/result/error + JSON round-trip) IS the observable contract U-022/U-047 consume → PORTED.
+
+- **sub-cycle (a) — protocol types (S-453..S-476).** PURE PORT, transport-agnostic, NO substrate decision.
+  `CommandType` (str enum: interview/batch_interview/close_env), `CommandStatus` (pending/processing/completed/failed),
+  `IPCCommand {command_id, command_type, args: Map, timestamp}` + `to_dict`(4-key)/`from_dict`(.get tolerance),
+  `IPCResponse {command_id, status, result: Option<Map>, error: Option<str>, timestamp}` + `to_dict`(5-key:
+  command_id/status/result/error/timestamp, result&error → JSON null when None, ensure_ascii=False)/`from_dict`.
+  timestamp default = `python_isoformat_local()`. serde with preserve_order for key order. New module
+  `src/services/simulation_ipc.rs`. Byte-exact differential testable (to_dict/from_dict round-trip, enum .value strings,
+  null result/error). **THIS CYCLE.**
+- **sub-cycle (b) — `SimulationIPCClient` + `SimulationIPCServer` (S-477..S-492).** **NEEDS THE SUBSTRATE DECISION
+  (architect when reached):** map the file-based request/response onto IN-PROCESS delivery. Client `send_command`
+  (write cmd file → poll response file w/ timeout/poll_interval → cleanup) → in-process send + await-with-timeout
+  (tokio `mpsc` + `oneshot` reply, or a handler trait the SimEngine implements). Server `poll_commands` (scan dir by
+  mtime) / `send_response`/`send_success`/`send_error` → the SimEngine-side command receive+reply loop. `start`/`stop`/
+  `_update_env_status`(env_status.json) / `check_env_alive` → in-process liveness (a shared running flag). The
+  PROTOCOL methods (send_interview timeout=60 / send_batch_interview timeout=120 / send_close_env timeout=30 — the
+  arg dicts) are CONTRACTUAL → ported; the file paths (ipc_commands/ipc_responses/env_status.json), os.remove cleanup,
+  mtime-ordered polling, JSONDecodeError-retry are subprocess-transport `[≠]` (no second process). Wires into U-022
+  (the sim loop driving interviews) — compose the channel with how SimEngine runs as a tokio task.
+
+**Owner-rule note:** the file-transport `[≠]` rests on the LOCKED OASIS-subprocess→in-process-SimEngine substrate
+decision (genuine inexpressibility — no second process to bridge), NOT on "the destination won't use it". The
+observable interview/close protocol is fully ported. Sub-cycle (b) verifier must confirm no protocol behavior is lost.
