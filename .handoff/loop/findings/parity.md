@@ -1639,3 +1639,68 @@ initial_snapshot.insert("reddit".to_string(), 0usize);
 The single observable divergence from the prior FAIL is resolved by a faithful, localized fix; no other (b) behavior regressed; 871 tests green. **Sub-cycle (b) is parity-clean.** S-530 flips to `- [x]`.
 
 **Unit ledger:** U-021 still gated on sub-cycle (c) `ZepGraphMemoryManager` (S-531+) — sub-cycle (b) is now PASS but the unit cannot flip `- [x]` until (c) is verified. No change to ledger/symbol-map made here beyond this parity.md trail (per instruction).
+
+---
+
+## 2026-06-17 — U-021 sub-cycle (c) `ZepGraphMemoryManager` → `GraphMemoryManager<L>` (S-531..S-539)
+
+**Verifier:** rust-port-parity-verifier · **Worktree:** `.worktrees/mirofish-port/teri` (branch `port/mirofish`)
+**Source:** `MiroFish/backend/app/services/zep_graph_memory_updater.py` L479-554
+**Rust:** `src/services/graph_memory.rs` L1886-2065 (struct + impl) + `manager_tests` L2071-2327
+
+### Map-onto adjudication (class-level singleton → instance struct)
+
+Python's `ZepGraphMemoryManager` is a class-level singleton: `_updaters` (class dict), `_lock` (class `threading.Lock`), `_stop_all_done` (class bool). Rust maps to an INSTANCE struct `GraphMemoryManager<L>` held in app state (e.g. `Arc<…>`). **Ruling: faithful map-onto, NOT a behavior change.** The mapping is *forced* — Rust has no generic statics, and `LlmClient` is not dyn-safe (the type is `GraphMemoryManager<L>`, generic over the client), so a class-level static keyed singleton is inexpressible. The observable contract is preserved exactly: ONE registry per process (one struct instance held in shared state), keyed by `simulation_id`, with idempotent `stop_all` as the U-049 cleanup entry point. This is a `[≠]`-class substrate adaptation of the *holder* — the per-method behavior is fully ported (so the methods themselves are `- [x]`, not `- [≠]`).
+
+### S-538 `stop_all` — highest-stakes (U-049 cleanup + idempotency). VERIFIED.
+
+(a) **Idempotent, no re-stop.** Rust checks `stop_all_done.compare_exchange(false,true,AcqRel,Acquire)` and `return`s on `Err` BEFORE acquiring the Mutex — exactly mirroring Python's `if cls._stop_all_done: return` (L534) which also tests before `with cls._lock` (L538). The flag flips on the FIRST call only; the second call short-circuits and never touches the (now-empty) map. Confirmed by `test_stop_all_idempotent`: registry empty after call 1, still empty after call 2, no panic.
+
+(b) **One failing updater does NOT abort the rest.** Read `GraphMemoryUpdater::stop` (L1017-1044): returns `()` (not `Result`), no `?`, no early-return; it does `store`/`take`/`let _ = timeout(handle).await`/counter-loads/`info!`. A panicking *worker task* surfaces as `Err(JoinError)` from `handle.await` and is **swallowed by `let _ =`** — it cannot propagate into `stop_all`. The `stop_all` loop (L2029-2038) calls `updater.stop().await` directly with **no `?`** inside `for (id, mut updater) in updaters.drain()`. Adversarial mental test (3 updaters, middle one "errors" on stop): since `stop()` is infallible/non-panicking by construction, all 3 stop and the loop completes. Even in the pathological panic case, `drain()`'s `Drain` guard removes all remaining entries on drop, so the **map ends empty regardless**. This is the faithful Rust equivalent of Python's per-iteration `try/except … continue` (L541-544) — Rust achieves catch-log-continue by making `stop()` infallible+self-logging rather than wrapping each call.
+
+(c) **Map ends empty.** `drain()` empties the HashMap (equivalent to Python `cls._updaters.clear()`, L545). Confirmed by `test_stop_all_clears_registry` (3 updaters → empty) and `test_stop_all_idempotent`.
+
+→ **S-538 `- [x]`.**
+
+### S-534 `create_updater` — VERIFIED. Stop-old-FIRST ordering preserved.
+
+L1945-1964: locks map; `if let Some(old) = updaters.get_mut(id) { old.stop().await }` BEFORE constructing/starting/inserting the new updater — exact match to Python L503-504 (`if id in _updaters: _updaters[id].stop()`) then construct+start+insert (L506-508). No leaked old worker. **Return-type ruling:** Python returns the updater (L511); Rust returns `Result<(), TeriError>`. The updater holds a `JoinHandle` behind the Mutex and is not `Clone`; returning a `&`/owned instance out of the guard is impossible. **No caller depends on the returned instance** — the access path is `get_updater`/`get_all_stats` (registry-mediated). `Result<()>` is a faithful access-path adaptation (the `[≠]`-class signature change documented in the symbol-map row), **not a downgrade**. Confirmed by `test_create_updater_registers` (Some + running) and `test_create_updater_replaces_existing` (new graph_id "graph-b", total_activities=0 → old was genuinely replaced, not appended).
+
+→ **S-534 `- [x]`.**
+
+### S-535 `get_updater` — VERIFIED. Presence + stats is the faithful observable.
+
+L1978-1987: returns `Option<UpdaterStats>` (snapshot) vs Python's `Optional[ZepGraphMemoryUpdater]`. **Ruling:** no caller needs the *live* updater object (the producer hot-path uses the updater handle held elsewhere; the manager's read surface is existence + stats). Returning a `&`/`&mut` through the `tokio::sync::Mutex` would force the caller to hold the lock for its entire use — a deadlock footgun. `None` vs `Some(_)` maps presence directly; `UpdaterStats` carries the readable state. Faithful composable equivalent (`[≠]`-class signature, documented). Confirmed by `test_get_updater_absent_returns_none` (None for unregistered) and `test_create_updater_registers` (Some after create).
+
+→ **S-535 `- [x]`.**
+
+### S-536 `stop_updater` — VERIFIED.
+
+L1995-2001: `updaters.remove(id)` → if `Some(mut updater)` stop + log; if `None` no-op. Matches Python L521-525 (`if id in _updaters: stop(); del`). Confirmed by `test_stop_updater_removes` (present after, absent after stop) and `test_stop_updater_absent_is_noop` (no panic, registry stays empty). → **S-536 `- [x]`.**
+
+### S-539 `get_all_stats` — VERIFIED.
+
+L2051-2058: one entry per updater, each value = `updater.get_stats().await`; key set = registry keys. Matches Python dict-comprehension L551-553. Confirmed by `test_get_all_stats_returns_all_entries` (len==2, contains sim-a/sim-b, graph_id per entry). `get_stats` (S-530, already `[x]`) is the per-entry value. → **S-539 `- [x]`.**
+
+### S-531/532/533/537 — struct + fields. VERIFIED.
+
+- **S-531** struct `GraphMemoryManager<L>` (L1904-1913) — the class→instance holder. `- [x]`.
+- **S-532** `updaters: tokio::sync::Mutex<HashMap<String, GraphMemoryUpdater<L>>>` — port of `_updaters`. `- [x]`.
+- **S-533** `_lock` folded into the Mutex. The separate `threading.Lock` has no observable beyond mutual exclusion, which the `tokio::sync::Mutex` provides. `tokio::sync::Mutex` (not `std::Mutex`) is **required** because guards are held across `.await` points (`old.stop().await`, `get_stats().await` while iterating). Nothing observable dropped. `- [x]`.
+- **S-537** `stop_all_done: AtomicBool` with `compare_exchange(AcqRel, Acquire)` — port of `_stop_all_done` check-before-lock. `- [x]`.
+
+### Tests reviewed (9 manager_tests) — all assert the right things, none weak.
+
+`test_stop_all_idempotent` asserts empty after both calls (the no-double-stop contract — confirmed by the AtomicBool short-circuit, and no-double-stop is structurally guaranteed since the map is already empty on call 2). `test_create_updater_replaces_existing` asserts the NEW updater's graph_id="graph-b" and total_activities=0 — proving the old was stopped+replaced (it added an activity to the old one; the new reads zero), i.e. it genuinely verifies replace-stops-old, not a weak presence check. No weakly-asserting test found. **Gap noted (non-blocking):** no test injects a *failing* `stop()` to exercise per-updater error isolation directly — but that isolation is structurally guaranteed (S-538(b): `stop()` is infallible/non-panicking, no `?`, `drain()` clears regardless), so the contract holds without a dedicated test.
+
+### Run
+
+`cargo test graph_memory` → **78 passed, 0 failed.** The 9 `services::graph_memory::manager_tests::*` confirmed present and passing (listed via `--list`).
+
+### Tally
+
+S-531 `- [x]` · S-532 `- [x]` · S-533 `- [x]` · S-534 `- [x]` · S-535 `- [x]` · S-536 `- [x]` · S-537 `- [x]` · S-538 `- [x]` · S-539 `- [x]` → **9/9 covered, zero `- [~]`, zero `- [≠]`** (all 9 methods/fields are fully ported; the holder's class→instance and the two return-type adaptations are forced/inexpressible signature shapes, documented, with behavior fully preserved — they do NOT downgrade observable contract, so the symbols are `[x]`, not skip-`[≠]`).
+
+### VERDICT: **PASS** — and **U-021 COMPLETE**
+
+Sub-cycle (a) S-493..S-514 = `[x]` (verified prior). Sub-cycle (b) S-515..S-530 = 13 `[x]` + 3 `[≠]` (verified above, parity-clean). Sub-cycle (c) S-531..S-539 = 9 `[x]` (this block). **All S-493..S-539 are now `[x]`/`[≠]` (every `[≠]` survived the challenge). The unit ledger U-021 may flip `- [x]` and commit.** No ledger/symbol-map edits made here beyond this parity.md trail (per instruction).

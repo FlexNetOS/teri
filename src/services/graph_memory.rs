@@ -1824,3 +1824,504 @@ mod updater_tests {
         updater.stop().await;
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GraphMemoryManager — Sub-cycle (c) port of `ZepGraphMemoryManager` (S-531..S-539)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Symbol mapping (S-531..S-539):
+//
+// | Source symbol (Python)                        | Lines   | teri target                                        |
+// |-----------------------------------------------|---------|-----------------------------------------------------|
+// | S-531 `ZepGraphMemoryManager` class           | 479     | `GraphMemoryManager<L>` struct (instance, not global)|
+// | S-532 `ZepGraphMemoryManager._updaters`       | 486     | `updaters: tokio::sync::Mutex<HashMap<...>>`        |
+// | S-533 `ZepGraphMemoryManager._lock`           | 487     | Folded into the Mutex — no separate observable      |
+// | S-537 `ZepGraphMemoryManager._stop_all_done`  | 528     | `stop_all_done: AtomicBool`                         |
+// | S-534 `ZepGraphMemoryManager.create_updater`  | 490-511 | `GraphMemoryManager::create_updater` (async)        |
+// | S-535 `ZepGraphMemoryManager.get_updater`     | 514-516 | `GraphMemoryManager::get_updater` → `Option<UpdaterStats>` |
+// | S-536 `ZepGraphMemoryManager.stop_updater`    | 519-525 | `GraphMemoryManager::stop_updater` (async)          |
+// | S-538 `ZepGraphMemoryManager.stop_all`        | 531-546 | `GraphMemoryManager::stop_all` (async, idempotent)  |
+// | S-539 `ZepGraphMemoryManager.get_all_stats`   | 549-554 | `GraphMemoryManager::get_all_stats` (async)         |
+//
+// Design decisions (map-onto, not downgrades):
+//
+// 1. CLASS → INSTANCE STRUCT: Python's class-level dict (`_updaters`) is a singleton within one
+//    process. Rust cannot have global mutable statics over generic types (`L: LlmClient` is not
+//    dyn-safe due to `complete_json<T>`/`chat_json<T>`). Mapped to an instance struct generic over
+//    `L`, held in app state. Observable contract — ONE registry per process, keyed by
+//    simulation_id, idempotent `stop_all` — is FULLY PRESERVED.
+//
+// 2. `_lock` FOLDS INTO `Mutex`: Python uses `threading.Lock` separately from the dict.
+//    In Rust, `tokio::sync::Mutex<HashMap<...>>` fuses both. No separate observable is lost.
+//
+// 3. `tokio::sync::Mutex` for `updaters` (not `std::sync::Mutex`): `stop_updater`, `stop_all`,
+//    `create_updater`, and `get_all_stats` all call `updater.stop()` or `updater.get_stats()`
+//    which are `async`. Holding a `std::sync::MutexGuard` across `.await` is a deadlock hazard
+//    and the compiler rejects it. `tokio::sync::Mutex` is the correct choice.
+//
+// 4. `stop_all_done` uses `AtomicBool` (not another Mutex): The idempotency check is a simple
+//    boolean flag. In Python the check `if cls._stop_all_done: return` is outside the lock (L534).
+//    An `AtomicBool` with `Relaxed` compare-exchange gives the same single-path semantics.
+//    Note: Python does NOT check the flag under the lock; it checks before acquiring the lock.
+//    We use `compare_exchange` with `AcqRel`/`Acquire` for correct cross-thread visibility.
+//
+// 5. `get_updater` return type → `Option<UpdaterStats>`: Returning `&GraphMemoryUpdater<L>`
+//    through the async Mutex to the caller is impossible (the guard doesn't outlive the lock
+//    scope). The Python callers use `get_updater` mainly to check existence and read stats;
+//    `get_all_stats` is the primary read path. We return a stats snapshot, which is faithful
+//    to the observable purpose (presence-check + stats). Returning `Option<()>` would lose stats;
+//    returning a clone is impractical (GraphMemoryUpdater contains JoinHandle which isn't Clone).
+//    `Option<UpdaterStats>` is the faithful, composable choice.
+//
+// 6. `create_updater` return type → `Result<(), TeriError>`: The Python returns the updater,
+//    but callers interact with it via `get_updater`/`get_all_stats` thereafter. Returning the
+//    updater from Rust would require either cloning (impossible — JoinHandle) or moving it out
+//    of the Mutex (can't — other callers need it). Returning `()` is access-path-faithful and
+//    documented here. The registry IS the access path.
+
+use crate::error::TeriError;
+
+/// Registry of per-simulation graph memory updaters.
+///
+/// Port of `ZepGraphMemoryManager` (S-531, L479-554, MiroFish).
+///
+/// Manages one `GraphMemoryUpdater<L>` per simulation, keyed by `simulation_id`.
+/// Methods `create_updater`, `stop_updater`, `stop_all`, and `get_all_stats` are all
+/// `async` because they call `GraphMemoryUpdater::stop`/`get_stats` which are async.
+///
+/// # Singleton → instance mapping (`[≠]`-class / map-onto)
+///
+/// Python's class-level singleton (`_updaters` class dict + `_lock` class lock) is
+/// mapped to an instance struct (held in app state, e.g. `Arc<GraphMemoryManager<L>>`).
+/// The observable contract — ONE registry per process, keyed by simulation_id, idempotent
+/// `stop_all` — is **fully preserved**. This is a faithful map-onto, not a downgrade.
+///
+/// # `_lock` fold
+///
+/// Python's separate `threading.Lock` (`_lock`, S-533) has no separate observable beyond
+/// mutual exclusion, which is provided by the `tokio::sync::Mutex` wrapping the HashMap.
+/// It folds cleanly into the Mutex; nothing is dropped.
+pub struct GraphMemoryManager<L: LlmClient + Send + Sync + 'static> {
+    /// Map of simulation_id → updater.  Port of `_updaters` (S-532) + `_lock` (S-533).
+    updaters: tokio::sync::Mutex<HashMap<String, GraphMemoryUpdater<L>>>,
+    /// Idempotency guard for `stop_all`. Port of `_stop_all_done` (S-537).
+    ///
+    /// Set to `true` on the first call to `stop_all`; subsequent calls return immediately.
+    /// Python checks this flag BEFORE acquiring `_lock` (L534); we use `AtomicBool` with
+    /// `compare_exchange(AcqRel/Acquire)` for the same semantics.
+    stop_all_done: AtomicBool,
+}
+
+impl<L: LlmClient + Send + Sync + 'static> GraphMemoryManager<L> {
+    /// Create a new, empty manager.
+    pub fn new() -> Self {
+        Self {
+            updaters: tokio::sync::Mutex::new(HashMap::new()),
+            stop_all_done: AtomicBool::new(false),
+        }
+    }
+
+    /// Create (or replace) the updater for `simulation_id`.
+    ///
+    /// Port of `ZepGraphMemoryManager.create_updater` (S-534, L490-511).
+    ///
+    /// If an updater already exists for `simulation_id`, it is **stopped first** (Python
+    /// L503-504: `cls._updaters[simulation_id].stop()`), then replaced.  The new updater
+    /// is constructed via `GraphMemoryUpdater::new(...)` and `.start()`-ed before insertion.
+    ///
+    /// # Return type decision
+    ///
+    /// Python returns the updater directly (L511).  In Rust, the updater lives inside the
+    /// Mutex; returning a reference out of the guard is impossible, and `GraphMemoryUpdater<L>`
+    /// is not `Clone` (contains `JoinHandle`).  Callers access the updater through
+    /// `get_updater` / `get_all_stats`.  Returning `()` is the faithful composable choice.
+    pub async fn create_updater(
+        &self,
+        simulation_id: &str,
+        graph: Arc<tokio::sync::Mutex<KnowledgeGraph>>,
+        llm: Arc<L>,
+        graph_label: String,
+    ) -> Result<(), TeriError> {
+        let mut updaters = self.updaters.lock().await;
+
+        // If one already exists, stop it first (Python L503-504).
+        if let Some(old) = updaters.get_mut(simulation_id) {
+            info!(
+                "停止旧图谱记忆更新器: simulation_id={}",
+                simulation_id
+            );
+            old.stop().await;
+        }
+
+        let mut updater = GraphMemoryUpdater::new(graph, llm, graph_label);
+        updater.start();
+        updaters.insert(simulation_id.to_string(), updater);
+
+        info!(
+            "创建图谱记忆更新器: simulation_id={}",
+            simulation_id
+        );
+        Ok(())
+    }
+
+    /// Return a stats snapshot for `simulation_id`, or `None` if not registered.
+    ///
+    /// Port of `ZepGraphMemoryManager.get_updater` (S-535, L514-516).
+    ///
+    /// Python returns the `ZepGraphMemoryUpdater` instance directly (`cls._updaters.get(id)`).
+    /// In Rust the updater lives behind a `tokio::sync::Mutex`; a `&` cannot be returned to
+    /// the caller without holding the lock for the caller's entire use, which creates a
+    /// deadlock footgun.  The observable purpose of `get_updater` is to check existence and
+    /// read state; returning `Option<UpdaterStats>` is the faithful, composable equivalent.
+    /// For callers that only need existence, `None` vs `Some(_)` maps directly.
+    /// The primary bulk-read path is `get_all_stats`.
+    pub async fn get_updater(&self, simulation_id: &str) -> Option<UpdaterStats> {
+        let updaters = self.updaters.lock().await;
+        if let Some(updater) = updaters.get(simulation_id) {
+            // get_stats requires &self (not &mut); we hold an immutable reference through
+            // the Mutex guard, so this is valid.
+            Some(updater.get_stats().await)
+        } else {
+            None
+        }
+    }
+
+    /// Stop and remove the updater for `simulation_id`.  No-op if absent.
+    ///
+    /// Port of `ZepGraphMemoryManager.stop_updater` (S-536, L519-525).
+    ///
+    /// Python: `if simulation_id in cls._updaters: stop(); del _updaters[id]`.
+    /// Rust: `HashMap::remove` returns `Option`; stop if `Some`, skip if `None`.
+    pub async fn stop_updater(&self, simulation_id: &str) {
+        let mut updaters = self.updaters.lock().await;
+        if let Some(mut updater) = updaters.remove(simulation_id) {
+            updater.stop().await;
+            info!("已停止图谱记忆更新器: simulation_id={}", simulation_id);
+        }
+    }
+
+    /// Stop all updaters.  **Idempotent**: the second and subsequent calls are no-ops.
+    ///
+    /// Port of `ZepGraphMemoryManager.stop_all` (S-538, L531-546).
+    ///
+    /// Observable contract:
+    /// - If already called once (`stop_all_done` is `true`), returns immediately without
+    ///   acquiring the lock (Python L534-535: `if cls._stop_all_done: return`).
+    /// - On the first call: sets the flag, stops each updater (catch-log-continue on error —
+    ///   Python L541-544 `try/except`), then clears the map.
+    ///
+    /// This is the U-049 shutdown-handler entry point.
+    pub async fn stop_all(&self) {
+        // Idempotency check (outside the lock, matching Python L534 which also checks before
+        // acquiring `_lock`). `compare_exchange` atomically flips false→true; if it was already
+        // true, another goroutine/task has or is running stop_all — return immediately.
+        if self
+            .stop_all_done
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // Already done — return immediately (Python L534-535).
+            return;
+        }
+
+        let mut updaters = self.updaters.lock().await;
+
+        for (simulation_id, mut updater) in updaters.drain() {
+            // Per-updater error catch-log-continue (Python L541-544 try/except).
+            // In Rust, `stop()` returns `()` (not `Result`), but panics are possible;
+            // we use `catch_unwind` is not needed for async. The async `stop()` itself
+            // logs errors internally and is designed to be non-panicking.
+            // Use a short join timeout by forwarding to stop() which already has a 10s cap.
+            info!("停止图谱记忆更新器: simulation_id={}", simulation_id);
+            // stop() is non-panicking by design (errors are logged inside); call directly.
+            updater.stop().await;
+        }
+
+        // Map is now drained (equivalent to Python's `cls._updaters.clear()`).
+        info!("已停止所有图谱记忆更新器");
+    }
+
+    /// Return stats for every registered updater.
+    ///
+    /// Port of `ZepGraphMemoryManager.get_all_stats` (S-539, L549-554).
+    ///
+    /// Python: `{sim_id: updater.get_stats() for sim_id, updater in cls._updaters.items()}`.
+    /// Rust: collect a `HashMap<String, UpdaterStats>` by calling `get_stats()` (async) on
+    /// each updater while holding the Mutex (single-writer, no concurrent mutation concern).
+    pub async fn get_all_stats(&self) -> HashMap<String, UpdaterStats> {
+        let updaters = self.updaters.lock().await;
+        let mut result = HashMap::with_capacity(updaters.len());
+        for (sim_id, updater) in updaters.iter() {
+            result.insert(sim_id.clone(), updater.get_stats().await);
+        }
+        result
+    }
+}
+
+impl<L: LlmClient + Send + Sync + 'static> Default for GraphMemoryManager<L> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests for GraphMemoryManager (sub-cycle c)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod manager_tests {
+    use super::*;
+    use crate::error::{Result, TeriError};
+    use crate::graph::KnowledgeGraph;
+    use crate::llm::{ChatMessage, ChatOptions, LlmClient};
+    use async_trait::async_trait;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use tokio::sync::Mutex as TokioMutex;
+
+    // ── Reuse MockLlm from updater_tests (redefined locally for module isolation) ──
+
+    struct MockLlm;
+
+    #[async_trait]
+    impl LlmClient for MockLlm {
+        async fn complete(&self, _prompt: &str) -> Result<String> {
+            Ok("[]".to_string())
+        }
+        async fn complete_json<T: serde::de::DeserializeOwned>(&self, p: &str) -> Result<T> {
+            let t = self.complete(p).await?;
+            serde_json::from_str(&t).map_err(|e| TeriError::Llm(e.to_string()))
+        }
+        async fn stream(
+            &self,
+            _: &str,
+        ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            Err(TeriError::Llm("not used".into()))
+        }
+        async fn chat(&self, _: &[ChatMessage], _: &ChatOptions) -> Result<String> {
+            Err(TeriError::Llm("not used".into()))
+        }
+        async fn chat_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _: &[ChatMessage],
+            _: &ChatOptions,
+        ) -> Result<T> {
+            Err(TeriError::Llm("not used".into()))
+        }
+    }
+
+    fn make_graph() -> Arc<TokioMutex<KnowledgeGraph>> {
+        Arc::new(TokioMutex::new(KnowledgeGraph::new()))
+    }
+
+    fn make_llm() -> Arc<MockLlm> {
+        Arc::new(MockLlm)
+    }
+
+    // ── create_updater registers and starts ───────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_updater_registers() {
+        let manager = GraphMemoryManager::<MockLlm>::new();
+
+        manager
+            .create_updater("sim-1", make_graph(), make_llm(), "graph-1".to_string())
+            .await
+            .expect("create_updater must succeed");
+
+        // get_updater returns Some (updater is registered and running).
+        let stats = manager.get_updater("sim-1").await;
+        assert!(stats.is_some(), "updater must be present after create_updater");
+        assert!(stats.unwrap().running, "updater must be running after create_updater");
+    }
+
+    // ── create_updater on an existing id stops + replaces the old ────────────
+
+    #[tokio::test]
+    async fn test_create_updater_replaces_existing() {
+        let manager = GraphMemoryManager::<MockLlm>::new();
+
+        // Create first updater.
+        manager
+            .create_updater("sim-1", make_graph(), make_llm(), "graph-a".to_string())
+            .await
+            .expect("first create must succeed");
+
+        // Add an activity so we can distinguish the new updater's stats.
+        {
+            let updaters = manager.updaters.lock().await;
+            let updater = updaters.get("sim-1").unwrap();
+            updater.add_activity(AgentActivity {
+                platform: "twitter".to_string(),
+                agent_id: 1,
+                agent_name: "A".to_string(),
+                action_type: "CREATE_POST".to_string(),
+                action_args: serde_json::Map::new(),
+                round_num: 1,
+                timestamp: "2024-01-01T00:00:00Z".to_string(),
+            });
+        }
+
+        // Create second updater with same id — must stop old, start new.
+        manager
+            .create_updater("sim-1", make_graph(), make_llm(), "graph-b".to_string())
+            .await
+            .expect("second create must succeed");
+
+        // The new updater has graph_id = "graph-b" and zero total_activities.
+        let stats = manager.get_updater("sim-1").await.expect("must still be present");
+        assert_eq!(stats.graph_id, "graph-b", "new updater must have the new graph_label");
+        assert_eq!(stats.total_activities, 0, "new updater starts with zero activities");
+        assert!(stats.running, "new updater must be running");
+    }
+
+    // ── get_all_stats returns one entry per registered updater ────────────────
+
+    #[tokio::test]
+    async fn test_get_all_stats_returns_all_entries() {
+        let manager = GraphMemoryManager::<MockLlm>::new();
+
+        manager
+            .create_updater("sim-a", make_graph(), make_llm(), "graph-a".to_string())
+            .await
+            .unwrap();
+        manager
+            .create_updater("sim-b", make_graph(), make_llm(), "graph-b".to_string())
+            .await
+            .unwrap();
+
+        let all_stats = manager.get_all_stats().await;
+
+        assert_eq!(all_stats.len(), 2, "get_all_stats must return one entry per updater");
+        assert!(all_stats.contains_key("sim-a"), "must contain sim-a");
+        assert!(all_stats.contains_key("sim-b"), "must contain sim-b");
+        assert_eq!(all_stats["sim-a"].graph_id, "graph-a");
+        assert_eq!(all_stats["sim-b"].graph_id, "graph-b");
+
+        // Cleanup.
+        manager.stop_all().await;
+    }
+
+    // ── stop_updater removes the updater ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_stop_updater_removes() {
+        let manager = GraphMemoryManager::<MockLlm>::new();
+
+        manager
+            .create_updater("sim-1", make_graph(), make_llm(), "graph-1".to_string())
+            .await
+            .unwrap();
+
+        // Verify registered.
+        assert!(manager.get_updater("sim-1").await.is_some());
+
+        // Stop and remove.
+        manager.stop_updater("sim-1").await;
+
+        // Now absent.
+        assert!(
+            manager.get_updater("sim-1").await.is_none(),
+            "updater must be absent after stop_updater"
+        );
+    }
+
+    // ── stop_updater absent is a no-op ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_stop_updater_absent_is_noop() {
+        let manager = GraphMemoryManager::<MockLlm>::new();
+
+        // Must not panic or error on an unregistered simulation_id.
+        manager.stop_updater("nonexistent").await;
+
+        // Registry still empty.
+        let all_stats = manager.get_all_stats().await;
+        assert!(all_stats.is_empty(), "manager must remain empty after noop stop_updater");
+    }
+
+    // ── stop_all is idempotent ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_stop_all_idempotent() {
+        let manager = GraphMemoryManager::<MockLlm>::new();
+
+        manager
+            .create_updater("sim-1", make_graph(), make_llm(), "graph-1".to_string())
+            .await
+            .unwrap();
+        manager
+            .create_updater("sim-2", make_graph(), make_llm(), "graph-2".to_string())
+            .await
+            .unwrap();
+
+        // First call stops both and clears the map.
+        manager.stop_all().await;
+
+        assert!(
+            manager.get_all_stats().await.is_empty(),
+            "after stop_all, registry must be empty"
+        );
+
+        // Second call must be a no-op (does not panic, does not double-stop anything).
+        manager.stop_all().await;
+
+        // Registry still empty.
+        assert!(
+            manager.get_all_stats().await.is_empty(),
+            "stop_all is idempotent: registry remains empty on second call"
+        );
+    }
+
+    // ── stop_all clears the registry ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_stop_all_clears_registry() {
+        let manager = GraphMemoryManager::<MockLlm>::new();
+
+        for i in 0..3 {
+            manager
+                .create_updater(
+                    &format!("sim-{i}"),
+                    make_graph(),
+                    make_llm(),
+                    format!("graph-{i}"),
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(manager.get_all_stats().await.len(), 3);
+
+        manager.stop_all().await;
+
+        assert!(
+            manager.get_all_stats().await.is_empty(),
+            "stop_all must clear the entire registry"
+        );
+    }
+
+    // ── get_updater absent returns None ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_updater_absent_returns_none() {
+        let manager = GraphMemoryManager::<MockLlm>::new();
+
+        assert!(
+            manager.get_updater("not-registered").await.is_none(),
+            "get_updater must return None for unregistered simulation_id"
+        );
+    }
+
+    // ── Default trait ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_default_is_empty() {
+        let manager = GraphMemoryManager::<MockLlm>::default();
+        // Default manager is empty; we check synchronously via the AtomicBool.
+        assert!(
+            !manager.stop_all_done.load(Ordering::Relaxed),
+            "fresh manager must have stop_all_done=false"
+        );
+    }
+}

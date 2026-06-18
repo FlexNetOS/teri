@@ -17,7 +17,14 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 2   # RESUMED 2026-06-17 (10th resume, reset 0); baseline re-verified 797 green.
+cycles_this_session: 3   # RESUMED 2026-06-17 (10th resume, reset 0); baseline re-verified 797 green. CYCLE BUDGET (3) reached → HAND OFF.
+# CYCLE3 (10th resume) 2026-06-17: U-021 sub-cycle (c) ZepGraphMemoryManager (S-531..S-539, 9/9 [x]) — opus PASS →
+#   U-021 COMPLETE (all S-493..S-539). GraphMemoryManager<L>: class-singleton→instance struct (forced: generic statics
+#   impossible, LlmClient not dyn-safe; observable one-registry+idempotent-stop_all contract preserved). stop_all
+#   idempotent (compare_exchange before lock) + per-updater error isolation structurally guaranteed (stop() infallible/
+#   no ?, drain() clears regardless) — U-049 cleanup entry. create_updater stops-old-first; Result<()>/Option<UpdaterStats>
+#   return shapes = faithful access-path adaptations (updater holds non-Clone JoinHandle behind Mutex). 9 manager_tests,
+#   880 green, clippy clean. 21/50 units [x]. Unblocks U-022/U-045; feeds U-049.
 # CYCLE1 (10th resume) 2026-06-17: U-021 sub-cycle (a) AgentActivity + to_episode_text + 12 _describe_* (S-493..S-514,
 #   22/22 [x]) — opus PASS (DECISION-13). NEW src/services/graph_memory.rs. PURE PORT byte-exact (verifier set-diffed
 #   41 Chinese literals); 4-way ladders, create_comment 5-branch, colon-vs-no-colon crux, Python-falsy or-fallbacks.

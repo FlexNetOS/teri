@@ -652,15 +652,15 @@
 - [x] S-528 · `unit:U-021` · `method` · `ZepGraphMemoryUpdater._send_batch_activities` · merges to text episode, client.graph.add · `zep_graph_memory_updater.py:396` → `async fn flush_batch<L>` (combined_text "\n".join → `extend_from_text`) (`src/services/graph_memory.rs`)
 - [x] S-529 · `unit:U-021` · `method` · `ZepGraphMemoryUpdater._flush_remaining` · `zep_graph_memory_updater.py:435` → drain section at end of `worker_loop` (channel-closed branch) (`src/services/graph_memory.rs`)
 - [x] S-530 · `unit:U-021` · `method` · `ZepGraphMemoryUpdater.get_stats` · `zep_graph_memory_updater.py:460` → `GraphMemoryUpdater::get_stats` → `UpdaterStats` (10 serde fields, byte-identical JSON keys) (`src/services/graph_memory.rs`)
-- [ ] S-531 · `unit:U-021` · `type` · `ZepGraphMemoryManager` · class-level dict of updaters · `zep_graph_memory_updater.py:479`
-- [ ] S-532 · `unit:U-021` · `field` · `ZepGraphMemoryManager._updaters` · `zep_graph_memory_updater.py:486`
-- [ ] S-533 · `unit:U-021` · `field` · `ZepGraphMemoryManager._lock` · `zep_graph_memory_updater.py:487`
-- [ ] S-534 · `unit:U-021` · `method` · `ZepGraphMemoryManager.create_updater` · `zep_graph_memory_updater.py:490`
-- [ ] S-535 · `unit:U-021` · `method` · `ZepGraphMemoryManager.get_updater` · `zep_graph_memory_updater.py:514`
-- [ ] S-536 · `unit:U-021` · `method` · `ZepGraphMemoryManager.stop_updater` · `zep_graph_memory_updater.py:519`
-- [ ] S-537 · `unit:U-021` · `field` · `ZepGraphMemoryManager._stop_all_done` · idempotency flag · `zep_graph_memory_updater.py:528`
-- [ ] S-538 · `unit:U-021` · `method` · `ZepGraphMemoryManager.stop_all` · idempotent via _stop_all_done · `zep_graph_memory_updater.py:531`
-- [ ] S-539 · `unit:U-021` · `method` · `ZepGraphMemoryManager.get_all_stats` · `zep_graph_memory_updater.py:549`
+- [x] S-531 · `unit:U-021` · `type` · `ZepGraphMemoryManager` · class-level dict of updaters · `zep_graph_memory_updater.py:479` → `GraphMemoryManager<L>` instance struct (`src/services/graph_memory.rs`); class→instance map-onto: observable contract (ONE registry per process, keyed by simulation_id, idempotent stop_all) fully preserved
+- [x] S-532 · `unit:U-021` · `field` · `ZepGraphMemoryManager._updaters` · `zep_graph_memory_updater.py:486` → `updaters: tokio::sync::Mutex<HashMap<String, GraphMemoryUpdater<L>>>` (`src/services/graph_memory.rs`)
+- [x] S-533 · `unit:U-021` · `field` · `ZepGraphMemoryManager._lock` · `zep_graph_memory_updater.py:487` → folded into `tokio::sync::Mutex` wrapping `updaters` (no separate observable; mutual exclusion is provided by the Mutex) (`src/services/graph_memory.rs`)
+- [x] S-534 · `unit:U-021` · `method` · `ZepGraphMemoryManager.create_updater` · `zep_graph_memory_updater.py:490` → `GraphMemoryManager::create_updater` async; stops old if present, constructs+starts new, inserts; return type `Result<(),TeriError>` (Python returned the updater; Rust cannot — JoinHandle not Clone — registry is the access path) (`src/services/graph_memory.rs`)
+- [x] S-535 · `unit:U-021` · `method` · `ZepGraphMemoryManager.get_updater` · `zep_graph_memory_updater.py:514` → `GraphMemoryManager::get_updater` async → `Option<UpdaterStats>` (Python returned &updater; returning &mut through Mutex to caller is a deadlock footgun; stats snapshot is the faithful composable return; primary read path is get_all_stats) (`src/services/graph_memory.rs`)
+- [x] S-536 · `unit:U-021` · `method` · `ZepGraphMemoryManager.stop_updater` · `zep_graph_memory_updater.py:519` → `GraphMemoryManager::stop_updater` async; remove from map, stop if Some, no-op if None (`src/services/graph_memory.rs`)
+- [x] S-537 · `unit:U-021` · `field` · `ZepGraphMemoryManager._stop_all_done` · idempotency flag · `zep_graph_memory_updater.py:528` → `stop_all_done: AtomicBool`; compare_exchange(AcqRel/Acquire) matches Python's check-before-lock semantics (`src/services/graph_memory.rs`)
+- [x] S-538 · `unit:U-021` · `method` · `ZepGraphMemoryManager.stop_all` · idempotent via _stop_all_done · `zep_graph_memory_updater.py:531` → `GraphMemoryManager::stop_all` async; idempotent via AtomicBool compare_exchange; drain+stop all (catch-log-continue); clears map; U-049 shutdown entry point (`src/services/graph_memory.rs`)
+- [x] S-539 · `unit:U-021` · `method` · `ZepGraphMemoryManager.get_all_stats` · `zep_graph_memory_updater.py:549` → `GraphMemoryManager::get_all_stats` async → `HashMap<String, UpdaterStats>` (`src/services/graph_memory.rs`)
 
 ---
 
