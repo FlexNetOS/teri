@@ -12,3 +12,4 @@ pub mod simulation_config;
 pub mod simulation_ipc;
 pub mod simulation_manager;
 pub mod simulation_runner;
+pub mod zep_tools;
