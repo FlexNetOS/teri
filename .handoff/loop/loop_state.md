@@ -367,3 +367,15 @@ next_iterate: U-022 [x] complete → U-017 port-fresh full implementation
 # - prepare_simulation_progress_callback_called
 # U-023 UNIT [x] (all sub-cycles complete). teri 997 green, clippy clean. NEXT: U-021 or U-020 based on merge ledger order.
 
+# CYCLE 7 (NEW SESSION 2026-06-18, 7th resume): [NEQ]-AUDIT + MERGE LEDGER VERIFICATION — opus PASS.
+# Parity ledger verification: U-020 and U-021 marked COMPLETE in findings/parity.md:
+# - U-020 sub-cycle (b) VERIFIED 2026-06-17: IPC Client+Server, mpsc+oneshot transport, FIFO ordering,
+#   check_env_alive start/stop liveness, client Clone concurrent send. 35 simulation_ipc tests.
+# - U-021 sub-cycles (a/b/c) VERIFIED 2026-06-17: AgentActivity to_episode_text, GraphMemoryUpdater
+#   extend_from_text + async worker, GraphMemoryManager registry with idempotent stop_all.
+# Merge ledger shows [ ] for these but parity ledger is authoritative. U-023 complete this session.
+# Build health: teri 997 green, clippy --all-targets clean (no warnings).
+# NEXT: U-024 ReportAgent extend-Y — needs to extend teri's simple template-based ReportAgent with
+# MiroFish's ReACT agent (tool calls: insight_forge/panorama_search/quick_search/interview_agents,
+# plan_outline, _generate_section_react). Requires ZepToolsService full methods wired to KnowledgeGraph.
+
