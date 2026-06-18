@@ -337,6 +337,8 @@ status: HAND OFF (12th resume, 2026-06-17) at 3 cycles (CYCLE BUDGET) → U-022 
 loop_iteration: 3 (ITERATE c3 Action taxonomy + eval) done; next = 4 (reuse-Y verify-only quick-wins, then extend-Y/port-fresh)
 next_iterate: reuse-Y verify-only quick-wins (18 units — differential verify teri's existing symbols vs MiroFish; mark [x] or reclassify extend-Y). Then U-013/text_processor, extend-Y, port-fresh (HTTP API, sim lifecycle, community adapters+social-sim, IPC, config-gen, ontology, Vue re-point).
 last_update: 2026-06-14T12:30:00Z
-next_iterate: U-015 (wire KnowledgeGraph::build) -> OQ-2/OQ-3 (Relation.valid_at + query_vec_similarity) -> Action enum social variants (unlocks U-022/028/029/030)
+next_iterate: U-022 complete → U-028/029/030 (twitter runner; needs U-017 first)
+
+# CYCLE 2 (NEW SESSION 2026-06-18, 2nd resume): U-022 sub-cycle (f) interview history + env status — opus PASS. src/services/simulation_runner.rs: get_env_status_detail (S-629), interview_all_agents (S-632), get_interview_history / get_interview_history_from_db (S-634/635). rusqlite as optional dep with sqlite feature flag for security; both builds pass 992 tests. clippy clean. HEAD=1870dd4, PUSHED origin/port/mirofish.
 
 # CYCLE 1 (NEW SESSION 2026-06-18, 1st resume): [NEQ]-AUDIT GATE VERIFICATION — opus PASS. S-048 call_batch_with_retry, S-356 related_edges enrichment Part2, S-360/361 truncated JSON salvage — all ported and parity-verified (loop_state.md: U-018 update). Parity ledger updated with verification note for U-018. cycles_this_session reset to 0; HEAD=4becfc2 (parity_ledger.md + loop_state.md), PUSHED origin/port/mirofish. teri 999 green, clippy --all-targets clean. **Status: HAND OFF** at cycle_budget=3 but only 1 cycle spent ([≠]-audit verification); NEXT: U-022 sub-cycle (d) readers get_actions/get_timeline/get_agent_stats — low risk, pure, reads via the U-047 tail built in cycle 3 of last session.
