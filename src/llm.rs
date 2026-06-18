@@ -3,8 +3,8 @@ use crate::error::{Result, TeriError};
 use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::pin::Pin;
 
 // ============================================================================
@@ -1146,10 +1146,7 @@ impl LlmClient for GeminiAdapter {
             gen_config.insert("maxOutputTokens".to_string(), serde_json::json!(max));
         }
         // Belt-and-suspenders JSON sentinel (also set responseMimeType)
-        gen_config.insert(
-            "responseMimeType".to_string(),
-            serde_json::json!("application/json"),
-        );
+        gen_config.insert("responseMimeType".to_string(), serde_json::json!("application/json"));
         payload["generationConfig"] = serde_json::Value::Object(gen_config);
 
         let response = self.call_api(payload).await?;
@@ -1762,10 +1759,7 @@ data: [DONE]\n",
     #[test]
     fn test_openai_chat_payload_shape() {
         // Build the payload that chat() would send (mirrors the implementation)
-        let messages = &[
-            ChatMessage::system("You are helpful"),
-            ChatMessage::user("Hello"),
-        ];
+        let messages = &[ChatMessage::system("You are helpful"), ChatMessage::user("Hello")];
         let opts = ChatOptions { temperature: Some(0.3), max_tokens: Some(4096) };
 
         let mut payload = serde_json::json!({
@@ -1807,10 +1801,14 @@ data: [DONE]\n",
             payload["max_tokens"] = serde_json::json!(max);
         }
 
-        assert!(payload.get("temperature").map(|v| v.is_null()).unwrap_or(true),
-            "temperature must be absent when None");
-        assert!(payload.get("max_tokens").map(|v| v.is_null()).unwrap_or(true),
-            "max_tokens must be absent when None");
+        assert!(
+            payload.get("temperature").map(|v| v.is_null()).unwrap_or(true),
+            "temperature must be absent when None"
+        );
+        assert!(
+            payload.get("max_tokens").map(|v| v.is_null()).unwrap_or(true),
+            "max_tokens must be absent when None"
+        );
     }
 
     /// Unit test: chat_json payload includes response_format.
@@ -1850,10 +1848,7 @@ data: [DONE]\n",
         let client = OpenAiAdapter::new(&openai_config(&server, 0));
         let resp = client
             .chat(
-                &[
-                    ChatMessage::system("You are helpful"),
-                    ChatMessage::user("Hello"),
-                ],
+                &[ChatMessage::system("You are helpful"), ChatMessage::user("Hello")],
                 &ChatOptions { temperature: Some(0.3), max_tokens: Some(4096) },
             )
             .await
@@ -1874,13 +1869,7 @@ data: [DONE]\n",
         });
 
         let client = OpenAiAdapter::new(&openai_config(&server, 0));
-        let resp = client
-            .chat(
-                &[ChatMessage::user("hi")],
-                &ChatOptions::default(),
-            )
-            .await
-            .unwrap();
+        let resp = client.chat(&[ChatMessage::user("hi")], &ChatOptions::default()).await.unwrap();
         assert_eq!(resp, "default response");
         mock.assert();
     }
@@ -1897,10 +1886,7 @@ data: [DONE]\n",
         });
 
         let client = OpenAiAdapter::new(&openai_config(&server, 0));
-        let resp = client
-            .chat(&[ChatMessage::user("q")], &ChatOptions::default())
-            .await
-            .unwrap();
+        let resp = client.chat(&[ChatMessage::user("q")], &ChatOptions::default()).await.unwrap();
         assert_eq!(resp, "Answer");
     }
 
@@ -1918,10 +1904,7 @@ data: [DONE]\n",
         let client = OpenAiAdapter::new(&openai_config(&server, 0));
         let resp: serde_json::Value = client
             .chat_json(
-                &[
-                    ChatMessage::system("sys"),
-                    ChatMessage::user("user"),
-                ],
+                &[ChatMessage::system("sys"), ChatMessage::user("user")],
                 &ChatOptions { temperature: Some(0.3), max_tokens: Some(4096) },
             )
             .await
@@ -1945,10 +1928,7 @@ data: [DONE]\n",
 
         let client = OpenAiAdapter::new(&openai_config(&server, 0));
         let resp: serde_json::Value = client
-            .chat_json(
-                &[ChatMessage::user("q")],
-                &ChatOptions::default(),
-            )
+            .chat_json(&[ChatMessage::user("q")], &ChatOptions::default())
             .await
             .unwrap();
         assert_eq!(resp["v"], 1);
@@ -1962,10 +1942,8 @@ data: [DONE]\n",
     /// user messages in "messages", and max_tokens defaults to 4096.
     #[test]
     fn test_anthropic_chat_payload_system_partition() {
-        let messages = &[
-            ChatMessage::system("You are a helpful assistant"),
-            ChatMessage::user("Hello"),
-        ];
+        let messages =
+            &[ChatMessage::system("You are a helpful assistant"), ChatMessage::user("Hello")];
         let opts = ChatOptions::default();
 
         let system_text: String = messages
@@ -2032,10 +2010,7 @@ data: [DONE]\n",
         );
         let resp = client
             .chat(
-                &[
-                    ChatMessage::system("You are a helpful assistant"),
-                    ChatMessage::user("Hello"),
-                ],
+                &[ChatMessage::system("You are a helpful assistant"), ChatMessage::user("Hello")],
                 &ChatOptions::default(),
             )
             .await
@@ -2089,10 +2064,7 @@ data: [DONE]\n",
         );
         let resp: serde_json::Value = client
             .chat_json(
-                &[
-                    ChatMessage::system("sys"),
-                    ChatMessage::user("produce JSON"),
-                ],
+                &[ChatMessage::system("sys"), ChatMessage::user("produce JSON")],
                 &ChatOptions { temperature: Some(0.3), max_tokens: Some(4096) },
             )
             .await
@@ -2166,8 +2138,7 @@ data: [DONE]\n",
     async fn test_gemini_chat_system_and_user() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1beta/models/gemini-1.5-pro:generateContent");
+            when.method(POST).path("/v1beta/models/gemini-1.5-pro:generateContent");
             then.status(200)
                 .header("Content-Type", "application/json")
                 .body(r#"{"candidates":[{"content":{"parts":[{"text":"Gemini answer"}]}}]}"#);
@@ -2200,10 +2171,7 @@ data: [DONE]\n",
         if let Some(max) = opts.max_tokens {
             gen_config.insert("maxOutputTokens".to_string(), serde_json::json!(max));
         }
-        gen_config.insert(
-            "responseMimeType".to_string(),
-            serde_json::json!("application/json"),
-        );
+        gen_config.insert("responseMimeType".to_string(), serde_json::json!("application/json"));
         let payload = serde_json::json!({
             "contents": [],
             "generationConfig": serde_json::Value::Object(gen_config),
@@ -2216,8 +2184,7 @@ data: [DONE]\n",
     async fn test_gemini_chat_json_sets_mime_type() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1beta/models/gemini-1.5-pro:generateContent");
+            when.method(POST).path("/v1beta/models/gemini-1.5-pro:generateContent");
             then.status(200)
                 .header("Content-Type", "application/json")
                 .body(r#"{"candidates":[{"content":{"parts":[{"text":"{\"x\":7}"}]}}]}"#);
@@ -2229,10 +2196,7 @@ data: [DONE]\n",
             server.base_url(),
         );
         let resp: serde_json::Value = client
-            .chat_json(
-                &[ChatMessage::user("give me JSON")],
-                &ChatOptions::default(),
-            )
+            .chat_json(&[ChatMessage::user("give me JSON")], &ChatOptions::default())
             .await
             .unwrap();
         assert_eq!(resp["x"], 7);
@@ -2244,8 +2208,7 @@ data: [DONE]\n",
     async fn test_gemini_chat_json_no_system_no_instruction() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1beta/models/gemini-1.5-pro:generateContent");
+            when.method(POST).path("/v1beta/models/gemini-1.5-pro:generateContent");
             then.status(200)
                 .header("Content-Type", "application/json")
                 .body(r#"{"candidates":[{"content":{"parts":[{"text":"{\"r\":1}"}]}}]}"#);

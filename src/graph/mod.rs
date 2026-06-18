@@ -649,11 +649,7 @@ impl KnowledgeGraph {
                 p1_progress,
                 crate::i18n::t_args(
                     "progress.sendingBatch",
-                    &[
-                        ("current", &chunk_num),
-                        ("total", &total_chunks),
-                        ("chunks", &1usize),
-                    ],
+                    &[("current", &chunk_num), ("total", &total_chunks), ("chunks", &1usize)],
                 ),
             );
 
@@ -1217,9 +1213,7 @@ Document text:
     ///
     /// Returns `None` if no entity with the given `id` exists.
     pub fn get_entity_by_id(&self, id: Uuid) -> Option<&Entity> {
-        self.index_by_id
-            .get(&id)
-            .and_then(|idx| self.inner.node_weight(*idx))
+        self.index_by_id.get(&id).and_then(|idx| self.inner.node_weight(*idx))
     }
 
     /// Get the name-to-index mapping (primarily for testing)
@@ -2538,7 +2532,10 @@ mod tests {
         // "Alice" was already present → entities_merged = 0 (Bob doesn't overlap Alice's name).
         assert_eq!(stats.entities_merged, 0, "no duplicate names in this extend call");
         // The Bob→Alice relation references Alice (pre-existing) → must NOT be dropped.
-        assert_eq!(stats.relations_added, 1, "Bob→Alice relation to pre-existing entity must be kept");
+        assert_eq!(
+            stats.relations_added, 1,
+            "Bob→Alice relation to pre-existing entity must be kept"
+        );
 
         assert_eq!(graph.entity_count(), 2, "Alice + Bob");
         assert_eq!(graph.relation_count(), 1, "Bob → Alice");
@@ -2552,7 +2549,11 @@ mod tests {
         let mut graph = KnowledgeGraph::new();
         // Pre-seed "Alice" directly.
         graph
-            .add_entity(Entity { id: Uuid::new_v4(), name: "Alice".to_string(), kind: EntityKind::Person })
+            .add_entity(Entity {
+                id: Uuid::new_v4(),
+                name: "Alice".to_string(),
+                kind: EntityKind::Person,
+            })
             .expect("add Alice");
 
         // Extend: LLM returns "Alice" again (same name → should be reused, not added).
@@ -2572,7 +2573,11 @@ mod tests {
     async fn test_extend_from_text_empty_text_noop() {
         let mut graph = KnowledgeGraph::new();
         graph
-            .add_entity(Entity { id: Uuid::new_v4(), name: "Alice".to_string(), kind: EntityKind::Person })
+            .add_entity(Entity {
+                id: Uuid::new_v4(),
+                name: "Alice".to_string(),
+                kind: EntityKind::Person,
+            })
             .expect("add Alice");
 
         let mock = MockLlmClient::new("[]", "[]");
@@ -2596,10 +2601,7 @@ mod tests {
         graph.set_ontology(&ontology);
 
         // Extend: LLM returns an entity with kind "MediaOutlet" (custom type).
-        let mock = MockLlmClient::new(
-            r#"[{"name": "CNN", "kind": "MediaOutlet"}]"#,
-            "[]",
-        );
+        let mock = MockLlmClient::new(r#"[{"name": "CNN", "kind": "MediaOutlet"}]"#, "[]");
         let stats = graph.extend_from_text("CNN is a media outlet.", &mock).await.expect("extend");
 
         assert_eq!(stats.entities_added, 1, "CNN added");

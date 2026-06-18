@@ -73,10 +73,7 @@ impl AgentActivity {
     /// key is absent or the value is not a JSON string.  Mirrors Python's
     /// `self.action_args.get("key", "")`.
     fn arg<'a>(&'a self, key: &str) -> &'a str {
-        self.action_args
-            .get(key)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
+        self.action_args.get(key).and_then(|v| v.as_str()).unwrap_or("")
     }
 
     /// Convert this activity to a natural-language episode string suitable for
@@ -179,11 +176,8 @@ impl AgentActivity {
         let original_author = self.arg("original_author_name");
         // Faithful `or`-fallback: first non-empty string wins.
         let quote_content_raw = self.arg("quote_content");
-        let quote_content = if !quote_content_raw.is_empty() {
-            quote_content_raw
-        } else {
-            self.arg("content")
-        };
+        let quote_content =
+            if !quote_content_raw.is_empty() { quote_content_raw } else { self.arg("content") };
 
         let mut base = if !original_content.is_empty() && !original_author.is_empty() {
             format!("引用了{original_author}的帖子「{original_content}」")
@@ -274,11 +268,7 @@ impl AgentActivity {
     /// `query` = `action_args["query"] or action_args["keyword"]` (first non-empty).
     fn describe_search(&self) -> String {
         let query_raw = self.arg("query");
-        let query = if !query_raw.is_empty() {
-            query_raw
-        } else {
-            self.arg("keyword")
-        };
+        let query = if !query_raw.is_empty() { query_raw } else { self.arg("keyword") };
         if !query.is_empty() {
             format!("搜索了「{query}」")
         } else {
@@ -291,11 +281,7 @@ impl AgentActivity {
     /// `query` = `action_args["query"] or action_args["username"]` (first non-empty).
     fn describe_search_user(&self) -> String {
         let query_raw = self.arg("query");
-        let query = if !query_raw.is_empty() {
-            query_raw
-        } else {
-            self.arg("username")
-        };
+        let query = if !query_raw.is_empty() { query_raw } else { self.arg("username") };
         if !query.is_empty() {
             format!("搜索了用户「{query}」")
         } else {
@@ -346,10 +332,7 @@ mod tests {
     fn test_to_episode_text_prefix() {
         let a = activity("CREATE_POST", json!({"content": "hello"}));
         let text = a.to_episode_text();
-        assert!(
-            text.starts_with("Alice: "),
-            "expected 'Alice: ' prefix, got: {text:?}"
-        );
+        assert!(text.starts_with("Alice: "), "expected 'Alice: ' prefix, got: {text:?}");
     }
 
     #[test]
@@ -371,10 +354,7 @@ mod tests {
     #[test]
     fn test_create_post_with_content() {
         let a = activity("CREATE_POST", json!({"content": "大家好"}));
-        assert_eq!(
-            a.to_episode_text(),
-            "Alice: 发布了一条帖子：「大家好」"
-        );
+        assert_eq!(a.to_episode_text(), "Alice: 发布了一条帖子：「大家好」");
     }
 
     #[test]
@@ -387,10 +367,7 @@ mod tests {
 
     #[test]
     fn test_like_post_content_and_author() {
-        let a = activity(
-            "LIKE_POST",
-            json!({"post_content": "好文章", "post_author_name": "Bob"}),
-        );
+        let a = activity("LIKE_POST", json!({"post_content": "好文章", "post_author_name": "Bob"}));
         assert_eq!(a.to_episode_text(), "Alice: 点赞了Bob的帖子：「好文章」");
     }
 
@@ -416,10 +393,8 @@ mod tests {
 
     #[test]
     fn test_dislike_post_content_and_author() {
-        let a = activity(
-            "DISLIKE_POST",
-            json!({"post_content": "差文章", "post_author_name": "Bob"}),
-        );
+        let a =
+            activity("DISLIKE_POST", json!({"post_content": "差文章", "post_author_name": "Bob"}));
         assert_eq!(a.to_episode_text(), "Alice: 踩了Bob的帖子：「差文章」");
     }
 
@@ -482,10 +457,7 @@ mod tests {
                 "quote_content": "我的评论"
             }),
         );
-        assert_eq!(
-            a.to_episode_text(),
-            "Alice: 引用了Carol的帖子「原文」，并评论道：「我的评论」"
-        );
+        assert_eq!(a.to_episode_text(), "Alice: 引用了Carol的帖子「原文」，并评论道：「我的评论」");
     }
 
     #[test]
@@ -518,40 +490,22 @@ mod tests {
     /// quote_content absent but content present → or-fallback uses content.
     #[test]
     fn test_quote_post_or_fallback_uses_content() {
-        let a = activity(
-            "QUOTE_POST",
-            json!({"content": "备用评论"}),
-        );
-        assert_eq!(
-            a.to_episode_text(),
-            "Alice: 引用了一条帖子，并评论道：「备用评论」"
-        );
+        let a = activity("QUOTE_POST", json!({"content": "备用评论"}));
+        assert_eq!(a.to_episode_text(), "Alice: 引用了一条帖子，并评论道：「备用评论」");
     }
 
     /// quote_content present (non-empty) → takes precedence over content.
     #[test]
     fn test_quote_post_or_fallback_quote_content_wins() {
-        let a = activity(
-            "QUOTE_POST",
-            json!({"quote_content": "优先评论", "content": "备用评论"}),
-        );
-        assert_eq!(
-            a.to_episode_text(),
-            "Alice: 引用了一条帖子，并评论道：「优先评论」"
-        );
+        let a = activity("QUOTE_POST", json!({"quote_content": "优先评论", "content": "备用评论"}));
+        assert_eq!(a.to_episode_text(), "Alice: 引用了一条帖子，并评论道：「优先评论」");
     }
 
     /// quote_content is empty string → falls back to content (Python falsy or-chain).
     #[test]
     fn test_quote_post_or_fallback_empty_quote_content_uses_content() {
-        let a = activity(
-            "QUOTE_POST",
-            json!({"quote_content": "", "content": "备用评论"}),
-        );
-        assert_eq!(
-            a.to_episode_text(),
-            "Alice: 引用了一条帖子，并评论道：「备用评论」"
-        );
+        let a = activity("QUOTE_POST", json!({"quote_content": "", "content": "备用评论"}));
+        assert_eq!(a.to_episode_text(), "Alice: 引用了一条帖子，并评论道：「备用评论」");
     }
 
     // ── FOLLOW ────────────────────────────────────────────────────────────────
@@ -580,34 +534,20 @@ mod tests {
                 "post_author_name": "Eve"
             }),
         );
-        assert_eq!(
-            a.to_episode_text(),
-            "Alice: 在Eve的帖子「原帖」下评论道：「我的看法」"
-        );
+        assert_eq!(a.to_episode_text(), "Alice: 在Eve的帖子「原帖」下评论道：「我的看法」");
     }
 
     #[test]
     fn test_create_comment_content_post_content_only() {
-        let a = activity(
-            "CREATE_COMMENT",
-            json!({"content": "我的看法", "post_content": "原帖"}),
-        );
-        assert_eq!(
-            a.to_episode_text(),
-            "Alice: 在帖子「原帖」下评论道：「我的看法」"
-        );
+        let a = activity("CREATE_COMMENT", json!({"content": "我的看法", "post_content": "原帖"}));
+        assert_eq!(a.to_episode_text(), "Alice: 在帖子「原帖」下评论道：「我的看法」");
     }
 
     #[test]
     fn test_create_comment_content_post_author_only() {
-        let a = activity(
-            "CREATE_COMMENT",
-            json!({"content": "我的看法", "post_author_name": "Eve"}),
-        );
-        assert_eq!(
-            a.to_episode_text(),
-            "Alice: 在Eve的帖子下评论道：「我的看法」"
-        );
+        let a =
+            activity("CREATE_COMMENT", json!({"content": "我的看法", "post_author_name": "Eve"}));
+        assert_eq!(a.to_episode_text(), "Alice: 在Eve的帖子下评论道：「我的看法」");
     }
 
     #[test]
@@ -954,7 +894,10 @@ impl<L: LlmClient + Send + Sync + 'static> GraphMemoryUpdater<L> {
     ///
     /// Call [`start`](Self::start) before adding activities.
     pub fn new(graph: Arc<Mutex<KnowledgeGraph>>, llm: Arc<L>, graph_label: String) -> Self {
-        info!("GraphMemoryUpdater 初始化完成: graph_label={}, batch_size={}", graph_label, BATCH_SIZE);
+        info!(
+            "GraphMemoryUpdater 初始化完成: graph_label={}, batch_size={}",
+            graph_label, BATCH_SIZE
+        );
         // Seed the buffer-size snapshot with the two initial platform keys (twitter + reddit),
         // matching MiroFish's `self._platform_buffers = {'twitter': [], 'reddit': []}` in
         // `__init__` (L252-255).  This ensures `get_stats().buffer_sizes` always contains
@@ -1083,21 +1026,11 @@ impl<L: LlmClient + Send + Sync + 'static> GraphMemoryUpdater<L> {
         // Construct AgentActivity from the dict fields with Python-identical defaults.
         // `round` key → `round_num` (Python `data.get("round", 0)`).
         let agent_id = data.get("agent_id").and_then(|v| v.as_i64()).unwrap_or(0);
-        let agent_name = data
-            .get("agent_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let action_type = data
-            .get("action_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let action_args = data
-            .get("action_args")
-            .and_then(|v| v.as_object())
-            .cloned()
-            .unwrap_or_default();
+        let agent_name = data.get("agent_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let action_type =
+            data.get("action_type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let action_args =
+            data.get("action_args").and_then(|v| v.as_object()).cloned().unwrap_or_default();
         let round_num = data.get("round").and_then(|v| v.as_i64()).unwrap_or(0);
         // Default timestamp: chrono RFC 3339 now (mirrors Python's `datetime.now().isoformat()`).
         let timestamp = data
@@ -1210,11 +1143,7 @@ async fn worker_loop<L: LlmClient + Send + Sync + 'static>(
     for (platform, buffer) in &mut platform_buffers {
         if !buffer.is_empty() {
             let platform_name = platform_display_name(platform);
-            info!(
-                "发送{}平台剩余的 {} 条活动",
-                platform_name,
-                buffer.len()
-            );
+            info!("发送{}平台剩余的 {} 条活动", platform_name, buffer.len());
             let batch: Vec<AgentActivity> = std::mem::take(buffer);
             flush_batch(batch, platform, &graph, &llm, &graph_label, &counters).await;
         }
@@ -1229,10 +1158,7 @@ async fn update_buffer_snapshot(
     snapshot: &BufferSnapshot,
 ) {
     let mut guard = snapshot.lock().await;
-    *guard = platform_buffers
-        .iter()
-        .map(|(k, v)| (k.clone(), v.len()))
-        .collect();
+    *guard = platform_buffers.iter().map(|(k, v)| (k.clone(), v.len())).collect();
 }
 
 /// Flush a batch of activities to the knowledge graph.
@@ -1259,7 +1185,8 @@ async fn flush_batch<L: LlmClient + Send + Sync + 'static>(
     }
 
     // combined_text: observable join — exact port of L407-409.
-    let episode_texts: Vec<String> = activities.iter().map(AgentActivity::to_episode_text).collect();
+    let episode_texts: Vec<String> =
+        activities.iter().map(AgentActivity::to_episode_text).collect();
     let combined_text = episode_texts.join("\n");
 
     debug!("批量内容预览: {}...", &combined_text[..combined_text.len().min(200)]);
@@ -1287,10 +1214,7 @@ async fn flush_batch<L: LlmClient + Send + Sync + 'static>(
         Err(e) => {
             // Non-fatal: increment failed_count and continue (port of L433, L392-394).
             counters.failed_count.fetch_add(1, Ordering::Relaxed);
-            error!(
-                "批量发送到图谱失败: graph_label={}, error={}",
-                graph_label, e
-            );
+            error!("批量发送到图谱失败: graph_label={}, error={}", graph_label, e);
         }
     }
 }
@@ -1348,8 +1272,7 @@ mod updater_tests {
 
         async fn complete_json<T: serde::de::DeserializeOwned>(&self, prompt: &str) -> Result<T> {
             let text = self.complete(prompt).await?;
-            serde_json::from_str(&text)
-                .map_err(|e| TeriError::Llm(format!("mock json parse: {e}")))
+            serde_json::from_str(&text).map_err(|e| TeriError::Llm(format!("mock json parse: {e}")))
         }
 
         async fn stream(
@@ -1497,11 +1420,9 @@ mod updater_tests {
     async fn test_batch_flush_at_batch_size() {
         // LLM returns a simple entity for every entity-extraction call, empty relations.
         let graph = Arc::new(Mutex::new(KnowledgeGraph::new()));
-        let llm = Arc::new(MockLlm::new(
-            r#"[{"name": "Entity1", "kind": "Concept"}]"#,
-            "[]",
-        ));
-        let mut updater = GraphMemoryUpdater::new(Arc::clone(&graph), llm, "batch-test".to_string());
+        let llm = Arc::new(MockLlm::new(r#"[{"name": "Entity1", "kind": "Concept"}]"#, "[]"));
+        let mut updater =
+            GraphMemoryUpdater::new(Arc::clone(&graph), llm, "batch-test".to_string());
         updater.start();
 
         // Add exactly BATCH_SIZE activities on the same platform.
@@ -1526,11 +1447,9 @@ mod updater_tests {
     #[tokio::test]
     async fn test_per_platform_independent_batching() {
         let graph = Arc::new(Mutex::new(KnowledgeGraph::new()));
-        let llm = Arc::new(MockLlm::new(
-            r#"[{"name": "Entity1", "kind": "Concept"}]"#,
-            "[]",
-        ));
-        let mut updater = GraphMemoryUpdater::new(Arc::clone(&graph), llm, "platform-test".to_string());
+        let llm = Arc::new(MockLlm::new(r#"[{"name": "Entity1", "kind": "Concept"}]"#, "[]"));
+        let mut updater =
+            GraphMemoryUpdater::new(Arc::clone(&graph), llm, "platform-test".to_string());
         updater.start();
 
         // Add 5 twitter + 3 reddit activities.
@@ -1562,7 +1481,8 @@ mod updater_tests {
     async fn test_flush_remaining_on_stop() {
         let graph = Arc::new(Mutex::new(KnowledgeGraph::new()));
         let llm = Arc::new(MockLlm::new("[]", "[]"));
-        let mut updater = GraphMemoryUpdater::new(Arc::clone(&graph), llm, "flush-test".to_string());
+        let mut updater =
+            GraphMemoryUpdater::new(Arc::clone(&graph), llm, "flush-test".to_string());
         updater.start();
 
         // Add 3 activities (< BATCH_SIZE — no flush during running).
@@ -1606,13 +1526,20 @@ mod updater_tests {
                 let t = self.complete(p).await?;
                 serde_json::from_str(&t).map_err(|e| TeriError::Llm(e.to_string()))
             }
-            async fn stream(&self, _: &str) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            async fn stream(
+                &self,
+                _: &str,
+            ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
                 Err(TeriError::Llm("not used".into()))
             }
             async fn chat(&self, _: &[ChatMessage], _: &ChatOptions) -> Result<String> {
                 Err(TeriError::Llm("not used".into()))
             }
-            async fn chat_json<T: serde::de::DeserializeOwned>(&self, _: &[ChatMessage], _: &ChatOptions) -> Result<T> {
+            async fn chat_json<T: serde::de::DeserializeOwned>(
+                &self,
+                _: &[ChatMessage],
+                _: &ChatOptions,
+            ) -> Result<T> {
                 Err(TeriError::Llm("not used".into()))
             }
         }
@@ -1632,10 +1559,7 @@ mod updater_tests {
             make_activity("twitter", "MUTE"),
         ];
         // Build expected combined text.
-        let expected_text: Vec<String> = activities
-            .iter()
-            .map(|a| a.to_episode_text())
-            .collect();
+        let expected_text: Vec<String> = activities.iter().map(|a| a.to_episode_text()).collect();
         let expected_combined = expected_text.join("\n");
 
         for a in activities {
@@ -1670,13 +1594,19 @@ mod updater_tests {
 
         // Verify all contractual keys are present (observable JSON contract).
         let json = serde_json::to_value(&stats).expect("serialize stats");
-        for key in &["graph_id", "batch_size", "total_activities", "batches_sent",
-                     "items_sent", "failed_count", "skipped_count", "queue_size",
-                     "buffer_sizes", "running"] {
-            assert!(
-                json.get(key).is_some(),
-                "get_stats JSON must have key '{key}'"
-            );
+        for key in &[
+            "graph_id",
+            "batch_size",
+            "total_activities",
+            "batches_sent",
+            "items_sent",
+            "failed_count",
+            "skipped_count",
+            "queue_size",
+            "buffer_sizes",
+            "running",
+        ] {
+            assert!(json.get(key).is_some(), "get_stats JSON must have key '{key}'");
         }
         assert_eq!(stats.graph_id, "stats-test");
         assert_eq!(stats.batch_size, BATCH_SIZE);
@@ -1946,10 +1876,7 @@ impl<L: LlmClient + Send + Sync + 'static> GraphMemoryManager<L> {
 
         // If one already exists, stop it first (Python L503-504).
         if let Some(old) = updaters.get_mut(simulation_id) {
-            info!(
-                "停止旧图谱记忆更新器: simulation_id={}",
-                simulation_id
-            );
+            info!("停止旧图谱记忆更新器: simulation_id={}", simulation_id);
             old.stop().await;
         }
 
@@ -1957,10 +1884,7 @@ impl<L: LlmClient + Send + Sync + 'static> GraphMemoryManager<L> {
         updater.start();
         updaters.insert(simulation_id.to_string(), updater);
 
-        info!(
-            "创建图谱记忆更新器: simulation_id={}",
-            simulation_id
-        );
+        info!("创建图谱记忆更新器: simulation_id={}", simulation_id);
         Ok(())
     }
 
@@ -2281,12 +2205,7 @@ mod manager_tests {
 
         for i in 0..3 {
             manager
-                .create_updater(
-                    &format!("sim-{i}"),
-                    make_graph(),
-                    make_llm(),
-                    format!("graph-{i}"),
-                )
+                .create_updater(&format!("sim-{i}"), make_graph(), make_llm(), format!("graph-{i}"))
                 .await
                 .unwrap();
         }

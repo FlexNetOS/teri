@@ -27,12 +27,12 @@
 //!
 //! # Symbols: S-636..S-680 (excluding S-675)
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, Map};
+use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::error::{Result, TeriError};
@@ -120,14 +120,14 @@ impl SimulationStatus {
     /// (e.g. `"created"`, not the variant name), so this provides a cheap ref.
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Created   => "created",
+            Self::Created => "created",
             Self::Preparing => "preparing",
-            Self::Ready     => "ready",
-            Self::Running   => "running",
-            Self::Paused    => "paused",
-            Self::Stopped   => "stopped",
+            Self::Ready => "ready",
+            Self::Running => "running",
+            Self::Paused => "paused",
+            Self::Stopped => "stopped",
             Self::Completed => "completed",
-            Self::Failed    => "failed",
+            Self::Failed => "failed",
         }
     }
 }
@@ -162,7 +162,7 @@ impl PlatformType {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Twitter => "twitter",
-            Self::Reddit  => "reddit",
+            Self::Reddit => "reddit",
         }
     }
 }
@@ -302,37 +302,32 @@ impl SimulationState {
         // maintains insertion order — identical to Python's ordered dict output.
         let mut map = Map::with_capacity(17);
 
-        map.insert("simulation_id".to_string(),   Value::String(self.simulation_id.clone()));
-        map.insert("project_id".to_string(),      Value::String(self.project_id.clone()));
-        map.insert("graph_id".to_string(),        Value::String(self.graph_id.clone()));
-        map.insert("enable_twitter".to_string(),  Value::Bool(self.enable_twitter));
-        map.insert("enable_reddit".to_string(),   Value::Bool(self.enable_reddit));
+        map.insert("simulation_id".to_string(), Value::String(self.simulation_id.clone()));
+        map.insert("project_id".to_string(), Value::String(self.project_id.clone()));
+        map.insert("graph_id".to_string(), Value::String(self.graph_id.clone()));
+        map.insert("enable_twitter".to_string(), Value::Bool(self.enable_twitter));
+        map.insert("enable_reddit".to_string(), Value::Bool(self.enable_reddit));
         // status emitted as lowercase string (.value), not as a struct
-        map.insert("status".to_string(),          Value::String(self.status.to_string()));
-        map.insert("entities_count".to_string(),  Value::Number(self.entities_count.into()));
-        map.insert("profiles_count".to_string(),  Value::Number(self.profiles_count.into()));
+        map.insert("status".to_string(), Value::String(self.status.to_string()));
+        map.insert("entities_count".to_string(), Value::Number(self.entities_count.into()));
+        map.insert("profiles_count".to_string(), Value::Number(self.profiles_count.into()));
         map.insert(
             "entity_types".to_string(),
-            Value::Array(
-                self.entity_types
-                    .iter()
-                    .map(|s| Value::String(s.clone()))
-                    .collect(),
-            ),
+            Value::Array(self.entity_types.iter().map(|s| Value::String(s.clone())).collect()),
         );
         map.insert("config_generated".to_string(), Value::Bool(self.config_generated));
-        map.insert("config_reasoning".to_string(),  Value::String(self.config_reasoning.clone()));
-        map.insert("current_round".to_string(),     Value::Number(self.current_round.into()));
-        map.insert("twitter_status".to_string(),    Value::String(self.twitter_status.clone()));
-        map.insert("reddit_status".to_string(),     Value::String(self.reddit_status.clone()));
-        map.insert("created_at".to_string(),        Value::String(self.created_at.clone()));
-        map.insert("updated_at".to_string(),        Value::String(self.updated_at.clone()));
+        map.insert("config_reasoning".to_string(), Value::String(self.config_reasoning.clone()));
+        map.insert("current_round".to_string(), Value::Number(self.current_round.into()));
+        map.insert("twitter_status".to_string(), Value::String(self.twitter_status.clone()));
+        map.insert("reddit_status".to_string(), Value::String(self.reddit_status.clone()));
+        map.insert("created_at".to_string(), Value::String(self.created_at.clone()));
+        map.insert("updated_at".to_string(), Value::String(self.updated_at.clone()));
         // error: null when None, string when Some
         map.insert(
             "error".to_string(),
             match &self.error {
                 Some(e) => Value::String(e.clone()),
-                None    => Value::Null,
+                None => Value::Null,
             },
         );
 
@@ -351,28 +346,23 @@ impl SimulationState {
     pub fn to_simple_dict(&self) -> Value {
         let mut map = Map::with_capacity(9);
 
-        map.insert("simulation_id".to_string(),   Value::String(self.simulation_id.clone()));
-        map.insert("project_id".to_string(),      Value::String(self.project_id.clone()));
-        map.insert("graph_id".to_string(),        Value::String(self.graph_id.clone()));
+        map.insert("simulation_id".to_string(), Value::String(self.simulation_id.clone()));
+        map.insert("project_id".to_string(), Value::String(self.project_id.clone()));
+        map.insert("graph_id".to_string(), Value::String(self.graph_id.clone()));
         // status as lowercase string (.value)
-        map.insert("status".to_string(),          Value::String(self.status.to_string()));
-        map.insert("entities_count".to_string(),  Value::Number(self.entities_count.into()));
-        map.insert("profiles_count".to_string(),  Value::Number(self.profiles_count.into()));
+        map.insert("status".to_string(), Value::String(self.status.to_string()));
+        map.insert("entities_count".to_string(), Value::Number(self.entities_count.into()));
+        map.insert("profiles_count".to_string(), Value::Number(self.profiles_count.into()));
         map.insert(
             "entity_types".to_string(),
-            Value::Array(
-                self.entity_types
-                    .iter()
-                    .map(|s| Value::String(s.clone()))
-                    .collect(),
-            ),
+            Value::Array(self.entity_types.iter().map(|s| Value::String(s.clone())).collect()),
         );
         map.insert("config_generated".to_string(), Value::Bool(self.config_generated));
         map.insert(
             "error".to_string(),
             match &self.error {
                 Some(e) => Value::String(e.clone()),
-                None    => Value::Null,
+                None => Value::Null,
             },
         );
 
@@ -394,14 +384,14 @@ mod tests {
     #[test]
     fn simulation_status_serde_all_variants() {
         let cases = [
-            (SimulationStatus::Created,   "\"created\""),
+            (SimulationStatus::Created, "\"created\""),
             (SimulationStatus::Preparing, "\"preparing\""),
-            (SimulationStatus::Ready,     "\"ready\""),
-            (SimulationStatus::Running,   "\"running\""),
-            (SimulationStatus::Paused,    "\"paused\""),
-            (SimulationStatus::Stopped,   "\"stopped\""),
+            (SimulationStatus::Ready, "\"ready\""),
+            (SimulationStatus::Running, "\"running\""),
+            (SimulationStatus::Paused, "\"paused\""),
+            (SimulationStatus::Stopped, "\"stopped\""),
             (SimulationStatus::Completed, "\"completed\""),
-            (SimulationStatus::Failed,    "\"failed\""),
+            (SimulationStatus::Failed, "\"failed\""),
         ];
         for (variant, expected_json) in &cases {
             let json = serde_json::to_string(variant).unwrap();
@@ -419,21 +409,21 @@ mod tests {
     /// Verify as_str returns the correct lowercase value for all 8 variants.
     #[test]
     fn simulation_status_as_str_all_variants() {
-        assert_eq!(SimulationStatus::Created.as_str(),   "created");
+        assert_eq!(SimulationStatus::Created.as_str(), "created");
         assert_eq!(SimulationStatus::Preparing.as_str(), "preparing");
-        assert_eq!(SimulationStatus::Ready.as_str(),     "ready");
-        assert_eq!(SimulationStatus::Running.as_str(),   "running");
-        assert_eq!(SimulationStatus::Paused.as_str(),    "paused");
-        assert_eq!(SimulationStatus::Stopped.as_str(),   "stopped");
+        assert_eq!(SimulationStatus::Ready.as_str(), "ready");
+        assert_eq!(SimulationStatus::Running.as_str(), "running");
+        assert_eq!(SimulationStatus::Paused.as_str(), "paused");
+        assert_eq!(SimulationStatus::Stopped.as_str(), "stopped");
         assert_eq!(SimulationStatus::Completed.as_str(), "completed");
-        assert_eq!(SimulationStatus::Failed.as_str(),    "failed");
+        assert_eq!(SimulationStatus::Failed.as_str(), "failed");
     }
 
     /// Display must match as_str.
     #[test]
     fn simulation_status_display() {
         assert_eq!(SimulationStatus::Running.to_string(), "running");
-        assert_eq!(SimulationStatus::Failed.to_string(),  "failed");
+        assert_eq!(SimulationStatus::Failed.to_string(), "failed");
     }
 
     // -- PlatformType serialization -----------------------------------------
@@ -441,10 +431,7 @@ mod tests {
     /// Both platform variants round-trip correctly.
     #[test]
     fn platform_type_serde_all_variants() {
-        let cases = [
-            (PlatformType::Twitter, "\"twitter\""),
-            (PlatformType::Reddit,  "\"reddit\""),
-        ];
+        let cases = [(PlatformType::Twitter, "\"twitter\""), (PlatformType::Reddit, "\"reddit\"")];
         for (variant, expected_json) in &cases {
             let json = serde_json::to_string(variant).unwrap();
             assert_eq!(json, *expected_json);
@@ -459,8 +446,10 @@ mod tests {
         // The only valid string values are "twitter" and "reddit".
         assert!(serde_json::from_str::<PlatformType>("\"twitter\"").is_ok());
         assert!(serde_json::from_str::<PlatformType>("\"reddit\"").is_ok());
-        assert!(serde_json::from_str::<PlatformType>("\"both\"").is_err(),
-            "PlatformType must NOT have a BOTH variant");
+        assert!(
+            serde_json::from_str::<PlatformType>("\"both\"").is_err(),
+            "PlatformType must NOT have a BOTH variant"
+        );
     }
 
     // -- SimulationState construction defaults ------------------------------
@@ -474,19 +463,19 @@ mod tests {
             "graph-001".to_string(),
         );
         assert_eq!(s.simulation_id, "sim-001");
-        assert_eq!(s.project_id,    "proj-001");
-        assert_eq!(s.graph_id,      "graph-001");
-        assert!(s.enable_twitter,  "enable_twitter default must be true");
-        assert!(s.enable_reddit,   "enable_reddit default must be true");
-        assert_eq!(s.status,           SimulationStatus::Created);
-        assert_eq!(s.entities_count,   0);
-        assert_eq!(s.profiles_count,   0);
+        assert_eq!(s.project_id, "proj-001");
+        assert_eq!(s.graph_id, "graph-001");
+        assert!(s.enable_twitter, "enable_twitter default must be true");
+        assert!(s.enable_reddit, "enable_reddit default must be true");
+        assert_eq!(s.status, SimulationStatus::Created);
+        assert_eq!(s.entities_count, 0);
+        assert_eq!(s.profiles_count, 0);
         assert!(s.entity_types.is_empty(), "entity_types default must be []");
-        assert!(!s.config_generated,  "config_generated default must be false");
+        assert!(!s.config_generated, "config_generated default must be false");
         assert_eq!(s.config_reasoning, "");
-        assert_eq!(s.current_round,    0);
-        assert_eq!(s.twitter_status,  "not_started");
-        assert_eq!(s.reddit_status,   "not_started");
+        assert_eq!(s.current_round, 0);
+        assert_eq!(s.twitter_status, "not_started");
+        assert_eq!(s.reddit_status, "not_started");
         assert!(!s.created_at.is_empty(), "created_at must be set on construction");
         assert!(!s.updated_at.is_empty(), "updated_at must be set on construction");
         assert!(s.error.is_none(), "error default must be None");
@@ -497,11 +486,8 @@ mod tests {
     /// to_dict must emit exactly 17 keys in Python declaration order.
     #[test]
     fn simulation_state_to_dict_key_count_and_order() {
-        let s = SimulationState::new(
-            "sim-1".to_string(),
-            "proj-1".to_string(),
-            "graph-1".to_string(),
-        );
+        let s =
+            SimulationState::new("sim-1".to_string(), "proj-1".to_string(), "graph-1".to_string());
         let dict = s.to_dict();
         let obj = dict.as_object().expect("to_dict must return a JSON object");
         assert_eq!(obj.len(), 17, "to_dict must emit exactly 17 keys");
@@ -555,10 +541,7 @@ mod tests {
         s.error = Some("something went wrong".to_string());
         let dict = s.to_dict();
         let obj = dict.as_object().unwrap();
-        assert_eq!(
-            obj["error"],
-            Value::String("something went wrong".to_string())
-        );
+        assert_eq!(obj["error"], Value::String("something went wrong".to_string()));
     }
 
     /// to_dict entity_types must serialise as a JSON array of strings.
@@ -581,7 +564,7 @@ mod tests {
         let dict = s.to_dict();
         let obj = dict.as_object().unwrap();
         assert_eq!(obj["enable_twitter"], Value::Bool(true));
-        assert_eq!(obj["enable_reddit"],  Value::Bool(true));
+        assert_eq!(obj["enable_reddit"], Value::Bool(true));
     }
 
     // -- to_simple_dict key count and order ---------------------------------
@@ -589,11 +572,8 @@ mod tests {
     /// to_simple_dict must emit exactly 9 keys in Python declaration order.
     #[test]
     fn simulation_state_to_simple_dict_key_count_and_order() {
-        let s = SimulationState::new(
-            "sim-1".to_string(),
-            "proj-1".to_string(),
-            "graph-1".to_string(),
-        );
+        let s =
+            SimulationState::new("sim-1".to_string(), "proj-1".to_string(), "graph-1".to_string());
         let dict = s.to_simple_dict();
         let obj = dict.as_object().expect("to_simple_dict must return a JSON object");
         assert_eq!(obj.len(), 9, "to_simple_dict must emit exactly 9 keys");
@@ -648,14 +628,14 @@ mod tests {
     #[test]
     fn simulation_state_to_dict_all_status_variants() {
         let variants = [
-            (SimulationStatus::Created,   "created"),
+            (SimulationStatus::Created, "created"),
             (SimulationStatus::Preparing, "preparing"),
-            (SimulationStatus::Ready,     "ready"),
-            (SimulationStatus::Running,   "running"),
-            (SimulationStatus::Paused,    "paused"),
-            (SimulationStatus::Stopped,   "stopped"),
+            (SimulationStatus::Ready, "ready"),
+            (SimulationStatus::Running, "running"),
+            (SimulationStatus::Paused, "paused"),
+            (SimulationStatus::Stopped, "stopped"),
             (SimulationStatus::Completed, "completed"),
-            (SimulationStatus::Failed,    "failed"),
+            (SimulationStatus::Failed, "failed"),
         ];
         for (variant, expected_str) in variants {
             let mut s = SimulationState::new("s".to_string(), "p".to_string(), "g".to_string());
@@ -684,28 +664,24 @@ mod tests {
     /// defaults — NOT timestamps which are non-deterministic).
     #[test]
     fn simulation_state_to_dict_shape_snapshot() {
-        let s = SimulationState::new(
-            "abc".to_string(),
-            "xyz".to_string(),
-            "ggg".to_string(),
-        );
+        let s = SimulationState::new("abc".to_string(), "xyz".to_string(), "ggg".to_string());
         let dict = s.to_dict();
         let obj = dict.as_object().unwrap();
 
-        assert_eq!(obj["simulation_id"],  Value::String("abc".to_string()));
-        assert_eq!(obj["project_id"],     Value::String("xyz".to_string()));
-        assert_eq!(obj["graph_id"],       Value::String("ggg".to_string()));
+        assert_eq!(obj["simulation_id"], Value::String("abc".to_string()));
+        assert_eq!(obj["project_id"], Value::String("xyz".to_string()));
+        assert_eq!(obj["graph_id"], Value::String("ggg".to_string()));
         assert_eq!(obj["enable_twitter"], Value::Bool(true));
-        assert_eq!(obj["enable_reddit"],  Value::Bool(true));
-        assert_eq!(obj["status"],         Value::String("created".to_string()));
+        assert_eq!(obj["enable_reddit"], Value::Bool(true));
+        assert_eq!(obj["status"], Value::String("created".to_string()));
         assert_eq!(obj["entities_count"], Value::Number(0.into()));
         assert_eq!(obj["profiles_count"], Value::Number(0.into()));
-        assert_eq!(obj["entity_types"],   Value::Array(vec![]));
+        assert_eq!(obj["entity_types"], Value::Array(vec![]));
         assert_eq!(obj["config_generated"], Value::Bool(false));
         assert_eq!(obj["config_reasoning"], Value::String(String::new()));
-        assert_eq!(obj["current_round"],  Value::Number(0.into()));
+        assert_eq!(obj["current_round"], Value::Number(0.into()));
         assert_eq!(obj["twitter_status"], Value::String("not_started".to_string()));
-        assert_eq!(obj["reddit_status"],  Value::String("not_started".to_string()));
+        assert_eq!(obj["reddit_status"], Value::String("not_started".to_string()));
         // created_at / updated_at: non-empty ISO strings (non-deterministic, just check type)
         assert!(obj["created_at"].is_string());
         assert!(obj["updated_at"].is_string());
@@ -826,10 +802,7 @@ impl SimulationManager {
     /// (the directory is created lazily on first use in each method, matching Python's
     /// per-call `_get_simulation_dir` → `os.makedirs`).
     pub fn new(sim_data_dir: impl Into<PathBuf>) -> Self {
-        SimulationManager {
-            sim_data_dir: sim_data_dir.into(),
-            cache: Mutex::new(HashMap::new()),
-        }
+        SimulationManager { sim_data_dir: sim_data_dir.into(), cache: Mutex::new(HashMap::new()) }
     }
 
     /// Create a `SimulationManager` from teri's `Config`.
@@ -949,91 +922,63 @@ impl SimulationManager {
 
         let now = python_isoformat_local();
 
-        let project_id = obj.get("project_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let project_id = obj.get("project_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-        let graph_id = obj.get("graph_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let graph_id = obj.get("graph_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-        let enable_twitter = obj.get("enable_twitter")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+        let enable_twitter = obj.get("enable_twitter").and_then(|v| v.as_bool()).unwrap_or(true);
 
-        let enable_reddit = obj.get("enable_reddit")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+        let enable_reddit = obj.get("enable_reddit").and_then(|v| v.as_bool()).unwrap_or(true);
 
         // Step 4: status — Python `SimulationStatus(data.get("status", "created"))`.
         // An invalid string raises ValueError in Python; we return Err here (faithful).
-        let status_str = obj.get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("created");
-        let status: SimulationStatus = serde_json::from_value(Value::String(status_str.to_string()))
-            .map_err(|_| TeriError::Sim(format!(
-                "invalid SimulationStatus {status_str:?} in {simulation_id}/state.json \
+        let status_str = obj.get("status").and_then(|v| v.as_str()).unwrap_or("created");
+        let status: SimulationStatus =
+            serde_json::from_value(Value::String(status_str.to_string())).map_err(|_| {
+                TeriError::Sim(format!(
+                    "invalid SimulationStatus {status_str:?} in {simulation_id}/state.json \
                  (Python SimulationStatus(str) raises ValueError on unknown value)"
-            )))?;
+                ))
+            })?;
 
-        let entities_count = obj.get("entities_count")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+        let entities_count = obj.get("entities_count").and_then(|v| v.as_i64()).unwrap_or(0);
 
-        let profiles_count = obj.get("profiles_count")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+        let profiles_count = obj.get("profiles_count").and_then(|v| v.as_i64()).unwrap_or(0);
 
-        let entity_types: Vec<String> = obj.get("entity_types")
+        let entity_types: Vec<String> = obj
+            .get("entity_types")
             .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|item| item.as_str().map(str::to_string))
-                    .collect()
-            })
+            .map(|arr| arr.iter().filter_map(|item| item.as_str().map(str::to_string)).collect())
             .unwrap_or_default();
 
-        let config_generated = obj.get("config_generated")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let config_generated =
+            obj.get("config_generated").and_then(|v| v.as_bool()).unwrap_or(false);
 
-        let config_reasoning = obj.get("config_reasoning")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let config_reasoning =
+            obj.get("config_reasoning").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-        let current_round = obj.get("current_round")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+        let current_round = obj.get("current_round").and_then(|v| v.as_i64()).unwrap_or(0);
 
-        let twitter_status = obj.get("twitter_status")
+        let twitter_status = obj
+            .get("twitter_status")
             .and_then(|v| v.as_str())
             .unwrap_or("not_started")
             .to_string();
 
-        let reddit_status = obj.get("reddit_status")
+        let reddit_status = obj
+            .get("reddit_status")
             .and_then(|v| v.as_str())
             .unwrap_or("not_started")
             .to_string();
 
         // Python: `data.get("created_at", datetime.now().isoformat())`
-        let created_at = obj.get("created_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&now)
-            .to_string();
+        let created_at = obj.get("created_at").and_then(|v| v.as_str()).unwrap_or(&now).to_string();
 
         // Python: `data.get("updated_at", datetime.now().isoformat())`
-        let updated_at = obj.get("updated_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&now)
-            .to_string();
+        let updated_at = obj.get("updated_at").and_then(|v| v.as_str()).unwrap_or(&now).to_string();
 
         // Python: `data.get("error")` — None if key absent or value is null
-        let error = obj.get("error")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+        let error = obj.get("error").and_then(|v| v.as_str()).map(str::to_string);
 
         let state = SimulationState {
             simulation_id: simulation_id.to_string(),
@@ -1173,7 +1118,7 @@ impl SimulationManager {
         use crate::i18n::{t, t_args};
         use crate::services::entity_reader::KnowledgeGraphEntityReader;
         use crate::services::oasis_profile_export::{
-            generate_profiles_from_entities, save_profiles, OutputPlatform,
+            OutputPlatform, generate_profiles_from_entities, save_profiles,
         };
 
         // --- Pre-load: missing simulation → Err (Python L262-264: raise ValueError) ---
@@ -1227,10 +1172,7 @@ impl SimulationManager {
             cb(PrepareProgress {
                 stage: "reading",
                 progress: 100,
-                message: t_args(
-                    "progress.readingComplete",
-                    &[("count", &filtered.filtered_count)],
-                ),
+                message: t_args("progress.readingComplete", &[("count", &filtered.filtered_count)]),
                 current: Some(filtered.filtered_count),
                 total: Some(filtered.filtered_count),
             });
@@ -1242,9 +1184,7 @@ impl SimulationManager {
         // not an exception; the route layer gets Ok(state) with status=FAILED.
         if filtered.filtered_count == 0 {
             state.status = SimulationStatus::Failed;
-            state.error = Some(
-                "没有找到符合条件的实体，请检查图谱是否正确构建".to_string(),
-            );
+            state.error = Some("没有找到符合条件的实体，请检查图谱是否正确构建".to_string());
             self.save_simulation_state(&mut state)?;
             return Ok(state);
         }
@@ -1285,14 +1225,13 @@ impl SimulationManager {
         }
 
         // Realtime output path: Reddit > Twitter > None (Python L329-337)
-        let realtime_output: Option<(std::path::PathBuf, OutputPlatform)> =
-            if state.enable_reddit {
-                Some((sim_dir.join("reddit_profiles.json"), OutputPlatform::Reddit))
-            } else if state.enable_twitter {
-                Some((sim_dir.join("twitter_profiles.csv"), OutputPlatform::Twitter))
-            } else {
-                None
-            };
+        let realtime_output: Option<(std::path::PathBuf, OutputPlatform)> = if state.enable_reddit {
+            Some((sim_dir.join("reddit_profiles.json"), OutputPlatform::Reddit))
+        } else if state.enable_twitter {
+            Some((sim_dir.join("twitter_profiles.csv"), OutputPlatform::Twitter))
+        } else {
+            None
+        };
 
         // Build the profile_progress closure (Python L318-327).
         // Maps (current, total, msg) → generating_profiles/pct/msg with current/total.
@@ -1303,8 +1242,7 @@ impl SimulationManager {
         // (via buffer_unordered on the current task — no spawn), so `cb_ptr` is always
         // valid and there is no concurrent aliasing. The pointer's target (`progress_callback`)
         // lives on this function's stack and outlives the closure.
-        let cb_ptr: *mut Option<&mut dyn FnMut(PrepareProgress<'_>)> =
-            &raw mut progress_callback;
+        let cb_ptr: *mut Option<&mut dyn FnMut(PrepareProgress<'_>)> = &raw mut progress_callback;
 
         let mut profile_progress = |current: i64, total: i64, msg: String| {
             let cb = unsafe { &mut *cb_ptr };
@@ -1353,18 +1291,24 @@ impl SimulationManager {
 
         // Final saves (Python L361-374: two independent `if` branches, NOT elif).
         if state.enable_reddit {
-            try_stage!(save_profiles(
-                &profiles,
-                &sim_dir.join("reddit_profiles.json"),
-                OutputPlatform::Reddit,
-            ).map_err(TeriError::from));
+            try_stage!(
+                save_profiles(
+                    &profiles,
+                    &sim_dir.join("reddit_profiles.json"),
+                    OutputPlatform::Reddit,
+                )
+                .map_err(TeriError::from)
+            );
         }
         if state.enable_twitter {
-            try_stage!(save_profiles(
-                &profiles,
-                &sim_dir.join("twitter_profiles.csv"),
-                OutputPlatform::Twitter,
-            ).map_err(TeriError::from));
+            try_stage!(
+                save_profiles(
+                    &profiles,
+                    &sim_dir.join("twitter_profiles.csv"),
+                    OutputPlatform::Twitter,
+                )
+                .map_err(TeriError::from)
+            );
         }
 
         // generating_profiles/100 — "完成，共 N 个Profile"
@@ -1373,10 +1317,7 @@ impl SimulationManager {
             cb(PrepareProgress {
                 stage: "generating_profiles",
                 progress: 100,
-                message: t_args(
-                    "progress.profilesComplete",
-                    &[("count", &(profile_count as i64))],
-                ),
+                message: t_args("progress.profilesComplete", &[("count", &(profile_count as i64))]),
                 current: Some(profile_count as i64),
                 total: Some(profile_count as i64),
             });
@@ -1433,7 +1374,9 @@ impl SimulationManager {
 
         // Write simulation_config.json (Python L423-425: open+write as UTF-8)
         let config_path = sim_dir.join("simulation_config.json");
-        try_stage!(std::fs::write(&config_path, sim_params.to_json().as_bytes()).map_err(TeriError::from));
+        try_stage!(
+            std::fs::write(&config_path, sim_params.to_json().as_bytes()).map_err(TeriError::from)
+        );
 
         state.config_generated = true;
         state.config_reasoning = sim_params.generation_reasoning.clone();
@@ -1544,11 +1487,7 @@ impl SimulationManager {
     /// "simulation not found" (hard error) from "profiles not yet generated" (empty list).
     ///
     /// `platform` default in Python: `"reddit"`. Callers must pass it explicitly in Rust.
-    pub fn get_profiles(
-        &self,
-        simulation_id: &str,
-        platform: &str,
-    ) -> Result<Vec<Value>> {
+    pub fn get_profiles(&self, simulation_id: &str, platform: &str) -> Result<Vec<Value>> {
         // Missing state → Err (Python `raise ValueError`)
         let state = self.load_simulation_state(simulation_id)?;
         if state.is_none() {
@@ -1672,7 +1611,12 @@ mod manager_tests {
             state.simulation_id
         );
         let hex_part = &state.simulation_id["sim_".len()..];
-        assert_eq!(hex_part.len(), 12, "hex suffix must be exactly 12 chars: {}", state.simulation_id);
+        assert_eq!(
+            hex_part.len(),
+            12,
+            "hex suffix must be exactly 12 chars: {}",
+            state.simulation_id
+        );
         // Valid hex chars are 0-9 and a-f (all lowercase). Digits are neither
         // uppercase nor lowercase — so we check: is_ascii_digit OR is_ascii_lowercase.
         assert!(
@@ -1744,10 +1688,7 @@ mod manager_tests {
         mgr.save_simulation_state(&mut state).unwrap();
 
         // updated_at must have been bumped BEFORE the write
-        assert_ne!(
-            state.updated_at, created_updated_at,
-            "updated_at must be bumped on save"
-        );
+        assert_ne!(state.updated_at, created_updated_at, "updated_at must be bumped on save");
 
         // What's on disk must match the bumped timestamp
         let state_json_path = dir.join(&state.simulation_id).join("state.json");
@@ -1856,10 +1797,8 @@ mod manager_tests {
         let hidden = dir.join(".DS_Store");
         std::fs::create_dir_all(&hidden).unwrap();
         // Write a fake state.json in there too
-        std::fs::write(
-            hidden.join("state.json"),
-            r#"{"project_id":"proj-h","status":"created"}"#
-        ).unwrap();
+        std::fs::write(hidden.join("state.json"), r#"{"project_id":"proj-h","status":"created"}"#)
+            .unwrap();
 
         // Create a file (not a dir) — should be skipped
         let not_a_dir = dir.join("readme.txt");
@@ -1920,10 +1859,7 @@ mod manager_tests {
 
         // No simulation created
         let result = mgr.get_profiles("sim_doesnotexist", "reddit");
-        assert!(
-            result.is_err(),
-            "missing state must return Err (Python raises ValueError)"
-        );
+        assert!(result.is_err(), "missing state must return Err (Python raises ValueError)");
     }
 
     #[test]
@@ -1946,7 +1882,8 @@ mod manager_tests {
         let state = mgr.create_simulation("p", "g", true, true).unwrap();
 
         // Write a profiles JSON file
-        let profiles_json = r#"[{"username":"alice","bio":"test"},{"username":"bob","bio":"test2"}]"#;
+        let profiles_json =
+            r#"[{"username":"alice","bio":"test"},{"username":"bob","bio":"test2"}]"#;
         let sim_dir = dir.join(&state.simulation_id);
         std::fs::write(sim_dir.join("reddit_profiles.json"), profiles_json).unwrap();
 
@@ -1964,10 +1901,8 @@ mod manager_tests {
 
         let sim_dir = dir.join(&state.simulation_id);
         // Reddit file absent, twitter file present
-        std::fs::write(
-            sim_dir.join("twitter_profiles.json"),
-            r#"[{"username":"charlie"}]"#
-        ).unwrap();
+        std::fs::write(sim_dir.join("twitter_profiles.json"), r#"[{"username":"charlie"}]"#)
+            .unwrap();
 
         // platform="reddit" → file absent → []
         let reddit = mgr.get_profiles(&state.simulation_id, "reddit").unwrap();
@@ -2061,10 +1996,7 @@ mod manager_tests {
             "config_file must end with simulation_config.json: {:?}",
             instr.config_file
         );
-        assert!(
-            !instr.substrate_note.is_empty(),
-            "substrate_note must explain the [≠] gap"
-        );
+        assert!(!instr.substrate_note.is_empty(), "substrate_note must explain the [≠] gap");
         assert!(
             instr.substrate_note.contains("SimEngine"),
             "substrate_note must direct caller to SimEngine: {}",
@@ -2085,8 +2017,7 @@ mod manager_tests {
             .map(|_| mgr.create_simulation("p", "g", true, true).unwrap().simulation_id)
             .collect();
 
-        let unique: std::collections::HashSet<&str> =
-            ids.iter().map(|s| s.as_str()).collect();
+        let unique: std::collections::HashSet<&str> = ids.iter().map(|s| s.as_str()).collect();
         assert_eq!(unique.len(), ids.len(), "all simulation IDs must be unique");
     }
 }
@@ -2099,7 +2030,7 @@ mod manager_tests {
 mod prepare_tests {
     use super::*;
     use crate::agent::PersonaGenerator;
-    use crate::graph::{KnowledgeGraph, Entity, EntityKind};
+    use crate::graph::{Entity, EntityKind, KnowledgeGraph};
     use crate::services::simulation_config::SimulationConfigGenerator;
     use std::env;
 
@@ -2107,10 +2038,7 @@ mod prepare_tests {
 
     fn temp_prepare_dir(suffix: &str) -> PathBuf {
         let mut p = env::temp_dir();
-        p.push(format!(
-            "teri_prepare_sim_{}_{suffix}",
-            std::process::id()
-        ));
+        p.push(format!("teri_prepare_sim_{}_{suffix}", std::process::id()));
         p
     }
 
@@ -2159,9 +2087,7 @@ mod prepare_tests {
             &self,
             _prompt: &str,
         ) -> crate::error::Result<
-            std::pin::Pin<
-                Box<dyn futures::Stream<Item = crate::error::Result<String>> + Send>,
-            >,
+            std::pin::Pin<Box<dyn futures::Stream<Item = crate::error::Result<String>> + Send>>,
         > {
             use futures::stream;
             Ok(Box::pin(stream::iter(vec![Ok(self.profile_response.clone())])))
@@ -2187,11 +2113,8 @@ mod prepare_tests {
     fn make_graph_with_entities(names: &[&str], kind: EntityKind) -> KnowledgeGraph {
         let mut g = KnowledgeGraph::new();
         for name in names {
-            let entity = Entity {
-                id: uuid::Uuid::new_v4(),
-                name: name.to_string(),
-                kind: kind.clone(),
-            };
+            let entity =
+                Entity { id: uuid::Uuid::new_v4(), name: name.to_string(), kind: kind.clone() };
             g.add_entity(entity).expect("add_entity must succeed");
         }
         g
@@ -2206,7 +2129,8 @@ mod prepare_tests {
         let graph = KnowledgeGraph::new();
         let pg = PersonaGenerator::new();
         let llm = MockLlm::all_ok();
-        let config_gen = SimulationConfigGenerator::new(MockLlm::all_ok(), "test-model", "http://localhost");
+        let config_gen =
+            SimulationConfigGenerator::new(MockLlm::all_ok(), "test-model", "http://localhost");
 
         let result = mgr
             .prepare_simulation(
@@ -2226,14 +2150,8 @@ mod prepare_tests {
 
         assert!(result.is_err(), "missing simulation must return Err");
         let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("模拟不存在"),
-            "error must contain '模拟不存在': {msg}"
-        );
-        assert!(
-            msg.contains("sim_doesnotexist"),
-            "error must contain the id: {msg}"
-        );
+        assert!(msg.contains("模拟不存在"), "error must contain '模拟不存在': {msg}");
+        assert!(msg.contains("sim_doesnotexist"), "error must contain the id: {msg}");
     }
 
     // ── Test 2: zero filtered entities → Ok(state) with status=FAILED ───────────
@@ -2246,7 +2164,8 @@ mod prepare_tests {
         let graph = KnowledgeGraph::new();
         let pg = PersonaGenerator::new();
         let llm = MockLlm::all_ok();
-        let config_gen = SimulationConfigGenerator::new(MockLlm::all_ok(), "test-model", "http://localhost");
+        let config_gen =
+            SimulationConfigGenerator::new(MockLlm::all_ok(), "test-model", "http://localhost");
 
         let state = mgr.create_simulation("proj", "graph", true, true).unwrap();
 
@@ -2305,7 +2224,8 @@ mod prepare_tests {
         let graph = make_graph_with_entities(&["Alice", "Bob"], EntityKind::Person);
         let pg = PersonaGenerator::new();
         let llm = MockLlm::all_ok();
-        let config_gen = SimulationConfigGenerator::new(MockLlm::all_ok(), "test-model", "http://localhost");
+        let config_gen =
+            SimulationConfigGenerator::new(MockLlm::all_ok(), "test-model", "http://localhost");
 
         let mut init = mgr.create_simulation("proj", "graph", false, true).unwrap();
         // enable_reddit=true, enable_twitter=false
@@ -2362,8 +2282,8 @@ mod prepare_tests {
         let config_raw = std::fs::read_to_string(&config_path).unwrap();
         assert!(!config_raw.is_empty(), "simulation_config.json must not be empty");
         // Must be valid JSON
-        let _parsed: serde_json::Value = serde_json::from_str(&config_raw)
-            .expect("simulation_config.json must be valid JSON");
+        let _parsed: serde_json::Value =
+            serde_json::from_str(&config_raw).expect("simulation_config.json must be valid JSON");
 
         // state.json must have status=ready
         let state_json = std::fs::read_to_string(sim_dir.join("state.json")).unwrap();
@@ -2381,7 +2301,8 @@ mod prepare_tests {
         let graph = make_graph_with_entities(&["Charlie"], EntityKind::Person);
         let pg = PersonaGenerator::new();
         let llm = MockLlm::all_ok();
-        let config_gen = SimulationConfigGenerator::new(MockLlm::all_ok(), "test-model", "http://localhost");
+        let config_gen =
+            SimulationConfigGenerator::new(MockLlm::all_ok(), "test-model", "http://localhost");
 
         let mut init = mgr.create_simulation("proj", "graph", true, false).unwrap();
         init.enable_twitter = true;
@@ -2433,7 +2354,8 @@ mod prepare_tests {
         let graph = make_graph_with_entities(&["Dave"], EntityKind::Person);
         let pg = PersonaGenerator::new();
         let llm = MockLlm::all_ok();
-        let config_gen = SimulationConfigGenerator::new(MockLlm::all_ok(), "test-model", "http://localhost");
+        let config_gen =
+            SimulationConfigGenerator::new(MockLlm::all_ok(), "test-model", "http://localhost");
 
         let init = mgr.create_simulation("proj", "graph", false, true).unwrap();
 
@@ -2468,10 +2390,7 @@ mod prepare_tests {
 
         // Stage sequence must start with reading, then generating_profiles, then generating_config
         let stage_names: Vec<&str> = stages_seen.iter().map(|(s, _)| s.as_str()).collect();
-        assert!(
-            stage_names.contains(&"reading"),
-            "must have 'reading' stage events"
-        );
+        assert!(stage_names.contains(&"reading"), "must have 'reading' stage events");
         assert!(
             stage_names.contains(&"generating_profiles"),
             "must have 'generating_profiles' stage events"
@@ -2486,7 +2405,10 @@ mod prepare_tests {
         let first_profile = stage_names.iter().position(|&s| s == "generating_profiles").unwrap();
         let first_config = stage_names.iter().position(|&s| s == "generating_config").unwrap();
         assert!(first_reading < first_profile, "reading must precede generating_profiles");
-        assert!(first_profile < first_config, "generating_profiles must precede generating_config");
+        assert!(
+            first_profile < first_config,
+            "generating_profiles must precede generating_config"
+        );
 
         // reading/0 must have current=None, total=None
         let reading_0 = stages_seen.iter().position(|(s, p)| s == "reading" && *p == 0);
@@ -2524,7 +2446,8 @@ mod prepare_tests {
         let graph = make_graph_with_entities(&["Eve"], EntityKind::Person);
         let pg = PersonaGenerator::new();
         let llm = MockLlm::all_ok();
-        let config_gen = SimulationConfigGenerator::new(MockLlm::all_ok(), "test-model", "http://localhost");
+        let config_gen =
+            SimulationConfigGenerator::new(MockLlm::all_ok(), "test-model", "http://localhost");
 
         let mut init = mgr.create_simulation("proj", "graph", false, true).unwrap();
         init.enable_reddit = true;
@@ -2534,8 +2457,7 @@ mod prepare_tests {
         // Sabotage: create reddit_profiles.json as a DIRECTORY so the final save_profiles
         // call (which tries to write a file there) will fail with EISDIR.
         let sim_dir = dir.join(&init.simulation_id);
-        std::fs::create_dir_all(sim_dir.join("reddit_profiles.json"))
-            .expect("create sabotage dir");
+        std::fs::create_dir_all(sim_dir.join("reddit_profiles.json")).expect("create sabotage dir");
 
         let result = mgr
             .prepare_simulation(
@@ -2587,7 +2509,8 @@ mod prepare_tests {
         let graph = make_graph_with_entities(&["Alice", "Bob", "Carol"], EntityKind::Person);
         let pg = PersonaGenerator::new();
         let llm = MockLlm::all_ok();
-        let config_gen = SimulationConfigGenerator::new(MockLlm::all_ok(), "test-model", "http://localhost");
+        let config_gen =
+            SimulationConfigGenerator::new(MockLlm::all_ok(), "test-model", "http://localhost");
 
         let mut init = mgr.create_simulation("proj", "graph", true, true).unwrap();
         // Both platforms enabled

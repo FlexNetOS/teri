@@ -176,8 +176,7 @@ pub(crate) fn save_reddit_json(
             item["profession"] = serde_json::Value::from(profession.as_str());
         }
         if !profile.interested_topics.is_empty() {
-            item["interested_topics"] =
-                serde_json::Value::from(profile.interested_topics.clone());
+            item["interested_topics"] = serde_json::Value::from(profile.interested_topics.clone());
         }
 
         data.push(item);
@@ -239,11 +238,8 @@ pub(crate) fn save_twitter_csv(
         file_path
     } else {
         let s = file_path.to_string_lossy();
-        let new = if s.ends_with(".json") {
-            s.replacen(".json", ".csv", 1)
-        } else {
-            format!("{s}.csv")
-        };
+        let new =
+            if s.ends_with(".json") { s.replacen(".json", ".csv", 1) } else { format!("{s}.csv") };
         resolved_path = std::path::PathBuf::from(new);
         resolved_path.as_path()
     };
@@ -269,7 +265,7 @@ pub(crate) fn save_twitter_csv(
         let description = profile.bio.replace(['\n', '\r'], " ");
 
         writer.write_record([
-            &idx.to_string(),       // user_id = row index (0-based)
+            &idx.to_string(), // user_id = row index (0-based)
             name.as_str(),
             profile.user_name.as_str(),
             &user_char,
@@ -491,8 +487,7 @@ pub async fn generate_profiles_from_entities<L: LlmClient>(
         // Realtime-save: write all completed (non-None) profiles so far.
         // Matches Python's `save_profiles_realtime()` called inside `as_completed` loop.
         if let Some((rt_path, rt_platform)) = realtime_output {
-            let completed: Vec<&(SocialProfile, String)> =
-                results.iter().flatten().collect();
+            let completed: Vec<&(SocialProfile, String)> = results.iter().flatten().collect();
             if !completed.is_empty()
                 && let Err(e) = realtime_save(&completed, rt_path, rt_platform)
             {
@@ -561,21 +556,15 @@ fn realtime_save(
                 return Ok(());
             }
             let file = std::fs::File::create(path)?;
-            let mut writer = csv::WriterBuilder::new()
-                .has_headers(false)
-                .from_writer(file);
+            let mut writer = csv::WriterBuilder::new().has_headers(false).from_writer(file);
             // Header from to_twitter_format keys
-            let fieldnames: Vec<String> = rows[0]
-                .as_object()
-                .map(|m| m.keys().cloned().collect())
-                .unwrap_or_default();
+            let fieldnames: Vec<String> =
+                rows[0].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
             writer.write_record(&fieldnames)?;
             for row in &rows {
                 if let Some(obj) = row.as_object() {
-                    let record: Vec<String> = fieldnames
-                        .iter()
-                        .map(|k| value_to_csv_string(&obj[k]))
-                        .collect();
+                    let record: Vec<String> =
+                        fieldnames.iter().map(|k| value_to_csv_string(&obj[k])).collect();
                     writer.write_record(&record)?;
                 }
             }
@@ -729,8 +718,17 @@ mod tests {
 
         // Profile with all optional fields missing — should see all OASIS defaults
         let profile = make_profile(
-            5, "alice_wonder", "Short bio.", "Detailed persona.", None, None, None, None, None,
-            vec![], 0,
+            5,
+            "alice_wonder",
+            "Short bio.",
+            "Detailed persona.",
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            0,
         );
         let pairs = vec![(profile, "Alice Wonder".to_string())];
 
@@ -762,9 +760,17 @@ mod tests {
         let path = dir.path().join("reddit_profiles.json");
 
         let profile = make_profile(
-            7, "bob_smith", "My bio.", "My persona.",
-            Some(25), Some("male"), Some("ENFP"), Some("美国"),
-            Some("Engineer"), vec!["Tech", "Science"], 500,
+            7,
+            "bob_smith",
+            "My bio.",
+            "My persona.",
+            Some(25),
+            Some("male"),
+            Some("ENFP"),
+            Some("美国"),
+            Some("Engineer"),
+            vec!["Tech", "Science"],
+            500,
         );
         let pairs = vec![(profile, "Bob Smith".to_string())];
 
@@ -791,8 +797,17 @@ mod tests {
         // bio of 200 chars
         let long_bio: String = "A".repeat(200);
         let profile = make_profile(
-            0, "user", &long_bio, "persona", Some(30), Some("male"), Some("INTJ"),
-            Some("China"), None, vec![], 1000,
+            0,
+            "user",
+            &long_bio,
+            "persona",
+            Some(30),
+            Some("male"),
+            Some("INTJ"),
+            Some("China"),
+            None,
+            vec![],
+            1000,
         );
         let pairs = vec![(profile, "User".to_string())];
 
@@ -810,8 +825,17 @@ mod tests {
         let path = dir.path().join("reddit_profiles.json");
 
         let profile = make_profile(
-            0, "user", "", "persona", Some(30), Some("male"), Some("INTJ"),
-            Some("China"), None, vec![], 1000,
+            0,
+            "user",
+            "",
+            "persona",
+            Some(30),
+            Some("male"),
+            Some("INTJ"),
+            Some("China"),
+            None,
+            vec![],
+            1000,
         );
         let pairs = vec![(profile, "Fallback Name".to_string())];
 
@@ -828,8 +852,17 @@ mod tests {
         let path = dir.path().join("reddit_profiles.json");
 
         let profile = make_profile(
-            0, "user", "bio", "", Some(30), Some("male"), Some("INTJ"),
-            Some("China"), None, vec![], 1000,
+            0,
+            "user",
+            "bio",
+            "",
+            Some(30),
+            Some("male"),
+            Some("INTJ"),
+            Some("China"),
+            None,
+            vec![],
+            1000,
         );
         let pairs = vec![(profile, "Fallback Name".to_string())];
 
@@ -851,8 +884,17 @@ mod tests {
 
         // Chinese gender input → should be normalized to English
         let profile = make_profile(
-            0, "user", "bio", "persona", Some(30), Some("男"), Some("INTJ"),
-            Some("China"), None, vec![], 1000,
+            0,
+            "user",
+            "bio",
+            "persona",
+            Some(30),
+            Some("男"),
+            Some("INTJ"),
+            Some("China"),
+            None,
+            vec![],
+            1000,
         );
         let pairs = vec![(profile, "Name".to_string())];
 
@@ -870,8 +912,17 @@ mod tests {
         let path = dir.path().join("reddit_profiles.json");
 
         let profile = make_profile(
-            0, "user", "生物", "人设", Some(30), Some("女"), Some("INTJ"),
-            Some("中国"), None, vec![], 1000,
+            0,
+            "user",
+            "生物",
+            "人设",
+            Some(30),
+            Some("女"),
+            Some("INTJ"),
+            Some("中国"),
+            None,
+            vec![],
+            1000,
         );
         let pairs = vec![(profile, "张三".to_string())];
 
@@ -888,8 +939,32 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("reddit_profiles.json");
 
-        let p0 = make_profile(0, "user0", "bio0", "persona0", Some(20), Some("male"), Some("INTJ"), Some("China"), None, vec![], 1000);
-        let p1 = make_profile(1, "user1", "bio1", "persona1", Some(30), Some("female"), Some("ENFP"), Some("Japan"), None, vec![], 2000);
+        let p0 = make_profile(
+            0,
+            "user0",
+            "bio0",
+            "persona0",
+            Some(20),
+            Some("male"),
+            Some("INTJ"),
+            Some("China"),
+            None,
+            vec![],
+            1000,
+        );
+        let p1 = make_profile(
+            1,
+            "user1",
+            "bio1",
+            "persona1",
+            Some(30),
+            Some("female"),
+            Some("ENFP"),
+            Some("Japan"),
+            None,
+            vec![],
+            2000,
+        );
         let pairs = vec![(p0, "Name0".to_string()), (p1, "Name1".to_string())];
 
         save_reddit_json(&pairs, &path).unwrap();
@@ -909,8 +984,17 @@ mod tests {
         let path = dir.path().join("twitter_profiles.csv");
 
         let profile = make_profile(
-            99, "alice", "My bio.", "My persona.", Some(25), Some("female"),
-            Some("INFJ"), Some("UK"), Some("Writer"), vec![], 1000,
+            99,
+            "alice",
+            "My bio.",
+            "My persona.",
+            Some(25),
+            Some("female"),
+            Some("INFJ"),
+            Some("UK"),
+            Some("Writer"),
+            vec![],
+            1000,
         );
         let pairs = vec![(profile, "Alice".to_string())];
 
@@ -933,8 +1017,17 @@ mod tests {
 
         // profile.user_id = 99 but row index = 0
         let profile = make_profile(
-            99, "alice", "bio", "persona", Some(25), Some("female"),
-            Some("INFJ"), Some("UK"), None, vec![], 1000,
+            99,
+            "alice",
+            "bio",
+            "persona",
+            Some(25),
+            Some("female"),
+            Some("INFJ"),
+            Some("UK"),
+            None,
+            vec![],
+            1000,
         );
         let pairs = vec![(profile, "Alice".to_string())];
 
@@ -955,8 +1048,17 @@ mod tests {
         let path = dir.path().join("twitter_profiles.csv");
 
         let profile = make_profile(
-            0, "alice", "Short bio.", "Detailed persona text.", Some(25), Some("female"),
-            Some("INFJ"), Some("UK"), None, vec![], 1000,
+            0,
+            "alice",
+            "Short bio.",
+            "Detailed persona text.",
+            Some(25),
+            Some("female"),
+            Some("INFJ"),
+            Some("UK"),
+            None,
+            vec![],
+            1000,
         );
         let pairs = vec![(profile, "Alice".to_string())];
 
@@ -977,8 +1079,17 @@ mod tests {
         let path = dir.path().join("twitter_profiles.csv");
 
         let profile = make_profile(
-            0, "alice", "Same text.", "Same text.", Some(25), Some("female"),
-            Some("INFJ"), Some("UK"), None, vec![], 1000,
+            0,
+            "alice",
+            "Same text.",
+            "Same text.",
+            Some(25),
+            Some("female"),
+            Some("INFJ"),
+            Some("UK"),
+            None,
+            vec![],
+            1000,
         );
         let pairs = vec![(profile, "Alice".to_string())];
 
@@ -987,10 +1098,7 @@ mod tests {
         let mut reader = csv::Reader::from_path(&path).unwrap();
         let record = reader.records().next().unwrap().unwrap();
         let user_char = record.get(3).unwrap();
-        assert_eq!(
-            user_char, "Same text.",
-            "user_char must be just bio when persona == bio"
-        );
+        assert_eq!(user_char, "Same text.", "user_char must be just bio when persona == bio");
     }
 
     #[test]
@@ -999,8 +1107,17 @@ mod tests {
         let path = dir.path().join("twitter_profiles.csv");
 
         let profile = make_profile(
-            0, "alice", "bio\nline2\r\nline3", "persona\nnewline",
-            Some(25), Some("female"), Some("INFJ"), Some("UK"), None, vec![], 1000,
+            0,
+            "alice",
+            "bio\nline2\r\nline3",
+            "persona\nnewline",
+            Some(25),
+            Some("female"),
+            Some("INFJ"),
+            Some("UK"),
+            None,
+            vec![],
+            1000,
         );
         let pairs = vec![(profile, "Alice".to_string())];
 
@@ -1021,8 +1138,17 @@ mod tests {
         let path = dir.path().join("twitter_profiles.csv");
 
         let profile = make_profile(
-            0, "alice", "bio line", "persona", Some(25), Some("female"),
-            Some("INFJ"), Some("UK"), None, vec![], 1000,
+            0,
+            "alice",
+            "bio line",
+            "persona",
+            Some(25),
+            Some("female"),
+            Some("INFJ"),
+            Some("UK"),
+            None,
+            vec![],
+            1000,
         );
         let pairs = vec![(profile, "Alice".to_string())];
 
@@ -1042,17 +1168,12 @@ mod tests {
         let p0 = make_profile(99, "u0", "bio0", "p0", None, None, None, None, None, vec![], 1000);
         let p1 = make_profile(99, "u1", "bio1", "p1", None, None, None, None, None, vec![], 1000);
         let p2 = make_profile(99, "u2", "bio2", "p2", None, None, None, None, None, vec![], 1000);
-        let pairs = vec![
-            (p0, "N0".to_string()),
-            (p1, "N1".to_string()),
-            (p2, "N2".to_string()),
-        ];
+        let pairs = vec![(p0, "N0".to_string()), (p1, "N1".to_string()), (p2, "N2".to_string())];
 
         save_twitter_csv(&pairs, &path).unwrap();
 
         let mut reader = csv::Reader::from_path(&path).unwrap();
-        let records: Vec<csv::StringRecord> =
-            reader.records().map(|r| r.unwrap()).collect();
+        let records: Vec<csv::StringRecord> = reader.records().map(|r| r.unwrap()).collect();
         assert_eq!(records.len(), 3);
         assert_eq!(records[0].get(0).unwrap(), "0");
         assert_eq!(records[1].get(0).unwrap(), "1");
@@ -1084,8 +1205,17 @@ mod tests {
         let path = dir.path().join("reddit_profiles.json");
 
         let profile = make_profile(
-            0, "user", "bio", "persona", Some(30), Some("male"), Some("INTJ"),
-            Some("China"), None, vec![], 1000,
+            0,
+            "user",
+            "bio",
+            "persona",
+            Some(30),
+            Some("male"),
+            Some("INTJ"),
+            Some("China"),
+            None,
+            vec![],
+            1000,
         );
         let pairs = vec![(profile, "Name".to_string())];
 
@@ -1102,8 +1232,17 @@ mod tests {
         let path = dir.path().join("twitter_profiles.csv");
 
         let profile = make_profile(
-            0, "user", "bio", "persona", Some(25), Some("female"), Some("ENFP"),
-            Some("Japan"), None, vec![], 1000,
+            0,
+            "user",
+            "bio",
+            "persona",
+            Some(25),
+            Some("female"),
+            Some("ENFP"),
+            Some("Japan"),
+            None,
+            vec![],
+            1000,
         );
         let pairs = vec![(profile, "Name".to_string())];
 
@@ -1122,8 +1261,17 @@ mod tests {
         let path = dir.path().join("reddit_profiles.json");
 
         let profile = make_profile(
-            0, "user", "bio", "persona", Some(30), Some("male"), Some("INTJ"),
-            Some("China"), None, vec![], 1000,
+            0,
+            "user",
+            "bio",
+            "persona",
+            Some(30),
+            Some("male"),
+            Some("INTJ"),
+            Some("China"),
+            None,
+            vec![],
+            1000,
         );
         let pairs = vec![(profile, "Name".to_string())];
 
@@ -1164,9 +1312,7 @@ mod tests {
         }
 
         fn always_error() -> Self {
-            Self {
-                response: "INVALID JSON !!!".to_string(),
-            }
+            Self { response: "INVALID JSON !!!".to_string() }
         }
     }
 
@@ -1186,9 +1332,7 @@ mod tests {
             &self,
             _prompt: &str,
         ) -> crate::error::Result<
-            std::pin::Pin<
-                Box<dyn futures::Stream<Item = crate::error::Result<String>> + Send>,
-            >,
+            std::pin::Pin<Box<dyn futures::Stream<Item = crate::error::Result<String>> + Send>>,
         > {
             use futures::stream;
             Ok(Box::pin(stream::iter(vec![Ok(self.response.clone())])))
@@ -1260,10 +1404,7 @@ mod tests {
     async fn generate_profiles_from_entities_fallback_on_llm_error() {
         let generator = PersonaGenerator::new();
         let llm = MockLlm::always_error();
-        let entities = vec![make_entity(
-            "00000000-0000-0000-0000-000000000001",
-            "FailEntity",
-        )];
+        let entities = vec![make_entity("00000000-0000-0000-0000-000000000001", "FailEntity")];
         let mut cb = |_c: i64, _t: i64, _m: String| {};
 
         let results = generate_profiles_from_entities(
@@ -1361,9 +1502,7 @@ mod tests {
     // regardless of parallel_count. Wall-clock timing and intermediate realtime-file/progress
     // order MAY differ (non-contractual), but the final Vec and written files are identical.
 
-    async fn run_generate(
-        parallel_count: usize,
-    ) -> Vec<(SocialProfile, String)> {
+    async fn run_generate(parallel_count: usize) -> Vec<(SocialProfile, String)> {
         let generator = PersonaGenerator::new();
         let llm = MockLlm::always_ok();
         let entities = vec![
@@ -1375,7 +1514,14 @@ mod tests {
         ];
         let mut cb = |_c: i64, _t: i64, _m: String| {};
         generate_profiles_from_entities(
-            &generator, &llm, &entities, None, true, parallel_count, None, &mut cb,
+            &generator,
+            &llm,
+            &entities,
+            None,
+            true,
+            parallel_count,
+            None,
+            &mut cb,
         )
         .await
     }
@@ -1468,8 +1614,17 @@ mod tests {
         let path = dir.path().join("reddit_profiles.json");
 
         let profile = make_profile(
-            3, "alice", "bio text", "persona text", Some(25), Some("female"),
-            Some("INFJ"), Some("UK"), Some("Writer"), vec!["Arts"], 800,
+            3,
+            "alice",
+            "bio text",
+            "persona text",
+            Some(25),
+            Some("female"),
+            Some("INFJ"),
+            Some("UK"),
+            Some("Writer"),
+            vec!["Arts"],
+            800,
         );
         let pairs = vec![(profile, "Alice".to_string())];
 
@@ -1480,8 +1635,19 @@ mod tests {
         let p = &parsed[0];
 
         // Verify the complete OASIS required field set is present
-        for key in &["user_id", "username", "name", "bio", "persona", "karma",
-                      "created_at", "age", "gender", "mbti", "country"] {
+        for key in &[
+            "user_id",
+            "username",
+            "name",
+            "bio",
+            "persona",
+            "karma",
+            "created_at",
+            "age",
+            "gender",
+            "mbti",
+            "country",
+        ] {
             assert!(p.get(*key).is_some(), "required key '{key}' must be present");
         }
         // Optional fields present when truthy
@@ -1495,9 +1661,17 @@ mod tests {
         let path = dir.path().join("twitter_profiles.csv");
 
         let profile = make_profile(
-            5, "alice_w", "Alice's bio.", "Alice's detailed persona.",
-            Some(30), Some("female"), Some("ENFJ"), Some("France"),
-            Some("Artist"), vec![], 1200,
+            5,
+            "alice_w",
+            "Alice's bio.",
+            "Alice's detailed persona.",
+            Some(30),
+            Some("female"),
+            Some("ENFJ"),
+            Some("France"),
+            Some("Artist"),
+            vec![],
+            1200,
         );
         let pairs = vec![(profile, "Alice Wonder".to_string())];
 
@@ -1516,10 +1690,7 @@ mod tests {
         assert_eq!(record.get(1).unwrap(), "Alice Wonder");
         assert_eq!(record.get(2).unwrap(), "alice_w");
         // user_char = "{bio} {persona}" since they differ
-        assert_eq!(
-            record.get(3).unwrap(),
-            "Alice's bio. Alice's detailed persona."
-        );
+        assert_eq!(record.get(3).unwrap(), "Alice's bio. Alice's detailed persona.");
         // description = bio
         assert_eq!(record.get(4).unwrap(), "Alice's bio.");
     }

@@ -47,8 +47,8 @@ use axum::{
 use std::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::{Config, TeriError};
 use crate::api::ApiState;
+use crate::{Config, TeriError};
 
 // ---------------------------------------------------------------------------
 // S-024 element 1 — JSON ensure_ascii=False (S-005 roll-up)
@@ -144,11 +144,7 @@ pub fn validate_locale(raw: &str) -> String {
     // translation set (currently {en, zh}). Routing through `is_supported_locale`
     // means a future locale file added under `i18n/locales/` is covered automatically —
     // no second site to update (removes the latent-drift risk a hardcoded list carries).
-    if crate::i18n::is_supported_locale(raw) {
-        raw.to_string()
-    } else {
-        "zh".to_string()
-    }
+    if crate::i18n::is_supported_locale(raw) { raw.to_string() } else { "zh".to_string() }
 }
 
 // ---------------------------------------------------------------------------
@@ -199,10 +195,7 @@ pub fn create_app(_state: std::sync::Arc<ApiState>) -> Router {
     // S-024 element 3 — CORS: CorsLayer::permissive() (allow_origin Any)
     // Source: CORS(app, resources={r"/api/*": {"origins": "*"}})
     // Applied at the router level for now; will be scoped to /api/* when blueprints land.
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
 
     // Startup logging (faithful to app/__init__.py:37-41, 77)
     tracing::info!("{}", "=".repeat(50));
@@ -250,10 +243,7 @@ pub fn resolve_bind_addr(cli_addr: Option<&str>) -> String {
         return addr.to_string();
     }
     let host = std::env::var("FLASK_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
-    let port: u16 = std::env::var("FLASK_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(5001);
+    let port: u16 = std::env::var("FLASK_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(5001);
     format!("{host}:{port}")
 }
 
@@ -299,19 +289,14 @@ pub async fn serve(config: Config, cli_addr: Option<&str>) -> crate::error::Resu
     // (atexit/SIGTERM handlers to kill simulation subprocesses) will compose in here
     // when U-023 (SimulationRunner) and U-049 (graceful shutdown) are ported.
     // MiroFish source: app/__init__.py:46-47, run.py:44 (threaded shutdown semantics).
-    axum::serve(
-        tokio::net::TcpListener::from_std(listener).map_err(TeriError::Io)?,
-        app,
-    )
-    .with_graceful_shutdown(async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to install CTRL+C handler");
-        tracing::info!("Received shutdown signal, stopping server...");
-        // PENDING U-023/U-049: call SimulationRunner::cleanup() here
-    })
-    .await
-    .map_err(TeriError::Io)?;
+    axum::serve(tokio::net::TcpListener::from_std(listener).map_err(TeriError::Io)?, app)
+        .with_graceful_shutdown(async {
+            tokio::signal::ctrl_c().await.expect("Failed to install CTRL+C handler");
+            tracing::info!("Received shutdown signal, stopping server...");
+            // PENDING U-023/U-049: call SimulationRunner::cleanup() here
+        })
+        .await
+        .map_err(TeriError::Io)?;
 
     Ok(())
 }
@@ -346,12 +331,7 @@ mod tests {
     async fn health_returns_200_with_ok_shape() {
         let app = test_app();
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
@@ -375,12 +355,7 @@ mod tests {
     async fn json_utf8_not_escaped_health_body() {
         let app = test_app();
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
@@ -410,12 +385,7 @@ mod tests {
 
         let app = Router::new().route("/chinese", get(chinese_handler));
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/chinese")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/chinese").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
@@ -497,12 +467,7 @@ mod tests {
         // Mirrors locale.py:30: request.headers.get('Accept-Language', 'zh')
         let app = locale_test_app();
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/locale-echo")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/locale-echo").body(Body::empty()).unwrap())
             .await
             .unwrap();
 

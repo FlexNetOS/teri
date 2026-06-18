@@ -74,9 +74,9 @@ impl CommandType {
     /// ```
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Interview      => "interview",
+            Self::Interview => "interview",
             Self::BatchInterview => "batch_interview",
-            Self::CloseEnv       => "close_env",
+            Self::CloseEnv => "close_env",
         }
     }
 }
@@ -115,10 +115,10 @@ impl CommandStatus {
     /// ```
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Pending    => "pending",
+            Self::Pending => "pending",
             Self::Processing => "processing",
-            Self::Completed  => "completed",
-            Self::Failed     => "failed",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
         }
     }
 }
@@ -158,19 +158,13 @@ impl IPCCommand {
     /// S-467
     pub fn to_dict(&self) -> Value {
         let mut map = Map::new();
-        map.insert(
-            "command_id".to_string(),
-            Value::String(self.command_id.clone()),
-        );
+        map.insert("command_id".to_string(), Value::String(self.command_id.clone()));
         map.insert(
             "command_type".to_string(),
             Value::String(self.command_type.as_str().to_string()),
         );
         map.insert("args".to_string(), Value::Object(self.args.clone()));
-        map.insert(
-            "timestamp".to_string(),
-            Value::String(self.timestamp.clone()),
-        );
+        map.insert("timestamp".to_string(), Value::String(self.timestamp.clone()));
         Value::Object(map)
     }
 
@@ -202,10 +196,8 @@ impl IPCCommand {
 
         // command_type — required; parse the string value
         // Python: CommandType(data["command_type"]) raises ValueError on unknown
-        let command_type_str = obj
-            .get("command_type")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
+        let command_type_str =
+            obj.get("command_type").and_then(|v| v.as_str()).ok_or_else(|| {
                 TeriError::Sim(
                     "IPCCommand.from_dict: missing required field 'command_type'".to_string(),
                 )
@@ -219,11 +211,8 @@ impl IPCCommand {
             })?;
 
         // args — optional; default empty map (Python: data.get("args", {}))
-        let args: Map<String, Value> = obj
-            .get("args")
-            .and_then(|v| v.as_object())
-            .cloned()
-            .unwrap_or_default();
+        let args: Map<String, Value> =
+            obj.get("args").and_then(|v| v.as_object()).cloned().unwrap_or_default();
 
         // timestamp — optional; default now (Python: data.get("timestamp", datetime.now().isoformat()))
         let timestamp = obj
@@ -232,12 +221,7 @@ impl IPCCommand {
             .map(str::to_string)
             .unwrap_or_else(python_isoformat_local);
 
-        Ok(Self {
-            command_id,
-            command_type,
-            args,
-            timestamp,
-        })
+        Ok(Self { command_id, command_type, args, timestamp })
     }
 }
 
@@ -282,20 +266,14 @@ impl IPCResponse {
     /// S-475
     pub fn to_dict(&self) -> Value {
         let mut map = Map::new();
-        map.insert(
-            "command_id".to_string(),
-            Value::String(self.command_id.clone()),
-        );
-        map.insert(
-            "status".to_string(),
-            Value::String(self.status.as_str().to_string()),
-        );
+        map.insert("command_id".to_string(), Value::String(self.command_id.clone()));
+        map.insert("status".to_string(), Value::String(self.status.as_str().to_string()));
         // result: None → null (key always present)
         map.insert(
             "result".to_string(),
             match &self.result {
                 Some(m) => Value::Object(m.clone()),
-                None    => Value::Null,
+                None => Value::Null,
             },
         );
         // error: None → null (key always present)
@@ -303,13 +281,10 @@ impl IPCResponse {
             "error".to_string(),
             match &self.error {
                 Some(s) => Value::String(s.clone()),
-                None    => Value::Null,
+                None => Value::Null,
             },
         );
-        map.insert(
-            "timestamp".to_string(),
-            Value::String(self.timestamp.clone()),
-        );
+        map.insert("timestamp".to_string(), Value::String(self.timestamp.clone()));
         Value::Object(map)
     }
 
@@ -343,35 +318,25 @@ impl IPCResponse {
 
         // status — required; parse the string value
         // Python: CommandStatus(data["status"]) raises ValueError on unknown
-        let status_str = obj
-            .get("status")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                TeriError::Sim(
-                    "IPCResponse.from_dict: missing required field 'status'".to_string(),
-                )
-            })?;
-        let status: CommandStatus =
-            serde_json::from_value(Value::String(status_str.to_string())).map_err(|_| {
-                TeriError::Sim(format!(
-                    "IPCResponse.from_dict: unrecognised status {status_str:?} \
+        let status_str = obj.get("status").and_then(|v| v.as_str()).ok_or_else(|| {
+            TeriError::Sim("IPCResponse.from_dict: missing required field 'status'".to_string())
+        })?;
+        let status: CommandStatus = serde_json::from_value(Value::String(status_str.to_string()))
+            .map_err(|_| {
+            TeriError::Sim(format!(
+                "IPCResponse.from_dict: unrecognised status {status_str:?} \
                      (Python CommandStatus(str) raises ValueError on unknown value)"
-                ))
-            })?;
+            ))
+        })?;
 
         // result — optional; absent OR JSON null → None
         // Python: data.get("result") → None when key absent
-        let result: Option<Map<String, Value>> = obj
-            .get("result")
-            .and_then(|v| v.as_object())
-            .cloned();
+        let result: Option<Map<String, Value>> =
+            obj.get("result").and_then(|v| v.as_object()).cloned();
 
         // error — optional; absent OR JSON null → None
         // Python: data.get("error") → None when key absent
-        let error: Option<String> = obj
-            .get("error")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+        let error: Option<String> = obj.get("error").and_then(|v| v.as_str()).map(str::to_string);
 
         // timestamp — optional; default now
         let timestamp = obj
@@ -380,13 +345,7 @@ impl IPCResponse {
             .map(str::to_string)
             .unwrap_or_else(python_isoformat_local);
 
-        Ok(Self {
-            command_id,
-            status,
-            result,
-            error,
-            timestamp,
-        })
+        Ok(Self { command_id, status, result, error, timestamp })
     }
 }
 
@@ -407,9 +366,9 @@ mod tests {
     #[test]
     fn command_type_serde_all_variants() {
         let cases = [
-            (CommandType::Interview,      "\"interview\""),
+            (CommandType::Interview, "\"interview\""),
             (CommandType::BatchInterview, "\"batch_interview\""),
-            (CommandType::CloseEnv,       "\"close_env\""),
+            (CommandType::CloseEnv, "\"close_env\""),
         ];
         for (variant, expected_json) in &cases {
             let json = serde_json::to_string(variant).unwrap();
@@ -427,9 +386,9 @@ mod tests {
     /// as_str() returns the Python .value string for each variant.
     #[test]
     fn command_type_as_str_all_variants() {
-        assert_eq!(CommandType::Interview.as_str(),      "interview");
+        assert_eq!(CommandType::Interview.as_str(), "interview");
         assert_eq!(CommandType::BatchInterview.as_str(), "batch_interview");
-        assert_eq!(CommandType::CloseEnv.as_str(),       "close_env");
+        assert_eq!(CommandType::CloseEnv.as_str(), "close_env");
     }
 
     // -----------------------------------------------------------------------
@@ -440,10 +399,10 @@ mod tests {
     #[test]
     fn command_status_serde_all_variants() {
         let cases = [
-            (CommandStatus::Pending,    "\"pending\""),
+            (CommandStatus::Pending, "\"pending\""),
             (CommandStatus::Processing, "\"processing\""),
-            (CommandStatus::Completed,  "\"completed\""),
-            (CommandStatus::Failed,     "\"failed\""),
+            (CommandStatus::Completed, "\"completed\""),
+            (CommandStatus::Failed, "\"failed\""),
         ];
         for (variant, expected_json) in &cases {
             let json = serde_json::to_string(variant).unwrap();
@@ -460,10 +419,10 @@ mod tests {
     /// as_str() returns the Python .value string for each variant.
     #[test]
     fn command_status_as_str_all_variants() {
-        assert_eq!(CommandStatus::Pending.as_str(),    "pending");
+        assert_eq!(CommandStatus::Pending.as_str(), "pending");
         assert_eq!(CommandStatus::Processing.as_str(), "processing");
-        assert_eq!(CommandStatus::Completed.as_str(),  "completed");
-        assert_eq!(CommandStatus::Failed.as_str(),     "failed");
+        assert_eq!(CommandStatus::Completed.as_str(), "completed");
+        assert_eq!(CommandStatus::Failed.as_str(), "failed");
     }
 
     // -----------------------------------------------------------------------
@@ -474,10 +433,10 @@ mod tests {
     #[test]
     fn ipc_command_to_dict_key_order_and_command_type_string() {
         let cmd = IPCCommand {
-            command_id:   "cmd-001".to_string(),
+            command_id: "cmd-001".to_string(),
             command_type: CommandType::Interview,
-            args:         Map::new(),
-            timestamp:    "2024-01-01T10:00:00".to_string(),
+            args: Map::new(),
+            timestamp: "2024-01-01T10:00:00".to_string(),
         };
         let dict = cmd.to_dict();
         let obj = dict.as_object().expect("to_dict must return a JSON object");
@@ -495,18 +454,18 @@ mod tests {
 
         // command_type is the .value string, not enum Debug
         assert_eq!(obj["command_type"], json!("interview"));
-        assert_eq!(obj["command_id"],   json!("cmd-001"));
-        assert_eq!(obj["timestamp"],    json!("2024-01-01T10:00:00"));
-        assert_eq!(obj["args"],         json!({}));
+        assert_eq!(obj["command_id"], json!("cmd-001"));
+        assert_eq!(obj["timestamp"], json!("2024-01-01T10:00:00"));
+        assert_eq!(obj["args"], json!({}));
     }
 
     /// to_dict with BatchInterview emits "batch_interview" (not "BatchInterview").
     #[test]
     fn ipc_command_to_dict_batch_interview_value_string() {
         let cmd = IPCCommand {
-            command_id:   "cmd-002".to_string(),
+            command_id: "cmd-002".to_string(),
             command_type: CommandType::BatchInterview,
-            args:         {
+            args: {
                 let mut m = Map::new();
                 m.insert("agents".to_string(), json!(["a", "b"]));
                 m
@@ -526,9 +485,9 @@ mod tests {
     #[test]
     fn ipc_command_round_trip() {
         let original = IPCCommand {
-            command_id:   "cmd-rt-001".to_string(),
+            command_id: "cmd-rt-001".to_string(),
             command_type: CommandType::CloseEnv,
-            args:         {
+            args: {
                 let mut m = Map::new();
                 m.insert("key".to_string(), json!("value"));
                 m
@@ -537,10 +496,10 @@ mod tests {
         };
         let dict = original.to_dict();
         let restored = IPCCommand::from_dict(&dict).unwrap();
-        assert_eq!(restored.command_id,   original.command_id);
+        assert_eq!(restored.command_id, original.command_id);
         assert_eq!(restored.command_type, original.command_type);
-        assert_eq!(restored.args,         original.args);
-        assert_eq!(restored.timestamp,    original.timestamp);
+        assert_eq!(restored.args, original.args);
+        assert_eq!(restored.timestamp, original.timestamp);
     }
 
     /// from_dict with absent args → empty map (Python .get("args", {})).
@@ -579,20 +538,17 @@ mod tests {
             "timestamp": "2024-01-01T13:00:00"
         });
         let cmd = IPCCommand::from_dict(&data).unwrap();
-        assert_eq!(cmd.command_id,   "cmd-full");
+        assert_eq!(cmd.command_id, "cmd-full");
         assert_eq!(cmd.command_type, CommandType::BatchInterview);
-        assert_eq!(cmd.args["n"],    json!(5));
-        assert_eq!(cmd.timestamp,    "2024-01-01T13:00:00");
+        assert_eq!(cmd.args["n"], json!(5));
+        assert_eq!(cmd.timestamp, "2024-01-01T13:00:00");
     }
 
     /// from_dict with missing command_id → Err.
     #[test]
     fn ipc_command_from_dict_missing_command_id_is_err() {
         let data = json!({"command_type": "interview"});
-        assert!(
-            IPCCommand::from_dict(&data).is_err(),
-            "missing command_id must return Err"
-        );
+        assert!(IPCCommand::from_dict(&data).is_err(), "missing command_id must return Err");
     }
 
     /// from_dict with unknown command_type string → Err.
@@ -617,10 +573,10 @@ mod tests {
     fn ipc_response_to_dict_null_not_omitted() {
         let resp = IPCResponse {
             command_id: "cmd-r-001".to_string(),
-            status:     CommandStatus::Completed,
-            result:     None,
-            error:      None,
-            timestamp:  "2024-01-01T14:00:00".to_string(),
+            status: CommandStatus::Completed,
+            result: None,
+            error: None,
+            timestamp: "2024-01-01T14:00:00".to_string(),
         };
         let dict = resp.to_dict();
         let obj = dict.as_object().expect("to_dict must return a JSON object");
@@ -641,7 +597,7 @@ mod tests {
 
         // result and error are JSON null (NOT omitted)
         assert_eq!(obj["result"], Value::Null, "result=None must be JSON null, not omitted");
-        assert_eq!(obj["error"],  Value::Null, "error=None must be JSON null, not omitted");
+        assert_eq!(obj["error"], Value::Null, "error=None must be JSON null, not omitted");
 
         // Verify the serialised JSON string contains the keys
         let serialised = serde_json::to_string(&dict).unwrap();
@@ -663,17 +619,17 @@ mod tests {
 
         let resp = IPCResponse {
             command_id: "cmd-r-002".to_string(),
-            status:     CommandStatus::Failed,
-            result:     Some(result_map),
-            error:      Some("something went wrong".to_string()),
-            timestamp:  "2024-01-01T15:00:00".to_string(),
+            status: CommandStatus::Failed,
+            result: Some(result_map),
+            error: Some("something went wrong".to_string()),
+            timestamp: "2024-01-01T15:00:00".to_string(),
         };
         let dict = resp.to_dict();
         let obj = dict.as_object().unwrap();
 
-        assert_eq!(obj["status"],           json!("failed"));
+        assert_eq!(obj["status"], json!("failed"));
         assert_eq!(obj["result"]["outcome"], json!("success"));
-        assert_eq!(obj["error"],             json!("something went wrong"));
+        assert_eq!(obj["error"], json!("something went wrong"));
     }
 
     // -----------------------------------------------------------------------
@@ -688,18 +644,18 @@ mod tests {
 
         let original = IPCResponse {
             command_id: "cmd-rt-002".to_string(),
-            status:     CommandStatus::Processing,
-            result:     Some(result_map),
-            error:      None,
-            timestamp:  "2024-06-17T10:00:00.000001".to_string(),
+            status: CommandStatus::Processing,
+            result: Some(result_map),
+            error: None,
+            timestamp: "2024-06-17T10:00:00.000001".to_string(),
         };
         let dict = original.to_dict();
         let restored = IPCResponse::from_dict(&dict).unwrap();
         assert_eq!(restored.command_id, original.command_id);
-        assert_eq!(restored.status,     original.status);
-        assert_eq!(restored.result,     original.result);
-        assert_eq!(restored.error,      original.error);
-        assert_eq!(restored.timestamp,  original.timestamp);
+        assert_eq!(restored.status, original.status);
+        assert_eq!(restored.result, original.result);
+        assert_eq!(restored.error, original.error);
+        assert_eq!(restored.timestamp, original.timestamp);
     }
 
     /// from_dict where result is JSON null → None.
@@ -714,7 +670,7 @@ mod tests {
         });
         let resp = IPCResponse::from_dict(&data).unwrap();
         assert!(resp.result.is_none(), "JSON null result must deserialise to None");
-        assert!(resp.error.is_none(),  "JSON null error must deserialise to None");
+        assert!(resp.error.is_none(), "JSON null error must deserialise to None");
     }
 
     /// from_dict with absent result and error → None (Python .get() default).
@@ -758,10 +714,10 @@ mod tests {
     #[test]
     fn ipc_command_to_dict_serialised_key_order() {
         let cmd = IPCCommand {
-            command_id:   "ord-test".to_string(),
+            command_id: "ord-test".to_string(),
             command_type: CommandType::Interview,
-            args:         Map::new(),
-            timestamp:    "2024-01-01T00:00:00".to_string(),
+            args: Map::new(),
+            timestamp: "2024-01-01T00:00:00".to_string(),
         };
         let s = serde_json::to_string(&cmd.to_dict()).unwrap();
         // The first key in the serialised string must be "command_id"
@@ -776,10 +732,10 @@ mod tests {
     fn ipc_response_to_dict_serialised_key_order() {
         let resp = IPCResponse {
             command_id: "ord-test-r".to_string(),
-            status:     CommandStatus::Pending,
-            result:     None,
-            error:      None,
-            timestamp:  "2024-01-01T00:00:00".to_string(),
+            status: CommandStatus::Pending,
+            result: None,
+            error: None,
+            timestamp: "2024-01-01T00:00:00".to_string(),
         };
         let s = serde_json::to_string(&resp.to_dict()).unwrap();
         assert!(
@@ -850,8 +806,8 @@ mod tests {
 // - start()/stop() liveness transitions
 
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
 
@@ -958,27 +914,17 @@ impl SimulationIPCClient {
         };
 
         // Log the send (mirrors Python logger.info(f"发送IPC命令: {command_type.value}, command_id=…"))
-        info!(
-            "发送IPC命令: {}, command_id={}",
-            command_type.as_str(),
-            command_id
-        );
+        info!("发送IPC命令: {}, command_id={}", command_type.as_str(), command_id);
 
         // Create the oneshot reply pair
         let (reply_tx, reply_rx) = oneshot::channel::<IPCResponse>();
 
         // Send the envelope — waits only if the bounded channel is full
-        self.tx
-            .send(IpcEnvelope {
-                command,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| {
-                crate::error::TeriError::Sim(format!(
-                    "IPC channel closed before send (command_id={command_id})"
-                ))
-            })?;
+        self.tx.send(IpcEnvelope { command, reply: reply_tx }).await.map_err(|_| {
+            crate::error::TeriError::Sim(format!(
+                "IPC channel closed before send (command_id={command_id})"
+            ))
+        })?;
 
         // Await the oneshot reply with the source-matching timeout
         match tokio::time::timeout(timeout, reply_rx).await {
@@ -1037,8 +983,7 @@ impl SimulationIPCClient {
         if let Some(p) = platform {
             args.insert("platform".to_string(), Value::String(p.to_string()));
         }
-        self.send_command(CommandType::Interview, args, timeout)
-            .await
+        self.send_command(CommandType::Interview, args, timeout).await
     }
 
     /// Send a batch interview command.
@@ -1066,8 +1011,7 @@ impl SimulationIPCClient {
         if let Some(p) = platform {
             args.insert("platform".to_string(), Value::String(p.to_string()));
         }
-        self.send_command(CommandType::BatchInterview, args, timeout)
-            .await
+        self.send_command(CommandType::BatchInterview, args, timeout).await
     }
 
     /// Send the close-environment command.
@@ -1077,12 +1021,8 @@ impl SimulationIPCClient {
     /// Args = `{}`.  Default timeout: 30 s.
     ///
     /// S-482
-    pub async fn send_close_env(
-        &self,
-        timeout: Duration,
-    ) -> crate::error::Result<IPCResponse> {
-        self.send_command(CommandType::CloseEnv, serde_json::Map::new(), timeout)
-            .await
+    pub async fn send_close_env(&self, timeout: Duration) -> crate::error::Result<IPCResponse> {
+        self.send_command(CommandType::CloseEnv, serde_json::Map::new(), timeout).await
     }
 
     /// Check whether the simulation environment is alive.
@@ -1211,10 +1151,7 @@ impl SimulationIPCServer {
     /// protocol/log fidelity per DECISION-16 §16.4).
     ///
     /// S-491
-    pub fn send_success(
-        envelope: IpcEnvelope,
-        result: serde_json::Map<String, Value>,
-    ) {
+    pub fn send_success(envelope: IpcEnvelope, result: serde_json::Map<String, Value>) {
         let command_id = envelope.command.command_id.clone();
         let response = IPCResponse {
             command_id,
@@ -1268,14 +1205,8 @@ impl SimulationIPCServer {
 pub fn channel(buffer: usize) -> (SimulationIPCClient, SimulationIPCServer) {
     let (tx, rx) = mpsc::channel::<IpcEnvelope>(buffer);
     let alive = Arc::new(AtomicBool::new(false));
-    let client = SimulationIPCClient {
-        tx,
-        alive: Arc::clone(&alive),
-    };
-    let server = SimulationIPCServer {
-        rx,
-        running: alive,
-    };
+    let client = SimulationIPCClient { tx, alive: Arc::clone(&alive) };
+    let server = SimulationIPCServer { rx, running: alive };
     (client, server)
 }
 
@@ -1385,12 +1316,7 @@ mod ipc_transport_tests {
         });
 
         client
-            .send_interview(
-                7,
-                "Hello agent",
-                Some("twitter"),
-                Duration::from_secs(5),
-            )
+            .send_interview(7, "Hello agent", Some("twitter"), Duration::from_secs(5))
             .await
             .expect("send_interview must succeed");
 
@@ -1463,10 +1389,8 @@ mod ipc_transport_tests {
             }
         });
 
-        let interviews = vec![
-            json!({"agent_id": 1, "prompt": "Q1"}),
-            json!({"agent_id": 2, "prompt": "Q2"}),
-        ];
+        let interviews =
+            vec![json!({"agent_id": 1, "prompt": "Q1"}), json!({"agent_id": 2, "prompt": "Q2"})];
         client
             .send_batch_interview(interviews.clone(), Some("reddit"), Duration::from_secs(5))
             .await
@@ -1475,7 +1399,10 @@ mod ipc_transport_tests {
         handle.abort();
 
         let args = rx_args.await.expect("args channel must receive");
-        assert_eq!(args["interviews"], json!([{"agent_id": 1, "prompt": "Q1"}, {"agent_id": 2, "prompt": "Q2"}]));
+        assert_eq!(
+            args["interviews"],
+            json!([{"agent_id": 1, "prompt": "Q1"}, {"agent_id": 2, "prompt": "Q2"}])
+        );
         assert_eq!(args["platform"], json!("reddit"));
         assert_eq!(args.len(), 2);
     }
@@ -1604,11 +1531,7 @@ mod ipc_transport_tests {
 
         // Use a very short timeout so the test is fast.
         let result = client
-            .send_command(
-                CommandType::CloseEnv,
-                serde_json::Map::new(),
-                Duration::from_millis(50),
-            )
+            .send_command(CommandType::CloseEnv, serde_json::Map::new(), Duration::from_millis(50))
             .await;
 
         assert!(result.is_err(), "send_command must Err on timeout");
@@ -1659,7 +1582,7 @@ mod ipc_transport_tests {
         let env_a = server.poll_commands().expect("first command must be available");
         let env_b = server.poll_commands().expect("second command must be available");
 
-        assert_eq!(env_a.command.command_id, "first",  "first received must be first sent");
+        assert_eq!(env_a.command.command_id, "first", "first received must be first sent");
         assert_eq!(env_b.command.command_id, "second", "second received must be second sent");
 
         // Clean up the reply channels

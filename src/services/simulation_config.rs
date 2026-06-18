@@ -553,18 +553,9 @@ impl SimulationParameters {
         // under the hood, preserving insertion order).
         let mut map = serde_json::Map::with_capacity(13);
 
-        map.insert(
-            "simulation_id".to_string(),
-            Value::String(self.simulation_id.clone()),
-        );
-        map.insert(
-            "project_id".to_string(),
-            Value::String(self.project_id.clone()),
-        );
-        map.insert(
-            "graph_id".to_string(),
-            Value::String(self.graph_id.clone()),
-        );
+        map.insert("simulation_id".to_string(), Value::String(self.simulation_id.clone()));
+        map.insert("project_id".to_string(), Value::String(self.project_id.clone()));
+        map.insert("graph_id".to_string(), Value::String(self.graph_id.clone()));
         map.insert(
             "simulation_requirement".to_string(),
             Value::String(self.simulation_requirement.clone()),
@@ -581,8 +572,7 @@ impl SimulationParameters {
         );
         map.insert(
             "event_config".to_string(),
-            serde_json::to_value(&self.event_config)
-                .expect("EventConfig is always serializable"),
+            serde_json::to_value(&self.event_config).expect("EventConfig is always serializable"),
         );
         map.insert(
             "twitter_config".to_string(),
@@ -594,18 +584,9 @@ impl SimulationParameters {
             serde_json::to_value(&self.reddit_config)
                 .expect("Option<PlatformConfig> is always serializable"),
         );
-        map.insert(
-            "llm_model".to_string(),
-            Value::String(self.llm_model.clone()),
-        );
-        map.insert(
-            "llm_base_url".to_string(),
-            Value::String(self.llm_base_url.clone()),
-        );
-        map.insert(
-            "generated_at".to_string(),
-            Value::String(self.generated_at.clone()),
-        );
+        map.insert("llm_model".to_string(), Value::String(self.llm_model.clone()));
+        map.insert("llm_base_url".to_string(), Value::String(self.llm_base_url.clone()));
+        map.insert("generated_at".to_string(), Value::String(self.generated_at.clone()));
         map.insert(
             "generation_reasoning".to_string(),
             Value::String(self.generation_reasoning.clone()),
@@ -673,9 +654,7 @@ mod tests {
         assert_eq!(night, vec![23]);
 
         // activity_multipliers
-        let mults = obj["activity_multipliers"]
-            .as_object()
-            .expect("should be an object");
+        let mults = obj["activity_multipliers"].as_object().expect("should be an object");
         assert_eq!(mults["dead"].as_f64().unwrap(), 0.05);
         assert_eq!(mults["morning"].as_f64().unwrap(), 0.4);
         assert_eq!(mults["work"].as_f64().unwrap(), 0.7);
@@ -700,10 +679,7 @@ mod tests {
         .collect::<Vec<_>>();
 
         for w in positions.windows(2) {
-            assert!(
-                w[0] < w[1],
-                "key order violated in CHINA_TIMEZONE_CONFIG JSON"
-            );
+            assert!(w[0] < w[1], "key order violated in CHINA_TIMEZONE_CONFIG JSON");
         }
     }
 
@@ -927,10 +903,7 @@ mod tests {
         let _: Value = serde_json::from_str(&json).expect("to_json() must produce valid JSON");
 
         // Must use 2-space indentation (serde_json::to_string_pretty)
-        assert!(
-            json.contains("  \"simulation_id\""),
-            "to_json() must use 2-space indentation"
-        );
+        assert!(json.contains("  \"simulation_id\""), "to_json() must use 2-space indentation");
     }
 
     #[test]
@@ -1151,11 +1124,8 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
             let doc_chars: Vec<char> = document_text.chars().collect();
             let truncated = doc_chars.len() > remaining_length;
             let doc_text: String = doc_chars.into_iter().take(remaining_length).collect();
-            let doc_text = if truncated {
-                format!("{doc_text}\n...(文档已截断)")
-            } else {
-                doc_text
-            };
+            let doc_text =
+                if truncated { format!("{doc_text}\n...(文档已截断)") } else { doc_text };
             context_parts.push(format!("\n## 原始文档内容\n{doc_text}"));
         }
 
@@ -1220,10 +1190,7 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
             }
 
             if type_entities.len() > display_count {
-                lines.push(format!(
-                    "  ... 还有 {} 个",
-                    type_entities.len() - display_count
-                ));
+                lines.push(format!("  ... 还有 {} 个", type_entities.len() - display_count));
             }
         }
 
@@ -1251,20 +1218,13 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
     /// - After 3 exhausted attempts: return last error.
     ///
     /// Return type: `Result<Value>` (a `serde_json::Value::Object`).
-    pub async fn call_llm_with_retry(
-        &self,
-        prompt: &str,
-        system_prompt: &str,
-    ) -> Result<Value> {
+    pub async fn call_llm_with_retry(&self, prompt: &str, system_prompt: &str) -> Result<Value> {
         let max_attempts = 3usize;
         let mut last_error: Option<TeriError> = None;
 
         for attempt in 0..max_attempts {
             let temperature = 0.7 - (attempt as f32 * 0.1);
-            let messages = [
-                ChatMessage::system(system_prompt),
-                ChatMessage::user(prompt),
-            ];
+            let messages = [ChatMessage::system(system_prompt), ChatMessage::user(prompt)];
             let opts = ChatOptions { temperature: Some(temperature), max_tokens: None };
 
             match self.client.chat(&messages, &opts).await {
@@ -1290,10 +1250,8 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
                         "JSON parse failed after all repair attempts (attempt {})",
                         attempt + 1
                     )));
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        2 * (attempt as u64 + 1),
-                    ))
-                    .await;
+                    tokio::time::sleep(std::time::Duration::from_secs(2 * (attempt as u64 + 1)))
+                        .await;
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -1302,10 +1260,8 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
                         &e.to_string()[..e.to_string().len().min(80)]
                     );
                     last_error = Some(e);
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        2 * (attempt as u64 + 1),
-                    ))
-                    .await;
+                    tokio::time::sleep(std::time::Duration::from_secs(2 * (attempt as u64 + 1)))
+                        .await;
                 }
             }
         }
@@ -1426,11 +1382,7 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
     /// - `max_agents_allowed = max(1, int(num_entities * 0.9))`.
     /// - System prompt appends `get_language_instruction()`.
     /// - On LLM failure: falls back to `_get_default_time_config(num_entities)`.
-    pub async fn generate_time_config(
-        &self,
-        context: &str,
-        num_entities: usize,
-    ) -> Value {
+    pub async fn generate_time_config(&self, context: &str, num_entities: usize) -> Value {
         // CHAR-based truncation — Python: context[:self.TIME_CONFIG_CONTEXT_LENGTH]
         let context_truncated: String =
             context.chars().take(Self::TIME_CONFIG_CONTEXT_LENGTH).collect();
@@ -1576,9 +1528,7 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
         // Ensure min < max
         if agents_per_hour_min >= agents_per_hour_max {
             agents_per_hour_min = (agents_per_hour_max / 2).max(1);
-            tracing::warn!(
-                "agents_per_hour_min >= max，已修正为 {agents_per_hour_min}"
-            );
+            tracing::warn!("agents_per_hour_min >= max，已修正为 {agents_per_hour_min}");
         }
 
         TimeSimulationConfig {
@@ -1725,12 +1675,7 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
             .unwrap_or("")
             .to_string();
 
-        EventConfig {
-            initial_posts,
-            scheduled_events: vec![],
-            hot_topics,
-            narrative_direction,
-        }
+        EventConfig { initial_posts, scheduled_events: vec![], hot_topics, narrative_direction }
     }
 
     // -----------------------------------------------------------------------
@@ -1782,14 +1727,14 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
         // alumni, organization, person.  Order governs which alias group wins when multiple
         // groups match a poster_type.
         let type_aliases: Vec<(&str, Vec<&str>)> = vec![
-            ("official",      vec!["official", "university", "governmentagency", "government"]),
-            ("university",    vec!["university", "official"]),
-            ("mediaoutlet",   vec!["mediaoutlet", "media"]),
-            ("student",       vec!["student", "person"]),
-            ("professor",     vec!["professor", "expert", "teacher"]),
-            ("alumni",        vec!["alumni", "person"]),
-            ("organization",  vec!["organization", "ngo", "company", "group"]),
-            ("person",        vec!["person", "student", "alumni"]),
+            ("official", vec!["official", "university", "governmentagency", "government"]),
+            ("university", vec!["university", "official"]),
+            ("mediaoutlet", vec!["mediaoutlet", "media"]),
+            ("student", vec!["student", "person"]),
+            ("professor", vec!["professor", "expert", "teacher"]),
+            ("alumni", vec!["alumni", "person"]),
+            ("organization", vec!["organization", "ngo", "company", "group"]),
+            ("person", vec!["person", "student", "alumni"]),
         ];
 
         // Round-robin counter: maps type key → next index to use
@@ -1798,29 +1743,18 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
         let mut updated_posts: Vec<Value> = Vec::with_capacity(event_config.initial_posts.len());
 
         for post in &event_config.initial_posts {
-            let poster_type_lower = post
-                .get("poster_type")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_lowercase();
-            let content = post
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+            let poster_type_lower =
+                post.get("poster_type").and_then(Value::as_str).unwrap_or("").to_lowercase();
+            let content = post.get("content").and_then(Value::as_str).unwrap_or("").to_string();
             // Preserve the ORIGINAL cased poster_type value (Python L804: post.get("poster_type", "Unknown"))
-            let original_poster_type = post
-                .get("poster_type")
-                .and_then(Value::as_str)
-                .unwrap_or("Unknown")
-                .to_string();
+            let original_poster_type =
+                post.get("poster_type").and_then(Value::as_str).unwrap_or("Unknown").to_string();
 
             let mut matched_agent_id: Option<i64> = None;
 
             // (1) Direct match
             if let Some(agents) = agents_by_type.get(&poster_type_lower) {
-                let idx = used_indices.get(&poster_type_lower).copied().unwrap_or(0)
-                    % agents.len();
+                let idx = used_indices.get(&poster_type_lower).copied().unwrap_or(0) % agents.len();
                 matched_agent_id = Some(agents[idx].agent_id);
                 used_indices.insert(poster_type_lower.clone(), idx + 1);
             } else {
@@ -1831,8 +1765,8 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
                     {
                         for alias in aliases {
                             if let Some(agents) = agents_by_type.get(*alias) {
-                                let idx = used_indices.get(*alias).copied().unwrap_or(0)
-                                    % agents.len();
+                                let idx =
+                                    used_indices.get(*alias).copied().unwrap_or(0) % agents.len();
                                 matched_agent_id = Some(agents[idx].agent_id);
                                 used_indices.insert(alias.to_string(), idx + 1);
                                 break 'outer;
@@ -1935,7 +1869,8 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
             "基于以下信息，为每个实体生成社交媒体活动配置。\n\n模拟需求: {simulation_requirement}\n\n## 实体列表\n```json\n{entity_list_json}\n```\n\n## 任务\n为每个实体生成活动配置，注意：\n- **时间符合目标用户群体作息**：以下为参考（东八区），请根据模拟场景调整\n- **官方机构**（University/GovernmentAgency）：活跃度低(0.1-0.3)，工作时间(9-17)活动，响应慢(60-240分钟)，影响力高(2.5-3.0)\n- **媒体**（MediaOutlet）：活跃度中(0.4-0.6)，全天活动(8-23)，响应快(5-30分钟)，影响力高(2.0-2.5)\n- **个人**（Student/Person/Alumni）：活跃度高(0.6-0.9)，主要晚间活动(18-23)，响应快(1-15分钟)，影响力低(0.8-1.2)\n- **公众人物/专家**：活跃度中(0.4-0.6)，影响力中高(1.5-2.0)\n\n返回JSON格式（不要markdown）：\n{{\n    \"agent_configs\": [\n        {{\n            \"agent_id\": <必须与输入一致>,\n            \"activity_level\": <0.0-1.0>,\n            \"posts_per_hour\": <发帖频率>,\n            \"comments_per_hour\": <评论频率>,\n            \"active_hours\": [<活跃小时列表，考虑中国人作息>],\n            \"response_delay_min\": <最小响应延迟分钟>,\n            \"response_delay_max\": <最大响应延迟分钟>,\n            \"sentiment_bias\": <-1.0到1.0>,\n            \"stance\": \"<supportive/opposing/neutral/observer>\",\n            \"influence_weight\": <影响力权重>\n        }},\n        ...\n    ]\n}}"
         );
 
-        let base_system = "你是社交媒体行为分析专家。返回纯JSON，配置需符合模拟场景中目标用户群体的作息习惯。";
+        let base_system =
+            "你是社交媒体行为分析专家。返回纯JSON，配置需符合模拟场景中目标用户群体的作息习惯。";
         let lang_instruction = get_language_instruction();
         let system_prompt = format!(
             "{base_system}\n\n{lang_instruction}\nIMPORTANT: The 'stance' field value MUST be one of the English strings: 'supportive', 'opposing', 'neutral', 'observer'. All JSON field names and numeric values must remain unchanged. Only natural language text fields should use the specified language."
@@ -1975,7 +1910,10 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
             .map(|(i, entity)| {
                 let agent_id = start_idx + i as i64;
                 let cfg = match llm_configs.get(&agent_id) {
-                    Some(v) if !v.is_null() && v.as_object().map(|o| !o.is_empty()).unwrap_or(false) => {
+                    Some(v)
+                        if !v.is_null()
+                            && v.as_object().map(|o| !o.is_empty()).unwrap_or(false) =>
+                    {
                         v.clone()
                     }
                     _ => self.generate_agent_config_by_rule(entity),
@@ -1988,10 +1926,7 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
                     cfg.get(key).and_then(Value::as_i64).unwrap_or(default)
                 };
                 let get_str = |key: &str, default: &str| -> String {
-                    cfg.get(key)
-                        .and_then(Value::as_str)
-                        .unwrap_or(default)
-                        .to_string()
+                    cfg.get(key).and_then(Value::as_str).unwrap_or(default).to_string()
                 };
                 let get_hours = |key: &str, default: Vec<i64>| -> Vec<i64> {
                     cfg.get(key)
@@ -2004,18 +1939,16 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
                     agent_id,
                     entity_uuid: entity.uuid.clone(),
                     entity_name: entity.name.clone(),
-                    entity_type: entity
-                        .get_entity_type()
-                        .unwrap_or_else(|| "Unknown".to_string()),
-                    activity_level:      get_f64("activity_level",      0.5),
-                    posts_per_hour:      get_f64("posts_per_hour",       0.5),  // NOTE: 0.5, not 1.0
-                    comments_per_hour:   get_f64("comments_per_hour",    1.0),  // NOTE: 1.0, not 2.0
-                    active_hours:        get_hours("active_hours", default_active_hours_batch.clone()), // [9..=22]
-                    response_delay_min:  get_i64("response_delay_min",   5),
-                    response_delay_max:  get_i64("response_delay_max",   60),
-                    sentiment_bias:      get_f64("sentiment_bias",        0.0),
-                    stance:              get_str("stance",                "neutral"),
-                    influence_weight:    get_f64("influence_weight",      1.0),
+                    entity_type: entity.get_entity_type().unwrap_or_else(|| "Unknown".to_string()),
+                    activity_level: get_f64("activity_level", 0.5),
+                    posts_per_hour: get_f64("posts_per_hour", 0.5), // NOTE: 0.5, not 1.0
+                    comments_per_hour: get_f64("comments_per_hour", 1.0), // NOTE: 1.0, not 2.0
+                    active_hours: get_hours("active_hours", default_active_hours_batch.clone()), // [9..=22]
+                    response_delay_min: get_i64("response_delay_min", 5),
+                    response_delay_max: get_i64("response_delay_max", 60),
+                    sentiment_bias: get_f64("sentiment_bias", 0.0),
+                    stance: get_str("stance", "neutral"),
+                    influence_weight: get_f64("influence_weight", 1.0),
                 }
             })
             .collect()
@@ -2144,11 +2077,7 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
                 3 + batch_idx,
                 t_args(
                     "progress.generatingAgentConfig",
-                    &[
-                        ("start", &(start_idx + 1)),
-                        ("end", &end_idx),
-                        ("total", &entities.len()),
-                    ],
+                    &[("start", &(start_idx + 1)), ("end", &end_idx), ("total", &entities.len()),],
                 )
             );
 
@@ -2162,10 +2091,8 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
                 .await;
             all_agent_configs.extend(batch_configs);
         }
-        reasoning_parts.push(t_args(
-            "progress.agentConfigResult",
-            &[("count", &all_agent_configs.len())],
-        ));
+        reasoning_parts
+            .push(t_args("progress.agentConfigResult", &[("count", &all_agent_configs.len())]));
 
         // ===== Assign initial-post agents =====
         tracing::info!("为初始帖子分配合适的发布者 Agent...");
@@ -2175,10 +2102,7 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
             .iter()
             .filter(|p| !p.get("poster_agent_id").map(Value::is_null).unwrap_or(true))
             .count();
-        reasoning_parts.push(t_args(
-            "progress.postAssignResult",
-            &[("count", &assigned_count)],
-        ));
+        reasoning_parts.push(t_args("progress.postAssignResult", &[("count", &assigned_count)]));
 
         // ===== Last step: platform configs =====
         report_progress!(total_steps, t("progress.generatingPlatformConfig"));
@@ -2228,10 +2152,7 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
             generation_reasoning: reasoning_parts.join(" | "),
         };
 
-        tracing::info!(
-            "模拟配置生成完成: {} 个Agent配置",
-            params.agent_configs.len()
-        );
+        tracing::info!("模拟配置生成完成: {} 个Agent配置", params.agent_configs.len());
 
         params
     }
@@ -2257,10 +2178,8 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
     /// 5. `["alumni"]` — alumni, lunch+evening (explicit list)
     /// 6. else (普通人) — general public, daytime+evening (explicit list)
     pub fn generate_agent_config_by_rule(&self, entity: &EntityNode) -> Value {
-        let entity_type = entity
-            .get_entity_type()
-            .unwrap_or_else(|| "Unknown".to_string())
-            .to_lowercase();
+        let entity_type =
+            entity.get_entity_type().unwrap_or_else(|| "Unknown".to_string()).to_lowercase();
 
         match entity_type.as_str() {
             "university" | "governmentagency" | "ngo" => {
@@ -2409,15 +2328,18 @@ mod generator_tests {
             Ok(self.response.clone())
         }
 
-        async fn complete_json<T: DeserializeOwned>(&self, _prompt: &str) -> crate::error::Result<T> {
-            serde_json::from_str(&self.response)
-                .map_err(|e| TeriError::Config(e.to_string()))
+        async fn complete_json<T: DeserializeOwned>(
+            &self,
+            _prompt: &str,
+        ) -> crate::error::Result<T> {
+            serde_json::from_str(&self.response).map_err(|e| TeriError::Config(e.to_string()))
         }
 
         async fn stream(
             &self,
             _prompt: &str,
-        ) -> crate::error::Result<Pin<Box<dyn Stream<Item = crate::error::Result<String>> + Send>>> {
+        ) -> crate::error::Result<Pin<Box<dyn Stream<Item = crate::error::Result<String>> + Send>>>
+        {
             unimplemented!("not needed for tests")
         }
 
@@ -2535,9 +2457,8 @@ mod generator_tests {
 
     #[test]
     fn summarize_entities_no_tail_at_exact_display_count() {
-        let entities: Vec<EntityNode> = (0..20)
-            .map(|i| make_node(&format!("P{i}"), vec!["Person"], "d"))
-            .collect();
+        let entities: Vec<EntityNode> =
+            (0..20).map(|i| make_node(&format!("P{i}"), vec!["Person"], "d")).collect();
         let g = make_gen("{}");
         let summary = g.summarize_entities(&entities);
         assert!(!summary.contains("还有"), "no tail line when exactly at display count");
@@ -2568,18 +2489,12 @@ mod generator_tests {
         let doc: String = "X".repeat(60_000);
         let ctx = g.build_context("req", &doc, &entities);
         // Should be truncated and contain the truncation marker
-        assert!(
-            ctx.contains("...(文档已截断)"),
-            "should have truncation marker in context"
-        );
+        assert!(ctx.contains("...(文档已截断)"), "should have truncation marker in context");
         // Total char length should be under MAX_CONTEXT_LENGTH + some margin for markers
         // The marker itself adds chars, just verify truncation happened
         let doc_section_start = ctx.find("## 原始文档内容").unwrap();
         let doc_section = &ctx[doc_section_start..];
-        assert!(
-            doc_section.chars().count() < 51_500,
-            "document section should be capped"
-        );
+        assert!(doc_section.chars().count() < 51_500, "document section should be capped");
     }
 
     #[test]
@@ -3082,7 +2997,7 @@ mod generator_tests {
         let g = make_gen("{}");
         // Two agents with identical influence; first in original order should win (stable sort)
         let agents = vec![
-            make_agent(10, "person", 2.0), // tied highest, FIRST
+            make_agent(10, "person", 2.0),  // tied highest, FIRST
             make_agent(11, "student", 2.0), // tied highest, second
         ];
         let posts = vec![serde_json::json!({"content": "hi", "poster_type": "alien"})];
@@ -3130,13 +3045,7 @@ mod generator_tests {
     // -----------------------------------------------------------------------
 
     fn make_node_with_label(name: &str, label: &str) -> EntityNode {
-        EntityNode::new(
-            "uuid",
-            name,
-            vec![label.to_string()],
-            "summary",
-            Map::new(),
-        )
+        EntityNode::new("uuid", name, vec![label.to_string()], "summary", Map::new())
     }
 
     #[test]
@@ -3344,9 +3253,7 @@ mod generator_tests {
             make_node("Alice", vec!["Entity", "Student"], "student desc"),
             make_node("CNN", vec!["Entity", "MediaOutlet"], "media desc"),
         ];
-        let configs = g
-            .generate_agent_configs_batch("context", &entities, 0, "test")
-            .await;
+        let configs = g.generate_agent_configs_batch("context", &entities, 0, "test").await;
         assert_eq!(configs.len(), 2);
         // Alice (Student) → rule: activity_level=0.8
         assert_eq!(configs[0].agent_id, 0);
@@ -3385,9 +3292,7 @@ mod generator_tests {
             make_node("Alice", vec!["Entity", "Student"], "s"),
             make_node("Uni", vec!["Entity", "University"], "u"),
         ];
-        let configs = g
-            .generate_agent_configs_batch("context", &entities, 0, "test")
-            .await;
+        let configs = g.generate_agent_configs_batch("context", &entities, 0, "test").await;
         assert_eq!(configs.len(), 2);
         // agent 0 from LLM
         assert_eq!(configs[0].activity_level, 0.99);
@@ -3417,16 +3322,21 @@ mod generator_tests {
         });
         let g = make_gen(llm_json.to_string());
         let entities = vec![make_node("Entity5", vec!["Entity", "Person"], "desc")];
-        let configs = g
-            .generate_agent_configs_batch("ctx", &entities, 5, "test")
-            .await;
+        let configs = g.generate_agent_configs_batch("ctx", &entities, 5, "test").await;
         assert_eq!(configs.len(), 1);
         let c = &configs[0];
         assert_eq!(c.agent_id, 5);
         // Batch defaults (NOT struct defaults)
         assert_eq!(c.posts_per_hour, 0.5, "batch default posts_per_hour must be 0.5, not 1.0");
-        assert_eq!(c.comments_per_hour, 1.0, "batch default comments_per_hour must be 1.0, not 2.0");
-        assert_eq!(c.active_hours, (9i64..23).collect::<Vec<_>>(), "batch default active_hours=[9..=22]");
+        assert_eq!(
+            c.comments_per_hour, 1.0,
+            "batch default comments_per_hour must be 1.0, not 2.0"
+        );
+        assert_eq!(
+            c.active_hours,
+            (9i64..23).collect::<Vec<_>>(),
+            "batch default active_hours=[9..=22]"
+        );
         assert_eq!(c.active_hours.len(), 14, "batch default active_hours has 14 elements");
     }
 
@@ -3450,9 +3360,7 @@ mod generator_tests {
             make_node("Alice", vec!["Entity", "Student"], "s"),
             make_node("Uni", vec!["Entity", "University"], "u"),
         ];
-        let configs = g
-            .generate_agent_configs_batch("ctx", &entities, 10, "req")
-            .await;
+        let configs = g.generate_agent_configs_batch("ctx", &entities, 10, "req").await;
         assert_eq!(configs[0].agent_id, 10);
         assert_eq!(configs[1].agent_id, 11);
     }
@@ -3462,9 +3370,7 @@ mod generator_tests {
         let g = make_gen("{\"agent_configs\": []}"); // empty → all use rules
         let mut entity = make_node("TestEntity", vec!["Entity", "Alumni"], "desc");
         entity.uuid = "my-uuid-123".to_string();
-        let configs = g
-            .generate_agent_configs_batch("ctx", &[entity], 0, "req")
-            .await;
+        let configs = g.generate_agent_configs_batch("ctx", &[entity], 0, "req").await;
         assert_eq!(configs[0].entity_uuid, "my-uuid-123");
         assert_eq!(configs[0].entity_name, "TestEntity");
     }
@@ -3478,9 +3384,7 @@ mod generator_tests {
         let long_summary = "A".repeat(500); // 500 chars > 300 AGENT_SUMMARY_LENGTH
         let g = make_gen("{\"agent_configs\": []}");
         let entity = make_node("LongSummaryEntity", vec!["Entity", "Student"], &long_summary);
-        let configs = g
-            .generate_agent_configs_batch("ctx", &[entity], 0, "req")
-            .await;
+        let configs = g.generate_agent_configs_batch("ctx", &[entity], 0, "req").await;
         assert_eq!(configs.len(), 1);
         // rule-based for Student
         assert_eq!(configs[0].activity_level, 0.8);
@@ -3496,23 +3400,23 @@ mod generator_tests {
     /// each stage calls `chat` once per invocation and reads the fields it needs,
     /// ignoring unknown ones. We compose a response that satisfies all three stage
     /// parsers simultaneously.
-    fn make_multi_stage_gen(
-        n_entities: usize,
-    ) -> (SimulationConfigGenerator<MockLlm>, String) {
+    fn make_multi_stage_gen(n_entities: usize) -> (SimulationConfigGenerator<MockLlm>, String) {
         // Build agent_configs entries that cover all n_entities agent_ids
         let agent_cfgs: Vec<serde_json::Value> = (0..n_entities)
-            .map(|i| serde_json::json!({
-                "agent_id": i as i64,
-                "activity_level": 0.5_f64,
-                "posts_per_hour": 0.5_f64,
-                "comments_per_hour": 1.0_f64,
-                "active_hours": [9, 10, 11, 12, 18, 19, 20, 21, 22],
-                "response_delay_min": 5_i64,
-                "response_delay_max": 60_i64,
-                "sentiment_bias": 0.0_f64,
-                "stance": "neutral",
-                "influence_weight": 1.0_f64,
-            }))
+            .map(|i| {
+                serde_json::json!({
+                    "agent_id": i as i64,
+                    "activity_level": 0.5_f64,
+                    "posts_per_hour": 0.5_f64,
+                    "comments_per_hour": 1.0_f64,
+                    "active_hours": [9, 10, 11, 12, 18, 19, 20, 21, 22],
+                    "response_delay_min": 5_i64,
+                    "response_delay_max": 60_i64,
+                    "sentiment_bias": 0.0_f64,
+                    "stance": "neutral",
+                    "influence_weight": 1.0_f64,
+                })
+            })
             .collect();
 
         // One JSON blob that works for time config, event config, AND agent_configs batch —
@@ -3575,7 +3479,10 @@ mod generator_tests {
 
         // Every callback invocation must report the same total_steps
         for (_, total, _) in &steps_received {
-            assert_eq!(*total, expected_total, "all callbacks must see total_steps={expected_total}");
+            assert_eq!(
+                *total, expected_total,
+                "all callbacks must see total_steps={expected_total}"
+            );
         }
 
         // Step sequence: 1, 2, 3 (batch 0), 4 (batch 1), 5 (platform)
@@ -3618,11 +3525,11 @@ mod generator_tests {
     async fn generate_config_twitter_config_present_with_correct_values() {
         let (g, _) = make_multi_stage_gen(1);
         let entities = vec![make_node("E0", vec!["Entity", "Student"], "d")];
-        let params = g
-            .generate_config("s", "p", "g", "r", "", &entities, true, true, None)
-            .await;
+        let params = g.generate_config("s", "p", "g", "r", "", &entities, true, true, None).await;
 
-        let tw = params.twitter_config.expect("twitter_config must be present when enable_twitter=true");
+        let tw = params
+            .twitter_config
+            .expect("twitter_config must be present when enable_twitter=true");
         assert_eq!(tw.platform, "twitter");
         assert_eq!(tw.recency_weight, 0.4);
         assert_eq!(tw.popularity_weight, 0.3);
@@ -3637,48 +3544,60 @@ mod generator_tests {
         //   recency=0.3 (default 0.4), popularity=0.4 (default 0.3), viral=15 (default 10), echo=0.6 (default 0.5).
         let (g, _) = make_multi_stage_gen(1);
         let entities = vec![make_node("E0", vec!["Entity", "Student"], "d")];
-        let params = g
-            .generate_config("s", "p", "g", "r", "", &entities, true, true, None)
-            .await;
+        let params = g.generate_config("s", "p", "g", "r", "", &entities, true, true, None).await;
 
-        let rd = params.reddit_config.expect("reddit_config must be present when enable_reddit=true");
+        let rd = params
+            .reddit_config
+            .expect("reddit_config must be present when enable_reddit=true");
         assert_eq!(rd.platform, "reddit");
         assert_eq!(rd.recency_weight, 0.3, "reddit recency_weight must be 0.3 (not default 0.4)");
-        assert_eq!(rd.popularity_weight, 0.4, "reddit popularity_weight must be 0.4 (not default 0.3)");
+        assert_eq!(
+            rd.popularity_weight, 0.4,
+            "reddit popularity_weight must be 0.4 (not default 0.3)"
+        );
         assert_eq!(rd.relevance_weight, 0.3);
         assert_eq!(rd.viral_threshold, 15, "reddit viral_threshold must be 15 (not default 10)");
-        assert_eq!(rd.echo_chamber_strength, 0.6, "reddit echo_chamber_strength must be 0.6 (not default 0.5)");
+        assert_eq!(
+            rd.echo_chamber_strength, 0.6,
+            "reddit echo_chamber_strength must be 0.6 (not default 0.5)"
+        );
     }
 
     #[tokio::test]
     async fn generate_config_enable_twitter_false_no_twitter_config() {
         let (g, _) = make_multi_stage_gen(1);
         let entities = vec![make_node("E0", vec!["Entity", "Student"], "d")];
-        let params = g
-            .generate_config("s", "p", "g", "r", "", &entities, false, true, None)
-            .await;
-        assert!(params.twitter_config.is_none(), "twitter_config must be None when enable_twitter=false");
-        assert!(params.reddit_config.is_some(), "reddit_config must be Some when enable_reddit=true");
+        let params = g.generate_config("s", "p", "g", "r", "", &entities, false, true, None).await;
+        assert!(
+            params.twitter_config.is_none(),
+            "twitter_config must be None when enable_twitter=false"
+        );
+        assert!(
+            params.reddit_config.is_some(),
+            "reddit_config must be Some when enable_reddit=true"
+        );
     }
 
     #[tokio::test]
     async fn generate_config_enable_reddit_false_no_reddit_config() {
         let (g, _) = make_multi_stage_gen(1);
         let entities = vec![make_node("E0", vec!["Entity", "Student"], "d")];
-        let params = g
-            .generate_config("s", "p", "g", "r", "", &entities, true, false, None)
-            .await;
-        assert!(params.reddit_config.is_none(), "reddit_config must be None when enable_reddit=false");
-        assert!(params.twitter_config.is_some(), "twitter_config must be Some when enable_twitter=true");
+        let params = g.generate_config("s", "p", "g", "r", "", &entities, true, false, None).await;
+        assert!(
+            params.reddit_config.is_none(),
+            "reddit_config must be None when enable_reddit=false"
+        );
+        assert!(
+            params.twitter_config.is_some(),
+            "twitter_config must be Some when enable_twitter=true"
+        );
     }
 
     #[tokio::test]
     async fn generate_config_both_disabled_no_platform_configs() {
         let (g, _) = make_multi_stage_gen(1);
         let entities = vec![make_node("E0", vec!["Entity", "Student"], "d")];
-        let params = g
-            .generate_config("s", "p", "g", "r", "", &entities, false, false, None)
-            .await;
+        let params = g.generate_config("s", "p", "g", "r", "", &entities, false, false, None).await;
         assert!(params.twitter_config.is_none());
         assert!(params.reddit_config.is_none());
     }
@@ -3691,46 +3610,56 @@ mod generator_tests {
         let entities: Vec<EntityNode> = (0..n)
             .map(|i| make_node(&format!("E{i}"), vec!["Entity", "Student"], "d"))
             .collect();
-        let params = g
-            .generate_config("s", "p", "g", "r", "", &entities, true, true, None)
-            .await;
+        let params = g.generate_config("s", "p", "g", "r", "", &entities, true, true, None).await;
 
         let reasoning = &params.generation_reasoning;
         // Must contain the " | " separator
         assert!(reasoning.contains(" | "), "reasoning must join parts with \" | \"");
         // Must contain time config label
-        assert!(reasoning.contains("Time Config") || reasoning.contains("时间配置"),
-            "reasoning must contain time config label: {reasoning}");
+        assert!(
+            reasoning.contains("Time Config") || reasoning.contains("时间配置"),
+            "reasoning must contain time config label: {reasoning}"
+        );
         // Must contain event config label
-        assert!(reasoning.contains("Event Config") || reasoning.contains("事件配置"),
-            "reasoning must contain event config label: {reasoning}");
+        assert!(
+            reasoning.contains("Event Config") || reasoning.contains("事件配置"),
+            "reasoning must contain event config label: {reasoning}"
+        );
         // Must contain agent config result
-        assert!(reasoning.contains("Agent Config") || reasoning.contains("Agent配置"),
-            "reasoning must contain agent config result: {reasoning}");
+        assert!(
+            reasoning.contains("Agent Config") || reasoning.contains("Agent配置"),
+            "reasoning must contain agent config result: {reasoning}"
+        );
         // Must contain post assignment result
-        assert!(reasoning.contains("Post Assignment") || reasoning.contains("帖子分配"),
-            "reasoning must contain post assignment result: {reasoning}");
+        assert!(
+            reasoning.contains("Post Assignment") || reasoning.contains("帖子分配"),
+            "reasoning must contain post assignment result: {reasoning}"
+        );
         // Must have exactly 3 " | " separators (4 parts, 3 joins)
-        assert_eq!(reasoning.matches(" | ").count(), 3,
-            "reasoning must have exactly 3 ' | ' separators (4 parts): {reasoning}");
+        assert_eq!(
+            reasoning.matches(" | ").count(),
+            3,
+            "reasoning must have exactly 3 ' | ' separators (4 parts): {reasoning}"
+        );
     }
 
     #[tokio::test]
     async fn generate_config_llm_model_and_base_url_in_params() {
         // llm_model and llm_base_url must be passed from self.model_name / self.base_url.
-        let llm = MockLlm::always(serde_json::json!({
-            "total_simulation_hours": 72_i64, "minutes_per_round": 60_i64,
-            "agents_per_hour_min": 1_i64, "agents_per_hour_max": 5_i64,
-            "peak_hours": [19_i64], "off_peak_hours": [0_i64],
-            "morning_hours": [6_i64], "work_hours": [9_i64],
-            "hot_topics": [], "narrative_direction": "", "initial_posts": [],
-            "agent_configs": [],
-        }).to_string());
+        let llm = MockLlm::always(
+            serde_json::json!({
+                "total_simulation_hours": 72_i64, "minutes_per_round": 60_i64,
+                "agents_per_hour_min": 1_i64, "agents_per_hour_max": 5_i64,
+                "peak_hours": [19_i64], "off_peak_hours": [0_i64],
+                "morning_hours": [6_i64], "work_hours": [9_i64],
+                "hot_topics": [], "narrative_direction": "", "initial_posts": [],
+                "agent_configs": [],
+            })
+            .to_string(),
+        );
         let g = SimulationConfigGenerator::new(llm, "my-model-x", "http://example.com");
         let entities = vec![make_node("E0", vec!["Entity", "Student"], "d")];
-        let params = g
-            .generate_config("s", "p", "g", "r", "", &entities, false, false, None)
-            .await;
+        let params = g.generate_config("s", "p", "g", "r", "", &entities, false, false, None).await;
         assert_eq!(params.llm_model, "my-model-x");
         assert_eq!(params.llm_base_url, "http://example.com");
     }
@@ -3739,7 +3668,17 @@ mod generator_tests {
     async fn generate_config_simulation_id_project_graph_in_params() {
         let (g, _) = make_multi_stage_gen(0);
         let params = g
-            .generate_config("sim-123", "proj-456", "graph-789", "My requirement", "", &[], false, false, None)
+            .generate_config(
+                "sim-123",
+                "proj-456",
+                "graph-789",
+                "My requirement",
+                "",
+                &[],
+                false,
+                false,
+                None,
+            )
             .await;
         assert_eq!(params.simulation_id, "sim-123");
         assert_eq!(params.project_id, "proj-456");
@@ -3758,9 +3697,17 @@ mod generator_tests {
 
         let mut calls: Vec<(i64, i64, String)> = Vec::new();
         g.generate_config(
-            "s", "p", "g", "r", "", &entities, true, true,
+            "s",
+            "p",
+            "g",
+            "r",
+            "",
+            &entities,
+            true,
+            true,
             Some(&mut |step, total, msg| calls.push((step, total, msg.to_string()))),
-        ).await;
+        )
+        .await;
 
         let steps: Vec<i64> = calls.iter().map(|(s, _, _)| *s).collect();
         let totals: Vec<i64> = calls.iter().map(|(_, t, _)| *t).collect();
@@ -3769,16 +3716,24 @@ mod generator_tests {
 
         // Step 1 message must relate to time config
         let msg1 = &calls[0].2;
-        assert!(msg1.contains("time") || msg1.contains("Time") || msg1.contains("时间"),
-            "step 1 message must be about time config: {msg1}");
+        assert!(
+            msg1.contains("time") || msg1.contains("Time") || msg1.contains("时间"),
+            "step 1 message must be about time config: {msg1}"
+        );
         // Step 2 message must relate to event config
         let msg2 = &calls[1].2;
-        assert!(msg2.contains("event") || msg2.contains("Event") || msg2.contains("事件"),
-            "step 2 message must be about event config: {msg2}");
+        assert!(
+            msg2.contains("event") || msg2.contains("Event") || msg2.contains("事件"),
+            "step 2 message must be about event config: {msg2}"
+        );
         // Last step message must relate to platform config
         let msg_last = &calls[4].2;
-        assert!(msg_last.contains("platform") || msg_last.contains("Platform") || msg_last.contains("平台"),
-            "last step message must be about platform config: {msg_last}");
+        assert!(
+            msg_last.contains("platform")
+                || msg_last.contains("Platform")
+                || msg_last.contains("平台"),
+            "last step message must be about platform config: {msg_last}"
+        );
     }
 
     #[tokio::test]
@@ -3789,9 +3744,7 @@ mod generator_tests {
         let entities: Vec<EntityNode> = (0..n)
             .map(|i| make_node(&format!("E{i}"), vec!["Entity", "Student"], "d"))
             .collect();
-        let params = g
-            .generate_config("s", "p", "g", "r", "", &entities, true, true, None)
-            .await;
+        let params = g.generate_config("s", "p", "g", "r", "", &entities, true, true, None).await;
         assert_eq!(params.agent_configs.len(), n);
         // ceil(15/15) = 1 → total_steps = 4
         // (not tested here — covered by generate_config_total_steps_formula)
@@ -3800,9 +3753,7 @@ mod generator_tests {
     #[tokio::test]
     async fn generate_config_generated_at_is_isoformat() {
         let (g, _) = make_multi_stage_gen(0);
-        let params = g
-            .generate_config("s", "p", "g", "r", "", &[], false, false, None)
-            .await;
+        let params = g.generate_config("s", "p", "g", "r", "", &[], false, false, None).await;
         let ts = &params.generated_at;
         assert!(ts.len() >= 19, "generated_at must be at least 19 chars: {ts}");
         assert_eq!(&ts[10..11], "T", "generated_at must have T separator: {ts}");
@@ -3822,20 +3773,20 @@ mod generator_tests {
             "hot_topics": [], "narrative_direction": "", "initial_posts": [],
             "agent_configs": [],
             // NOTE: no "reasoning" field
-        }).to_string();
+        })
+        .to_string();
         let g = make_gen(no_reasoning);
         let entities = vec![make_node("E0", vec!["Entity", "Student"], "d")];
-        let params = g
-            .generate_config("s", "p", "g", "r", "", &entities, false, false, None)
-            .await;
+        let params = g.generate_config("s", "p", "g", "r", "", &entities, false, false, None).await;
 
         let reasoning = &params.generation_reasoning;
         // The t("common.success") fallback should appear in the reasoning string.
         // "Success" (en locale) or "成功" (zh locale) depending on locale.
         assert!(
-            reasoning.contains("Success") || reasoning.contains("成功") || reasoning.contains("success"),
+            reasoning.contains("Success")
+                || reasoning.contains("成功")
+                || reasoning.contains("success"),
             "reasoning must contain common.success fallback when no reasoning key: {reasoning}"
         );
     }
-
 }

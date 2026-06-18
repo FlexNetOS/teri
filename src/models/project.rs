@@ -257,81 +257,45 @@ impl Project {
             .unwrap_or("Unnamed Project")
             .to_string();
 
-        let status_str = obj
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("created");
+        let status_str = obj.get("status").and_then(|v| v.as_str()).unwrap_or("created");
         let status: ProjectStatus = serde_json::from_value(Value::String(status_str.to_string()))
             .map_err(|_| {
-                TeriError::Config(format!("invalid project status: {status_str:?}"))
-            })?;
+            TeriError::Config(format!("invalid project status: {status_str:?}"))
+        })?;
 
-        let created_at = obj
-            .get("created_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let created_at = obj.get("created_at").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-        let updated_at = obj
-            .get("updated_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let updated_at = obj.get("updated_at").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
         // Python: data.get('files', []) — keep verbatim, never validate per-element shape.
         // Using strict per-element parse caused silent full-vector collapse on legacy 3-key dicts.
-        let files: Vec<Value> = obj
-            .get("files")
-            .and_then(|v| v.as_array().cloned())
-            .unwrap_or_default();
+        let files: Vec<Value> =
+            obj.get("files").and_then(|v| v.as_array().cloned()).unwrap_or_default();
 
-        let total_text_length = obj
-            .get("total_text_length")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+        let total_text_length = obj.get("total_text_length").and_then(|v| v.as_i64()).unwrap_or(0);
 
-        let ontology = obj.get("ontology").and_then(|v| {
-            if v.is_null() {
-                None
-            } else {
-                Some(v.clone())
-            }
-        });
+        let ontology = obj
+            .get("ontology")
+            .and_then(|v| if v.is_null() { None } else { Some(v.clone()) });
 
-        let analysis_summary = obj
-            .get("analysis_summary")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let analysis_summary =
+            obj.get("analysis_summary").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-        let graph_id = obj
-            .get("graph_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let graph_id = obj.get("graph_id").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-        let graph_build_task_id = obj
-            .get("graph_build_task_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let graph_build_task_id =
+            obj.get("graph_build_task_id").and_then(|v| v.as_str()).map(|s| s.to_string());
 
         let simulation_requirement = obj
             .get("simulation_requirement")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        let chunk_size = obj
-            .get("chunk_size")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(500);
+        let chunk_size = obj.get("chunk_size").and_then(|v| v.as_i64()).unwrap_or(500);
 
-        let chunk_overlap = obj
-            .get("chunk_overlap")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(50);
+        let chunk_overlap = obj.get("chunk_overlap").and_then(|v| v.as_i64()).unwrap_or(50);
 
-        let error = obj
-            .get("error")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let error = obj.get("error").and_then(|v| v.as_str()).map(|s| s.to_string());
 
         Ok(Project {
             project_id,
@@ -378,9 +342,7 @@ impl ProjectManager {
     /// Create a `ProjectManager` with an explicit projects directory.
     /// Used in tests to point at a temp dir.
     pub fn new(projects_dir: impl Into<PathBuf>) -> Self {
-        ProjectManager {
-            projects_dir: projects_dir.into(),
-        }
+        ProjectManager { projects_dir: projects_dir.into() }
     }
 
     /// Create a `ProjectManager` from teri's `Config`.
@@ -885,10 +847,21 @@ mod tests {
 
         // All 14 keys present
         let expected_keys: HashSet<&str> = [
-            "project_id", "name", "status", "created_at", "updated_at",
-            "files", "total_text_length", "ontology", "analysis_summary",
-            "graph_id", "graph_build_task_id", "simulation_requirement",
-            "chunk_size", "chunk_overlap", "error",
+            "project_id",
+            "name",
+            "status",
+            "created_at",
+            "updated_at",
+            "files",
+            "total_text_length",
+            "ontology",
+            "analysis_summary",
+            "graph_id",
+            "graph_build_task_id",
+            "simulation_requirement",
+            "chunk_size",
+            "chunk_overlap",
+            "error",
         ]
         .iter()
         .copied()
@@ -931,14 +904,8 @@ mod tests {
 
         let json = serde_json::to_string_pretty(&project.to_dict()).unwrap();
         // Raw Chinese chars must appear verbatim, not as \u escape sequences
-        assert!(
-            json.contains("中文项目名称"),
-            "Non-ASCII must not be escaped in JSON output"
-        );
-        assert!(
-            !json.contains("\\u4e2d"),
-            "\\u escapes must NOT appear for non-ASCII"
-        );
+        assert!(json.contains("中文项目名称"), "Non-ASCII must not be escaped in JSON output");
+        assert!(!json.contains("\\u4e2d"), "\\u escapes must NOT appear for non-ASCII");
     }
 
     // -----------------------------------------------------------------------
@@ -1010,17 +977,12 @@ mod tests {
         let project = pm.create_project("File Test").unwrap();
 
         let bytes = b"hello world content";
-        let file_info = pm
-            .save_file_to_project(&project.project_id, bytes, "Report.PDF")
-            .unwrap();
+        let file_info = pm.save_file_to_project(&project.project_id, bytes, "Report.PDF").unwrap();
 
         // saved_filename = {8 hex chars}.pdf
         assert_eq!(file_info.saved_filename.len(), "abcdef12.pdf".len()); // 8+1+3=12? actually 8+4=12
         // Extension lowercased
-        assert!(
-            file_info.saved_filename.ends_with(".pdf"),
-            "extension must be lowercased .pdf"
-        );
+        assert!(file_info.saved_filename.ends_with(".pdf"), "extension must be lowercased .pdf");
         // 8 hex chars before extension
         let stem = file_info.saved_filename.trim_end_matches(".pdf");
         assert_eq!(stem.len(), 8);
@@ -1044,9 +1006,7 @@ mod tests {
     fn test_save_file_no_extension() {
         let (pm, _dir) = temp_manager();
         let project = pm.create_project("No Ext").unwrap();
-        let file_info = pm
-            .save_file_to_project(&project.project_id, b"data", "README")
-            .unwrap();
+        let file_info = pm.save_file_to_project(&project.project_id, b"data", "README").unwrap();
         // No extension: saved_filename = 8 hex chars (no dot)
         assert_eq!(file_info.saved_filename.len(), 8);
         assert!(file_info.saved_filename.chars().all(|c| c.is_ascii_hexdigit()));

@@ -128,18 +128,9 @@ impl EntityNode {
             Value::Array(self.labels.iter().map(|l| Value::String(l.clone())).collect()),
         );
         map.insert("summary".to_string(), Value::String(self.summary.clone()));
-        map.insert(
-            "attributes".to_string(),
-            Value::Object(self.attributes.clone()),
-        );
-        map.insert(
-            "related_edges".to_string(),
-            Value::Array(self.related_edges.clone()),
-        );
-        map.insert(
-            "related_nodes".to_string(),
-            Value::Array(self.related_nodes.clone()),
-        );
+        map.insert("attributes".to_string(), Value::Object(self.attributes.clone()));
+        map.insert("related_edges".to_string(), Value::Array(self.related_edges.clone()));
+        map.insert("related_nodes".to_string(), Value::Array(self.related_nodes.clone()));
         Value::Object(map)
     }
 
@@ -228,11 +219,8 @@ impl FilteredEntities {
         map.insert("entities".to_string(), Value::Array(entities_arr));
 
         // entity_types: list(self.entity_types) — unspecified order (Python set)
-        let types_arr: Vec<Value> = self
-            .entity_types
-            .iter()
-            .map(|t| Value::String(t.clone()))
-            .collect();
+        let types_arr: Vec<Value> =
+            self.entity_types.iter().map(|t| Value::String(t.clone())).collect();
         map.insert("entity_types".to_string(), Value::Array(types_arr));
 
         map.insert(
@@ -344,7 +332,15 @@ mod tests {
         let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
         assert_eq!(
             keys,
-            ["uuid", "name", "labels", "summary", "attributes", "related_edges", "related_nodes"]
+            [
+                "uuid",
+                "name",
+                "labels",
+                "summary",
+                "attributes",
+                "related_edges",
+                "related_nodes"
+            ]
         );
     }
 
@@ -448,10 +444,8 @@ mod tests {
         let types_arr = obj["entity_types"].as_array().unwrap();
         assert_eq!(types_arr.len(), 2);
         // Values are strings (order unspecified — set semantics)
-        let mut type_strings: Vec<String> = types_arr
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect();
+        let mut type_strings: Vec<String> =
+            types_arr.iter().map(|v| v.as_str().unwrap().to_string()).collect();
         type_strings.sort();
         assert_eq!(type_strings, vec!["Organization", "Person"]);
     }
@@ -624,11 +618,8 @@ impl<'a> KnowledgeGraphEntityReader<'a> {
             Ok(rels) => rels
                 .into_iter()
                 .map(|(neighbor, relation, is_outgoing)| {
-                    let (from_id, to_id) = if is_outgoing {
-                        (id, neighbor.id)
-                    } else {
-                        (neighbor.id, id)
-                    };
+                    let (from_id, to_id) =
+                        if is_outgoing { (id, neighbor.id) } else { (neighbor.id, id) };
                     build_full_edge_dict(&relation.kind.to_string(), &from_id, &to_id)
                 })
                 .collect(),
@@ -718,7 +709,7 @@ impl<'a> KnowledgeGraphEntityReader<'a> {
                 entity.id.to_string(),
                 entity.name.clone(),
                 labels,
-                "", // [≠] summary — DECISION-9 Q2: no per-entity summary in teri
+                "",         // [≠] summary — DECISION-9 Q2: no per-entity summary in teri
                 Map::new(), // [≠] attributes — DECISION-9 Q2: no attribute bag in teri
             );
 
@@ -777,7 +768,7 @@ impl<'a> KnowledgeGraphEntityReader<'a> {
             entity.id.to_string(),
             entity.name.clone(),
             vec![entity.kind.to_string()],
-            "", // [≠] summary — DECISION-9 Q2
+            "",         // [≠] summary — DECISION-9 Q2
             Map::new(), // [≠] attributes — DECISION-9 Q2
         );
 
@@ -822,10 +813,7 @@ fn build_node_dict(id: Uuid, name: &str, kind_str: &str) -> Value {
     let mut map = serde_json::Map::with_capacity(5);
     map.insert("uuid".to_string(), Value::String(id.to_string()));
     map.insert("name".to_string(), Value::String(name.to_string()));
-    map.insert(
-        "labels".to_string(),
-        Value::Array(vec![Value::String(kind_str.to_string())]),
-    );
+    map.insert("labels".to_string(), Value::Array(vec![Value::String(kind_str.to_string())]));
     // [≠] summary — DECISION-9 Q2: teri extraction produces no per-entity summary
     map.insert("summary".to_string(), Value::String(String::new()));
     // [≠] attributes — DECISION-9 Q2: teri Entity has no attribute bag
@@ -889,15 +877,9 @@ fn enrich_entity_node(
         // [≠] fact — DECISION-9 Q4: empty; consumer falls back to edge_name+direction template
         edge_map.insert("fact".to_string(), Value::String(String::new()));
         if is_outgoing {
-            edge_map.insert(
-                "target_node_uuid".to_string(),
-                Value::String(neighbor.id.to_string()),
-            );
+            edge_map.insert("target_node_uuid".to_string(), Value::String(neighbor.id.to_string()));
         } else {
-            edge_map.insert(
-                "source_node_uuid".to_string(),
-                Value::String(neighbor.id.to_string()),
-            );
+            edge_map.insert("source_node_uuid".to_string(), Value::String(neighbor.id.to_string()));
         }
         related_edges.push(Value::Object(edge_map));
         related_node_ids.insert(neighbor.id);
@@ -1078,16 +1060,10 @@ mod reader_tests {
             assert_eq!(labels.len(), 1);
         }
         // Find Alice's node and check label = "person"
-        let alice = nodes
-            .iter()
-            .find(|n| n["name"].as_str().unwrap() == "Alice")
-            .unwrap();
+        let alice = nodes.iter().find(|n| n["name"].as_str().unwrap() == "Alice").unwrap();
         assert_eq!(alice["labels"][0].as_str().unwrap(), "person");
         // Find RustConf's node and check label = "Conference" (Custom PascalCase verbatim)
-        let conf = nodes
-            .iter()
-            .find(|n| n["name"].as_str().unwrap() == "RustConf")
-            .unwrap();
+        let conf = nodes.iter().find(|n| n["name"].as_str().unwrap() == "RustConf").unwrap();
         assert_eq!(conf["labels"][0].as_str().unwrap(), "Conference");
     }
 
@@ -1445,9 +1421,7 @@ mod reader_tests {
         // [≠] DECISION-9 Q2: summary=""
         let g = make_test_graph();
         let r = KnowledgeGraphEntityReader::new(&g);
-        let node = r
-            .get_entity_with_context("00000000-0000-0000-0000-000000000001")
-            .unwrap();
+        let node = r.get_entity_with_context("00000000-0000-0000-0000-000000000001").unwrap();
         assert_eq!(node.summary, "", "[≠] summary must be empty");
     }
 
@@ -1456,9 +1430,7 @@ mod reader_tests {
         // [≠] DECISION-9 Q2: attributes={}
         let g = make_test_graph();
         let r = KnowledgeGraphEntityReader::new(&g);
-        let node = r
-            .get_entity_with_context("00000000-0000-0000-0000-000000000001")
-            .unwrap();
+        let node = r.get_entity_with_context("00000000-0000-0000-0000-000000000001").unwrap();
         assert!(node.attributes.is_empty(), "[≠] attributes must be empty map");
     }
 

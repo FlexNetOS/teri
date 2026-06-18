@@ -319,8 +319,7 @@ impl SimulationLogManager {
     /// S-080 `get_twitter_logger` — lazy-init, returns same instance on repeat calls.
     pub fn get_twitter_logger(&mut self) -> std::io::Result<&mut PlatformActionLogger> {
         if self.twitter_logger.is_none() {
-            self.twitter_logger =
-                Some(PlatformActionLogger::new("twitter", &self.simulation_dir)?);
+            self.twitter_logger = Some(PlatformActionLogger::new("twitter", &self.simulation_dir)?);
         }
         Ok(self.twitter_logger.as_mut().unwrap())
     }
@@ -328,8 +327,7 @@ impl SimulationLogManager {
     /// S-081 `get_reddit_logger` — lazy-init, returns same instance on repeat calls.
     pub fn get_reddit_logger(&mut self) -> std::io::Result<&mut PlatformActionLogger> {
         if self.reddit_logger.is_none() {
-            self.reddit_logger =
-                Some(PlatformActionLogger::new("reddit", &self.simulation_dir)?);
+            self.reddit_logger = Some(PlatformActionLogger::new("reddit", &self.simulation_dir)?);
         }
         Ok(self.reddit_logger.as_mut().unwrap())
     }
@@ -624,11 +622,16 @@ mod tests {
         let obj = parsed.as_object().unwrap();
 
         // Exact 8 keys.
-        let keys: std::collections::HashSet<&str> =
-            obj.keys().map(|s| s.as_str()).collect();
+        let keys: std::collections::HashSet<&str> = obj.keys().map(|s| s.as_str()).collect();
         let expected: std::collections::HashSet<&str> = [
-            "round", "timestamp", "agent_id", "agent_name", "action_type",
-            "action_args", "result", "success",
+            "round",
+            "timestamp",
+            "agent_id",
+            "agent_name",
+            "action_type",
+            "action_args",
+            "result",
+            "success",
         ]
         .iter()
         .copied()
@@ -744,8 +747,7 @@ mod tests {
         let parsed: Value = serde_json::from_str(content.trim()).unwrap();
         let obj = parsed.as_object().unwrap();
 
-        let keys: std::collections::HashSet<&str> =
-            obj.keys().map(|s| s.as_str()).collect();
+        let keys: std::collections::HashSet<&str> = obj.keys().map(|s| s.as_str()).collect();
         let expected: std::collections::HashSet<&str> =
             ["round", "timestamp", "event_type", "simulated_hour"].iter().copied().collect();
         assert_eq!(keys, expected);
@@ -766,8 +768,7 @@ mod tests {
         let parsed: Value = serde_json::from_str(content.trim()).unwrap();
         let obj = parsed.as_object().unwrap();
 
-        let keys: std::collections::HashSet<&str> =
-            obj.keys().map(|s| s.as_str()).collect();
+        let keys: std::collections::HashSet<&str> = obj.keys().map(|s| s.as_str()).collect();
         let expected: std::collections::HashSet<&str> =
             ["round", "timestamp", "event_type", "actions_count"].iter().copied().collect();
         assert_eq!(keys, expected);
@@ -791,8 +792,7 @@ mod tests {
         let parsed: Value = serde_json::from_str(content.trim()).unwrap();
         let obj = parsed.as_object().unwrap();
 
-        let keys: std::collections::HashSet<&str> =
-            obj.keys().map(|s| s.as_str()).collect();
+        let keys: std::collections::HashSet<&str> = obj.keys().map(|s| s.as_str()).collect();
         let expected: std::collections::HashSet<&str> =
             ["timestamp", "event_type", "platform", "total_rounds", "total_actions"]
                 .iter()
@@ -822,15 +822,9 @@ mod tests {
         let raw_str = std::str::from_utf8(&raw_bytes).unwrap();
 
         // Chinese chars appear verbatim in the UTF-8 stream.
-        assert!(
-            raw_str.contains("中文用户"),
-            "Non-ASCII must be written raw, not escaped"
-        );
+        assert!(raw_str.contains("中文用户"), "Non-ASCII must be written raw, not escaped");
         // No \u escape for the first char of 中 (U+4E2D → 中)
-        assert!(
-            !raw_str.contains("\\u4e2d"),
-            "\\u escapes must NOT appear for non-ASCII chars"
-        );
+        assert!(!raw_str.contains("\\u4e2d"), "\\u escapes must NOT appear for non-ASCII chars");
 
         std::fs::remove_dir_all(&base).ok();
     }
@@ -1132,18 +1126,26 @@ mod tests {
         let log_path = base.join("actions.jsonl");
         let logger = ActionLogger::new(log_path.to_str().unwrap()).unwrap();
 
-        logger.log_action(1, "twitter", 10, "Alice", "REPOST", None, None, true).unwrap();
+        logger
+            .log_action(1, "twitter", 10, "Alice", "REPOST", None, None, true)
+            .unwrap();
 
         let content = std::fs::read_to_string(&log_path).unwrap();
         let parsed: Value = serde_json::from_str(content.trim()).unwrap();
         let obj = parsed.as_object().unwrap();
 
         // Must have 9 keys including platform.
-        let keys: std::collections::HashSet<&str> =
-            obj.keys().map(|s| s.as_str()).collect();
+        let keys: std::collections::HashSet<&str> = obj.keys().map(|s| s.as_str()).collect();
         let expected: std::collections::HashSet<&str> = [
-            "round", "timestamp", "platform", "agent_id", "agent_name",
-            "action_type", "action_args", "result", "success",
+            "round",
+            "timestamp",
+            "platform",
+            "agent_id",
+            "agent_name",
+            "action_type",
+            "action_args",
+            "result",
+            "success",
         ]
         .iter()
         .copied()
@@ -1165,8 +1167,7 @@ mod tests {
         let parsed: Value = serde_json::from_str(content.trim()).unwrap();
         let obj = parsed.as_object().unwrap();
 
-        let keys: std::collections::HashSet<&str> =
-            obj.keys().map(|s| s.as_str()).collect();
+        let keys: std::collections::HashSet<&str> = obj.keys().map(|s| s.as_str()).collect();
         let expected: std::collections::HashSet<&str> =
             ["round", "timestamp", "platform", "event_type", "simulated_hour"]
                 .iter()
@@ -1194,8 +1195,7 @@ mod tests {
         let parsed: Value = serde_json::from_str(content.trim()).unwrap();
         let obj = parsed.as_object().unwrap();
 
-        let keys: std::collections::HashSet<&str> =
-            obj.keys().map(|s| s.as_str()).collect();
+        let keys: std::collections::HashSet<&str> = obj.keys().map(|s| s.as_str()).collect();
         let expected: std::collections::HashSet<&str> =
             ["timestamp", "platform", "event_type", "total_rounds", "agents_count"]
                 .iter()
@@ -1352,8 +1352,7 @@ mod tests {
         let parsed: Value = serde_json::from_str(content.trim()).unwrap();
         let obj = parsed.as_object().unwrap();
 
-        let keys: std::collections::HashSet<&str> =
-            obj.keys().map(|s| s.as_str()).collect();
+        let keys: std::collections::HashSet<&str> = obj.keys().map(|s| s.as_str()).collect();
         let expected: std::collections::HashSet<&str> =
             ["timestamp", "platform", "event_type", "total_rounds", "total_actions"]
                 .iter()

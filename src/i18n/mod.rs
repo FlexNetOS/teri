@@ -452,10 +452,9 @@ mod tests {
     #[tokio::test]
     async fn t_args_en_locale_interpolation() {
         // en.json progress.buildFailed = "Build failed: {error}"
-        let msg = run_with("en", async {
-            t_args("api.buildFailed", &[("error", &"network error")])
-        })
-        .await;
+        let msg =
+            run_with("en", async { t_args("api.buildFailed", &[("error", &"network error")]) })
+                .await;
         assert_eq!(msg, "Build failed: network error");
     }
 

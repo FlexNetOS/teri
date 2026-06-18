@@ -325,10 +325,7 @@ mod tests {
 
     impl MockGraphLlm {
         fn new(entity_resp: &str, relation_resp: &str) -> Self {
-            Self {
-                entity_resp: entity_resp.to_string(),
-                relation_resp: relation_resp.to_string(),
-            }
+            Self { entity_resp: entity_resp.to_string(), relation_resp: relation_resp.to_string() }
         }
     }
 
@@ -349,8 +346,7 @@ mod tests {
             prompt: &str,
         ) -> crate::error::Result<T> {
             let r = self.complete(prompt).await?;
-            serde_json::from_str(&r)
-                .map_err(|e| TeriError::Llm(format!("JSON parse: {e}")))
+            serde_json::from_str(&r).map_err(|e| TeriError::Llm(format!("JSON parse: {e}")))
         }
 
         async fn stream(
@@ -396,10 +392,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let mock_llm = MockGraphLlm::new(
-            r#"[{"name": "Alice", "kind": "Person"}]"#,
-            r#"[]"#,
-        );
+        let mock_llm = MockGraphLlm::new(r#"[{"name": "Alice", "kind": "Person"}]"#, r#"[]"#);
 
         let task_id = rt.block_on(async {
             build_graph_async(
@@ -424,7 +417,10 @@ mod tests {
         assert!(
             matches!(
                 task.status,
-                TaskStatus::Pending | TaskStatus::Processing | TaskStatus::Completed | TaskStatus::Failed
+                TaskStatus::Pending
+                    | TaskStatus::Processing
+                    | TaskStatus::Completed
+                    | TaskStatus::Failed
             ),
             "task must have a valid status"
         );
@@ -458,9 +454,7 @@ mod tests {
         .await
         .expect("worker inner must not return Err");
 
-        let task = TaskManager::global()
-            .get_task(&task_id)
-            .expect("task must exist");
+        let task = TaskManager::global().get_task(&task_id).expect("task must exist");
         assert_eq!(
             task.status,
             crate::task::TaskStatus::Completed,
@@ -474,14 +468,9 @@ mod tests {
         let graph_info = &result["graph_info"];
         assert_eq!(graph_info["node_count"], 2);
         assert_eq!(graph_info["edge_count"], 1);
-        let types = graph_info["entity_types"]
-            .as_array()
-            .expect("entity_types must be an array");
+        let types = graph_info["entity_types"].as_array().expect("entity_types must be an array");
         assert!(!types.is_empty(), "entity_types must not be empty");
-        assert!(
-            result.get("graph").is_some(),
-            "result must contain serialized graph"
-        );
+        assert!(result.get("graph").is_some(), "result must contain serialized graph");
         assert!(
             result["chunks_processed"].as_u64().unwrap_or(0) > 0,
             "chunks_processed must be > 0"
@@ -547,17 +536,12 @@ mod tests {
 
         assert!(result.is_err(), "worker inner must return Err on LLM failure");
         let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("simulated failure"),
-            "error message must propagate: {err_msg}"
-        );
+        assert!(err_msg.contains("simulated failure"), "error message must propagate: {err_msg}");
 
         // Simulate what build_graph_worker does: route Err to fail_task
         TaskManager::global().fail_task(&task_id, err_msg.clone());
 
-        let task = TaskManager::global()
-            .get_task(&task_id)
-            .expect("task must exist");
+        let task = TaskManager::global().get_task(&task_id).expect("task must exist");
         assert_eq!(
             task.status,
             crate::task::TaskStatus::Failed,
@@ -589,14 +573,8 @@ mod tests {
 
         graph.set_ontology(&ontology);
 
-        assert_eq!(
-            graph.ontology_entity_types,
-            vec!["MediaOutlet", "Journalist"]
-        );
-        assert_eq!(
-            graph.ontology_edge_types,
-            vec!["PUBLISHES_IN", "COVERS_TOPIC"]
-        );
+        assert_eq!(graph.ontology_entity_types, vec!["MediaOutlet", "Journalist"]);
+        assert_eq!(graph.ontology_edge_types, vec!["PUBLISHES_IN", "COVERS_TOPIC"]);
     }
 
     /// `set_ontology` with empty arrays leaves both sets empty.
@@ -631,8 +609,8 @@ mod tests {
     fn test_parse_entities_custom_kind_maps_to_custom_variant() {
         let json = r#"[{"name": "BBC", "kind": "MediaOutlet"}]"#;
         let custom = vec!["MediaOutlet".to_string(), "Journalist".to_string()];
-        let entities = KnowledgeGraph::parse_entities_json_with_custom(json, &custom)
-            .expect("parse ok");
+        let entities =
+            KnowledgeGraph::parse_entities_json_with_custom(json, &custom).expect("parse ok");
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].kind, EntityKind::Custom("MediaOutlet".to_string()));
     }
@@ -642,8 +620,8 @@ mod tests {
     fn test_parse_entities_builtin_kind_still_maps_to_builtin() {
         let json = r#"[{"name": "Alice", "kind": "Person"}]"#;
         let custom = vec!["MediaOutlet".to_string()];
-        let entities = KnowledgeGraph::parse_entities_json_with_custom(json, &custom)
-            .expect("parse ok");
+        let entities =
+            KnowledgeGraph::parse_entities_json_with_custom(json, &custom).expect("parse ok");
         assert_eq!(entities[0].kind, EntityKind::Person);
     }
 
@@ -652,8 +630,8 @@ mod tests {
     fn test_parse_entities_unknown_unregistered_maps_to_other() {
         let json = r#"[{"name": "X", "kind": "SomeRandomThing"}]"#;
         let custom = vec!["MediaOutlet".to_string()];
-        let entities = KnowledgeGraph::parse_entities_json_with_custom(json, &custom)
-            .expect("parse ok");
+        let entities =
+            KnowledgeGraph::parse_entities_json_with_custom(json, &custom).expect("parse ok");
         assert_eq!(entities[0].kind, EntityKind::Other);
     }
 
@@ -669,7 +647,8 @@ mod tests {
                     Ok(r#"[{"name": "BBC", "kind": "MediaOutlet"}]"#.to_string())
                 } else {
                     // Relation with a custom edge kind
-                    Ok(r#"[{"from": "BBC", "to": "BBC", "kind": "COVERS_TOPIC", "weight": 0.8}]"#.to_string())
+                    Ok(r#"[{"from": "BBC", "to": "BBC", "kind": "COVERS_TOPIC", "weight": 0.8}]"#
+                        .to_string())
                 }
             }
             async fn complete_json<T: serde::de::DeserializeOwned>(
@@ -687,10 +666,18 @@ mod tests {
             > {
                 Err(TeriError::Llm("not used".into()))
             }
-            async fn chat(&self, _m: &[ChatMessage], _o: &ChatOptions) -> crate::error::Result<String> {
+            async fn chat(
+                &self,
+                _m: &[ChatMessage],
+                _o: &ChatOptions,
+            ) -> crate::error::Result<String> {
                 Err(TeriError::Llm("not used".into()))
             }
-            async fn chat_json<T: serde::de::DeserializeOwned>(&self, _m: &[ChatMessage], _o: &ChatOptions) -> crate::error::Result<T> {
+            async fn chat_json<T: serde::de::DeserializeOwned>(
+                &self,
+                _m: &[ChatMessage],
+                _o: &ChatOptions,
+            ) -> crate::error::Result<T> {
                 Err(TeriError::Llm("not used".into()))
             }
         }
@@ -719,10 +706,7 @@ mod tests {
         // Relation should be Custom("COVERS_TOPIC")
         let edges = graph.get_all_edges();
         assert_eq!(edges.len(), 1);
-        assert_eq!(
-            edges[0].2.kind,
-            RelationKind::Custom("COVERS_TOPIC".to_string())
-        );
+        assert_eq!(edges[0].2.kind, RelationKind::Custom("COVERS_TOPIC".to_string()));
     }
 
     /// `EntityKind::Custom` Display emits the PascalCase name verbatim.

@@ -459,7 +459,9 @@ pub fn validate_and_process(mut result: Value) -> Value {
     if let Some(entities) = result["entity_types"].as_array_mut() {
         for entity in entities.iter_mut() {
             // PascalCase name (py:294-298)
-            if let Some(original_name) = entity.get("name").and_then(Value::as_str).map(str::to_string) {
+            if let Some(original_name) =
+                entity.get("name").and_then(Value::as_str).map(str::to_string)
+            {
                 let pascal = to_pascal_case(&original_name);
                 if pascal != original_name {
                     tracing::warn!(
@@ -487,7 +489,9 @@ pub fn validate_and_process(mut result: Value) -> Value {
     if let Some(edges) = result["edge_types"].as_array_mut() {
         for edge in edges.iter_mut() {
             // UPPER_SNAKE_CASE name (py:311-314)
-            if let Some(original_name) = edge.get("name").and_then(Value::as_str).map(str::to_string) {
+            if let Some(original_name) =
+                edge.get("name").and_then(Value::as_str).map(str::to_string)
+            {
                 let upper = original_name.to_uppercase();
                 if upper != original_name {
                     tracing::warn!(
@@ -500,7 +504,9 @@ pub fn validate_and_process(mut result: Value) -> Value {
             }
             // Remap source_targets via entity_name_map (py:315-320)
             // NOTE: ensure source_targets exists BEFORE iterating it (py order: iterate first, then ensure)
-            if let Some(source_targets) = edge.get_mut("source_targets").and_then(Value::as_array_mut) {
+            if let Some(source_targets) =
+                edge.get_mut("source_targets").and_then(Value::as_array_mut)
+            {
                 for st in source_targets.iter_mut() {
                     if let Some(src) = st.get("source").and_then(Value::as_str).map(str::to_string)
                         && let Some(mapped) = entity_name_map.get(&src)
@@ -531,10 +537,7 @@ pub fn validate_and_process(mut result: Value) -> Value {
     const MAX_EDGE_TYPES: usize = 10;
 
     // --- Dedup entities by name, keep first (py:333-342) ---
-    let entities: Vec<Value> = result["entity_types"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let entities: Vec<Value> = result["entity_types"].as_array().cloned().unwrap_or_default();
 
     let mut seen_names: HashSet<String> = HashSet::new();
     let mut deduped: Vec<Value> = Vec::new();
@@ -797,8 +800,7 @@ mod tests {
         let result = validate_and_process(json!({}));
         let entities = result["entity_types"].as_array().unwrap();
         // Person and Organization fallbacks are injected
-        let names: Vec<&str> =
-            entities.iter().filter_map(|e| e["name"].as_str()).collect();
+        let names: Vec<&str> = entities.iter().filter_map(|e| e["name"].as_str()).collect();
         assert!(names.contains(&"Person"), "Person fallback injected");
         assert!(names.contains(&"Organization"), "Organization fallback injected");
         assert_eq!(result["edge_types"], json!([]));
@@ -915,9 +917,7 @@ mod tests {
         });
         let result = validate_and_process(input);
         let entities = result["entity_types"].as_array().unwrap();
-        let names: Vec<&str> = entities.iter()
-            .filter_map(|e| e["name"].as_str())
-            .collect();
+        let names: Vec<&str> = entities.iter().filter_map(|e| e["name"].as_str()).collect();
         assert!(names.contains(&"Person"), "Person fallback must be injected");
         assert!(names.contains(&"Organization"), "Organization fallback must be injected");
     }
