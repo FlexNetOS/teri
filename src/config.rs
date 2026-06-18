@@ -89,18 +89,6 @@ impl Config {
                 base_url: std::env::var("LLM_BASE_URL")
                     .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
                 api_key: api_key.unwrap_or_default().to_string(),
-                api_key: std::env::var("LLM_API_KEY").map_err(|_| {
-                    TeriError::Config(
-                        "LLM_API_KEY not set. teri receives secrets via envctl injection \
-                         (vault-held key, injected into the child env only) — canonical: \
-                         `env-ctl run --provider <provider> -- teri …`. Until envctl's \
-                         data-plane phase lands, register the key in the vault \
-                         (`env-ctl secret add teri-llm --provider <provider> --value-stdin`) \
-                         or use a local .env for development. Never export real keys in \
-                         your shell profile."
-                            .to_string(),
-                    )
-                })?,
                 model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4o".to_string()),
                 embed_model: std::env::var("EMBED_MODEL")
                     .unwrap_or_else(|_| "text-embedding-3-small".to_string()),

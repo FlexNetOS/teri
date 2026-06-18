@@ -28,10 +28,7 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Parse BEFORE loading config: --help / --version / usage errors must work
-    // keyless (exit 0 / 0 / 2). The LLM_API_KEY requirement belongs to running
-    // a command, not to asking the CLI what it can do.
-    let cli = Cli::parse();
+    dotenvy::dotenv().ok();
 
     // FIX-1.1: Parse CLI FIRST so --help/--version work keyless. Config is loaded lazily per-command.
     let cli = Cli::parse();
@@ -73,8 +70,6 @@ async fn run_cmd() -> Result<()> {
         ));
     }
 
-    // Config::from_env() loads .env itself (dotenvy) and validates.
-    let config = Config::from_env()?;
     tracing_subscriber::fmt().with_env_filter(&config.logging.level).init();
 
     // Create data directories for persistence layer
@@ -110,27 +105,4 @@ async fn serve_cmd() -> Result<()> {
 
     tracing::info!("Starting API server on {addr}");
     Err(TeriError::Unknown("API server not yet implemented".to_string()))
-    match cli.command {
-        Commands::Run { seed, query, agents } => {
-            tracing::info!("Starting simulation: seed={seed}, agents={agents}");
-            tracing::info!("Query: {query}");
-            // A swarm pointed at a stub backend silently simulates on canned
-            // text — refuse before any pipeline work.
-            let backend = teri::preflight::verify_backend(&config.llm).await?;
-            tracing::info!(
-                "Inference backend accepted: {} model(s), probe ok",
-                backend.models.len()
-            );
-            Err(TeriError::Unknown("Pipeline not yet implemented".to_string()))
-        }
-        Commands::Serve { addr } => {
-            tracing::info!("Starting API server on {addr}");
-            let backend = teri::preflight::verify_backend(&config.llm).await?;
-            tracing::info!(
-                "Inference backend accepted: {} model(s), probe ok",
-                backend.models.len()
-            );
-            Err(TeriError::Unknown("API server not yet implemented".to_string()))
-        }
-    }
 }
