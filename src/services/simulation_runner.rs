@@ -63,6 +63,10 @@ use crate::error::Result;
 use crate::models::project::python_isoformat_local;
 use crate::services::simulation_ipc::IPCResponse;
 
+// SQLite support for interview history (optional, feature-gated for security)
+#[cfg(feature = "sqlite")]
+use rusqlite;
+
 // ---------------------------------------------------------------------------
 // RunnerStatus  (S-541..S-549)
 // ---------------------------------------------------------------------------
@@ -4045,6 +4049,256 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
             .ok_or_else(|| TeriError::Sim(format!("Simulation not found: {}", simulation_id)))?;
         handle.ipc_client().send_close_env(timeout).await
     }
+
+    // ---------------------------------------------------------------------------
+    // Sub-cycle (f) - History, env-status + register_cleanup boundary
+    // S-629, S-632, S-634/635
+    // ---------------------------------------------------------------------------
+
+    /// Get detailed status of the simulation environment from env_status.json.
+    ///
+    /// Port of `get_env_status_detail(simulation_id)` (`simulation_runner.py:1392-1428`).
+    /// Returns default status if file doesn't exist or is invalid.
+    pub fn get_env_status_detail(
+        &self,
+        simulation_id: &str,
+    ) -> Result<serde_json::Map<String, Value>> {
+        let sim_dir = self.sim_data_dir.join(simulation_id);
+        let status_file = sim_dir.join("env_status.json");
+
+        let default_status = {
+            let mut m = serde_json::Map::new();
+            m.insert("status".to_string(), Value::String("stopped".to_string()));
+            m.insert("twitter_available".to_string(), Value::Bool(false));
+            m.insert("reddit_available".to_string(), Value::Bool(false));
+            m.insert("timestamp".to_string(), Value::Null);
+            m
+        };
+
+        if !status_file.exists() {
+            return Ok(default_status);
+        }
+
+        let content = std::fs::read_to_string(&status_file)
+            .map_err(|e| TeriError::Sim(format!("Failed to read env_status.json: {}", e)))?;
+
+        let status: serde_json::Map<String, Value> = match serde_json::from_str(&content) {
+            Ok(s) => s,
+            Err(_) => return Ok(default_status),
+        };
+
+        // Extract fields with defaults matching Python's .get()
+        let mut result = default_status;
+        if let Some(v) = status.get("status").and_then(|s| s.as_str()) {
+            result.insert("status".to_string(), Value::String(v.to_string()));
+        }
+        if let Some(v) = status.get("twitter_available").and_then(|b| b.as_bool()) {
+            result.insert("twitter_available".to_string(), Value::Bool(v));
+        }
+        if let Some(v) = status.get("reddit_available").and_then(|b| b.as_bool()) {
+            result.insert("reddit_available".to_string(), Value::Bool(v));
+        }
+        if let Some(v) = status.get("timestamp") {
+            result.insert("timestamp".to_string(), v.clone());
+        }
+
+        Ok(result)
+    }
+
+    /// Interview all agents via IPC by reading agent_configs from simulation_config.json.
+    ///
+    /// Port of `interview_all_agents(simulation_id, prompt, platform=None, timeout=180.0)`
+    /// (`simulation_runner.py:1551-1609`).
+    ///
+    /// Reads agent configurations and sends a batch interview command for all agents.
+    pub async fn interview_all_agents(
+        &self,
+        simulation_id: &str,
+        prompt: &str,
+        platform: Option<&str>,
+        timeout: Duration,
+    ) -> Result<IPCResponse> {
+        let sim_dir = self.sim_data_dir.join(simulation_id);
+        let config_path = sim_dir.join("simulation_config.json");
+
+        if !sim_dir.exists() {
+            return Err(TeriError::Sim(format!("Simulation not found: {}", simulation_id)));
+        }
+
+        if !config_path.exists() {
+            return Err(TeriError::Sim(format!("Simulation config not found: {}", simulation_id)));
+        }
+
+        let content = std::fs::read_to_string(&config_path)
+            .map_err(|e| TeriError::Sim(format!("Failed to read simulation_config.json: {}", e)))?;
+
+        let config: serde_json::Map<String, Value> =
+            serde_json::from_str(&content).map_err(|e| {
+                TeriError::Sim(format!("Failed to parse simulation_config.json: {}", e))
+            })?;
+
+        let agent_configs =
+            config.get("agent_configs").and_then(|v| v.as_array()).ok_or_else(|| {
+                TeriError::Sim("agent_configs not found in simulation_config.json".to_string())
+            })?;
+
+        if agent_configs.is_empty() {
+            return Err(TeriError::Sim(format!(
+                "No agents found in simulation config: {}",
+                simulation_id
+            )));
+        }
+
+        let mut interviews = Vec::new();
+        for agent_config in agent_configs {
+            if let Some(obj) = agent_config.as_object()
+                && let Some(agent_id) = obj.get("agent_id").and_then(|v| v.as_i64())
+            {
+                interviews.push(serde_json::json!({
+                    "agent_id": agent_id,
+                    "prompt": prompt
+                }));
+            }
+        }
+
+        self.interview_agents_batch(simulation_id, interviews, platform, timeout).await
+    }
+
+    // SQLite support for interview history (optional, feature-gated for security)
+    #[cfg(feature = "sqlite")]
+    fn get_interview_history_from_db(
+        db_path: &Path,
+        _platform_name: &str,
+        agent_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Map<String, Value>>> {
+        use rusqlite::{Connection, params};
+
+        if !db_path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::new();
+
+        match Connection::open(db_path) {
+            Ok(conn) => {
+                let query = if agent_id.is_some() {
+                    "SELECT user_id, info, created_at FROM trace WHERE action = 'interview' AND user_id = ? ORDER BY created_at DESC LIMIT ?"
+                } else {
+                    "SELECT user_id, info, created_at FROM trace WHERE action = 'interview' ORDER BY created_at DESC LIMIT ?"
+                };
+
+                let mut stmt = match conn.prepare(query) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("Failed to prepare query for {}: {}", db_path.display(), e);
+                        return Ok(Vec::new());
+                    }
+                };
+
+                let limit_param = limit as i64;
+                let iter = match agent_id {
+                    Some(aid) => stmt.query_map(params![aid, limit_param], Self::row_to_result),
+                    None => stmt.query_map(params![limit_param], Self::row_to_result),
+                };
+
+                if let Ok(rows) = iter {
+                    for row in rows {
+                        if let Ok(r) = row {
+                            results.push(r);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to open SQLite db {}: {}", db_path.display(), e);
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Convert a SQLite row to a JSON map for interview history.
+    #[cfg(feature = "sqlite")]
+    fn row_to_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Map<String, Value>> {
+        let user_id: i64 = row.get(0)?;
+        let info_json: String = row.get(1).unwrap_or_default();
+        let created_at: String = row.get(2)?;
+
+        // Parse info JSON or use empty map
+        let info: serde_json::Map<String, Value> = match serde_json::from_str(&info_json) {
+            Ok(i) => i,
+            Err(_) => {
+                serde_json::json!({"raw": info_json}).as_object().cloned().unwrap_or_default()
+            }
+        };
+
+        // Build result map matching Python's response structure
+        let mut result = serde_json::Map::new();
+        result.insert("agent_id".to_string(), Value::Number(user_id.into()));
+        result.insert(
+            "platform".to_string(),
+            Value::String(row.get::<_, String>(3).unwrap_or_default()),
+        );
+
+        // Response: info.get("response", info) - if "response" exists use it, else use info directly
+        let response = info
+            .get("response")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Object(info.clone()));
+        result.insert("response".to_string(), response);
+
+        // Prompt: info.get("prompt", "")
+        result.insert(
+            "prompt".to_string(),
+            Value::String(info.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string()),
+        );
+        result.insert("timestamp".to_string(), Value::String(created_at));
+
+        Ok(result)
+    }
+
+    /// Get interview history from all platform databases.
+    ///
+    /// Port of `get_interview_history(simulation_id, platform=None, agent_id=None, limit=100)`
+    /// (`simulation_runner.py:1717-1762`).
+    #[cfg(feature = "sqlite")]
+    pub fn get_interview_history(
+        &self,
+        simulation_id: &str,
+        platform: Option<&str>,
+        agent_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Map<String, Value>>> {
+        let sim_dir = self.sim_data_dir.join(simulation_id);
+
+        let platforms = match platform {
+            Some("twitter") | Some("reddit") => vec![platform.unwrap()],
+            _ => vec!["twitter", "reddit"],
+        };
+
+        let mut results = Vec::new();
+        for p in &platforms {
+            let db_path = sim_dir.join(format!("{}_simulation.db", p));
+            let platform_results =
+                Self::get_interview_history_from_db(&db_path, p, agent_id, limit)?;
+            results.extend(platform_results);
+        }
+
+        // Sort by timestamp descending
+        results.sort_by(|a, b| {
+            let ts_a = a.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+            let ts_b = b.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+            ts_b.cmp(ts_a)
+        });
+
+        // If multiple platforms queried and results exceed limit, truncate
+        if platforms.len() > 1 && results.len() > limit {
+            results.truncate(limit);
+        }
+
+        Ok(results)
+    }
 }
 
 /// Helper: read actions from a single JSONL file with optional filters.
@@ -4409,7 +4663,7 @@ mod reader_tests {
 
     #[test]
     fn get_actions_returns_paginated_results() {
-        let (runner, dir) = make_runner_with_logs("pagination");
+        let (runner, _dir) = make_runner_with_logs("pagination");
         // Use the same sim_id that was used to create logs
         let actions = runner.get_actions("pagination", 2, 0, None, None, None).unwrap();
         assert_eq!(actions.len(), 2);
@@ -4417,7 +4671,7 @@ mod reader_tests {
 
     #[test]
     fn get_all_actions_filters_by_platform() {
-        let (runner, dir) = make_runner_with_logs("filter-platform");
+        let (runner, _dir) = make_runner_with_logs("filter-platform");
         // Use the same sim_id that was used to create logs
         let tw_only =
             runner.get_all_actions("filter-platform", Some("twitter"), None, None).unwrap();
@@ -4436,7 +4690,7 @@ mod reader_tests {
 
     #[test]
     fn get_all_actions_filters_by_agent_id() {
-        let (runner, dir) = make_runner_with_logs("filter-agent");
+        let (runner, _dir) = make_runner_with_logs("filter-agent");
         // Use the same sim_id that was used to create logs
         let filtered = runner.get_all_actions("filter-agent", None, Some(1), None).unwrap();
         assert_eq!(filtered.len(), 1);
@@ -4445,7 +4699,7 @@ mod reader_tests {
 
     #[test]
     fn get_timeline_aggregates_by_round() {
-        let (runner, dir) = make_runner_with_logs("timeline");
+        let (runner, _dir) = make_runner_with_logs("timeline");
         // Use the same sim_id that was used to create logs
         let timeline = runner.get_timeline("timeline", 1, None).unwrap();
         assert_eq!(timeline.len(), 2); // rounds 1 and 2
@@ -4453,7 +4707,7 @@ mod reader_tests {
 
     #[test]
     fn get_agent_stats_aggregates_per_agent() {
-        let (runner, dir) = make_runner_with_logs("agent-stats");
+        let (runner, _dir) = make_runner_with_logs("agent-stats");
         let stats = runner.get_agent_stats("agent-stats").unwrap();
         assert_eq!(stats.len(), 5); // 3 twitter + 2 reddit agents
         // First agent should be the one with most actions
@@ -4464,7 +4718,7 @@ mod reader_tests {
 
     #[test]
     fn get_all_actions_sorts_by_timestamp_descending() {
-        let (runner, dir) = make_runner_with_logs("timestamp-sort");
+        let (runner, _dir) = make_runner_with_logs("timestamp-sort");
         // Use the same sim_id that was used to create logs
         let actions = runner.get_all_actions("timestamp-sort", None, None, None).unwrap();
         // Actions should be sorted by timestamp descending

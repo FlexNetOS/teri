@@ -87,6 +87,8 @@ regex = "1"
 # CSV writing (OASIS twitter_profiles.csv export — S-370)
 csv = "1"
 
+# SQLite for interview history storage (optional, feature-gated for security)
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 # File format support
 pdfium-render = "0.8"
 scraper = "0.19"
@@ -102,5 +104,9 @@ httpmock = "0.7"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+[features]
+default = []
+sqlite = ["rusqlite"]
 
 [workspace]
