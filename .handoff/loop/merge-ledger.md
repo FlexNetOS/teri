@@ -40,7 +40,7 @@ Status legend: `pending` (not started).
 ## Layer 4-6 — Runner / Manager / Report
 - [ ] U-022 · map-onto-substrate · `SimRunner` · map-onto `src/sim::SimEngine` · -> teri::sim::SimEngine · refs: action_logger, ipc, broadcast · pending · verify-only vs X (native — no subprocess)
 - [ ] U-023 · port-fresh · `SimulationManager` · new module src/sim/manager.rs · -> teri::sim::manager · refs: models::task, graph, agent, config_generator · pending
-- [ ] U-024 · extend-Y · `ReportAgent` · merge-into `src/report` · -> teri::report::ReportAgent · refs: report::generate_stream, graph search (U-017), llm · pending
+- [ ] U-024 · extend-Y (CONFIRMED, not reuse-Y) · `ReportAgent` · merge-into `src/report` · -> teri::report::ReportAgent · refs: report::generate_stream, graph search (U-017), llm · pending · ARCH: findings/u024-architecture.md — BOTH paths coexist (template `PredictionReport` + ReACT `Report`); ZepTools wiring = `ReportTools<'g>{graph:&KnowledgeGraph}` facade (DECISION-9, zero blast radius, leaf struct), NOT Arc; graph_id=[≠] handle/PORTED label. Sub-cycles a→i: (a)data-model✓[parity byte-level PASS, 17 tests] (b)ReportTools-wiring[BLOCKER←NEXT] (b2)insight_forge[OQ-3] (c)tool-dispatch (d)plan_outline (e)ReACT-loop (f)ReportManager (g)loggers/Sink (h)generate_report (i)chat. Risks: [!]insight_forge/OQ-3, [!]interview_agents/U-020, text-tool-protocol-not-native (PORT verbatim).
 
 ## Layer 7 — HTTP API
 - [ ] U-025 · port-fresh · `graph routes` · new module src/api/graph.rs · -> teri::api::graph · refs: models::{project,task}, graph::ontology, graph::build · pending

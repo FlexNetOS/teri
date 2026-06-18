@@ -17,7 +17,7 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 0   # NEW SESSION 2026-06-18; first cycle starts now
+cycles_this_session: 1   # NEW SESSION 2026-06-18; CYCLE 8 = U-024 sub-cycle (a) data-model
 # CYCLE3 (12th resume) 2026-06-17: U-022 sub-cycle (c) MONITOR + offset-tail + graph-fire (S-605/613/614/615 + S-1056/U-047,
 #   5 [x]) — opus PASS (DECISION-17 Area 2, porter@opus). src/services/simulation_runner.rs: monitor_simulation (2s
 #   MONITOR_POLL_INTERVAL poll loop, per-platform file-exists guard, save_run_state per poll, loop-exit on U-048
@@ -379,3 +379,22 @@ next_iterate: U-022 [x] complete → U-017 port-fresh full implementation
 # MiroFish's ReACT agent (tool calls: insight_forge/panorama_search/quick_search/interview_agents,
 # plan_outline, _generate_section_react). Requires ZepToolsService full methods wired to KnowledgeGraph.
 
+
+
+# CYCLE 8 (NEW SESSION 2026-06-18, 8th resume): U-024 ReportAgent extend-Y BEGUN — architect-driven.
+# ARCHITECT DECISION (rust-port-architect, findings/u024-architecture.md): extend-Y CONFIRMED (not reuse-Y) —
+#   ReACT path + template path COEXIST (different contracts, neither subsumes the other). ZepTools wiring =
+#   ReportTools<'g>{graph:&KnowledgeGraph} facade (DECISION-9, borrow not Arc); ZepToolsService is a LEAF
+#   (zero production callers) so wiring blast radius ~0. graph_id = [≠] Zep-handle semantics / PORTED string label.
+#   9 sub-cycles: (a)data-model (b)ReportTools-wiring[BLOCKER] (b2)insight_forge[OQ-3] (c)tool-dispatch
+#   (d)plan_outline (e)ReACT-loop (f)ReportManager (g)loggers/Sink (h)generate_report (i)chat.
+# SUB-CYCLE (a) DONE — porter@porter, parity@opus byte-level PASS. src/report/mod.rs +ReportStatus/ReportSection/
+#   ReportOutline/Report + to_dict (contractual key-order, preserve_order serde) + to_markdown. 17 new tests
+#   (24 report total), clippy clean. Atomic gate: X-parity byte-level PASS, Y-green, Y-not-regressed (7 orig tests).
+#   8/8 sub-cycle-(a) symbols verified. graph_id [≠] challenged by verifier = legit (field ported, only Zep-select
+#   semantics inexpressible).
+# HARNESS UPGRADE (this session, per owner ask): architect formally wired into the loop as the design/decision
+#   gate for large extend-Y/structural units — demonstrated on U-024. Pending: harness-evolution to durably encode.
+# NEXT: U-024 sub-cycle (b) ReportTools↔KnowledgeGraph wiring [THE BLOCKER] — build ReportTools<'g,L> facade,
+#   re-home quick_search/panorama_search/get_entities_by_type/get_entity_summary/get_graph_statistics/
+#   get_simulation_context onto it (real graph reads, kill the TeriError::Unknown stubs). Then (c) tool-dispatch.
