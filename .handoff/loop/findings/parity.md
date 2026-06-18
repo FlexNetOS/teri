@@ -1981,3 +1981,35 @@ Re-verify ONLY the two fixes that FAILed the prior block. The three structural c
 
 ### Verdict
 **PASS — U-022 sub-cycle (c) is parity-verified, no downgrade.** Symbols flipped `- [~]`→`- [x]`: **S-605, S-613, S-614, S-615**. **U-047 / S-1056 REALIZED + VERIFIED** (`- [~]`→`- [x]`). `[≠]` rows on S-613 confirmed (daemon flag + exit-code branch genuinely inexpressible). The orchestrator may proceed to the next sub-cycle / commit.
+
+---
+
+## 2026-06-18 — U-024 sub-cycle (b): `ReportTools<'g,L>` graph-tool methods (PARITY VERIFIER)
+
+**Scope:** differential parity of the `ReportTools<'g,L>` facade (`src/services/zep_tools.rs`) vs Python `ZepToolsService` graph methods (`MiroFish/.../zep_tools.py`). Default-skeptical, ran both sides.
+
+**Evidence base:** `cargo test --lib` → **1020 passed, 0 failed** (no Y-regression). `zep_tools` suite **28/28**, `entity_reader` **56/56**, graph `partition` **3/3**. Python reference harness (`/tmp/parity_check.py`) over the Rust `fixture_graph()` reproduced active_count=2 / historical_count=1 at t=300 and the 100/+10 scoring — matching Rust assertions.
+
+### Per-surface verdict
+1. **local_search/search_graph/quick_search** — PASS. Score constants match (exact=100 `py:584`↔`rs:828`; per-kw=+10 `py:589`↔`rs:833`). Tokenize split on `,`/`，` len>1 (`py:575`↔`rs:815-820`). Descending sort `reverse=True` (`py:603`↔`rs:858`). `[:limit]` cap (`py:605`↔`rs:860`). scope edges/nodes/both + node-summary-as-fact `[name]: summary` (`py:635`↔`rs:902`). search_graph→local_search is Python's own fallback path (`py:544`); Zep cross-encoder is `[≠]` (server-side, inexpressible) — LEGIT.
+2. **panorama_search** — PASS. active = `is_active_at` true (`py:1199 not(is_expired or is_invalid)` ↔ teri `partition_edges_at(t).0` via valid_at window). historical tag `[{valid_at} - {invalid_at}] {fact}` (`py:1205`↔`rs:1070`). include_expired gate `[:limit] if include_expired else []` (`py:1230`↔`rs:1078`); default `True`↔caller-passed bool. **str→bool coercion is OUT OF SCOPE** — it lives in `report_agent.py:986-987` (ReACT dispatch), not in panorama_search (`zep_tools.py:1149` is plain `bool=True`). Not a missing behavior of this unit.
+3. **get_entities_by_type** — PASS (with recorded DECISION-8 mapping). Python `entity_type in node.labels` exact match; Rust delegates to U-016 `filter_defined_entities` matching `kind.to_string()`. Casing divergence (Zep `"Student"` ↔ teri lowercase `"person"`) is the pre-accepted DECISION-8 `[≠]`, not a new drop.
+4. **get_entity_summary** — PASS. dict KEY ORDER entity_name/entity_info/related_facts/related_edges/total_relations (`py:847-853`↔`rs:643-661`). search_graph(limit=20) + case-insensitive name match + node_edges aggregation faithful.
+5. **get_graph_statistics** — PASS. Key order graph_id/total_nodes/total_edges/entity_types/relation_types (`py:882-888`↔`rs:702-714`). graph_id RETAINED in output (`py:883`↔`rs:704`). entity_types excludes Entity/Node (`py:874`↔`rs:689`). Test asserts counts 4/3 + per-type.
+6. **get_simulation_context** — PASS. entities `[:limit]` + total_entities = FULL typed count (`py:939-940`↔`rs:766/769-772`). limit default 30 honored. summary="" is DECISION-9 Q2 `[≠]`.
+7. **get_all_nodes/edges/node_detail/node_edges** — PASS. Entity→NodeInfo, EdgeTriple→EdgeInfo. Temporal map: valid_at `Some((s,Some(e)))`→valid_at=s, invalid_at=e, expired_at=e (closed window); `Some((s,None))`→valid_at=s only; `None`→all None (`rs:1316-1327`). Test asserts "100"/"200"/"200". node_detail bad/missing uuid→None; node_edges filter by source/target.
+8. **DTO key order + to_text** — PASS. InsightForgeResult 9-key order + PanoramaResult 9-key order asserted by tests; to_text Chinese headers verbatim (`## 未来预测深度分析`, `## 广度搜索结果（未来全景视图）`, `【关键事实】`, `【历史/过期事实】`).
+9. **EdgeInfo::is_invalid()** — PASS. Python `invalid_at is not None` (`py:135`) ↔ Rust `self.invalid_at.is_some()` (`rs:202`). Prior bug `source_node_uuid.is_empty()` CORRECTED; `test_edge_info_is_invalid_uses_invalid_at` proves empty-source + invalid_at=None → false.
+
+### Deferred — HONEST, not silent drops
+- **insight_forge** — PASS-as-deferred. Multi-sub-query STRUCTURE preserved (sub_queries populated via the SAME keyword fallback Python uses on `_generate_sub_queries` exception, `py:1138-1143`↔`rs:1127-1135`); per-sub-query + main-query search, dedup via seen-set, entity_insights, relationship_chains all built. Only semantic ranking QUALITY is `[!]` (OQ-3). Not dropped.
+- **interview_agents** — PASS-as-deferred. Returns honest `Err` the ReACT loop tolerates (mirrors Python `_execute_tool` try/except → "工具执行失败"). Does NOT fabricate a fake interview. Test asserts `is_err()`.
+
+### `[≠]` challenge results — all LEGIT (substrate-true, not feature-skips)
+- NodeInfo.summary="" / attributes={} — teri Entity is `{id,name,kind}`; no per-entity summary or attr bag exists to read. Zep summaries are server-ingestion artifacts. INEXPRESSIBLE. ✓
+- EdgeInfo.uuid="" / fact="" — teri Relation is `{kind,weight,valid_at}`; no uuid, no LLM-generated fact sentence. No consumer reads edge uuid. INEXPRESSIBLE. ✓
+- search_graph cross-encoder reranking — Zep Cloud server-side; teri has no Zep server. Python itself falls back to local_search. INEXPRESSIBLE. ✓
+- graph_id selection — the bound `&KnowledgeGraph` IS the selector; graph_id retained where observable (get_graph_statistics output). Server-handle artifact. INEXPRESSIBLE. ✓
+
+### Verdict
+**PASS — U-024 sub-cycle (b) is parity-verified, no downgrade.** Every re-homed graph method matches Python (scoring constants, sort order, caps, partition boundary, key order, temporal mapping). Every `[≠]` is genuinely inexpressible (substrate-true), not a portable-feature skip. Both deferrals are honest (structure preserved / honest error). 1020/1020 lib tests pass — Y not regressed.

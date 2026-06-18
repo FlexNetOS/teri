@@ -17,7 +17,7 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 1   # NEW SESSION 2026-06-18; CYCLE 8 = U-024 sub-cycle (a) data-model
+cycles_this_session: 2   # NEW SESSION 2026-06-18; CYCLE 8=U-024(a), CYCLE 9=U-024(b) ReportTools wiring
 # CYCLE3 (12th resume) 2026-06-17: U-022 sub-cycle (c) MONITOR + offset-tail + graph-fire (S-605/613/614/615 + S-1056/U-047,
 #   5 [x]) — opus PASS (DECISION-17 Area 2, porter@opus). src/services/simulation_runner.rs: monitor_simulation (2s
 #   MONITOR_POLL_INTERVAL poll loop, per-platform file-exists guard, save_run_state per poll, loop-exit on U-048
@@ -398,3 +398,22 @@ next_iterate: U-022 [x] complete → U-017 port-fresh full implementation
 # NEXT: U-024 sub-cycle (b) ReportTools↔KnowledgeGraph wiring [THE BLOCKER] — build ReportTools<'g,L> facade,
 #   re-home quick_search/panorama_search/get_entities_by_type/get_entity_summary/get_graph_statistics/
 #   get_simulation_context onto it (real graph reads, kill the TeriError::Unknown stubs). Then (c) tool-dispatch.
+
+
+# CYCLE 9 (2026-06-18, 9th resume): U-024 sub-cycle (b) ReportTools↔KnowledgeGraph wiring — THE BLOCKER CLEARED.
+# porter@porter, parity@opus (ran BOTH sides — Python harness over Rust fixture_graph reproduced active=2/historical=1
+# @t=300 + 100/+10 scoring exactly). src/services/zep_tools.rs: NEW ReportTools<'g,L>{graph:&KnowledgeGraph, llm:&L,
+# reader:KnowledgeGraphEntityReader<'g>} (DECISION-9 borrow, NOT Arc). 12 stub methods (TeriError::Unknown) KILLED →
+# real graph reads: local_search/search_graph/quick_search (exact=100,+10/kw,desc,scope), panorama_search
+# (partition_edges_at active/historical), get_entities_by_type (U-016 reader), get_entity_summary (5-key),
+# get_graph_statistics (graph_id retained), get_simulation_context (limit 30), get_all_nodes/edges/node_detail/
+# node_edges (Entity→NodeInfo, EdgeTriple→EdgeInfo temporal map). DTO rebuild: InsightForgeResult + PanoramaResult
+# Python-exact 9-key order + to_text Chinese headers. BUG FIXED: EdgeInfo::is_invalid was source_node_uuid.is_empty()
+# (divergent) → invalid_at.is_some() (Python py:135). DEFERRED-HONEST: insight_forge=(b2)/OQ-3 (multi-sub-query
+# STRUCTURE preserved w/ keyword fallback = Python's own exception fallback, NOT dropped); interview_agents=(e)/U-020
+# IPC (honest Err the ReACT loop tolerates, no fabricated interview). [≠] all LEGIT (Zep server artifacts: NodeInfo
+# summary/attrs, EdgeInfo uuid/fact, cross-encoder rerank, graph_id selection — teri has no such data). 28 new tests,
+# 1020 total green, clippy --all-targets clean. Atomic gate: X-parity PASS + Y-green + Y-not-regressed. Y-drift checked
+# (develop 7c354a5 = config/main only, no U-024 overlap). NEXT: U-024 (c) tool-dispatch — ReportTool enum +
+# parse_tool_calls (3-tier) + execute (param coercions incl include_expired str→bool, back-compat redirects) +
+# _get_tools_description. (c) needs (b)'s ReportTools::execute target. Then (d) plan_outline.
