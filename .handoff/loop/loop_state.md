@@ -337,7 +337,7 @@ status: HAND OFF (12th resume, 2026-06-17) at 3 cycles (CYCLE BUDGET) → U-022 
 loop_iteration: 3 (ITERATE c3 Action taxonomy + eval) done; next = 4 (reuse-Y verify-only quick-wins, then extend-Y/port-fresh)
 next_iterate: reuse-Y verify-only quick-wins (18 units — differential verify teri's existing symbols vs MiroFish; mark [x] or reclassify extend-Y). Then U-013/text_processor, extend-Y, port-fresh (HTTP API, sim lifecycle, community adapters+social-sim, IPC, config-gen, ontology, Vue re-point).
 last_update: 2026-06-14T12:30:00Z
-next_iterate: U-017 (ZepToolsService - skeleton + stubs; full implementation pending)
+next_iterate: U-022 [x] complete → U-017 port-fresh full implementation
 
 # CYCLE 3 (NEW SESSION 2026-06-18, 3rd resume): U-017 skeleton port — opus PASS. src/services/zep_tools.rs: SearchResult/NodeInfo/EdgeInfo/InsightForgeResult/PanoramaResult/AgentInterview/InterviewResult DTOs; ZepToolsService<L> struct with all methods stubbed (returns NotImplemented errors). U-022 complete (all 6 sub-cycles). teri 996 green, clippy clean. HEAD=95bc06d, PUSHED origin/port/mirofish.
 
