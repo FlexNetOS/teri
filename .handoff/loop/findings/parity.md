@@ -2163,3 +2163,103 @@ module or its tests.
 crafted edge cases; all three JSON files are byte-identical (format + key-order + non-ASCII); section
 padding, pagination shapes, and every back-compat fallback match. One non-contractual timestamp-format
 flag routed to the porter as a consistency nit, not a downgrade.
+
+---
+
+## 2026-06-18 — U-024 sub-cycle (g1) — `ReportLogger` (agent_log.jsonl) + 7 wirings into `generate_section_react`
+
+**Surfaces verified:** entry shape/key-order; JSONL compact format; all 13 helpers
+(action/stage/details key+order+message-key); timestamp; elapsed_seconds rounding; the 7
+`generate_section_react` wirings; None-guard. Differential vs `report_agent.py:36–305` (logger) and
+`:1221–1530` (wiring). Symbols in scope: S-681..S-698 (18 g1 symbols).
+
+**Tests:** `cargo test --lib report::logger` ⇒ 22 passed. `cargo test --lib` ⇒ **1166 passed**
+(1144 prior baseline still green, +22 new logger tests) — Y-not-regressed CONFIRMED.
+
+### Per-surface results
+
+1. **Entry shape + key order** — PASS. `log()` (logger.rs:185–208) inserts into `serde_json::Map`
+   in exactly `timestamp, elapsed_seconds, report_id, action, stage, section_title, section_index,
+   details` — identical to py:85–94. `section_title`/`section_index` → `Value::Null` when `None`
+   (logger.rs:200,206 vs py:91,92). serde_json `preserve_order` keeps insertion order; asserted by
+   `test_log_entry_key_order_and_top_level_shape`.
+2. **JSONL format** — PASS. `serde_json::to_string` (compact, logger.rs:212) + `writeln!` (`\n`,
+   :223) + `OpenOptions::append(true).create(true)` (:218–222) ≡ py:97–98 `open('a') ... json.dumps(
+   ensure_ascii=False)+'\n'`. Non-ASCII unescaped (serde_json default) asserted by
+   `test_log_non_ascii_unescaped` (中文/日本語 literal). Compact/single-line asserted by
+   `test_log_compact_format_and_single_line`.
+   - *Non-contractual nit (NOT a fail):* Python default `json.dumps` separators emit `", "`/`": "`
+     (space after comma/colon); serde_json compact emits no spaces. The jsonl is machine-read by the
+     frontend via `JSON.parse` (whitespace-insensitive) — observably equivalent. Same strategy already
+     accepted in `sim::action_logger`.
+3. **13 helpers** — PASS for action/stage/details-key/order/message-key on all 13. Verified each Rust
+   helper's `details` `Map` insertion order + i18n key against Python verbatim (logger.rs:237–589 vs
+   py:100–304). All 13 message keys resolve in `i18n/locales/{en,zh}.json:569–581` (not pass-through).
+   Spot-confirmed details-bearing ones: `log_tool_result` includes `result_length` (5 keys, :408–424);
+   `log_llm_response` includes `response_length`+`has_tool_calls`+`has_final_answer` (6 keys,
+   :449–467); `log_section_content` includes `content_length`+`tool_calls_count` (4 keys, :490–505);
+   `log_error` sets `section_index=None` (:588 → `self.log(..., None)`). Per-helper key-order asserted
+   by 13 dedicated tests.
+4. **timestamp** — PASS. `python_isoformat_local()` (project.rs:50–58) = `Local::now().naive_local()`
+   with microsecond fraction emitted only when non-zero — matches Python NAIVE `datetime.now()
+   .isoformat()` (CPython ground truth: `2026-06-18T12:00:00` whole / `...123456` with micros). The
+   (f) fix is in place.
+5. **elapsed_seconds** — PASS. `start.elapsed().as_secs_f64()` → `round_half_even_2dp` (logger.rs:181–
+   182). Banker's-rounding helper verified against CPython ground truth: `round(1.234,2)=1.23`,
+   `round(1.235,2)=1.24`, `round(0.045,2)=0.04`, `round(2.675,2)=2.67`, `round(12.345,2)=12.35` — the
+   helper's mantissa-bit tie-resolution matches. Value is wall-time-dependent → parity is the
+   rounding-function + key, both correct.
+6. **Wiring (7 sites)** — PASS. Diffed line-by-line against Python `if self.report_logger:` blocks,
+   all guarded by `if let Some(l) = self.report_logger.as_ref()`, same point, same args:
+   - `log_section_start` pre-loop (mod.rs:825 vs py:1252).
+   - `log_llm_response` after conflict-resolution, `iteration+1`+has_tool_calls/has_final_answer
+     (mod.rs:960 vs py:1364).
+   - `log_tool_call` before `execute_by_name`, `iteration+1` (mod.rs:1024 vs py:1423).
+   - `log_tool_result` after execute, `iteration+1` (mod.rs:1047 vs py:1438).
+   - `log_section_content` ×3: situation-1 valid-final return (mod.rs:998 vs py:1395), situation-3
+     no-prefix return (mod.rs:1125 vs py:1493), force-final return (mod.rs:1155 vs py:1522) — each
+     with the right content + `tool_calls_count`. NONE dropped or misplaced.
+   - `multiToolOnlyFirst` correctly left as a (g2) console-log marker (mod.rs:1033–1036, NOT a
+     ReportLogger call) — Python py:1421 is `logger.info(...)`, a console log. Correct.
+7. **None-guard** — PASS. `report_logger: None` ⇒ every `if let Some` is skipped ⇒ no file, loop
+   behavior identical. The (e) ReACT-loop tests run with `None` and remain green (in the 1166).
+
+### Scope split (g1/g2/h) — legitimately tracked, NOT a silent drop
+`ReportConsoleLogger` (S-699..S-704) → g2; `ReportSink`/higher-level API → h. Both remain `- [ ]`/open
+in `symbol-map.md`; the g1 wiring leaves an explicit `// (g2): …` marker at the console-log site. The
+deferral is recorded, not waved.
+
+### ✗ FAIL — `*_length` keys use BYTE count, Python uses CHARACTER count (observable downgrade)
+
+**Input:** any non-ASCII tool result / LLM response / section content (the dominant case — this is a
+Chinese-language product; system prompts + outputs are Chinese).
+**Expected (source):** Python `len(result)` / `len(response)` / `len(content)` = **character count**
+(py:207, 230, 252, 276; CPython `len('中文')==2`).
+**Actual (Rust):** `result.len()` / `response.len()` / `content.len()` / `full_content.len()` =
+**byte count** (logger.rs:407, 448, 489, 526; for 3-byte UTF-8 ≈ 3× the char count).
+- 4 affected sites: `log_tool_result.result_length`, `log_llm_response.response_length`,
+  `log_section_content.content_length`, `log_section_full_complete.content_length`.
+- **Observable**: the frontend renders this value literally as characters —
+  `Step4Report.vue:1862` `formatResultSize` returns `` `${length} chars` `` / `` `${(length/1000)
+  .toFixed(1)}k chars` ``. A 1000-Chinese-char result displays as "3.0k chars" instead of "1000
+  chars". Distinct rendered output for the same input.
+- **Project convention already settled the opposite way:** TextProcessor parity (this file, §2026
+  earlier — "`chars` = Unicode scalar count") ports Python `len(str)` → Rust `.chars().count()`. The
+  logger regressed to `.len()`, and a code comment (logger.rs:993) even *acknowledges* the mismatch
+  ("Python len() on str = char count, but we use byte len here") — this is a documented downgrade, not
+  a non-contractual artifact.
+- **Fix (mechanical, route to porter):** change `.len()` → `.chars().count()` at logger.rs:407, 448,
+  489, 526; tighten the 4 length-asserting tests to assert the char count on a non-ASCII fixture
+  (e.g. `result text 中文` → 9 chars, currently the test only asserts `is_number()`, which is why this
+  slipped the existing goldens).
+
+**Symbols:** affected helpers **stay `- [~]`**: S-693 (`log_tool_result`), S-694 (`log_llm_response`),
+S-695 (`log_section_content`), S-696 (`log_section_full_complete`). The other 14 g1 symbols
+(S-681..S-692, S-697, S-698) are individually parity-clean but the **unit cannot PASS** with 4
+unproven symbols (rollup rule).
+
+**UNIT (g1) VERDICT: FAIL.** Entry shape, all 13 helpers' action/stage/details keys+order+message,
+timestamp, elapsed rounding, and the 7 wirings all match Python — but 4 `*_length` values are a real
+observable byte-vs-char downgrade against a convention this port already established. Route back to the
+rust-port-porter for the 4-site `.chars().count()` fix + non-ASCII length-assertion in the 4 tests;
+re-verify. Symbols S-681..S-698 remain `- [~]`.

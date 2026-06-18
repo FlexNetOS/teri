@@ -1,3 +1,4 @@
+pub mod logger;
 pub mod manager;
 
 use crate::error::{Result, TeriError};
@@ -535,6 +536,11 @@ pub struct ReportAgent {
     pub graph_id: String,
     pub simulation_id: String,
     pub simulation_requirement: String,
+    /// Optional JSONL activity logger (sub-cycle g1).
+    ///
+    /// `None` → all log_* calls are no-ops; the (e) tests continue to work unmodified.
+    /// `Some(l)` → every wired log point writes to `…/reports/{id}/agent_log.jsonl`.
+    pub report_logger: Option<logger::ReportLogger>,
 }
 
 impl ReportAgent {
@@ -548,6 +554,7 @@ impl ReportAgent {
             graph_id: String::new(),
             simulation_id: String::new(),
             simulation_requirement: String::new(),
+            report_logger: None,
         }
     }
 
@@ -563,6 +570,7 @@ impl ReportAgent {
             graph_id: graph_id.into(),
             simulation_id: simulation_id.into(),
             simulation_requirement: simulation_requirement.into(),
+            report_logger: None,
         }
     }
 
@@ -807,15 +815,16 @@ impl ReportAgent {
         tools: &crate::services::zep_tools::ReportTools<'_, L>,
         llm: &L,
         progress: Option<&ProgressCallback<'_>>,
-        // section_index is used by sub-cycle (g) log calls; kept in signature so (g) can
-        // wire the log calls without changing the API. Suppress dead-code warning here.
-        #[allow(unused_variables)] section_index: usize,
+        section_index: usize,
     ) -> String {
         use crate::i18n::t_args;
         use crate::llm::{ChatMessage, ChatOptions};
         use crate::services::zep_tools::{get_tools_description, parse_tool_calls};
 
-        // (g): log_section_start(section.title, section_index)
+        // (g1): log_section_start
+        if let Some(l) = self.report_logger.as_ref() {
+            l.log_section_start(&section.title, section_index);
+        }
 
         // ── Build system prompt ──────────────────────────────────────────────
         let tools_desc = get_tools_description();
@@ -947,8 +956,17 @@ impl ReportAgent {
                 }
             }
 
-            // (g): log_llm_response(section_title, section_index, response, iteration+1,
-            //                       has_tool_calls, has_final_answer)
+            // (g1): log_llm_response
+            if let Some(l) = self.report_logger.as_ref() {
+                l.log_llm_response(
+                    &section.title,
+                    section_index,
+                    &response,
+                    iteration + 1,
+                    has_tool_calls,
+                    has_final_answer,
+                );
+            }
 
             // ── SITUATION 1: LLM output Final Answer (report_agent.py:1374-1402) ──
             if has_final_answer {
@@ -976,7 +994,15 @@ impl ReportAgent {
                 // Rust: rsplit gives the same last-occurrence semantics.
                 let final_answer =
                     response.rsplit("Final Answer:").next().unwrap_or("").trim().to_string();
-                // (g): log_section_content(section_title, section_index, final_answer, tool_calls_count)
+                // (g1): log_section_content — situation-1 valid-final-answer return
+                if let Some(l) = self.report_logger.as_ref() {
+                    l.log_section_content(
+                        &section.title,
+                        section_index,
+                        &final_answer,
+                        tool_calls_count,
+                    );
+                }
                 return final_answer;
             }
 
@@ -994,9 +1020,19 @@ impl ReportAgent {
 
                 // Execute first call only (report_agent.py:1419-1468)
                 let call = &tool_calls[0];
-                // (g): log_tool_call(section_title, section_index, call.name, call.parameters, iteration+1)
+                // (g1): log_tool_call
+                if let Some(l) = self.report_logger.as_ref() {
+                    l.log_tool_call(
+                        &section.title,
+                        section_index,
+                        &call.name,
+                        serde_json::Value::Object(call.parameters.clone()),
+                        iteration + 1,
+                    );
+                }
                 if tool_calls.len() > 1 {
-                    // (g): log_multiToolOnlyFirst(total=tool_calls.len(), tool_name=call.name)
+                    // (g2): log_multiToolOnlyFirst — CONSOLE log (Python logger.info), owned by
+                    // sub-cycle (g2) / ReportConsoleLogger. NOT a ReportLogger call. Do NOT wire here.
                 }
 
                 let result = tools.execute_by_name(
@@ -1007,7 +1043,16 @@ impl ReportAgent {
                     &self.simulation_requirement,
                     &report_context,
                 );
-                // (g): log_tool_result(section_title, section_index, call.name, result, iteration+1)
+                // (g1): log_tool_result
+                if let Some(l) = self.report_logger.as_ref() {
+                    l.log_tool_result(
+                        &section.title,
+                        section_index,
+                        &call.name,
+                        &result,
+                        iteration + 1,
+                    );
+                }
 
                 tool_calls_count += 1;
                 used_tools.insert(
@@ -1076,7 +1121,15 @@ impl ReportAgent {
             // Situation 3 else: sufficient tools, no prefix → accept raw response (report_agent.py:1491)
             // Python: final_answer = response.strip()
             let final_answer = response.trim().to_string();
-            // (g): log_section_content(section_title, section_index, final_answer, tool_calls_count)
+            // (g1): log_section_content — situation-3 no-prefix return
+            if let Some(l) = self.report_logger.as_ref() {
+                l.log_section_content(
+                    &section.title,
+                    section_index,
+                    &final_answer,
+                    tool_calls_count,
+                );
+            }
             return final_answer;
         }
         // ── POST-LOOP: FORCE-FINAL (report_agent.py:1502-1530) ──────────────────
@@ -1084,8 +1137,8 @@ impl ReportAgent {
 
         let force_response = llm.chat(&messages, &opts).await;
 
-        // (g): log_section_content(section_title, section_index, <result>, tool_calls_count)
-        match force_response {
+        // (g1): log_section_content — force-final return (compute result first, then log+return)
+        let force_result = match force_response {
             // None/Err case (report_agent.py:1513-1515)
             Err(_) => crate::i18n::t("report.sectionGenFailedContent"),
             Ok(s) if s.is_empty() => crate::i18n::t("report.sectionGenFailedContent"),
@@ -1098,7 +1151,11 @@ impl ReportAgent {
                     s
                 }
             }
+        };
+        if let Some(l) = self.report_logger.as_ref() {
+            l.log_section_content(&section.title, section_index, &force_result, tool_calls_count);
         }
+        force_result
     }
 
     // -----------------------------------------------------------------------
@@ -2428,5 +2485,145 @@ Final Answer: This is premature."#;
             .await;
 
         assert_eq!(result, "last occurrence");
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (g1): ReportLogger wiring into generate_section_react
+    //
+    // Tests that:
+    //   1. With report_logger=Some, the loop writes a parseable jsonl sequence
+    //      containing the expected action types in the correct order.
+    //   2. With report_logger=None, no file is written (byte-stable prior behavior).
+    // -----------------------------------------------------------------------
+
+    fn parse_jsonl_actions(path: &std::path::Path) -> Vec<String> {
+        let f = std::fs::File::open(path).expect("agent_log.jsonl must exist");
+        let reader = std::io::BufReader::new(f);
+        use std::io::BufRead as _;
+        reader
+            .lines()
+            .filter_map(|l| {
+                let l = l.unwrap();
+                if l.is_empty() {
+                    return None;
+                }
+                let v: serde_json::Map<String, serde_json::Value> =
+                    serde_json::from_str(&l).ok()?;
+                v.get("action")?.as_str().map(|s| s.to_string())
+            })
+            .collect()
+    }
+
+    /// generate_section_react WITH a logger: happy path (3 tool calls + Final Answer) →
+    /// agent_log.jsonl must contain [section_start, llm_response×4, tool_call×3, tool_result×3, section_content]
+    /// in correct order.
+    ///
+    /// The exact interleaving is:
+    ///   log_section_start
+    ///   iter0: llm_response, tool_call, tool_result
+    ///   iter1: llm_response, tool_call, tool_result
+    ///   iter2: llm_response, tool_call, tool_result
+    ///   iter3: llm_response, section_content (Final Answer)
+    #[tokio::test]
+    async fn test_react_with_logger_happy_path_writes_jsonl_sequence() {
+        let upload_dir =
+            std::env::temp_dir().join(format!("teri_react_logger_test_{}", std::process::id()));
+
+        let tc_quick =
+            r#"<tool_call>{"name": "quick_search", "parameters": {"query": "q"}}</tool_call>"#;
+        let tc_panorama =
+            r#"<tool_call>{"name": "panorama_search", "parameters": {"query": "q"}}</tool_call>"#;
+        let tc_insight =
+            r#"<tool_call>{"name": "insight_forge", "parameters": {"query": "q"}}</tool_call>"#;
+        let final_answer = "Final Answer: Section content here.";
+
+        let llm = ScriptedChatLlm::new(vec![tc_quick, tc_panorama, tc_insight, final_answer]);
+        let (graph, section, outline) = make_react_fixtures();
+
+        let logger = crate::report::logger::ReportLogger::new("react-test-001", &upload_dir)
+            .expect("logger construction must not fail");
+
+        let mut agent = ReportAgent::new_react("g1", "sim1", "req");
+        agent.report_logger = Some(logger);
+        let tools = make_tools_fixture(&graph, &llm);
+
+        let result = agent
+            .generate_section_react(&section, &outline, &[], &tools, &llm, None, 0)
+            .await;
+
+        assert_eq!(result, "Section content here.");
+
+        // Verify the jsonl was written
+        let log_path = upload_dir.join("reports").join("react-test-001").join("agent_log.jsonl");
+        assert!(log_path.exists(), "agent_log.jsonl must be created");
+
+        let actions = parse_jsonl_actions(&log_path);
+        // Expected sequence: section_start, then per-iteration pairs
+        assert_eq!(actions[0], "section_start", "first entry must be section_start");
+
+        // Count each action type
+        let llm_responses = actions.iter().filter(|a| a.as_str() == "llm_response").count();
+        let tool_calls = actions.iter().filter(|a| a.as_str() == "tool_call").count();
+        let tool_results = actions.iter().filter(|a| a.as_str() == "tool_result").count();
+        let section_contents = actions.iter().filter(|a| a.as_str() == "section_content").count();
+
+        assert_eq!(llm_responses, 4, "must have 4 llm_response entries (3 tool iters + 1 final)");
+        assert_eq!(tool_calls, 3, "must have 3 tool_call entries");
+        assert_eq!(tool_results, 3, "must have 3 tool_result entries");
+        assert_eq!(section_contents, 1, "must have 1 section_content entry at the end");
+
+        // Last action must be section_content
+        assert_eq!(
+            actions.last().map(|s| s.as_str()),
+            Some("section_content"),
+            "last entry must be section_content"
+        );
+
+        // Each entry is valid parseable JSON with the contractual top-level keys
+        let log_raw = std::fs::read_to_string(&log_path).unwrap();
+        for line in log_raw.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let obj: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(line).expect("each line must be valid compact JSON");
+            assert!(obj.contains_key("timestamp"), "entry missing timestamp");
+            assert!(obj.contains_key("elapsed_seconds"), "entry missing elapsed_seconds");
+            assert!(obj["elapsed_seconds"].is_number(), "elapsed_seconds must be a number");
+            assert!(obj.contains_key("report_id"), "entry missing report_id");
+        }
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    /// generate_section_react with report_logger=None must NOT create any file,
+    /// and the result must be identical to the pre-(g) behavior.
+    #[tokio::test]
+    async fn test_react_without_logger_no_file_written() {
+        let upload_dir =
+            std::env::temp_dir().join(format!("teri_react_nologger_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&upload_dir);
+
+        let tc = r#"<tool_call>{"name": "quick_search", "parameters": {"query": "q"}}</tool_call>"#;
+        let llm = ScriptedChatLlm::new(vec![tc, tc, tc, "Final Answer: no logger content"]);
+        let (graph, section, outline) = make_react_fixtures();
+        let agent = ReportAgent::new_react("g1", "sim1", "req");
+        // report_logger = None (default from new_react)
+        let tools = make_tools_fixture(&graph, &llm);
+
+        let result = agent
+            .generate_section_react(&section, &outline, &[], &tools, &llm, None, 0)
+            .await;
+
+        assert_eq!(result, "no logger content");
+
+        // No file should have been written anywhere under upload_dir
+        let log_path = upload_dir.join("reports").join("g1").join("agent_log.jsonl");
+        assert!(
+            !log_path.exists(),
+            "agent_log.jsonl must NOT be created when report_logger is None"
+        );
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
     }
 }

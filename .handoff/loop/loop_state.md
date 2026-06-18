@@ -17,7 +17,7 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 3   # BUDGET REACHED; CYCLE 11=U-024(d), 12=U-024(e), 13=U-024(f) ReportManager
+cycles_this_session: 1   # NEW SESSION 2026-06-18; CYCLE 14 = U-024 sub-cycle (g1) ReportLogger
 # CYCLE3 (12th resume) 2026-06-17: U-022 sub-cycle (c) MONITOR + offset-tail + graph-fire (S-605/613/614/615 + S-1056/U-047,
 #   5 [x]) — opus PASS (DECISION-17 Area 2, porter@opus). src/services/simulation_runner.rs: monitor_simulation (2s
 #   MONITOR_POLL_INTERVAL poll loop, per-platform file-exists guard, save_run_state per poll, loop-exit on U-048
@@ -501,3 +501,26 @@ next_iterate: U-022 [x] complete → U-017 port-fresh full implementation
 # streaming; report_id uuid; deps b,c,d,e,f,g], (i) chat [conversational 2-iter ReACT, get_report_by_simulation, 15000-char
 # ctx cap, response cleaning]. Also pending: (b2) insight_forge semantic [OQ-3 query_vec_similarity]; interview_agents tool
 # [U-020 IPC, wired at h]. After U-024: U-025/26/27 HTTP API routes (report route exposes the ReACT per-section stream).
+
+
+# CYCLE 14 (2026-06-18, 14th resume): U-024 sub-cycle (g1) ReportLogger — porter@porter, parity@opus FAIL→fix→PASS.
+# SCOPE SPLIT (loop-driver decision, recorded): architect's (g) = loggers/ReportSink split into (g1) ReportLogger jsonl
+# [THIS], (g2) ReportConsoleLogger [tracing/console_log.txt subscriber — distinct global-subscriber concern, the ReACT
+# loop never touches it], and ReportSink folded into (h) [SSE+jsonl unify only meaningful once h's streaming exists —
+# avoid speculative abstraction]. NOTHING dropped — g2 + ReportSink remain open/tracked in merge-ledger + symbol-map.
+# NEW src/report/logger.rs: ReportLogger{report_id, log_file_path, start:Instant}. log(action,stage,details,
+# section_title:Option,section_index:Option) → 8-key entry (timestamp=python_isoformat_local naive, elapsed_seconds=2dp
+# banker's-round, report_id, action, stage, section_title|null, section_index|null, details) → COMPACT json + "\n" append.
+# All 13 helpers (log_start/planning_start/planning_context/planning_complete/section_start/react_thought/tool_call/
+# tool_result/llm_response/section_content/section_full_complete/report_complete/error) verbatim details key-order + t()
+# msgs (all report.* i18n keys already in en/zh.json). ReportAgent +report_logger:Option<ReportLogger> field (None in
+# new/new_react). Wired 7 jsonl markers in generate_section_react (if let Some(l)=self.report_logger.as_ref()); left
+# multiToolOnlyFirst as // (g2): console marker. GATE CAUGHT a real downgrade: result_length/response_length/
+# content_length×2 used .len() (BYTES) vs Python len(str) (CHARS, len("中文")=2) — observable in frontend "{n} chars"
+# (~3× for CJK) — FIXED .chars().count() ×4 + tightened test (14 chars not 18 bytes). 24 new tests, 1166 green, clippy
+# clean. Atomic gate: X-parity PASS + Y-green + Y-not-regressed. Y-drift clean.
+# U-024 progress: a✓ b✓ c✓ d✓ e✓ f✓ g1✓ | REMAINING: (g2) ReportConsoleLogger [tracing file layer → console_log.txt,
+# format '[%H:%M:%S] LEVEL: message', attach/detach to report_agent+zep_tools loggers; report_agent.py:307-388], (h)
+# generate_report [orchestration plan→sections→assemble + status machine + save-section streaming + report_id uuid +
+# ReportSink SSE/jsonl unify + log_start/planning_*/report_complete/error wiring + console_logger create/close; deps
+# b,c,d,e,f,g1,g2], (i) chat. (b2 insight_forge OQ-3; interview_agents U-020 at h).

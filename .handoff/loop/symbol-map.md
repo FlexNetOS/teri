@@ -817,24 +817,24 @@
 
 ## U-024 — `backend/app/services/report_agent.py`
 
-- [ ] S-681 · `unit:U-024` · `type` · `ReportLogger` · JSONL agent_log.jsonl writer · `report_agent.py:36`
-- [ ] S-682 · `unit:U-024` · `method` · `ReportLogger.__init__` · `report_agent.py:44`
-- [ ] S-683 · `unit:U-024` · `method` · `ReportLogger._ensure_log_file` · `report_agent.py:58`
-- [ ] S-684 · `unit:U-024` · `method` · `ReportLogger._get_elapsed_time` · `report_agent.py:63`
-- [ ] S-685 · `unit:U-024` · `method` · `ReportLogger.log` · `report_agent.py:67`
-- [ ] S-686 · `unit:U-024` · `method` · `ReportLogger.log_start` · `report_agent.py:100`
-- [ ] S-687 · `unit:U-024` · `method` · `ReportLogger.log_planning_start` · `report_agent.py:113`
-- [ ] S-688 · `unit:U-024` · `method` · `ReportLogger.log_planning_context` · `report_agent.py:121`
-- [ ] S-689 · `unit:U-024` · `method` · `ReportLogger.log_planning_complete` · `report_agent.py:132`
-- [ ] S-690 · `unit:U-024` · `method` · `ReportLogger.log_section_start` · `report_agent.py:143`
-- [ ] S-691 · `unit:U-024` · `method` · `ReportLogger.log_react_thought` · `report_agent.py:153`
-- [ ] S-692 · `unit:U-024` · `method` · `ReportLogger.log_tool_call` · `report_agent.py:167`
-- [ ] S-693 · `unit:U-024` · `method` · `ReportLogger.log_tool_result` · `report_agent.py:189`
-- [ ] S-694 · `unit:U-024` · `method` · `ReportLogger.log_llm_response` · `report_agent.py:212`
-- [ ] S-695 · `unit:U-024` · `method` · `ReportLogger.log_section_content` · `report_agent.py:237`
-- [ ] S-696 · `unit:U-024` · `method` · `ReportLogger.log_section_full_complete` · `report_agent.py:258`
-- [ ] S-697 · `unit:U-024` · `method` · `ReportLogger.log_report_complete` · `report_agent.py:281`
-- [ ] S-698 · `unit:U-024` · `method` · `ReportLogger.log_error` · `report_agent.py:293`
+- [~] S-681 · `unit:U-024` · `type` · `ReportLogger` · JSONL agent_log.jsonl writer · `report_agent.py:36` → `teri::report::logger::ReportLogger` (`src/report/logger.rs`)
+- [~] S-682 · `unit:U-024` · `method` · `ReportLogger.__init__` · `report_agent.py:44` → `ReportLogger::new(report_id, upload_folder)` — dir creation, Instant start
+- [~] S-683 · `unit:U-024` · `method` · `ReportLogger._ensure_log_file` · `report_agent.py:58` → folded into `ReportLogger::new` (create_dir_all)
+- [~] S-684 · `unit:U-024` · `method` · `ReportLogger._get_elapsed_time` · `report_agent.py:63` → `self.start.elapsed().as_secs_f64()` inlined in `log()`; rounded via `round_half_even_2dp`
+- [~] S-685 · `unit:U-024` · `method` · `ReportLogger.log` · `report_agent.py:67` → `ReportLogger::log` — builds 8-key entry in contractual order, compact JSON+`\n`, non-ASCII unescaped, append-open
+- [~] S-686 · `unit:U-024` · `method` · `ReportLogger.log_start` · `report_agent.py:100` → `ReportLogger::log_start(simulation_id, graph_id, simulation_requirement)`
+- [~] S-687 · `unit:U-024` · `method` · `ReportLogger.log_planning_start` · `report_agent.py:113` → `ReportLogger::log_planning_start()`
+- [~] S-688 · `unit:U-024` · `method` · `ReportLogger.log_planning_context` · `report_agent.py:121` → `ReportLogger::log_planning_context(context: Value)`
+- [~] S-689 · `unit:U-024` · `method` · `ReportLogger.log_planning_complete` · `report_agent.py:132` → `ReportLogger::log_planning_complete(outline_dict: Value)`
+- [~] S-690 · `unit:U-024` · `method` · `ReportLogger.log_section_start` · `report_agent.py:143` → `ReportLogger::log_section_start(section_title, section_index)`
+- [~] S-691 · `unit:U-024` · `method` · `ReportLogger.log_react_thought` · `report_agent.py:153` → `ReportLogger::log_react_thought(section_title, section_index, iteration, thought)`
+- [~] S-692 · `unit:U-024` · `method` · `ReportLogger.log_tool_call` · `report_agent.py:167` → `ReportLogger::log_tool_call(section_title, section_index, tool_name, parameters: Value, iteration)`
+- [~] S-693 · `unit:U-024` · `method` · `ReportLogger.log_tool_result` · `report_agent.py:189` → `ReportLogger::log_tool_result(section_title, section_index, tool_name, result, iteration)`
+- [~] S-694 · `unit:U-024` · `method` · `ReportLogger.log_llm_response` · `report_agent.py:212` → `ReportLogger::log_llm_response(section_title, section_index, response, iteration, has_tool_calls, has_final_answer)`
+- [~] S-695 · `unit:U-024` · `method` · `ReportLogger.log_section_content` · `report_agent.py:237` → `ReportLogger::log_section_content(section_title, section_index, content, tool_calls_count)`
+- [~] S-696 · `unit:U-024` · `method` · `ReportLogger.log_section_full_complete` · `report_agent.py:258` → `ReportLogger::log_section_full_complete(section_title, section_index, full_content)`
+- [~] S-697 · `unit:U-024` · `method` · `ReportLogger.log_report_complete` · `report_agent.py:281` → `ReportLogger::log_report_complete(total_sections, total_time_seconds)`
+- [~] S-698 · `unit:U-024` · `method` · `ReportLogger.log_error` · `report_agent.py:293` → `ReportLogger::log_error(error_message, stage, section_title: Option<&str>)`
 - [ ] S-699 · `unit:U-024` · `type` · `ReportConsoleLogger` · attaches file handler to named loggers · `report_agent.py:307`
 - [ ] S-700 · `unit:U-024` · `method` · `ReportConsoleLogger.__init__` · `report_agent.py:315`
 - [ ] S-701 · `unit:U-024` · `method` · `ReportConsoleLogger._ensure_log_file` · `report_agent.py:330`
