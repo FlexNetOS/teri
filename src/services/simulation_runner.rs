@@ -3758,3 +3758,729 @@ mod monitor_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+// ===========================================================================
+// Reader methods — sub-cycle (d) — reads via the U-047 tail from read_action_log
+//
+// Ports S-618 `get_actions`, S-619 `get_timeline`, S-620 `get_agent_stats`.
+// All are pure reads that use the same underlying log-tail mechanism.
+// ===========================================================================
+
+impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
+    /// Port of `SimulationRunner.get_all_actions` (S-618, `simulation_runner.py:894-952`).
+    ///
+    /// Reads all actions from both platforms (`twitter/actions.jsonl`, `reddit/actions.jsonl`),
+    /// applying optional filters for platform/agent_id/round_num. Actions are sorted by
+    /// timestamp descending (newest first), matching Python's `.sort(key=lambda x: x.timestamp, reverse=True)`.
+    ///
+    /// The per-platform log paths use the same pattern as [`read_action_log`]:
+    /// `{sim_data_dir}/{simulation_id}/{platform}/actions.jsonl`
+    pub fn get_all_actions(
+        &self,
+        simulation_id: &str,
+        platform: Option<&str>,
+        agent_id: Option<i64>,
+        round_num: Option<i64>,
+    ) -> Result<Vec<AgentAction>> {
+        let sim_dir = self.sim_data_dir.join(simulation_id);
+
+        // Collect actions from all relevant platforms.
+        // Twitter log path: {sim_dir}/twitter/actions.jsonl
+        // Reddit log path: {sim_dir}/reddit/actions.jsonl
+        let mut actions: Vec<AgentAction> = vec![];
+
+        if platform.is_none() || platform == Some("twitter") {
+            let twitter_log = sim_dir.join("twitter").join("actions.jsonl");
+            if twitter_log.exists() {
+                actions.extend(read_actions_from_file(
+                    &twitter_log,
+                    Some("twitter"),
+                    platform,
+                    agent_id,
+                    round_num,
+                )?);
+            }
+        }
+
+        if platform.is_none() || platform == Some("reddit") {
+            let reddit_log = sim_dir.join("reddit").join("actions.jsonl");
+            if reddit_log.exists() {
+                actions.extend(read_actions_from_file(
+                    &reddit_log,
+                    Some("reddit"),
+                    platform,
+                    agent_id,
+                    round_num,
+                )?);
+            }
+        }
+
+        // Fallback: try old single-file format (no platform subdir)
+        if actions.is_empty() {
+            let legacy_log = sim_dir.join("actions.jsonl");
+            if legacy_log.exists() {
+                actions.extend(read_actions_from_file(
+                    &legacy_log,
+                    None, // legacy format should have platform in the record
+                    platform,
+                    agent_id,
+                    round_num,
+                )?);
+            }
+        }
+
+        // Sort by timestamp descending (newest first), matching Python's reverse=True.
+        // We need to parse timestamps; use chrono for this.
+        actions.sort_by(|a, b| {
+            let a_ts = parse_timestamp(&a.timestamp);
+            let b_ts = parse_timestamp(&b.timestamp);
+            b_ts.cmp(&a_ts) // descending: b vs a (newer first)
+        });
+
+        Ok(actions)
+    }
+
+    /// Port of `SimulationRunner.get_actions` (S-618, `simulation_runner.py:955-987`).
+    ///
+    /// Returns actions with pagination (limit/offset), plus optional filters.
+    ///
+    /// # Arguments
+    /// * `simulation_id` — simulation ID
+    /// * `limit` — max number of results to return (default 100)
+    /// * `offset` — skip this many results from the start (default 0)
+    /// * `platform` — filter by platform ("twitter" or "reddit"); None = both
+    /// * `agent_id` — filter by agent ID; None = all agents
+    /// * `round_num` — filter by round number; None = all rounds
+    pub fn get_actions(
+        &self,
+        simulation_id: &str,
+        limit: usize,
+        offset: usize,
+        platform: Option<&str>,
+        agent_id: Option<i64>,
+        round_num: Option<i64>,
+    ) -> Result<Vec<AgentAction>> {
+        let all = self.get_all_actions(simulation_id, platform, agent_id, round_num)?;
+        // Apply pagination: [offset..offset+limit]
+        let end = (offset + limit).min(all.len());
+        Ok(all[offset..end].to_vec())
+    }
+
+    /// Port of `SimulationRunner.get_timeline` (S-619, `simulation_runner.py:989-1057`).
+    ///
+    /// Returns per-round summaries for all rounds in the simulation.
+    ///
+    /// # Arguments
+    /// * `simulation_id` — simulation ID
+    /// * `start_round` — include only rounds >= this (default 0)
+    /// * `end_round` — include only rounds <= this; None = no upper bound
+    pub fn get_timeline(
+        &self,
+        simulation_id: &str,
+        start_round: i64,
+        end_round: Option<i64>,
+    ) -> Result<Vec<TimelineEntry>> {
+        let actions = self.get_all_actions(simulation_id, None, None, None)?;
+
+        // Group by round_num
+        let mut rounds: std::collections::HashMap<i64, TimelineRound> = std::collections::HashMap::new();
+
+        for action in &actions {
+            let round_num = action.round_num;
+
+            if round_num < start_round {
+                continue;
+            }
+            if let Some(end) = end_round && round_num > end {
+                continue;
+            }
+
+            let entry = rounds.entry(round_num).or_insert(TimelineRound::new(round_num));
+            entry.total_actions += 1;
+
+            match action.platform.as_str() {
+                "twitter" => entry.twitter_actions += 1,
+                "reddit" => entry.reddit_actions += 1,
+                _ => {}
+            }
+
+            entry.active_agents.insert(action.agent_id);
+
+            *entry.action_types.entry(action.action_type.clone()).or_insert(0) += 1;
+
+            // Track first/last timestamps (ascending order in our slice, so we need to handle this)
+        }
+
+        // Convert to TimelineEntry and sort by round_num ascending
+        let mut result: Vec<TimelineEntry> = rounds
+            .into_values()
+            .map(|r| r.into_entry())
+            .collect();
+
+        result.sort_by(|a, b| a.round_num.cmp(&b.round_num));
+
+        Ok(result)
+    }
+
+    /// Port of `SimulationRunner.get_agent_stats` (S-620, `simulation_runner.py:1060-1094`).
+    ///
+    /// Returns per-agent statistics sorted by total actions descending.
+    pub fn get_agent_stats(&self, simulation_id: &str) -> Result<Vec<AgentStats>> {
+        let actions = self.get_all_actions(simulation_id, None, None, None)?;
+
+        let mut agent_stats: std::collections::HashMap<i64, AgentStatsEntry> = std::collections::HashMap::new();
+
+        for action in &actions {
+            let entry = agent_stats.entry(action.agent_id).or_insert_with(|| AgentStatsEntry {
+                agent_id: action.agent_id,
+                agent_name: action.agent_name.clone(),
+                total_actions: 0,
+                twitter_actions: 0,
+                reddit_actions: 0,
+                action_types: std::collections::HashMap::new(),
+                first_action_time: action.timestamp.clone(),
+                last_action_time: action.timestamp.clone(),
+            });
+
+            entry.total_actions += 1;
+
+            match action.platform.as_str() {
+                "twitter" => entry.twitter_actions += 1,
+                "reddit" => entry.reddit_actions += 1,
+                _ => {}
+            }
+
+            *entry
+                .action_types
+                .entry(action.action_type.clone())
+                .or_insert(0) += 1;
+
+            // Update last_action_time (we're iterating newest-first, so first seen is latest)
+        }
+
+        let mut result: Vec<AgentStats> = agent_stats
+            .into_values()
+            .map(|e| e.into_stats())
+            .collect();
+
+        // Sort by total_actions descending (Python's reverse=True on key=lambda x: x["total_actions"])
+        result.sort_by(|a, b| b.total_actions.cmp(&a.total_actions));
+
+        Ok(result)
+    }
+}
+
+/// Helper: read actions from a single JSONL file with optional filters.
+///
+/// Mirrors Python's `_read_actions_from_file`.
+fn read_actions_from_file(
+    log_path: &Path,
+    default_platform: Option<&str>,
+    platform_filter: Option<&str>,
+    agent_id_filter: Option<i64>,
+    round_num_filter: Option<i64>,
+) -> Result<Vec<AgentAction>> {
+    use std::io::{BufRead, BufReader};
+
+    let file = std::fs::File::open(log_path).map_err(|e| {
+        TeriError::Sim(format!("Failed to open log file {}: {}", log_path.display(), e))
+    })?;
+    let reader = BufReader::new(file);
+
+    let mut actions = Vec::new();
+
+    for line in reader.lines() {
+        let line = line.map_err(|e| {
+            TeriError::Sim(format!("Failed to read line from {}: {}", log_path.display(), e))
+        })?;
+
+        // Skip blank lines (Python: `if not line:`)
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Parse JSON
+        let data: Value = serde_json::from_str(&line).map_err(|e| {
+            TeriError::Sim(format!("Failed to parse JSON from {}: {}", log_path.display(), e))
+        })?;
+
+        // Apply filters before building the action
+        if let Some(pf) = platform_filter {
+            let record_platform = data
+                .get("platform")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if record_platform != pf && default_platform != Some(pf) {
+                continue;
+            }
+        }
+
+        if let Some(af) = agent_id_filter {
+            let record_agent_id = data.get("agent_id").and_then(Value::as_i64).unwrap_or(0);
+            if record_agent_id != af {
+                continue;
+            }
+        }
+
+        if let Some(rf) = round_num_filter {
+            let record_round = data.get("round").and_then(Value::as_i64).unwrap_or(0);
+            if record_round != rf {
+                continue;
+            }
+        }
+
+        // Build AgentAction (Python field defaults + platform from file path)
+        let action = AgentAction {
+            round_num: data.get("round").and_then(Value::as_i64).unwrap_or(0),
+            timestamp: data
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .map(String::from)
+                .unwrap_or_else(python_isoformat_local),
+            platform: data
+                .get("platform")
+                .and_then(Value::as_str)
+                .map(String::from)
+                .unwrap_or_else(|| default_platform.unwrap_or("twitter").to_string()),
+            agent_id: data.get("agent_id").and_then(Value::as_i64).unwrap_or(0),
+            agent_name: data
+                .get("agent_name")
+                .and_then(Value::as_str)
+                .map(String::from)
+                .unwrap_or_default(),
+            action_type: data
+                .get("action_type")
+                .and_then(Value::as_str)
+                .map(String::from)
+                .unwrap_or_default(),
+            action_args: data
+                .get("action_args")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default(),
+            result: data.get("result").and_then(Value::as_str).map(String::from),
+            success: data.get("success").and_then(Value::as_bool).unwrap_or(true),
+        };
+
+        actions.push(action);
+    }
+
+    Ok(actions)
+}
+
+/// Parse a timestamp string into chrono::DateTime for sorting.
+///
+/// Handles ISO-8601 format with optional timezone or naive datetime.
+fn parse_timestamp(ts: &str) -> chrono::DateTime<chrono::Utc> {
+    // Try parsing with nano seconds first (Python's isoformat includes them)
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.f") {
+        return chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc);
+    }
+    // Try without fractional seconds
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S") {
+        return chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc);
+    }
+    // Fallback: parse with any format (might handle timezone)
+    if let Ok(dt) = ts.parse::<chrono::DateTime<chrono::Utc>>() {
+        return dt;
+    }
+    // Last resort: use current time as fallback
+    chrono::Utc::now()
+}
+
+/// Per-round summary for timeline output.
+#[derive(Debug, Clone)]
+struct TimelineRound {
+    round_num: i64,
+    twitter_actions: usize,
+    reddit_actions: usize,
+    total_actions: usize,
+    active_agents: std::collections::HashSet<i64>,
+    action_types: std::collections::HashMap<String, usize>,
+}
+
+impl TimelineRound {
+    fn new(round_num: i64) -> Self {
+        Self {
+            round_num,
+            twitter_actions: 0,
+            reddit_actions: 0,
+            total_actions: 0,
+            active_agents: std::collections::HashSet::new(),
+            action_types: std::collections::HashMap::new(),
+        }
+    }
+
+    fn into_entry(self) -> TimelineEntry {
+        TimelineEntry {
+            round_num: self.round_num,
+            twitter_actions: self.twitter_actions as i64,
+            reddit_actions: self.reddit_actions as i64,
+            total_actions: self.total_actions as i64,
+            active_agents_count: self.active_agents.len() as i64,
+            active_agents: self.active_agents.into_iter().collect(),
+            action_type_counts: self
+                .action_types
+                .into_iter()
+                .map(|(k, v)| (k, Value::Number((v as i64).into())))
+                .collect(),
+        }
+    }
+}
+
+/// Output type for [`SimulationRunner::get_timeline`].
+#[derive(Debug, Clone, Serialize)]
+pub struct TimelineEntry {
+    pub round_num: i64,
+    pub twitter_actions: i64,
+    pub reddit_actions: i64,
+    pub total_actions: i64,
+    pub active_agents_count: i64,
+    pub active_agents: Vec<i64>,
+    #[serde(rename = "action_types")]
+    pub action_type_counts: serde_json::Map<String, Value>,
+}
+
+impl TimelineEntry {
+    /// Convert to a JSON Value (for API responses).
+    pub fn to_value(&self) -> Value {
+        let mut m = Map::new();
+        m.insert("round_num".into(), Value::Number(self.round_num.into()));
+        m.insert(
+            "twitter_actions".into(),
+            Value::Number(self.twitter_actions.into()),
+        );
+        m.insert(
+            "reddit_actions".into(),
+            Value::Number(self.reddit_actions.into()),
+        );
+        m.insert(
+            "total_actions".into(),
+            Value::Number(self.total_actions.into()),
+        );
+        m.insert(
+            "active_agents_count".into(),
+            Value::Number(self.active_agents_count.into()),
+        );
+        m.insert(
+            "active_agents".into(),
+            Value::Array(
+                self.active_agents
+                    .iter()
+                    .map(|&id| Value::Number(id.into()))
+                    .collect(),
+            ),
+        );
+        m.insert("action_types".into(), Value::Object(self.action_type_counts.clone()));
+        Value::Object(m)
+    }
+}
+
+/// Per-agent statistics entry (internal type).
+#[derive(Debug, Clone)]
+struct AgentStatsEntry {
+    agent_id: i64,
+    agent_name: String,
+    total_actions: usize,
+    twitter_actions: usize,
+    reddit_actions: usize,
+    action_types: std::collections::HashMap<String, usize>,
+    first_action_time: String,
+    last_action_time: String,
+}
+
+impl AgentStatsEntry {
+    fn into_stats(self) -> AgentStats {
+        AgentStats {
+            agent_id: self.agent_id,
+            agent_name: self.agent_name,
+            total_actions: self.total_actions as i64,
+            twitter_actions: self.twitter_actions as i64,
+            reddit_actions: self.reddit_actions as i64,
+            action_type_counts: self
+                .action_types
+                .into_iter()
+                .map(|(k, v)| (k, Value::Number((v as i64).into())))
+                .collect(),
+            first_action_time: self.first_action_time,
+            last_action_time: self.last_action_time,
+        }
+    }
+}
+
+/// Output type for [`SimulationRunner::get_agent_stats`].
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentStats {
+    pub agent_id: i64,
+    pub agent_name: String,
+    pub total_actions: i64,
+    pub twitter_actions: i64,
+    pub reddit_actions: i64,
+    #[serde(rename = "action_types")]
+    pub action_type_counts: serde_json::Map<String, Value>,
+    pub first_action_time: String,
+    pub last_action_time: String,
+}
+
+impl AgentStats {
+    /// Convert to a JSON Value (for API responses).
+    pub fn to_value(&self) -> Value {
+        let mut m = Map::new();
+        m.insert("agent_id".into(), Value::Number(self.agent_id.into()));
+        m.insert("agent_name".into(), Value::String(self.agent_name.clone()));
+        m.insert(
+            "total_actions".into(),
+            Value::Number(self.total_actions.into()),
+        );
+        m.insert(
+            "twitter_actions".into(),
+            Value::Number(self.twitter_actions.into()),
+        );
+        m.insert(
+            "reddit_actions".into(),
+            Value::Number(self.reddit_actions.into()),
+        );
+        m.insert(
+            "first_action_time".into(),
+            Value::String(self.first_action_time.clone()),
+        );
+        m.insert(
+            "last_action_time".into(),
+            Value::String(self.last_action_time.clone()),
+        );
+        m.insert("action_types".into(), Value::Object(self.action_type_counts.clone()));
+        Value::Object(m)
+    }
+}
+
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+    use crate::llm::{ChatMessage, ChatOptions, LlmClient};
+    use async_trait::async_trait;
+    use std::io::Write;
+
+    // Mock LLM for testing (defined locally since llm::testing doesn't exist)
+    struct MockLlm;
+    #[async_trait]
+    impl LlmClient for MockLlm {
+        async fn complete(&self, _: &str) -> Result<String> {
+            Ok("Think(test)".to_string())
+        }
+        async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+            Err(TeriError::Llm("not used".into()))
+        }
+        async fn stream(
+            &self,
+            _: &str,
+        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            Err(TeriError::Llm("not used".into()))
+        }
+        async fn chat(&self, _: &[ChatMessage], _: &ChatOptions) -> Result<String> {
+            Err(TeriError::Llm("not used".into()))
+        }
+        async fn chat_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _: &[ChatMessage],
+            _: &ChatOptions,
+        ) -> Result<T> {
+            Err(TeriError::Llm("not used".into()))
+        }
+    }
+
+    fn temp_dir(suffix: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("teri_test_readers_{}", suffix));
+        p
+    }
+
+    /// Create a test runner and dir with sample action logs.
+    fn make_runner_with_logs(
+        sim_id: &str,
+    ) -> (SimulationRunner<MockLlm>, std::path::PathBuf) {
+        let dir = temp_dir(sim_id);
+        // The simulation_id becomes the subdirectory
+        let sim_dir = dir.join(sim_id);
+        std::fs::create_dir_all(&sim_dir).unwrap();
+
+        // Create sample Twitter actions
+        let twitter_dir = sim_dir.join("twitter");
+        std::fs::create_dir_all(&twitter_dir).unwrap();
+        // Truncate existing file or create new one (write mode instead of append)
+        let mut twitter_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(twitter_dir.join("actions.jsonl"))
+            .unwrap();
+
+        // Write some Twitter actions
+        for i in 0..3 {
+            writeln!(
+                &mut twitter_file,
+                "{{\"round\": {}, \"timestamp\": \"2026-06-18T10:00:{}Z\", \"platform\": \"twitter\", \
+                 \"agent_id\": {}, \"agent_name\": \"TwitterAgent{}\", \
+                 \"action_type\": \"CREATE_POST\", \"action_args\": {{\"content\": \"tweet {}\"}}, \
+                 \"result\": null, \"success\": true}}",
+                (i % 2) + 1,
+                i,
+                i,
+                i,
+                i
+            )
+            .unwrap();
+        }
+
+        // Create sample Reddit actions
+        let reddit_dir = sim_dir.join("reddit");
+        std::fs::create_dir_all(&reddit_dir).unwrap();
+        let mut reddit_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(reddit_dir.join("actions.jsonl"))
+            .unwrap();
+
+        for i in 0..2 {
+            writeln!(
+                &mut reddit_file,
+                "{{\"round\": {}, \"timestamp\": \"2026-06-18T10:00:{}Z\", \"platform\": \"reddit\", \
+                 \"agent_id\": {}, \"agent_name\": \"RedditAgent{}\", \
+                 \"action_type\": \"LIKE_POST\", \"action_args\": {{\"post_id\": \"r{}\"}}, \
+                 \"result\": null, \"success\": true}}",
+                (i % 2) + 1,
+                i + 3,
+                i + 10,
+                i,
+                i
+            )
+            .unwrap();
+        }
+
+        let manager = Arc::new(SimulationManager::new(&dir));
+        let graph_mgr = Arc::new(GraphMemoryManager::<MockLlm>::new());
+        let runner = SimulationRunner::new(
+            &dir,
+            graph_mgr,
+            Arc::clone(&manager) as Arc<SimulationManager>,
+        );
+        (runner, dir)
+    }
+
+    #[test]
+    fn get_actions_returns_paginated_results() {
+        let (runner, dir) = make_runner_with_logs("pagination");
+        // Use the same sim_id that was used to create logs
+        let actions = runner
+            .get_actions("pagination", 2, 0, None, None, None)
+            .unwrap();
+        assert_eq!(actions.len(), 2);
+    }
+
+    #[test]
+    fn get_all_actions_filters_by_platform() {
+        let (runner, dir) = make_runner_with_logs("filter-platform");
+        // Use the same sim_id that was used to create logs
+        let tw_only = runner
+            .get_all_actions("filter-platform", Some("twitter"), None, None)
+            .unwrap();
+        assert_eq!(tw_only.len(), 3);
+        for a in &tw_only {
+            assert_eq!(a.platform, "twitter");
+        }
+
+        let rd_only = runner
+            .get_all_actions("filter-platform", Some("reddit"), None, None)
+            .unwrap();
+        assert_eq!(rd_only.len(), 2);
+        for a in &rd_only {
+            assert_eq!(a.platform, "reddit");
+        }
+    }
+
+    #[test]
+    fn get_all_actions_filters_by_agent_id() {
+        let (runner, dir) = make_runner_with_logs("filter-agent");
+        // Use the same sim_id that was used to create logs
+        let filtered = runner
+            .get_all_actions("filter-agent", None, Some(1), None)
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].agent_id, 1);
+    }
+
+    #[test]
+    fn get_timeline_aggregates_by_round() {
+        let (runner, dir) = make_runner_with_logs("timeline");
+        // Use the same sim_id that was used to create logs
+        let timeline = runner.get_timeline("timeline", 1, None).unwrap();
+        assert_eq!(timeline.len(), 2); // rounds 1 and 2
+    }
+
+    #[test]
+    fn get_agent_stats_aggregates_per_agent() {
+        let (runner, dir) = make_runner_with_logs("agent-stats");
+        let stats = runner.get_agent_stats("agent-stats").unwrap();
+        assert_eq!(stats.len(), 5); // 3 twitter + 2 reddit agents
+        // First agent should be the one with most actions
+        assert!(stats[0].total_actions >= stats[1..].iter().map(|s| s.total_actions).max().unwrap_or(0));
+    }
+
+    #[test]
+    fn get_all_actions_sorts_by_timestamp_descending() {
+        let (runner, dir) = make_runner_with_logs("timestamp-sort");
+        // Use the same sim_id that was used to create logs
+        let actions = runner.get_all_actions("timestamp-sort", None, None, None).unwrap();
+        // Actions should be sorted by timestamp descending
+        for i in 0..actions.len().saturating_sub(1) {
+            let a_ts = parse_timestamp(&actions[i].timestamp);
+            let b_ts = parse_timestamp(&actions[i + 1].timestamp);
+            assert!(
+                a_ts >= b_ts,
+                "Action {} timestamp should be >= action {}",
+                i,
+                i + 1
+            );
+        }
+    }
+
+    #[test]
+    fn get_all_actions_falls_back_to_legacy_format() {
+        let dir = temp_dir("legacy");
+        // The simulation_id becomes the subdirectory
+        let sim_dir = dir.join("sim-legacy");
+        std::fs::create_dir_all(&sim_dir).unwrap();
+
+        // Write legacy single-file format (no platform subdirs, platform in record)
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(sim_dir.join("actions.jsonl"))
+            .unwrap();
+        writeln!(
+            f,
+            "{{\"round\": 1, \"timestamp\": \"2026-06-18T10:00:00Z\", \
+             \"platform\": \"twitter\", \"agent_id\": 1, \"agent_name\": \"LegacyAgent\", \
+             \"action_type\": \"CREATE_POST\", \"success\": true}}"
+        )
+        .unwrap();
+
+        let manager = Arc::new(SimulationManager::new(&dir));
+        let graph_mgr = Arc::new(GraphMemoryManager::<MockLlm>::new());
+        let runner = SimulationRunner::new(
+            &dir,
+            graph_mgr,
+            Arc::clone(&manager) as Arc<SimulationManager>,
+        );
+
+        let actions = runner.get_all_actions("sim-legacy", None, None, None).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].platform, "twitter");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
