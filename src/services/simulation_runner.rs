@@ -3883,7 +3883,8 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
         let actions = self.get_all_actions(simulation_id, None, None, None)?;
 
         // Group by round_num
-        let mut rounds: std::collections::HashMap<i64, TimelineRound> = std::collections::HashMap::new();
+        let mut rounds: std::collections::HashMap<i64, TimelineRound> =
+            std::collections::HashMap::new();
 
         for action in &actions {
             let round_num = action.round_num;
@@ -3891,7 +3892,9 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
             if round_num < start_round {
                 continue;
             }
-            if let Some(end) = end_round && round_num > end {
+            if let Some(end) = end_round
+                && round_num > end
+            {
                 continue;
             }
 
@@ -3912,10 +3915,7 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
         }
 
         // Convert to TimelineEntry and sort by round_num ascending
-        let mut result: Vec<TimelineEntry> = rounds
-            .into_values()
-            .map(|r| r.into_entry())
-            .collect();
+        let mut result: Vec<TimelineEntry> = rounds.into_values().map(|r| r.into_entry()).collect();
 
         result.sort_by(|a, b| a.round_num.cmp(&b.round_num));
 
@@ -3928,7 +3928,8 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
     pub fn get_agent_stats(&self, simulation_id: &str) -> Result<Vec<AgentStats>> {
         let actions = self.get_all_actions(simulation_id, None, None, None)?;
 
-        let mut agent_stats: std::collections::HashMap<i64, AgentStatsEntry> = std::collections::HashMap::new();
+        let mut agent_stats: std::collections::HashMap<i64, AgentStatsEntry> =
+            std::collections::HashMap::new();
 
         for action in &actions {
             let entry = agent_stats.entry(action.agent_id).or_insert_with(|| AgentStatsEntry {
@@ -3950,18 +3951,13 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
                 _ => {}
             }
 
-            *entry
-                .action_types
-                .entry(action.action_type.clone())
-                .or_insert(0) += 1;
+            *entry.action_types.entry(action.action_type.clone()).or_insert(0) += 1;
 
             // Update last_action_time (we're iterating newest-first, so first seen is latest)
         }
 
-        let mut result: Vec<AgentStats> = agent_stats
-            .into_values()
-            .map(|e| e.into_stats())
-            .collect();
+        let mut result: Vec<AgentStats> =
+            agent_stats.into_values().map(|e| e.into_stats()).collect();
 
         // Sort by total_actions descending (Python's reverse=True on key=lambda x: x["total_actions"])
         result.sort_by(|a, b| b.total_actions.cmp(&a.total_actions));
@@ -4007,10 +4003,7 @@ fn read_actions_from_file(
 
         // Apply filters before building the action
         if let Some(pf) = platform_filter {
-            let record_platform = data
-                .get("platform")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let record_platform = data.get("platform").and_then(Value::as_str).unwrap_or("");
             if record_platform != pf && default_platform != Some(pf) {
                 continue;
             }
@@ -4147,30 +4140,13 @@ impl TimelineEntry {
     pub fn to_value(&self) -> Value {
         let mut m = Map::new();
         m.insert("round_num".into(), Value::Number(self.round_num.into()));
-        m.insert(
-            "twitter_actions".into(),
-            Value::Number(self.twitter_actions.into()),
-        );
-        m.insert(
-            "reddit_actions".into(),
-            Value::Number(self.reddit_actions.into()),
-        );
-        m.insert(
-            "total_actions".into(),
-            Value::Number(self.total_actions.into()),
-        );
-        m.insert(
-            "active_agents_count".into(),
-            Value::Number(self.active_agents_count.into()),
-        );
+        m.insert("twitter_actions".into(), Value::Number(self.twitter_actions.into()));
+        m.insert("reddit_actions".into(), Value::Number(self.reddit_actions.into()));
+        m.insert("total_actions".into(), Value::Number(self.total_actions.into()));
+        m.insert("active_agents_count".into(), Value::Number(self.active_agents_count.into()));
         m.insert(
             "active_agents".into(),
-            Value::Array(
-                self.active_agents
-                    .iter()
-                    .map(|&id| Value::Number(id.into()))
-                    .collect(),
-            ),
+            Value::Array(self.active_agents.iter().map(|&id| Value::Number(id.into())).collect()),
         );
         m.insert("action_types".into(), Value::Object(self.action_type_counts.clone()));
         Value::Object(m)
@@ -4229,26 +4205,11 @@ impl AgentStats {
         let mut m = Map::new();
         m.insert("agent_id".into(), Value::Number(self.agent_id.into()));
         m.insert("agent_name".into(), Value::String(self.agent_name.clone()));
-        m.insert(
-            "total_actions".into(),
-            Value::Number(self.total_actions.into()),
-        );
-        m.insert(
-            "twitter_actions".into(),
-            Value::Number(self.twitter_actions.into()),
-        );
-        m.insert(
-            "reddit_actions".into(),
-            Value::Number(self.reddit_actions.into()),
-        );
-        m.insert(
-            "first_action_time".into(),
-            Value::String(self.first_action_time.clone()),
-        );
-        m.insert(
-            "last_action_time".into(),
-            Value::String(self.last_action_time.clone()),
-        );
+        m.insert("total_actions".into(), Value::Number(self.total_actions.into()));
+        m.insert("twitter_actions".into(), Value::Number(self.twitter_actions.into()));
+        m.insert("reddit_actions".into(), Value::Number(self.reddit_actions.into()));
+        m.insert("first_action_time".into(), Value::String(self.first_action_time.clone()));
+        m.insert("last_action_time".into(), Value::String(self.last_action_time.clone()));
         m.insert("action_types".into(), Value::Object(self.action_type_counts.clone()));
         Value::Object(m)
     }
@@ -4298,9 +4259,7 @@ mod reader_tests {
     }
 
     /// Create a test runner and dir with sample action logs.
-    fn make_runner_with_logs(
-        sim_id: &str,
-    ) -> (SimulationRunner<MockLlm>, std::path::PathBuf) {
+    fn make_runner_with_logs(sim_id: &str) -> (SimulationRunner<MockLlm>, std::path::PathBuf) {
         let dir = temp_dir(sim_id);
         // The simulation_id becomes the subdirectory
         let sim_dir = dir.join(sim_id);
@@ -4362,11 +4321,8 @@ mod reader_tests {
 
         let manager = Arc::new(SimulationManager::new(&dir));
         let graph_mgr = Arc::new(GraphMemoryManager::<MockLlm>::new());
-        let runner = SimulationRunner::new(
-            &dir,
-            graph_mgr,
-            Arc::clone(&manager) as Arc<SimulationManager>,
-        );
+        let runner =
+            SimulationRunner::new(&dir, graph_mgr, Arc::clone(&manager) as Arc<SimulationManager>);
         (runner, dir)
     }
 
@@ -4374,9 +4330,7 @@ mod reader_tests {
     fn get_actions_returns_paginated_results() {
         let (runner, dir) = make_runner_with_logs("pagination");
         // Use the same sim_id that was used to create logs
-        let actions = runner
-            .get_actions("pagination", 2, 0, None, None, None)
-            .unwrap();
+        let actions = runner.get_actions("pagination", 2, 0, None, None, None).unwrap();
         assert_eq!(actions.len(), 2);
     }
 
@@ -4384,17 +4338,15 @@ mod reader_tests {
     fn get_all_actions_filters_by_platform() {
         let (runner, dir) = make_runner_with_logs("filter-platform");
         // Use the same sim_id that was used to create logs
-        let tw_only = runner
-            .get_all_actions("filter-platform", Some("twitter"), None, None)
-            .unwrap();
+        let tw_only =
+            runner.get_all_actions("filter-platform", Some("twitter"), None, None).unwrap();
         assert_eq!(tw_only.len(), 3);
         for a in &tw_only {
             assert_eq!(a.platform, "twitter");
         }
 
-        let rd_only = runner
-            .get_all_actions("filter-platform", Some("reddit"), None, None)
-            .unwrap();
+        let rd_only =
+            runner.get_all_actions("filter-platform", Some("reddit"), None, None).unwrap();
         assert_eq!(rd_only.len(), 2);
         for a in &rd_only {
             assert_eq!(a.platform, "reddit");
@@ -4405,9 +4357,7 @@ mod reader_tests {
     fn get_all_actions_filters_by_agent_id() {
         let (runner, dir) = make_runner_with_logs("filter-agent");
         // Use the same sim_id that was used to create logs
-        let filtered = runner
-            .get_all_actions("filter-agent", None, Some(1), None)
-            .unwrap();
+        let filtered = runner.get_all_actions("filter-agent", None, Some(1), None).unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].agent_id, 1);
     }
@@ -4426,7 +4376,9 @@ mod reader_tests {
         let stats = runner.get_agent_stats("agent-stats").unwrap();
         assert_eq!(stats.len(), 5); // 3 twitter + 2 reddit agents
         // First agent should be the one with most actions
-        assert!(stats[0].total_actions >= stats[1..].iter().map(|s| s.total_actions).max().unwrap_or(0));
+        assert!(
+            stats[0].total_actions >= stats[1..].iter().map(|s| s.total_actions).max().unwrap_or(0)
+        );
     }
 
     #[test]
@@ -4438,12 +4390,7 @@ mod reader_tests {
         for i in 0..actions.len().saturating_sub(1) {
             let a_ts = parse_timestamp(&actions[i].timestamp);
             let b_ts = parse_timestamp(&actions[i + 1].timestamp);
-            assert!(
-                a_ts >= b_ts,
-                "Action {} timestamp should be >= action {}",
-                i,
-                i + 1
-            );
+            assert!(a_ts >= b_ts, "Action {} timestamp should be >= action {}", i, i + 1);
         }
     }
 
@@ -4471,11 +4418,8 @@ mod reader_tests {
 
         let manager = Arc::new(SimulationManager::new(&dir));
         let graph_mgr = Arc::new(GraphMemoryManager::<MockLlm>::new());
-        let runner = SimulationRunner::new(
-            &dir,
-            graph_mgr,
-            Arc::clone(&manager) as Arc<SimulationManager>,
-        );
+        let runner =
+            SimulationRunner::new(&dir, graph_mgr, Arc::clone(&manager) as Arc<SimulationManager>);
 
         let actions = runner.get_all_actions("sim-legacy", None, None, None).unwrap();
         assert_eq!(actions.len(), 1);
