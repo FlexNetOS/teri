@@ -18,6 +18,14 @@ dest_base: develop
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
 cycles_this_session: 2   # RESUMED 2026-06-17 (11th resume, reset 0); baseline re-verified 880 green.
+# GIT/PR DISCIPLINE (owner-mandated 2026-06-17, post-cycle-2): owner flagged that work was committed locally but
+#   NEVER pushed (38 commits unpushed) + no PRs = DANGEROUS. ACTIONS TAKEN: (1) cargo fmt whole branch (porters ran
+#   clippy not fmt → CI Format gate would've blocked) commit 1afbe0c; (2) PUSHED port/mirofish to origin (fe9d855..
+#   1afbe0c); (3) opened PR #5 port/mirofish→develop (OPEN, HELD until port-DONE per owner choice — NOT auto-merged;
+#   repo has no CI checks so auto-merge would merge incomplete port immediately); (4) repaired develop's non-compiling
+#   tip via repair-only PR #6 (merged → develop tip 7c354a5; config.rs+main.rs only, no [workspace] aid). NEW STANDING
+#   RULE: push port/mirofish every session (cargo fmt first); keep PR #5 open + update body; merge to develop only at
+#   100% DONE. gh fork PRs need -R FlexNetOS/teri.
 # CYCLE2 (11th resume) 2026-06-17: U-020 sub-cycle (b) SimulationIPCClient + SimulationIPCServer (S-477..S-492, 15 [x]
 #   + S-488 [≠]) — opus PASS (DECISION-16 architect, map-onto-substrate) → U-020 COMPLETE. file-based subprocess IPC →
 #   in-process tokio::mpsc<IpcEnvelope> + per-command oneshot<IPCResponse>; client clonable Sender, server Receiver
