@@ -1965,6 +1965,40 @@ impl<L: LlmClient + Send + Sync + 'static> GraphMemoryManager<L> {
         info!("已停止所有图谱记忆更新器");
     }
 
+    /// Fire one action dict into the live updater for `simulation_id`, if one is registered.
+    ///
+    /// This is the manager-side analog of MiroFish's monitor path
+    /// (`simulation_runner.py:_read_action_log` L583-684):
+    /// ```python
+    /// graph_updater = ZepGraphMemoryManager.get_updater(state.simulation_id)
+    /// ...
+    /// if graph_updater:
+    ///     graph_updater.add_activity_from_dict(action_data, platform)
+    /// ```
+    /// MiroFish gets the updater instance out of the registry and calls `add_activity_from_dict`
+    /// on it. In teri the updater lives behind the manager's `Mutex` (a `&` cannot escape the
+    /// guard — see [`get_updater`]'s return-type note), so the call is performed *through* the
+    /// manager while the guard is held. This is sound because
+    /// [`GraphMemoryUpdater::add_activity_from_dict`] takes `&self` and never blocks (it is a
+    /// non-blocking mpsc `send` to the worker — see [`GraphMemoryUpdater::add_activity`]); no
+    /// `.await` happens under the guard beyond the lock acquisition itself.
+    ///
+    /// No-op (silently) when no updater is registered for `simulation_id` — faithful to Python
+    /// where `get_updater` returns `None` and the `if graph_updater:` guard skips the call.
+    /// The `event_type`-skip and field-default logic live in `add_activity_from_dict` (U-021,
+    /// S-525), so this method forwards the raw parsed JSON dict unchanged.
+    pub async fn fire_activity_from_dict(
+        &self,
+        simulation_id: &str,
+        data: &serde_json::Value,
+        platform: &str,
+    ) {
+        let updaters = self.updaters.lock().await;
+        if let Some(updater) = updaters.get(simulation_id) {
+            updater.add_activity_from_dict(data, platform);
+        }
+    }
+
     /// Return stats for every registered updater.
     ///
     /// Port of `ZepGraphMemoryManager.get_all_stats` (S-539, L549-554).

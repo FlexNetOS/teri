@@ -879,7 +879,17 @@ const IPC_CHANNEL_BUFFER: usize = 64;
 /// realize the cooperative-stop signal and the DECISION-16 interview transport.
 pub struct RunHandle {
     /// The real-time run state (S-602 `_run_states[id]`).
-    pub state: SimulationRunState,
+    ///
+    /// Wrapped in `Arc<tokio::sync::Mutex<…>>` because in MiroFish the run-state object is
+    /// **shared mutable state**: `_run_states[id]` is mutated by BOTH the lifecycle methods
+    /// (`start`/`stop`/`cleanup` set status/flags) AND the monitor thread
+    /// (`_read_action_log` calls `state.add_action(...)`, sets `current_round`,
+    /// `twitter_completed`, `runner_status=COMPLETED`, …). The monitor (sub-cycle c) runs as a
+    /// separate task that must write the SAME state `get_run_state` returns, so the state lives
+    /// behind a shared `Arc<Mutex>` both the runner and the monitor task hold. (Sub-cycle (b)
+    /// stored this as a plain `SimulationRunState`; (c) shares it — the only lifecycle rework
+    /// the monitor required.)
+    pub state: Arc<tokio::sync::Mutex<SimulationRunState>>,
     /// The spawned simulation task — the in-process analog of `_processes[id]`'s `Popen`
     /// (S-603). Driving `SimEngine::run`. `abort()` is the SIGKILL analog.
     task: JoinHandle<()>,
@@ -889,8 +899,9 @@ pub struct RunHandle {
     /// In-process IPC client for interview/close-env round-trips (DECISION-16). The paired
     /// server is owned by the sim task. (`[≠]` replaces the file-IPC the Popen child used.)
     ipc_client: SimulationIPCClient,
-    /// The monitor task (`_monitor_threads[id]`, S-605). Ported in sub-cycle (c); `None`
-    /// here. `stop`/`cleanup_all` abort it if present, so (c) needs no lifecycle rework.
+    /// The monitor task (`_monitor_threads[id]`, S-605). Spawned in sub-cycle (c) by
+    /// [`SimulationRunner::start_simulation`]. `stop`/`cleanup_all` abort it if present so it
+    /// does not outlive the run (the daemon-thread teardown analog).
     monitor: Option<JoinHandle<()>>,
     /// Whether graph-memory updating is enabled for this run (S-608 `_graph_memory_enabled[id]`).
     graph_enabled: bool,
@@ -994,11 +1005,14 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
     ///
     /// Returns a clone (the live state lives behind the `runs` mutex; a borrow cannot escape).
     pub async fn get_run_state(&self, simulation_id: &str) -> Result<Option<SimulationRunState>> {
-        {
+        // Take a clone of the shared-state Arc out of the map (drop the runs lock before we
+        // lock the per-run state mutex — never hold two locks nested).
+        let state_arc = {
             let runs = self.runs.lock().await;
-            if let Some(handle) = runs.get(simulation_id) {
-                return Ok(Some(handle.state.clone()));
-            }
+            runs.get(simulation_id).map(|h| Arc::clone(&h.state))
+        };
+        if let Some(arc) = state_arc {
+            return Ok(Some(arc.lock().await.clone()));
         }
         // Not in memory — load from disk (S-610).
         load_run_state(&self.sim_data_dir, simulation_id)
@@ -1148,6 +1162,12 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
         let RunInputs { mut engine, pool, graph, llm } = inputs;
         engine.with_shutdown(Arc::clone(&shutdown));
 
+        // Subscribe to the terminal completion signal (U-048) BEFORE the engine moves into the
+        // spawned task — this receiver is the monitor's loop-exit signal, replacing Python's
+        // `process.poll()` (DECISION-17 §17 Area 2). `watch` retains the final value, so even if
+        // the run finishes before the monitor first polls, the monitor still observes `Some(..)`.
+        let completion_rx = engine.subscribe_completion();
+
         let task = spawn_sim_task(engine, pool, graph, llm, ipc_server);
 
         // process_pid stays None ([≠] value-only — no OS pid). runner_status → Running.
@@ -1156,12 +1176,31 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
 
         tracing::info!("模拟启动成功: {}, platform={}", simulation_id, platform);
 
+        // (7b) Spawn the monitor task (`_monitor_threads[id]`, S-605/S-613). It tails the
+        // per-platform `actions.jsonl` files by byte offset (S-614 / U-047), fires graph-memory
+        // per new action when enabled, detects `simulation_end` → COMPLETED (dual-platform gated
+        // by S-615), and updates `current_round`/`simulated_hours` from `round_end` events. The
+        // shared run-state Arc is the SAME one `get_run_state` reads, so the monitor's writes are
+        // observable. The monitor loops on the 2s poll cadence until the run task finishes (via
+        // `completion_rx`), then does ONE final tail pass so no trailing action is lost.
+        let state_arc = Arc::new(tokio::sync::Mutex::new(state.clone()));
+        let monitor = spawn_monitor_task(
+            MonitorContext {
+                simulation_id: simulation_id.to_string(),
+                sim_data_dir: self.sim_data_dir.clone(),
+                state: Arc::clone(&state_arc),
+                graph_mgr: Arc::clone(&self.graph_mgr),
+                graph_enabled,
+            },
+            completion_rx,
+        );
+
         let handle = RunHandle {
-            state: state.clone(),
+            state: state_arc,
             task,
             shutdown,
             ipc_client,
-            monitor: None, // set in sub-cycle (c)
+            monitor: Some(monitor),
             graph_enabled,
         };
 
@@ -1198,7 +1237,7 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
 
         // Determine the current status for the precondition checks.
         let current_status = match &handle {
-            Some(h) => h.state.runner_status.clone(),
+            Some(h) => h.state.lock().await.runner_status.clone(),
             None => match load_run_state(&self.sim_data_dir, simulation_id)? {
                 Some(s) => s.runner_status,
                 None => {
@@ -1221,7 +1260,7 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
         // (3): transition to Stopping, persist. Build the working state from the live handle
         // if present, else from disk.
         let mut state = match &handle {
-            Some(h) => h.state.clone(),
+            Some(h) => h.state.lock().await.clone(),
             None => load_run_state(&self.sim_data_dir, simulation_id)?
                 .unwrap_or_else(|| SimulationRunState::new(simulation_id.to_string())),
         };
@@ -1326,7 +1365,7 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
             terminate_handle(&mut handle, &simulation_id, CLEANUP_GRACE).await;
 
             // Update run_state.json (L1234-1241).
-            let mut state = handle.state.clone();
+            let mut state = handle.state.lock().await.clone();
             state.runner_status = RunnerStatus::Stopped;
             state.twitter_running = false;
             state.reddit_running = false;
@@ -1457,6 +1496,439 @@ async fn terminate_handle(handle: &mut RunHandle, simulation_id: &str, grace: Du
         monitor.abort();
         let _ = monitor.await;
     }
+}
+
+// ===========================================================================
+// Simulation MONITOR — sub-cycle (c)
+//
+// Ports S-613 (`_monitor_simulation`), S-614 (`_read_action_log`), S-615
+// (`_check_all_platforms_completed`), and populates S-605 (`_monitor_threads` →
+// `RunHandle.monitor`, spawned in `start_simulation` above).
+//
+// REALIZES U-047 `JSONL_TAIL_CONTRACT` (S-1056): the offset/seek incremental reader
+// ([`read_action_log`]) is the byte-offset tail — seek to the last offset, read only
+// NEW complete lines, advance the offset only past complete lines (a trailing line
+// without a newline is a partial write and is NOT consumed until the next poll sees it
+// newline-terminated), never re-read, never lose a line.
+//
+// Monitor source — tail U-010's `actions.jsonl` by byte offset (DECISION-17 §17 Area 2,
+// "Monitor source decision"). teri's `SimEngine` writes the SAME `{sim_dir}/{platform}/
+// actions.jsonl` via `PlatformActionLogger` (U-010); the monitor re-derives run-state
+// from that log exactly as MiroFish's `_read_action_log` does (`f.seek(position)` →
+// readline → `f.tell()`). U-048's `subscribe_completion()` is the loop-exit signal,
+// replacing Python's `process.poll()` (DECISION-17 §17 Area 2).
+//
+// `[≠]` in this sub-cycle:
+//   - The OS-thread `daemon=True` flag (`simulation_runner.py:467`) — a tokio task is
+//     inherently tied to the runtime; the OBSERVABLE "monitor dies with the run" is PORTED
+//     via `terminate_handle` aborting `RunHandle.monitor` on stop/cleanup/shutdown.
+//   - The non-zero `exit_code` → FAILED branch + `simulation.log` tail read
+//     (`simulation_runner.py:524-544`): there is no OS exit code in-process. teri's sim
+//     task returns `Result`; a run that ends without emitting `simulation_end` simply leaves
+//     the state as last persisted (RUNNING flags cleared on the natural-end path below). The
+//     COMPLETED-via-`simulation_end` path (the observable success contract) IS PORTED; the
+//     exit-code FAILED branch is the OS-mechanism `[≠]` (the run-failure observable is carried
+//     by the sim task's own error logging + the `Failed` transitions in `start_simulation`).
+// ===========================================================================
+
+/// Poll cadence for the monitor loop — mirrors MiroFish `time.sleep(2)`
+/// (`simulation_runner.py:517`). The 2s interval is an observable cadence and is preserved.
+const MONITOR_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Everything the monitor task needs to tail the action logs and update the shared run-state.
+///
+/// Owned by the spawned monitor task (it is `'static`); built in `start_simulation`.
+struct MonitorContext<L: LlmClient + Send + Sync + 'static> {
+    /// The simulation id (for log lines + graph-fire routing).
+    simulation_id: String,
+    /// Root simulation-data dir; the per-platform logs live at `{dir}/{id}/{platform}/actions.jsonl`.
+    sim_data_dir: std::path::PathBuf,
+    /// The SHARED run-state — the same `Arc<Mutex>` `get_run_state` reads, so monitor writes
+    /// are observable (`add_action`, `current_round`, `*_completed`, `runner_status=COMPLETED`).
+    state: Arc<tokio::sync::Mutex<SimulationRunState>>,
+    /// Graph-memory manager (U-021) — the monitor fires `add_activity_from_dict` per new action
+    /// through it when `graph_enabled` (the `get_updater(...).add_activity_from_dict(...)` analog).
+    graph_mgr: Arc<GraphMemoryManager<L>>,
+    /// Whether graph-memory updating is enabled for this run (`_graph_memory_enabled[id]`).
+    graph_enabled: bool,
+}
+
+/// Spawn the monitor task (`_monitor_threads[id]`, S-605). Returns its `JoinHandle` for storage
+/// in `RunHandle.monitor` (aborted by `terminate_handle` on stop/cleanup).
+///
+/// `completion_rx` (U-048 terminal signal) is passed separately from `ctx` because the loop needs
+/// `&mut` access to it (for `changed()`/`borrow()`), while the per-poll readers borrow `ctx`
+/// read-only — keeping them in separate values avoids a partial-move/borrow conflict.
+fn spawn_monitor_task<L: LlmClient + Send + Sync + 'static>(
+    ctx: MonitorContext<L>,
+    completion_rx: tokio::sync::watch::Receiver<Option<crate::sim::SimCompletion>>,
+) -> JoinHandle<()> {
+    tokio::spawn(monitor_simulation(ctx, completion_rx))
+}
+
+/// Port of `SimulationRunner._monitor_simulation` (S-613, `simulation_runner.py:481-544`).
+///
+/// The daemon monitor loop:
+/// 1. Polls the per-platform `actions.jsonl` files every [`MONITOR_POLL_INTERVAL`] (2s) by BYTE
+///    POSITION (the [`read_action_log`] seek pattern), parsing only NEW complete lines.
+/// 2. Fires `ZepGraphMemoryUpdater.add_activity_from_dict` per action WHEN graph memory is enabled
+///    (inside [`read_action_log`], via the graph manager).
+/// 3. Detects the `simulation_end` event to mark the platform completed and — once ALL enabled
+///    platforms have completed ([`check_all_platforms_completed`], S-615) — sets the run COMPLETED.
+/// 4. Persists `run_state.json` after each poll (Python L514 `_save_run_state(state)`).
+///
+/// Loop exit: the in-process analog of `while process.poll() is None` is the U-048 completion
+/// watch (`completion_rx`). When the sim task finishes (signals `Some(SimCompletion)`), the loop
+/// breaks and does ONE FINAL tail pass (Python L518-522 "进程结束后，最后读取一次日志") so no action
+/// written between the last poll and the end signal is lost. The task is also abortable (the
+/// daemon-thread teardown analog) via `RunHandle.monitor` in `terminate_handle`.
+async fn monitor_simulation<L: LlmClient + Send + Sync + 'static>(
+    ctx: MonitorContext<L>,
+    mut completion_rx: tokio::sync::watch::Receiver<Option<crate::sim::SimCompletion>>,
+) {
+    let sim_dir = ctx.sim_data_dir.join(&ctx.simulation_id);
+    let twitter_log = sim_dir.join("twitter").join("actions.jsonl");
+    let reddit_log = sim_dir.join("reddit").join("actions.jsonl");
+
+    // Per-file byte offsets — the U-047 tail position. Monotonic per file (advanced only past
+    // complete lines). Start at 0 (read from the beginning on the first poll).
+    let mut twitter_position: u64 = 0;
+    let mut reddit_position: u64 = 0;
+
+    // `completion_rx` starts at `None`; `Some(..)` means the run task finished (poll() is not None).
+
+    loop {
+        // poll() is None ⇒ still running. Check the watch's current value WITHOUT consuming it.
+        let finished = completion_rx.borrow().is_some();
+        if finished {
+            break;
+        }
+
+        // Read Twitter actions (only if the file exists — Python `os.path.exists` guard, L506).
+        if twitter_log.exists() {
+            twitter_position =
+                read_action_log(&twitter_log, twitter_position, &ctx, "twitter").await;
+        }
+        // Read Reddit actions (L511).
+        if reddit_log.exists() {
+            reddit_position = read_action_log(&reddit_log, reddit_position, &ctx, "reddit").await;
+        }
+
+        // Persist state after the poll (Python L514 `cls._save_run_state(state)`).
+        {
+            let state = ctx.state.lock().await;
+            if let Err(e) = save_run_state(&ctx.sim_data_dir, &state) {
+                tracing::warn!("保存运行状态失败: {}, error={}", ctx.simulation_id, e);
+            }
+        }
+
+        // Sleep the poll interval OR wake early when completion fires (whichever first). Waking
+        // early on completion lets the final-pass run promptly; the 2s cadence is otherwise honored.
+        tokio::select! {
+            _ = tokio::time::sleep(MONITOR_POLL_INTERVAL) => {}
+            res = completion_rx.changed() => {
+                // `changed()` resolves when the value transitions to Some(..) (or the sender drops).
+                // Either way the run is over; loop back, the top-of-loop check breaks out.
+                let _ = res;
+            }
+        }
+    }
+
+    // Process ended — FINAL read pass so no trailing action is lost (Python L518-522).
+    if twitter_log.exists() {
+        twitter_position = read_action_log(&twitter_log, twitter_position, &ctx, "twitter").await;
+    }
+    if reddit_log.exists() {
+        reddit_position = read_action_log(&reddit_log, reddit_position, &ctx, "reddit").await;
+    }
+    // Offsets consumed only to satisfy the final assignment (mirrors Python reusing `*_position`).
+    let _ = (twitter_position, reddit_position);
+
+    // Natural-end housekeeping: clear the platform running flags + persist (Python L545-547
+    // `state.twitter_running = False; state.reddit_running = False; _save_run_state(state)`).
+    // The COMPLETED transition itself happens inside `read_action_log` on `simulation_end`; the
+    // OS-exit-code → FAILED branch (L524-544) is `[≠]` (no OS exit code in-process — see module
+    // note). A run that ended cleanly has already been marked COMPLETED by the final pass above.
+    {
+        let mut state = ctx.state.lock().await;
+        state.twitter_running = false;
+        state.reddit_running = false;
+        if let Err(e) = save_run_state(&ctx.sim_data_dir, &state) {
+            tracing::warn!("保存运行状态失败: {}, error={}", ctx.simulation_id, e);
+        }
+    }
+
+    // Stop the graph-memory updater (Python L549-557 `finally:` block — stop updater if enabled).
+    if ctx.graph_enabled {
+        ctx.graph_mgr.stop_updater(&ctx.simulation_id).await;
+        tracing::info!("已停止图谱记忆更新: simulation_id={}", ctx.simulation_id);
+    }
+
+    tracing::info!("模拟监控结束: {}", ctx.simulation_id);
+}
+
+/// Port of `SimulationRunner._read_action_log` (S-614, `simulation_runner.py:559-688`) — the
+/// offset/seek incremental reader that REALIZES U-047 `JSONL_TAIL_CONTRACT` (S-1056).
+///
+/// Opens the JSONL, seeks to the last byte `position`, reads only NEW **complete** lines (a line
+/// is complete iff it is newline-terminated), parses each, applies its side effects to the shared
+/// run-state, and returns the NEW byte offset (the position past the last complete line consumed).
+///
+/// # U-047 tail invariants (preserved exactly)
+/// - **No re-read:** the seek to `position` skips everything already consumed.
+/// - **No partial-line loss / no partial-line consumption:** a trailing fragment without a `\n`
+///   is NOT consumed; the returned offset stops at the end of the last complete (newline-
+///   terminated) line, so the next poll re-reads the fragment once it is newline-terminated.
+///   (MiroFish relies on Python's `for line in f` yielding only newline-terminated lines while the
+///   writer appends atomically per `writeln!`; we make the newline-boundary explicit so a
+///   half-flushed final line is never parsed.)
+/// - **Offset monotonic** per file (advanced only past complete lines).
+/// - **Robust to a growing file** between polls (each poll seeks to the prior offset and reads the
+///   delta) and to **read errors** (logged; the offset is left unchanged so the next poll retries —
+///   Python L686-688 `except Exception: return position`).
+///
+/// # Per-line dispatch (mirrors Python L569-684 exactly)
+/// - Blank lines are skipped (Python `if line:`).
+/// - A line that is not valid JSON is skipped (Python `except json.JSONDecodeError: pass`).
+/// - A record with an `event_type`:
+///   - `"simulation_end"` → mark the platform completed + not-running; if
+///     [`check_all_platforms_completed`] is now true → run `runner_status=COMPLETED` + `completed_at`.
+///   - `"round_end"` → update per-platform `*_current_round` (monotonic max) + `*_simulated_hours`,
+///     and the global `current_round` (max) + `simulated_hours` (max of the two platforms).
+///   - any other `event_type` → `continue` (no action; NOT added as an action).
+/// - Otherwise it is an action record → build an [`AgentAction`] (Python field defaults), call
+///   `state.add_action(...)` (S-596 cap/counter/updated_at), bump global `current_round` if larger,
+///   and — when `graph_enabled` — fire `add_activity_from_dict(raw_dict, platform)` (U-021).
+///
+/// Returns the new byte offset; on any I/O/seek error returns `position` unchanged.
+async fn read_action_log<L: LlmClient + Send + Sync + 'static>(
+    log_path: &Path,
+    position: u64,
+    ctx: &MonitorContext<L>,
+    platform: &str,
+) -> u64 {
+    use std::io::{Read, Seek, SeekFrom};
+
+    // Open + seek to the last offset (Python `open(...)` + `f.seek(position)`, L578-580).
+    let mut file = match std::fs::File::open(log_path) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!("读取动作日志失败: {}, error={}", log_path.display(), e);
+            return position;
+        }
+    };
+    if let Err(e) = file.seek(SeekFrom::Start(position)) {
+        tracing::warn!("读取动作日志失败: {}, error={}", log_path.display(), e);
+        return position;
+    }
+
+    // Read the delta from `position` to EOF.
+    let mut buf = Vec::new();
+    if let Err(e) = file.read_to_end(&mut buf) {
+        tracing::warn!("读取动作日志失败: {}, error={}", log_path.display(), e);
+        return position;
+    }
+
+    // Split into COMPLETE (newline-terminated) lines only. A trailing fragment without a newline
+    // is a partial write — leave it unconsumed (U-047 partial-line safety) by not advancing the
+    // offset past it and not parsing it.
+    let mut consumed: u64 = 0; // bytes of complete lines consumed this pass
+    let mut new_position = position;
+
+    // Iterate line-by-line over the buffer, tracking the byte length (incl. the `\n`) of each
+    // complete line so the offset advances by exact bytes (UTF-8-safe; lengths are byte counts).
+    let mut start = 0usize;
+    while let Some(rel_nl) = buf[start..].iter().position(|&b| b == b'\n') {
+        let line_end = start + rel_nl; // index of '\n'
+        let line_bytes = &buf[start..line_end]; // line WITHOUT the trailing '\n'
+        // Advance the consumed byte count past this complete line INCLUDING its '\n'.
+        consumed += (line_end - start + 1) as u64;
+        new_position = position + consumed;
+        start = line_end + 1;
+
+        // Decode + strip (Python `line.strip()`). Lossy decode is safe: the writer emits UTF-8.
+        let line = String::from_utf8_lossy(line_bytes);
+        let line = line.trim();
+        if line.is_empty() {
+            continue; // Python `if line:`
+        }
+        // Parse JSON; skip on error (Python `except json.JSONDecodeError: pass`).
+        let action_data: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        apply_log_record(&action_data, ctx, platform).await;
+    }
+
+    new_position
+}
+
+/// Apply one parsed JSONL record's side effects to the shared run-state (and fire graph memory).
+///
+/// Factored out of [`read_action_log`] so the lock-scoping discipline is explicit: the shared
+/// state mutex is held ONLY for the synchronous state mutation, and is DROPPED before the
+/// (potentially-awaiting) graph-memory fire — never held across `.await`.
+async fn apply_log_record<L: LlmClient + Send + Sync + 'static>(
+    action_data: &Value,
+    ctx: &MonitorContext<L>,
+    platform: &str,
+) {
+    // ---- event_type records (Python L585-661) ----
+    if let Some(event_type) = action_data.get("event_type").and_then(Value::as_str) {
+        match event_type {
+            "simulation_end" => {
+                // Mark this platform completed + not-running; gate run-COMPLETED on ALL platforms.
+                let mut state = ctx.state.lock().await;
+                match platform {
+                    "twitter" => {
+                        state.twitter_completed = true;
+                        state.twitter_running = false;
+                        tracing::info!(
+                            "Twitter 模拟已完成: {}, total_rounds={:?}, total_actions={:?}",
+                            ctx.simulation_id,
+                            action_data.get("total_rounds"),
+                            action_data.get("total_actions"),
+                        );
+                    }
+                    "reddit" => {
+                        state.reddit_completed = true;
+                        state.reddit_running = false;
+                        tracing::info!(
+                            "Reddit 模拟已完成: {}, total_rounds={:?}, total_actions={:?}",
+                            ctx.simulation_id,
+                            action_data.get("total_rounds"),
+                            action_data.get("total_actions"),
+                        );
+                    }
+                    _ => {}
+                }
+                // Dual-platform gate (S-615): COMPLETED only when ALL enabled platforms done.
+                if check_all_platforms_completed(&ctx.sim_data_dir, &state) {
+                    state.runner_status = RunnerStatus::Completed;
+                    state.completed_at = Some(crate::models::project::python_isoformat_local());
+                    tracing::info!("所有平台模拟已完成: {}", ctx.simulation_id);
+                }
+            }
+            "round_end" => {
+                // Per-platform + global round / simulated-hours updates (Python L642-661).
+                let round_num = action_data.get("round").and_then(Value::as_i64).unwrap_or(0);
+                let simulated_hours =
+                    action_data.get("simulated_hours").and_then(Value::as_i64).unwrap_or(0);
+                let mut state = ctx.state.lock().await;
+                match platform {
+                    "twitter" => {
+                        if round_num > state.twitter_current_round {
+                            state.twitter_current_round = round_num;
+                        }
+                        state.twitter_simulated_hours = simulated_hours;
+                    }
+                    "reddit" => {
+                        if round_num > state.reddit_current_round {
+                            state.reddit_current_round = round_num;
+                        }
+                        state.reddit_simulated_hours = simulated_hours;
+                    }
+                    _ => {}
+                }
+                // Global round = max; global simulated_hours = max of the two platforms (L658-661).
+                if round_num > state.current_round {
+                    state.current_round = round_num;
+                }
+                state.simulated_hours =
+                    state.twitter_simulated_hours.max(state.reddit_simulated_hours);
+            }
+            // Any other event_type → `continue` in Python (no action recorded).
+            _ => {}
+        }
+        return; // Python `continue` after handling an event_type record (L661).
+    }
+
+    // ---- action records (Python L663-684) ----
+    // Build the AgentAction with Python-identical field defaults. NOTE the U-010 ↔ U-022 field
+    // alignment: U-010's `log_action` writes `"round"` (NOT `round_num`), `agent_id`, `agent_name`,
+    // `action_type`, `action_args`, `result`, `success`, `timestamp` — and NO `platform` key (the
+    // platform is the directory). The monitor maps `"round"` → `round_num` and supplies `platform`
+    // from the file location, EXACTLY as MiroFish's `_read_action_log` does (L665-674).
+    let action = AgentAction {
+        round_num: action_data.get("round").and_then(Value::as_i64).unwrap_or(0),
+        timestamp: action_data
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(crate::models::project::python_isoformat_local),
+        platform: platform.to_string(),
+        agent_id: action_data.get("agent_id").and_then(Value::as_i64).unwrap_or(0),
+        agent_name: action_data.get("agent_name").and_then(Value::as_str).unwrap_or("").to_string(),
+        action_type: action_data
+            .get("action_type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        action_args: action_data
+            .get("action_args")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default(),
+        result: action_data.get("result").and_then(Value::as_str).map(str::to_string),
+        success: action_data.get("success").and_then(Value::as_bool).unwrap_or(true),
+    };
+
+    // State mutation under the lock ONLY (no .await held across it).
+    {
+        let mut state = ctx.state.lock().await;
+        let round_num = action.round_num;
+        state.add_action(action); // S-596: insert-at-front, cap 50, per-platform count, updated_at
+        // Update global round (Python L677-678).
+        if round_num != 0 && round_num > state.current_round {
+            state.current_round = round_num;
+        }
+    } // lock dropped here
+
+    // Fire graph memory per action when enabled (Python L681-684) — AFTER dropping the state lock.
+    // The raw parsed dict is forwarded unchanged; U-021's `add_activity_from_dict` does the
+    // `event_type`-skip (already excluded above) + field defaults + DO_NOTHING filter.
+    if ctx.graph_enabled {
+        ctx.graph_mgr
+            .fire_activity_from_dict(&ctx.simulation_id, action_data, platform)
+            .await;
+    }
+}
+
+/// Port of `SimulationRunner._check_all_platforms_completed` (S-615,
+/// `simulation_runner.py:694-718`).
+///
+/// Dual-platform completion gate: a platform is "enabled" iff its `actions.jsonl` exists; the run
+/// is complete iff EVERY enabled platform has its `*_completed` flag set (and at least one platform
+/// is enabled). Returns `true` only when all enabled platforms have completed.
+///
+/// Exact Python logic (L709-718):
+/// ```python
+/// twitter_enabled = os.path.exists(twitter_log)
+/// reddit_enabled  = os.path.exists(reddit_log)
+/// if twitter_enabled and not state.twitter_completed: return False
+/// if reddit_enabled and not state.reddit_completed:  return False
+/// return twitter_enabled or reddit_enabled
+/// ```
+fn check_all_platforms_completed(sim_data_dir: &Path, state: &SimulationRunState) -> bool {
+    let sim_dir = sim_data_dir.join(&state.simulation_id);
+    let twitter_log = sim_dir.join("twitter").join("actions.jsonl");
+    let reddit_log = sim_dir.join("reddit").join("actions.jsonl");
+
+    // A platform is enabled iff its actions.jsonl exists (Python L706-707).
+    let twitter_enabled = twitter_log.exists();
+    let reddit_enabled = reddit_log.exists();
+
+    // An enabled-but-not-completed platform blocks completion (Python L710-713).
+    if twitter_enabled && !state.twitter_completed {
+        return false;
+    }
+    if reddit_enabled && !state.reddit_completed {
+        return false;
+    }
+
+    // At least one platform must be enabled AND completed (Python L716-717).
+    twitter_enabled || reddit_enabled
 }
 
 // ---------------------------------------------------------------------------
@@ -2731,5 +3203,558 @@ mod lifecycle_tests {
 
         // Both drained.
         assert!(runner.get_running_simulations().await.is_empty());
+    }
+}
+
+// ===========================================================================
+// Tests — Simulation MONITOR (sub-cycle c): offset-tail, graph-fire, completion,
+// dual-platform gate, final-read-after-end.
+//
+// These exercise S-613 (`monitor_simulation`), S-614 (`read_action_log` / U-047
+// S-1056), S-615 (`check_all_platforms_completed`) directly and end-to-end.
+// ===========================================================================
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::*;
+    use crate::graph::KnowledgeGraph;
+    use crate::llm::{ChatMessage, ChatOptions, LlmClient};
+    use crate::services::graph_memory::GraphMemoryManager;
+    use async_trait::async_trait;
+    use std::env;
+    use std::io::Write;
+    use std::pin::Pin;
+
+    // ---- Mock LLM (unused by the updater worker on the happy path; required by the type). ----
+    struct MockLlm;
+    #[async_trait]
+    impl LlmClient for MockLlm {
+        async fn complete(&self, _: &str) -> Result<String> {
+            Ok("Think(idle)".to_string())
+        }
+        async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+            Err(TeriError::Llm("not used".into()))
+        }
+        async fn stream(
+            &self,
+            _: &str,
+        ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            Err(TeriError::Llm("not used".into()))
+        }
+        async fn chat(&self, _: &[ChatMessage], _: &ChatOptions) -> Result<String> {
+            Err(TeriError::Llm("not used".into()))
+        }
+        async fn chat_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _: &[ChatMessage],
+            _: &ChatOptions,
+        ) -> Result<T> {
+            Err(TeriError::Llm("not used".into()))
+        }
+    }
+
+    fn temp_dir(suffix: &str) -> std::path::PathBuf {
+        let mut p = env::temp_dir();
+        p.push(format!(
+            "teri_test_sim_monitor_{}_{}_{}",
+            std::process::id(),
+            suffix,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p
+    }
+
+    /// The 4-tuple `make_ctx` returns: the monitor context, its temp dir, the shared run-state
+    /// Arc (to assert on after a read), and the graph manager Arc (to assert graph-fire).
+    type CtxFixture = (
+        MonitorContext<MockLlm>,
+        std::path::PathBuf,
+        Arc<tokio::sync::Mutex<SimulationRunState>>,
+        Arc<GraphMemoryManager<MockLlm>>,
+    );
+
+    /// Build a bare `MonitorContext<MockLlm>` over a fresh temp dir for one sim id. Returns the
+    /// context, the dir, the shared state Arc, and the graph manager Arc.
+    fn make_ctx(suffix: &str, sim_id: &str, graph_enabled: bool) -> CtxFixture {
+        let dir = temp_dir(suffix);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(tokio::sync::Mutex::new(SimulationRunState::new(sim_id.to_string())));
+        let graph_mgr = Arc::new(GraphMemoryManager::<MockLlm>::new());
+        let ctx = MonitorContext {
+            simulation_id: sim_id.to_string(),
+            sim_data_dir: dir.clone(),
+            state: Arc::clone(&state),
+            graph_mgr: Arc::clone(&graph_mgr),
+            graph_enabled,
+        };
+        (ctx, dir, state, graph_mgr)
+    }
+
+    /// Append a single JSONL line (newline-terminated) to `{dir}/{sim_id}/{platform}/actions.jsonl`.
+    fn append_line(dir: &Path, sim_id: &str, platform: &str, value: &Value) {
+        let pdir = dir.join(sim_id).join(platform);
+        std::fs::create_dir_all(&pdir).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(pdir.join("actions.jsonl"))
+            .unwrap();
+        writeln!(f, "{}", serde_json::to_string(value).unwrap()).unwrap();
+    }
+
+    /// Append RAW bytes (no auto newline) — for partial-line tests.
+    fn append_raw(dir: &Path, sim_id: &str, platform: &str, bytes: &str) {
+        let pdir = dir.join(sim_id).join(platform);
+        std::fs::create_dir_all(&pdir).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(pdir.join("actions.jsonl"))
+            .unwrap();
+        f.write_all(bytes.as_bytes()).unwrap();
+    }
+
+    fn action_value(round: i64, agent_id: i64, action_type: &str) -> Value {
+        serde_json::json!({
+            "round": round,
+            "timestamp": "2026-06-17T10:00:00",
+            "agent_id": agent_id,
+            "agent_name": format!("agent-{agent_id}"),
+            "action_type": action_type,
+            "action_args": {"content": "hello"},
+            "result": null,
+            "success": true,
+        })
+    }
+
+    fn log_path(dir: &Path, sim_id: &str, platform: &str) -> std::path::PathBuf {
+        dir.join(sim_id).join(platform).join("actions.jsonl")
+    }
+
+    // -----------------------------------------------------------------------
+    // read_action_log — the U-047 offset tail (S-614 / S-1056)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn read_action_log_reads_new_lines_and_returns_offset() {
+        let sim_id = "tail-basic";
+        let (ctx, dir, state, _g) = make_ctx("tail_basic", sim_id, false);
+        append_line(&dir, sim_id, "twitter", &action_value(1, 7, "CREATE_POST"));
+        append_line(&dir, sim_id, "twitter", &action_value(1, 8, "LIKE_POST"));
+
+        let path = log_path(&dir, sim_id, "twitter");
+        let off = read_action_log(&path, 0, &ctx, "twitter").await;
+
+        // Both actions consumed → 2 recent_actions, twitter count == 2, current_round == 1.
+        let s = state.lock().await;
+        assert_eq!(s.recent_actions.len(), 2);
+        assert_eq!(s.twitter_actions_count, 2);
+        assert_eq!(s.current_round, 1);
+        // Offset advanced to EOF (file size).
+        assert_eq!(off, std::fs::metadata(&path).unwrap().len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_action_log_no_double_read_across_polls() {
+        // The core U-047 invariant: a second poll from the returned offset must NOT re-read the
+        // already-consumed lines, only the NEW one appended between polls.
+        let sim_id = "tail-nodouble";
+        let (ctx, dir, state, _g) = make_ctx("tail_nodouble", sim_id, false);
+        append_line(&dir, sim_id, "twitter", &action_value(1, 1, "CREATE_POST"));
+
+        let path = log_path(&dir, sim_id, "twitter");
+        let off1 = read_action_log(&path, 0, &ctx, "twitter").await;
+        assert_eq!(state.lock().await.recent_actions.len(), 1);
+
+        // File grows between polls (one more line).
+        append_line(&dir, sim_id, "twitter", &action_value(2, 2, "LIKE_POST"));
+        let off2 = read_action_log(&path, off1, &ctx, "twitter").await;
+
+        // Exactly ONE more action consumed (no re-read of the first line).
+        let s = state.lock().await;
+        assert_eq!(s.recent_actions.len(), 2, "second poll must read only the NEW line");
+        assert_eq!(s.twitter_actions_count, 2);
+        assert!(off2 > off1, "offset must advance past the growth");
+        assert_eq!(off2, std::fs::metadata(&path).unwrap().len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_action_log_partial_line_not_consumed() {
+        // A trailing line WITHOUT a newline is a partial write — it must NOT be parsed/consumed,
+        // and the offset must stop at the end of the last COMPLETE (newline-terminated) line.
+        let sim_id = "tail-partial";
+        let (ctx, dir, state, _g) = make_ctx("tail_partial", sim_id, false);
+        // One complete line, then a partial fragment (no newline).
+        append_line(&dir, sim_id, "twitter", &action_value(1, 1, "CREATE_POST"));
+        let complete_len = {
+            let path = log_path(&dir, sim_id, "twitter");
+            std::fs::metadata(&path).unwrap().len()
+        };
+        append_raw(&dir, sim_id, "twitter", "{\"round\": 2, \"agent_id\": 2, \"action_t");
+
+        let path = log_path(&dir, sim_id, "twitter");
+        let off = read_action_log(&path, 0, &ctx, "twitter").await;
+
+        // Only the complete line consumed; the partial fragment is left for the next poll.
+        let s = state.lock().await;
+        assert_eq!(s.recent_actions.len(), 1, "partial line must NOT be consumed");
+        assert_eq!(off, complete_len, "offset must stop at the last complete line, not EOF");
+        drop(s);
+
+        // Now the writer finishes the line (newline-terminate it). Next poll consumes it exactly once.
+        append_raw(&dir, sim_id, "twitter", "ype\": \"LIKE_POST\", \"success\": true}\n");
+        let off2 = read_action_log(&path, off, &ctx, "twitter").await;
+        let s = state.lock().await;
+        assert_eq!(s.recent_actions.len(), 2, "the now-complete line must be consumed once");
+        assert_eq!(off2, std::fs::metadata(&path).unwrap().len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_action_log_skips_blank_and_invalid_lines() {
+        let sim_id = "tail-skip";
+        let (ctx, dir, state, _g) = make_ctx("tail_skip", sim_id, false);
+        // blank line, an invalid-JSON line, then a valid action.
+        append_raw(&dir, sim_id, "twitter", "\n");
+        append_raw(&dir, sim_id, "twitter", "not json at all\n");
+        append_line(&dir, sim_id, "twitter", &action_value(1, 1, "CREATE_POST"));
+
+        let path = log_path(&dir, sim_id, "twitter");
+        let off = read_action_log(&path, 0, &ctx, "twitter").await;
+        let s = state.lock().await;
+        assert_eq!(s.recent_actions.len(), 1, "blank + invalid lines skipped, valid one kept");
+        // Offset still advances past ALL complete lines (blank + invalid + valid all newline-term).
+        assert_eq!(off, std::fs::metadata(&path).unwrap().len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_action_log_event_types_not_added_as_actions() {
+        let sim_id = "tail-events";
+        let (ctx, dir, state, _g) = make_ctx("tail_events", sim_id, false);
+        // round_end + an unknown event + simulation_end — none are "actions".
+        append_line(
+            &dir,
+            sim_id,
+            "twitter",
+            &serde_json::json!({"event_type": "round_end", "round": 5, "simulated_hours": 12}),
+        );
+        append_line(
+            &dir,
+            sim_id,
+            "twitter",
+            &serde_json::json!({"event_type": "round_start", "round": 6}),
+        );
+
+        let path = log_path(&dir, sim_id, "twitter");
+        let _ = read_action_log(&path, 0, &ctx, "twitter").await;
+        let s = state.lock().await;
+        assert_eq!(s.recent_actions.len(), 0, "event_type records are not actions");
+        // round_end updated per-platform + global round/hours.
+        assert_eq!(s.twitter_current_round, 5);
+        assert_eq!(s.twitter_simulated_hours, 12);
+        assert_eq!(s.current_round, 5);
+        assert_eq!(s.simulated_hours, 12);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // check_all_platforms_completed — dual-platform gate (S-615)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn check_completed_single_twitter_only() {
+        let dir = temp_dir("gate_tw_only");
+        let sim_id = "gate-tw";
+        // Only twitter log exists → twitter-only run.
+        std::fs::create_dir_all(dir.join(sim_id).join("twitter")).unwrap();
+        std::fs::write(log_path(&dir, sim_id, "twitter"), b"").unwrap();
+
+        let mut state = SimulationRunState::new(sim_id.to_string());
+        // Not yet completed → gate false.
+        assert!(!check_all_platforms_completed(&dir, &state));
+        // Twitter completed → gate true (reddit not enabled).
+        state.twitter_completed = true;
+        assert!(check_all_platforms_completed(&dir, &state));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_completed_dual_requires_both() {
+        let dir = temp_dir("gate_dual");
+        let sim_id = "gate-dual";
+        // BOTH logs exist → dual-platform run.
+        std::fs::create_dir_all(dir.join(sim_id).join("twitter")).unwrap();
+        std::fs::create_dir_all(dir.join(sim_id).join("reddit")).unwrap();
+        std::fs::write(log_path(&dir, sim_id, "twitter"), b"").unwrap();
+        std::fs::write(log_path(&dir, sim_id, "reddit"), b"").unwrap();
+
+        let mut state = SimulationRunState::new(sim_id.to_string());
+        // Neither done → false.
+        assert!(!check_all_platforms_completed(&dir, &state));
+        // Only twitter done → STILL false (reddit enabled, not completed).
+        state.twitter_completed = true;
+        assert!(
+            !check_all_platforms_completed(&dir, &state),
+            "one platform done must NOT complete"
+        );
+        // Both done → true.
+        state.reddit_completed = true;
+        assert!(check_all_platforms_completed(&dir, &state), "both done = completed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_completed_no_platforms_enabled_is_false() {
+        let dir = temp_dir("gate_none");
+        let sim_id = "gate-none";
+        std::fs::create_dir_all(dir.join(sim_id)).unwrap();
+        let state = SimulationRunState::new(sim_id.to_string());
+        // No actions.jsonl anywhere → no platform enabled → false (not vacuously true).
+        assert!(!check_all_platforms_completed(&dir, &state));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // simulation_end → COMPLETED (via read_action_log dispatch)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn simulation_end_single_platform_marks_completed() {
+        let sim_id = "end-single";
+        let (ctx, dir, state, _g) = make_ctx("end_single", sim_id, false);
+        append_line(&dir, sim_id, "twitter", &action_value(1, 1, "CREATE_POST"));
+        append_line(
+            &dir,
+            sim_id,
+            "twitter",
+            &serde_json::json!({"event_type": "simulation_end", "platform": "twitter",
+                "total_rounds": 1, "total_actions": 1}),
+        );
+
+        let path = log_path(&dir, sim_id, "twitter");
+        let _ = read_action_log(&path, 0, &ctx, "twitter").await;
+
+        let s = state.lock().await;
+        assert!(s.twitter_completed, "twitter must be flagged completed");
+        assert!(!s.twitter_running);
+        // Only twitter enabled → run COMPLETED.
+        assert_eq!(s.runner_status, RunnerStatus::Completed);
+        assert!(s.completed_at.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn simulation_end_dual_one_platform_not_completed() {
+        // Dual-platform: twitter ends but reddit still running → run NOT completed yet.
+        let sim_id = "end-dual";
+        let (ctx, dir, state, _g) = make_ctx("end_dual", sim_id, false);
+        // Both platform logs exist (dual run).
+        append_line(&dir, sim_id, "reddit", &action_value(1, 9, "CREATE_POST"));
+        append_line(&dir, sim_id, "twitter", &action_value(1, 1, "CREATE_POST"));
+        append_line(
+            &dir,
+            sim_id,
+            "twitter",
+            &serde_json::json!({"event_type": "simulation_end", "platform": "twitter",
+                "total_rounds": 1, "total_actions": 1}),
+        );
+
+        let tpath = log_path(&dir, sim_id, "twitter");
+        let _ = read_action_log(&tpath, 0, &ctx, "twitter").await;
+
+        {
+            let s = state.lock().await;
+            assert!(s.twitter_completed);
+            assert_ne!(
+                s.runner_status,
+                RunnerStatus::Completed,
+                "reddit still enabled+running → run must NOT be completed yet"
+            );
+        }
+
+        // Now reddit ends too → run COMPLETED.
+        append_line(
+            &dir,
+            sim_id,
+            "reddit",
+            &serde_json::json!({"event_type": "simulation_end", "platform": "reddit",
+                "total_rounds": 1, "total_actions": 1}),
+        );
+        let rpath = log_path(&dir, sim_id, "reddit");
+        let _ = read_action_log(&rpath, 0, &ctx, "reddit").await;
+
+        let s = state.lock().await;
+        assert!(s.reddit_completed);
+        assert_eq!(s.runner_status, RunnerStatus::Completed, "both done → completed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // graph-fire when enabled / not when disabled
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn graph_fire_disabled_does_not_register_activities() {
+        let sim_id = "graph-off";
+        let (ctx, dir, _state, graph_mgr) = make_ctx("graph_off", sim_id, false);
+        // No updater created (graph_enabled = false). Reading an action must NOT touch the manager.
+        append_line(&dir, sim_id, "twitter", &action_value(1, 1, "CREATE_POST"));
+        let path = log_path(&dir, sim_id, "twitter");
+        let _ = read_action_log(&path, 0, &ctx, "twitter").await;
+        // No updater registered → get_all_stats empty.
+        assert!(graph_mgr.get_all_stats().await.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn graph_fire_enabled_forwards_actions_to_updater() {
+        let sim_id = "graph-on";
+        let (ctx, dir, _state, graph_mgr) = make_ctx("graph_on", sim_id, true);
+        // Register a live updater so the monitor's fire path has a target.
+        let graph = Arc::new(tokio::sync::Mutex::new(KnowledgeGraph::new()));
+        graph_mgr
+            .create_updater(sim_id, graph, Arc::new(MockLlm), "test-graph".to_string())
+            .await
+            .unwrap();
+
+        // Two real actions + one DO_NOTHING (the updater skips DO_NOTHING) + an event (skipped).
+        append_line(&dir, sim_id, "twitter", &action_value(1, 1, "CREATE_POST"));
+        append_line(&dir, sim_id, "twitter", &action_value(1, 2, "LIKE_POST"));
+        append_line(&dir, sim_id, "twitter", &action_value(1, 3, "DO_NOTHING"));
+        append_line(
+            &dir,
+            sim_id,
+            "twitter",
+            &serde_json::json!({"event_type": "round_end", "round": 1}),
+        );
+
+        let path = log_path(&dir, sim_id, "twitter");
+        let _ = read_action_log(&path, 0, &ctx, "twitter").await;
+
+        // The updater must have RECEIVED the action dicts (total_activities counts non-DO_NOTHING
+        // enqueues; DO_NOTHING is skipped_count; event_type records are filtered before enqueue).
+        // Give the async send a moment to register on the counters.
+        let stats = graph_mgr.get_all_stats().await;
+        let s = stats.get(sim_id).expect("updater registered");
+        assert_eq!(s.total_activities, 2, "2 real actions forwarded (DO_NOTHING skipped)");
+        assert_eq!(s.skipped_count, 1, "DO_NOTHING is skipped by the updater");
+
+        // Cleanup the updater task.
+        graph_mgr.stop_all().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // file-not-yet-exists robustness (read_action_log on a missing file)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn read_action_log_missing_file_returns_position_unchanged() {
+        let sim_id = "missing";
+        let (ctx, dir, state, _g) = make_ctx("missing", sim_id, false);
+        // The file does NOT exist. read_action_log opens it → error → returns position unchanged.
+        let path = log_path(&dir, sim_id, "twitter");
+        let off = read_action_log(&path, 42, &ctx, "twitter").await;
+        assert_eq!(off, 42, "missing file must leave the offset unchanged");
+        assert_eq!(state.lock().await.recent_actions.len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // monitor_simulation — end-to-end: poll, completion exit, FINAL read pass
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn monitor_loop_does_final_read_after_completion() {
+        // Drive the full monitor loop: it polls, the completion signal fires, then the FINAL pass
+        // must pick up an action written AFTER completion fired (no trailing action lost — L518-522).
+        let sim_id = "final-read";
+        let (ctx, dir, state, _g) = make_ctx("final_read", sim_id, false);
+
+        // A completion watch we control: start None (running), flip to Some to end the loop.
+        let (tx, rx) = tokio::sync::watch::channel::<Option<crate::sim::SimCompletion>>(None);
+
+        // Write one action BEFORE the loop sees completion.
+        append_line(&dir, sim_id, "twitter", &action_value(1, 1, "CREATE_POST"));
+
+        let monitor = tokio::spawn(monitor_simulation(ctx, rx));
+
+        // Let the monitor do at least one poll (it sleeps 2s, but reads immediately on entry).
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Write a SECOND action, THEN signal completion — the loop must do a final read that picks
+        // it up.
+        append_line(&dir, sim_id, "twitter", &action_value(2, 2, "LIKE_POST"));
+        let _ = tx.send(Some(crate::sim::SimCompletion { total_ticks: 2 }));
+
+        // The monitor task should finish promptly (it wakes early on completion via select!).
+        tokio::time::timeout(Duration::from_secs(3), monitor)
+            .await
+            .expect("monitor must exit after completion")
+            .expect("monitor task must not panic");
+
+        // BOTH actions present (the second one via the final read pass).
+        let s = state.lock().await;
+        assert_eq!(s.recent_actions.len(), 2, "the final read pass must capture the late action");
+        // Natural-end housekeeping cleared the running flags.
+        assert!(!s.twitter_running);
+        assert!(!s.reddit_running);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn monitor_loop_already_completed_at_start_still_reads() {
+        // If the completion watch is ALREADY Some at the monitor's first poll (the run finished
+        // before the monitor started), the loop breaks immediately but the FINAL read pass still
+        // runs — so actions are not lost (watch retains the final value; no race — DECISION-17).
+        let sim_id = "already-done";
+        let (ctx, dir, state, _g) = make_ctx("already_done", sim_id, false);
+        append_line(&dir, sim_id, "twitter", &action_value(1, 1, "CREATE_POST"));
+
+        let (_tx, rx) =
+            tokio::sync::watch::channel(Some(crate::sim::SimCompletion { total_ticks: 1 }));
+        let monitor = tokio::spawn(monitor_simulation(ctx, rx));
+        tokio::time::timeout(Duration::from_secs(3), monitor)
+            .await
+            .expect("monitor must exit")
+            .expect("no panic");
+
+        // The final pass still read the action even though the loop never polled.
+        assert_eq!(state.lock().await.recent_actions.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn monitor_loop_persists_run_state_json() {
+        // The monitor persists run_state.json after polls / at end. After it exits, the on-disk
+        // run_state.json must reflect the actions it consumed.
+        let sim_id = "persist";
+        let (ctx, dir, _state, _g) = make_ctx("persist", sim_id, false);
+        append_line(&dir, sim_id, "twitter", &action_value(3, 1, "CREATE_POST"));
+        append_line(
+            &dir,
+            sim_id,
+            "twitter",
+            &serde_json::json!({"event_type": "simulation_end", "platform": "twitter",
+                "total_rounds": 1, "total_actions": 1}),
+        );
+
+        let (_tx, rx) =
+            tokio::sync::watch::channel(Some(crate::sim::SimCompletion { total_ticks: 1 }));
+        let monitor = tokio::spawn(monitor_simulation(ctx, rx));
+        tokio::time::timeout(Duration::from_secs(3), monitor).await.unwrap().unwrap();
+
+        // run_state.json persisted with the consumed action + COMPLETED status.
+        let on_disk = load_run_state(&dir, sim_id).unwrap().expect("run_state.json persisted");
+        assert_eq!(on_disk.runner_status, RunnerStatus::Completed);
+        assert_eq!(on_disk.recent_actions.len(), 1);
+        assert_eq!(on_disk.current_round, 3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

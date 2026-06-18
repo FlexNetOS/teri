@@ -17,7 +17,23 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 2   # RESUMED 2026-06-17 (12th resume, reset 0); baseline re-verified 917 green. Next: U-022 SimulationRunner via architect decomposition.
+cycles_this_session: 3   # RESUMED 2026-06-17 (12th resume, reset 0); baseline re-verified 917 green. CYCLE BUDGET HIT → HAND OFF.
+# CYCLE3 (12th resume) 2026-06-17: U-022 sub-cycle (c) MONITOR + offset-tail + graph-fire (S-605/613/614/615 + S-1056/U-047,
+#   5 [x]) — opus PASS (DECISION-17 Area 2, porter@opus). src/services/simulation_runner.rs: monitor_simulation (2s
+#   MONITOR_POLL_INTERVAL poll loop, per-platform file-exists guard, save_run_state per poll, loop-exit on U-048
+#   subscribe_completion replacing process.poll(), ONE FINAL read pass after end signal, stops graph updater on exit),
+#   read_action_log + apply_log_record (the U-047 byte-offset tail — seek-to-offset, consume ONLY newline-terminated
+#   complete lines, partial last line preserved/never double-read, robust to missing-file/growth/IO-error),
+#   check_all_platforms_completed (dual-platform gate). RunHandle.monitor now populated (spawned in start_simulation,
+#   aborted+reaped by terminate_handle = daemon-thread teardown analog). NEW GraphMemoryManager::fire_activity_from_dict
+#   (manager-side get_updater(id).add_activity_from_dict analog). STRUCTURAL: RunHandle.state SimulationRunState →
+#   Arc<tokio::Mutex<SimulationRunState>> (models Python shared-mutable _run_states[id]; verifier confirmed lock NEVER
+#   held across .await; 5 call sites updated, (a)/(b) preserved). U-010↔U-021 field map verified 1:1 (round→round_num,
+#   platform from dir, 7 fields direct; producer action_logger.rs writes json+\n in one write → EOF always complete-line).
+#   U-047 (S-1056) REALIZED here (was carry-forward). 2 [≠] (daemon=True flag inexpressible; exit_code→FAILED + simulation.log
+#   tail — no OS exit code in-process, COMPLETED-via-simulation_end ported). Producer-side deferral CLEAN (missing-file
+#   no-op = Python's no-log behavior). teri 999 green, clippy --all-targets clean. U-022 unit STAYS [ ] (sub-cycles d
+#   readers / e interview / f history+env+register_cleanup remain — 50%+ of U-022 done: a+b+c).
 # CYCLE2 (12th resume) 2026-06-17: U-022 sub-cycle (b) LIFECYCLE (S-599/600/602/603/608/612/616/617/624/625/627, 11 [x]
 #   + 4 [≠] + S-626 [→U-049]) — opus FAIL→fix→PASS (DECISION-17, porter@opus). src/services/simulation_runner.rs:
 #   SimulationRunner<L> (owned Mutex<HashMap<String,RunHandle>>), RunHandle{state,task:JoinHandle,shutdown:Arc<AtomicBool>,

@@ -1947,3 +1947,37 @@ Re-verify ONLY the two fixes that FAILed the prior block. The three structural c
 - Confirmed `[≠]`: S-601, S-604, S-606, S-607. Confirmed `[→U-049]`: S-626.
 - Left `- [ ]` for sub-cycles c-f: S-605 (`_monitor_threads`, monitor task), S-615 (`_check_all_platforms_completed`), + monitor/reader/interview symbols.
 - Sub-cycle (b) symbols verified: **11/11 cleared lifecycle (`- [x]`) + 4 `[≠]` + 1 `[→U-049]`** — the unit may proceed; (b) is PASS.
+
+---
+
+## 2026-06-17 — U-022 sub-cycle (c): simulation MONITOR + action-log offset-tail + graph-memory firing — **PASS**
+
+**Verifier:** rust-port-parity-verifier (opus, fail-closed, default-skeptical)
+**Scope:** S-605, S-613, S-614, S-615 (U-022) + S-1056 / U-047 realization. Touches U-021 `graph_memory.rs` (NEW `GraphMemoryManager::fire_activity_from_dict`) and the `RunHandle.state` → `Arc<tokio::sync::Mutex<…>>` structural change.
+
+**Method:** `cargo test` → **999 passed, 6 ignored** (no regression to U-010/U-021/U-048/sim suites; matches baseline). `cargo clippy --all-targets -- -D warnings` → **clean**. Sub-cycle (c) tests run + pass explicitly (6 `read_action_log_*` + 12 monitor/gate/end/graph). Differential read of Python `_monitor_simulation` / `_read_action_log` / `_check_all_platforms_completed` (`backend/app/services/simulation_runner.py:482-718`), Python `add_activity_from_dict` (`zep_graph_memory_updater.py:340-362`), and the U-010 PRODUCER `backend/scripts/action_logger.py:43-116` vs teri `src/sim/action_logger.rs`.
+
+### HIGH-RISK adversarial findings
+
+1. **U-047 offset-tail invariants (S-614) — the crux — PASS.** `read_action_log` (`simulation_runner.rs:1704`): opens, `seek(Start(position))`, `read_to_end` the delta, then advances the offset ONLY past newline-terminated complete lines (`while let Some(rel_nl) = buf[start..].iter().position(|&b| b==b'\n')`); a trailing fragment is left unconsumed and the offset stops at the last complete line. Tests prove (a) no-re-read across polls, (b) partial line NOT consumed + offset stops at complete-line boundary + consumed exactly once when later newline-terminated, (c) no double-fire, (d) missing-file returns `position` unchanged + growth-between-polls + IO-error robustness.
+   - **Offset vs Python `f.tell()`:** On writer-produced input the two are byte-for-byte identical. The U-010 producer (`PlatformActionLogger.log_action`, `action_logger.py:65-66` / `src/sim/action_logger.rs:125-135`) writes `json.dumps(entry) + '\n'` in ONE write per record, so the file at EOF is ALWAYS at a complete-line boundary → Python's `for line in f` never yields a fragment and `f.tell()`==EOF==end-of-last-complete-line==Rust's `new_position`. The test `read_action_log_reads_new_lines_and_returns_offset` asserts `off == file len`, confirming.
+   - **Divergence assessment:** Rust's explicit newline-boundary is a STRICT SUPERSET of robustness vs the torn-write edge (won't parse/error on a half-flushed final line); identical observable on all writer inputs. NOT a downgrade.
+
+2. **U-010 ↔ U-021 field-name mapping — PASS (no drift).** Cross-checked BOTH boundaries against the PRODUCER, not just claimed: producer writes `round` (not `round_num`), `agent_id`, `agent_name`, `action_type`, `action_args`, `result`, `success`, `timestamp` and NO `platform` key. Consumer `apply_log_record` (`simulation_runner.rs:1854-1880`) and `GraphMemoryUpdater::add_activity_from_dict` (`graph_memory.rs:1020-1052`) both map `round`→`round_num` and supply `platform` from the directory — 1:1, exactly as Python `_read_action_log` L665-674 and `add_activity_from_dict` L352-360. No silent empty/wrong-data path.
+   - Note: producer `log_round_end` writes `actions_count` not `simulated_hours`; the consumer's `round_end` branch defaults `simulated_hours` to 0 when absent — this is a FAITHFUL port (Python's writer/consumer behave identically), parity-preserving, not a Rust gap.
+
+3. **simulation_end → COMPLETED + FINAL read pass — PASS.** `monitor_simulation` (1585) breaks on the U-048 `completion_rx.borrow().is_some()` (correct `process.poll()` replacement; `watch` retains the final value), then does ONE final read pass (1638-1643). Test `monitor_loop_does_final_read_after_completion` proves an action written AFTER completion fires is still captured (no trailing-action loss, Python L518-522). Test `monitor_loop_already_completed_at_start_still_reads` proves no race for a late-subscribing monitor (DECISION-17).
+
+4. **Dual-platform gate (S-615) — PASS.** `check_all_platforms_completed` (1918) is a line-by-line port of Python L706-718. Single-platform completes alone; dual requires BOTH (`check_completed_dual_requires_both`: twitter-only-done → still false → both-done → true); no-platform-enabled is false (not vacuously true).
+
+5. **Graph-fire only when enabled, once per action — PASS.** `graph_fire_disabled_does_not_register_activities` (graph_enabled=false → manager untouched). `graph_fire_enabled_forwards_actions_to_updater`: 2 real actions + 1 DO_NOTHING + 1 event → `total_activities==2`, `skipped_count==1` — proving fire-exactly-once, the U-021 DO_NOTHING skip (`add_activity`, `graph_memory.rs:998`) is reached, and event_type records are filtered before enqueue.
+
+6. **`RunHandle.state` → `Arc<Mutex>` structural change — PASS, no latent deadlock.** Every state-lock in the monitor path holds ONLY synchronous work (`save_run_state` is a sync `fn`, `check_all_platforms_completed` is sync, the field mutations are sync); the ONE `.await` after a state mutation (the graph-fire) is explicitly performed AFTER the guard is dropped (`apply_log_record` 1883-1900, `{ … } // lock dropped here`). No lock held across `await` anywhere. No nested locks (`get_run_state` 1007 takes the `runs` lock, clones the `state` Arc, DROPS `runs`, THEN locks the state mutex). `get_run_state` reads through the SAME Arc the monitor writes → monitor updates are observable (the point of the change). The 5 updated call sites (1015, 1240, 1263, 1368, 1186/1199) preserve sub-cycle (a)/(b) behavior — (b) lifecycle symbols stay `[x]`, full suite green.
+
+7. **`[≠]` adjudication — CONFIRMED inexpressible, NOT a disguised skip.**
+   - `daemon=True` OS-thread flag: genuinely inexpressible — a tokio task IS tied to the runtime; the OBSERVABLE "monitor dies with the run" is PORTED (`terminate_handle` aborts+awaits `RunHandle.monitor`, 1495-1498). No dropped observable.
+   - non-zero `exit_code`→FAILED branch + `simulation.log` tail (Python L524-544): inexpressible — there is no OS exit code for an in-process `tokio::spawn(SimEngine::run)`. The COMPLETED-via-`simulation_end` success observable IS ported; run-failure is carried by the sim task's own error logging + the `Failed` transitions in `start_simulation`. Substrate-true, not "dest won't use it".
+   - **Producer-side deferral is clean, not a hidden gap:** the CONSUMER monitor contract is faithful on its own — the U-010 producer (`PlatformActionLogger`, S-070..S-077) ALREADY exists and writes the matching field shape, and the monitor's missing-file path is a no-op exactly as Python's behavior when no log exists. (c) does not silently depend on anything unbuilt.
+
+### Verdict
+**PASS — U-022 sub-cycle (c) is parity-verified, no downgrade.** Symbols flipped `- [~]`→`- [x]`: **S-605, S-613, S-614, S-615**. **U-047 / S-1056 REALIZED + VERIFIED** (`- [~]`→`- [x]`). `[≠]` rows on S-613 confirmed (daemon flag + exit-code branch genuinely inexpressible). The orchestrator may proceed to the next sub-cycle / commit.
