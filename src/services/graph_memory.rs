@@ -774,3 +774,1053 @@ mod tests {
         assert_eq!(a.to_episode_text(), b.to_episode_text());
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GraphMemoryUpdater — Sub-cycle (b) port of `ZepGraphMemoryUpdater` (S-515..S-530)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Symbol mapping (DECISION-14 / S-515..S-530):
+//
+// | Source symbol (Python)                  | Lines    | teri target                              |
+// |-----------------------------------------|----------|------------------------------------------|
+// | S-515 `ZepGraphMemoryUpdater` class     | 202      | `GraphMemoryUpdater` struct              |
+// | S-516 `__init__`                        | 232-269  | `GraphMemoryUpdater::new` (no api_key)  |
+// | S-517 `PLATFORM_DISPLAY_NAMES` +        | 220-223, | `platform_display_name` fn (PORTED)     |
+// |        `_get_platform_display_name`     | 271-273  |                                          |
+// | S-518 `BATCH_SIZE`                      | 217      | `const BATCH_SIZE: usize = 5`           |
+// | S-519 `MAX_RETRIES`                     | 229      | `[≠]` literal retry-loop (non-contractual)|
+// | S-520 `RETRY_DELAY`                     | 230      | `[≠]` network backoff delay              |
+// | S-521 `SEND_INTERVAL`                   | 226      | `[≠]` Zep network rate-limit            |
+// | S-522 `start`                           | 275-291  | `start` — locale-capture + spawn        |
+// | S-523 `stop`                            | 293-308  | `stop` async — drop tx + join + log     |
+// | S-524 `add_activity`                    | 310-338  | `add_activity` — DO_NOTHING skip + send |
+// | S-525 `add_activity_from_dict`          | 340-362  | `add_activity_from_dict`                |
+// | S-526 `_worker_loop`                    | 364-394  | spawned worker future                   |
+// | S-527 `_send_batch_activities`          | 396-433  | `flush_batch` — combined_text + extend  |
+// | S-528 `_flush_remaining`               | 435-458  | worker drain-on-close + per-platform    |
+// | S-529 `get_stats`                       | 460-476  | `get_stats` → `UpdaterStats` (serde)    |
+//
+// `[≠]` adjudications (DECISION-14 Decision 4):
+// - `[≠]` S-519/S-520 SEND_INTERVAL — Zep network rate-limit; non-contractual in-process
+// - `[≠]` S-520 MAX_RETRIES/RETRY_DELAY literal retry-loop — Zep-network transient-retry;
+//          in-process keeps failed_count + continue-on-error, drops network retry cadence
+// - `[≠]` S-516 ZEP_API_KEY check — native graph is keyless; substrate-absent
+// - `[≠]` Zep coreference entity-resolution — teri merges by exact name; no entity dropped
+//
+// PORTED (not `[≠]`):
+// - BATCH_SIZE=5, platform display names ("世界1"/"世界2"), combined_text "\n".join,
+//   DO_NOTHING skip, event_type skip, all 5 stat counters, get_stats, _flush_remaining
+//   leftovers, per-platform independent batching.
+
+use crate::graph::KnowledgeGraph;
+use crate::llm::LlmClient;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use tokio::sync::{Mutex, mpsc};
+use tokio::task::JoinHandle;
+use tracing::{debug, error, info};
+
+/// Batch size: number of same-platform activities to accumulate before flushing.
+///
+/// Port of `ZepGraphMemoryUpdater.BATCH_SIZE = 5` (S-518, L217).
+const BATCH_SIZE: usize = 5;
+
+/// Resolve a platform identifier to its console display name.
+///
+/// Port of `ZepGraphMemoryUpdater.PLATFORM_DISPLAY_NAMES` + `_get_platform_display_name`
+/// (S-517, L220-223, L271-273). PORTED (used in log lines — observable output).
+///
+/// `twitter` → `"世界1"`, `reddit` → `"世界2"`, anything else → the input string slice.
+fn platform_display_name(platform: &str) -> &str {
+    match platform.to_lowercase().as_str() {
+        "twitter" => "世界1",
+        "reddit" => "世界2",
+        _ => platform,
+    }
+}
+
+/// Atomic counters shared between the producer side (`add_activity`) and the worker task
+/// (`flush_batch`, `_flush_remaining`).
+///
+/// All counters use `Relaxed` ordering — they are updated by at most two parties (producer
+/// and worker) and read by `get_stats`, where a snapshot (not a strict linearisation) is
+/// the only observable requirement (matches Python's non-atomic incrementing style).
+#[derive(Debug, Default)]
+struct UpdaterCounters {
+    /// Activities actually enqueued (excludes DO_NOTHING skips).
+    total_activities: AtomicI64,
+    /// Batches successfully flushed to the graph.
+    total_sent: AtomicI64,
+    /// Activities successfully flushed to the graph (sum of batch sizes).
+    total_items_sent: AtomicI64,
+    /// Batches that failed to flush (extend_from_text error; worker continues).
+    failed_count: AtomicI64,
+    /// Activities skipped because `action_type == "DO_NOTHING"`.
+    skipped_count: AtomicI64,
+    /// Approximate queue depth: incremented on send, decremented when worker pops.
+    /// Best-effort — mpsc::UnboundedReceiver has no public len().
+    queued: AtomicUsize,
+}
+
+/// Stats snapshot returned by [`GraphMemoryUpdater::get_stats`].
+///
+/// Byte-identical JSON keys to MiroFish `ZepGraphMemoryUpdater.get_stats()` (S-529, L465-476).
+/// The key `graph_id` maps to `graph_label` (the teri analog; no Zep server handle).
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdaterStats {
+    /// The `graph_label` string (teri analog of Python's `graph_id`).
+    pub graph_id: String,
+    /// Batch size constant (always 5).
+    pub batch_size: usize,
+    /// Activities enqueued (excludes DO_NOTHING).
+    pub total_activities: i64,
+    /// Batches successfully flushed.
+    pub batches_sent: i64,
+    /// Activities successfully flushed.
+    pub items_sent: i64,
+    /// Batches that failed to flush.
+    pub failed_count: i64,
+    /// Activities skipped (DO_NOTHING).
+    pub skipped_count: i64,
+    /// Approximate queue depth.
+    pub queue_size: usize,
+    /// Per-platform buffer sizes (activities accumulated but not yet batched).
+    pub buffer_sizes: HashMap<String, usize>,
+    /// Whether the worker task is running.
+    pub running: bool,
+}
+
+/// Snapshot of per-platform buffer sizes, written by the worker and read by `get_stats`.
+///
+/// The worker task owns the actual buffers; it updates this snapshot after every mutation
+/// so `get_stats` can read it without entering the worker's ownership domain.
+type BufferSnapshot = Arc<Mutex<HashMap<String, usize>>>;
+
+/// Async background graph-memory updater.
+///
+/// Port of `ZepGraphMemoryUpdater` (S-515, L202-476, MiroFish).
+///
+/// Accumulates [`AgentActivity`] records per platform and flushes them in batches of
+/// [`BATCH_SIZE`] = 5 to the underlying [`KnowledgeGraph`] via
+/// [`KnowledgeGraph::extend_from_text`].  Decoupled via a tokio mpsc channel so the
+/// simulation hot-path never blocks on LLM extraction.
+///
+/// # Generic `L: LlmClient` note (DECISION-14)
+///
+/// DECISION-14 proposed `Arc<dyn LlmClient>`, but `LlmClient` has generic methods
+/// (`complete_json<T>`, `chat_json<T>`) making it non-dyn-compatible in Rust.  Per the
+/// task brief: "if `LlmClient` isn't dyn-safe, use a generic `<L: LlmClient + Send + Sync
+/// + 'static>` and note it."  The observable contract is identical; the type parameter is
+///   the implementation detail.
+///
+/// # Substrate differences from Python (`[≠]`)
+/// - No `ZEP_API_KEY` validation (keyless substrate).
+/// - No `SEND_INTERVAL` sleep (Zep network rate-limit; non-contractual in-process).
+/// - No literal `MAX_RETRIES` / `RETRY_DELAY` retry-loop (Zep-network transient-retry;
+///   `failed_count + continue-on-error` IS ported).
+/// - Entity merge by EXACT name (no Zep coreference/fuzzy resolution; no entity dropped).
+///
+/// # Observable contract (PORTED)
+/// All 5 stat counters, `get_stats`, `add_activity` DO_NOTHING skip, `add_activity_from_dict`
+/// event_type skip, `combined_text = episode_texts.join("\n")`, per-platform independent
+/// batching at `BATCH_SIZE`, `_flush_remaining` on `stop`, platform display names in logs.
+pub struct GraphMemoryUpdater<L: LlmClient + Send + Sync + 'static> {
+    /// The target knowledge graph (shared, async-mutex-protected).
+    graph: Arc<Mutex<KnowledgeGraph>>,
+    /// LLM client for entity/relation extraction.
+    llm: Arc<L>,
+    /// Label used in log lines (was `graph_id` in Python; the teri analog).
+    graph_label: String,
+    /// Sender half of the activity channel.  Dropped on `stop()` to signal the worker.
+    tx: Option<mpsc::UnboundedSender<AgentActivity>>,
+    /// Worker task handle.  Joined on `stop()`.
+    worker: Option<JoinHandle<()>>,
+    /// Whether the worker is running.
+    running: Arc<AtomicBool>,
+    /// Counters — shared between producer and worker.
+    counters: Arc<UpdaterCounters>,
+    /// Buffer size snapshot — written by worker, read by get_stats.
+    buffer_snapshot: BufferSnapshot,
+}
+
+impl<L: LlmClient + Send + Sync + 'static> GraphMemoryUpdater<L> {
+    /// Construct a new updater.
+    ///
+    /// Port of `ZepGraphMemoryUpdater.__init__` (S-516, L232-269).
+    ///
+    /// The Python `api_key` / `ZEP_API_KEY` check is `[≠]` substrate-absent (the native
+    /// graph requires no API key).
+    ///
+    /// Call [`start`](Self::start) before adding activities.
+    pub fn new(graph: Arc<Mutex<KnowledgeGraph>>, llm: Arc<L>, graph_label: String) -> Self {
+        info!("GraphMemoryUpdater 初始化完成: graph_label={}, batch_size={}", graph_label, BATCH_SIZE);
+        // Seed the buffer-size snapshot with the two initial platform keys (twitter + reddit),
+        // matching MiroFish's `self._platform_buffers = {'twitter': [], 'reddit': []}` in
+        // `__init__` (L252-255).  This ensures `get_stats().buffer_sizes` always contains
+        // both keys (value 0) even before any activity has been received by the worker.
+        let mut initial_snapshot = HashMap::new();
+        initial_snapshot.insert("twitter".to_string(), 0usize);
+        initial_snapshot.insert("reddit".to_string(), 0usize);
+        Self {
+            graph,
+            llm,
+            graph_label,
+            tx: None,
+            worker: None,
+            running: Arc::new(AtomicBool::new(false)),
+            counters: Arc::new(UpdaterCounters::default()),
+            buffer_snapshot: Arc::new(Mutex::new(initial_snapshot)),
+        }
+    }
+
+    /// Start the background worker task.
+    ///
+    /// Port of `ZepGraphMemoryUpdater.start` (S-522, L275-291).
+    ///
+    /// Idempotent: if already running, returns immediately.
+    /// Captures the current locale before spawning (U-050 site: `get_locale()` + `with_locale`).
+    pub fn start(&mut self) {
+        if self.running.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // U-050: capture locale before the spawn so the worker runs under the same locale.
+        let locale = crate::i18n::get_locale();
+
+        let (tx, rx) = mpsc::unbounded_channel::<AgentActivity>();
+        self.tx = Some(tx);
+        self.running.store(true, Ordering::Relaxed);
+
+        let graph = Arc::clone(&self.graph);
+        let llm = Arc::clone(&self.llm);
+        let graph_label = self.graph_label.clone();
+        let running = Arc::clone(&self.running);
+        let counters = Arc::clone(&self.counters);
+        let buffer_snapshot = Arc::clone(&self.buffer_snapshot);
+
+        let handle = tokio::spawn(crate::i18n::with_locale(locale, async move {
+            worker_loop(rx, graph, llm, graph_label, running, counters, buffer_snapshot).await;
+        }));
+
+        self.worker = Some(handle);
+        info!("GraphMemoryUpdater 已启动: graph_label={}", self.graph_label);
+    }
+
+    /// Stop the background worker task and flush any remaining activities.
+    ///
+    /// Port of `ZepGraphMemoryUpdater.stop` (S-523, L293-308).
+    ///
+    /// Drops the sender (signals the worker `recv()` returns `None`) then awaits the worker
+    /// to complete its final flush.  Mirrors the Python `join(timeout=10)` safety cap via
+    /// `tokio::time::timeout(10s, handle)` — the timeout is a safety guard, not a contract.
+    pub async fn stop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+
+        // Drop the sender — this signals the worker's recv() loop to drain and exit.
+        self.tx.take();
+
+        // Await the worker (with a 10s safety cap matching Python's join(timeout=10)).
+        if let Some(handle) = self.worker.take() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), handle).await;
+        }
+
+        let total_activities = self.counters.total_activities.load(Ordering::Relaxed);
+        let total_sent = self.counters.total_sent.load(Ordering::Relaxed);
+        let total_items_sent = self.counters.total_items_sent.load(Ordering::Relaxed);
+        let failed_count = self.counters.failed_count.load(Ordering::Relaxed);
+        let skipped_count = self.counters.skipped_count.load(Ordering::Relaxed);
+
+        info!(
+            "GraphMemoryUpdater 已停止: graph_label={}, total_activities={}, batches_sent={}, \
+             items_sent={}, failed={}, skipped={}",
+            self.graph_label,
+            total_activities,
+            total_sent,
+            total_items_sent,
+            failed_count,
+            skipped_count
+        );
+    }
+
+    /// Add an agent activity to the queue for batched graph update.
+    ///
+    /// Port of `ZepGraphMemoryUpdater.add_activity` (S-524, L310-338).
+    ///
+    /// `DO_NOTHING` activities are skipped BEFORE enqueue (`skipped_count += 1`, return).
+    /// All other activities are sent to the worker channel and `total_activities` is incremented.
+    /// Runs on the producer side (simulation hot-path); never blocks.
+    pub fn add_activity(&self, activity: AgentActivity) {
+        // Contractual filter: skip DO_NOTHING before enqueue.
+        if activity.action_type == "DO_NOTHING" {
+            self.counters.skipped_count.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        if let Some(tx) = &self.tx {
+            // Ignore send errors if the worker is gone (stop() was called).
+            let _ = tx.send(activity);
+            self.counters.total_activities.fetch_add(1, Ordering::Relaxed);
+            self.counters.queued.fetch_add(1, Ordering::Relaxed);
+        }
+
+        debug!("添加活动到图谱队列: graph_label={}", self.graph_label);
+    }
+
+    /// Build an [`AgentActivity`] from a JSON dict and enqueue it.
+    ///
+    /// Port of `ZepGraphMemoryUpdater.add_activity_from_dict` (S-525, L340-362).
+    ///
+    /// Entries containing an `event_type` key are skipped (they are simulation-event markers,
+    /// not agent-action records).  All other entries are converted to [`AgentActivity`] using
+    /// the same field defaults as Python (`data.get("key", default)`).
+    pub fn add_activity_from_dict(&self, data: &serde_json::Value, platform: &str) {
+        // Skip event-type entries (contractual, L349-350).
+        if data.get("event_type").is_some() {
+            return;
+        }
+
+        // Construct AgentActivity from the dict fields with Python-identical defaults.
+        // `round` key → `round_num` (Python `data.get("round", 0)`).
+        let agent_id = data.get("agent_id").and_then(|v| v.as_i64()).unwrap_or(0);
+        let agent_name = data
+            .get("agent_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let action_type = data
+            .get("action_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let action_args = data
+            .get("action_args")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let round_num = data.get("round").and_then(|v| v.as_i64()).unwrap_or(0);
+        // Default timestamp: chrono RFC 3339 now (mirrors Python's `datetime.now().isoformat()`).
+        let timestamp = data
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+
+        let activity = AgentActivity {
+            platform: platform.to_string(),
+            agent_id,
+            agent_name,
+            action_type,
+            action_args,
+            round_num,
+            timestamp,
+        };
+
+        self.add_activity(activity);
+    }
+
+    /// Return a stats snapshot.
+    ///
+    /// Port of `ZepGraphMemoryUpdater.get_stats` (S-529, L460-476).
+    ///
+    /// JSON key names are byte-identical to the Python source for API contract parity.
+    /// `graph_id` maps to `graph_label` (the teri analog; no Zep server handle).
+    /// `queue_size` is best-effort (approximated via an atomic counter).
+    pub async fn get_stats(&self) -> UpdaterStats {
+        let buffer_sizes = self.buffer_snapshot.lock().await.clone();
+        UpdaterStats {
+            graph_id: self.graph_label.clone(),
+            batch_size: BATCH_SIZE,
+            total_activities: self.counters.total_activities.load(Ordering::Relaxed),
+            batches_sent: self.counters.total_sent.load(Ordering::Relaxed),
+            items_sent: self.counters.total_items_sent.load(Ordering::Relaxed),
+            failed_count: self.counters.failed_count.load(Ordering::Relaxed),
+            skipped_count: self.counters.skipped_count.load(Ordering::Relaxed),
+            queue_size: self.counters.queued.load(Ordering::Relaxed),
+            buffer_sizes,
+            running: self.running.load(Ordering::Relaxed),
+        }
+    }
+}
+
+// ─── Worker task (private) ────────────────────────────────────────────────────
+
+/// The spawned worker loop.
+///
+/// Port of `ZepGraphMemoryUpdater._worker_loop` (S-526, L364-394) +
+/// `_send_batch_activities` (S-527, L396-433) + `_flush_remaining` (S-528, L435-458).
+///
+/// Runs under the locale captured at `start()` via `with_locale` (U-050).
+///
+/// Receive loop: each activity is placed in per-platform buffers. When a platform's buffer
+/// reaches `BATCH_SIZE`, the first `BATCH_SIZE` activities are drained and flushed.
+/// When the sender is dropped (`stop()` drops `tx`), `recv()` returns `None`; the loop exits
+/// and the drain-and-flush (`_flush_remaining`) is performed for all non-empty buffers.
+///
+/// `[≠]` SEND_INTERVAL between flushes: the 0.5 s Zep network rate-limit sleep is omitted
+/// (in-process extraction has no remote rate to throttle; non-contractual; DECISION-14 §4).
+async fn worker_loop<L: LlmClient + Send + Sync + 'static>(
+    mut rx: mpsc::UnboundedReceiver<AgentActivity>,
+    graph: Arc<Mutex<KnowledgeGraph>>,
+    llm: Arc<L>,
+    graph_label: String,
+    running: Arc<AtomicBool>,
+    counters: Arc<UpdaterCounters>,
+    buffer_snapshot: BufferSnapshot,
+) {
+    // Per-platform activity buffers — exclusively owned by the worker (no lock needed).
+    // Seeded with the two initial platforms matching Python's `_platform_buffers` (L252-255).
+    let mut platform_buffers: HashMap<String, Vec<AgentActivity>> = {
+        let mut m = HashMap::new();
+        m.insert("twitter".to_string(), Vec::new());
+        m.insert("reddit".to_string(), Vec::new());
+        m
+    };
+
+    // Main receive loop (port of _worker_loop while loop, L367-394).
+    while let Some(activity) = rx.recv().await {
+        counters.queued.fetch_sub(1, Ordering::Relaxed);
+
+        let platform = activity.platform.to_lowercase();
+        platform_buffers.entry(platform.clone()).or_default().push(activity);
+
+        // Update the buffer-size snapshot for get_stats.
+        update_buffer_snapshot(&platform_buffers, &buffer_snapshot).await;
+
+        // If this platform has reached BATCH_SIZE, drain and flush.
+        if platform_buffers.get(&platform).map_or(0, Vec::len) >= BATCH_SIZE {
+            let batch: Vec<AgentActivity> = platform_buffers
+                .get_mut(&platform)
+                .map(|buf| buf.drain(..BATCH_SIZE).collect())
+                .unwrap_or_default();
+
+            update_buffer_snapshot(&platform_buffers, &buffer_snapshot).await;
+
+            flush_batch(batch, &platform, &graph, &llm, &graph_label, &counters).await;
+            // [≠] SEND_INTERVAL 0.5 s sleep omitted (Zep network rate-limit; non-contractual).
+        }
+    }
+
+    // Channel closed (stop() dropped the sender) — drain and flush remaining buffers.
+    // Port of `_flush_remaining` (S-528, L435-458):
+    // Since buffers live in the worker (no separate queue-to-buffer drain step needed),
+    // we simply flush every non-empty per-platform buffer once.
+    running.store(false, Ordering::Relaxed);
+
+    for (platform, buffer) in &mut platform_buffers {
+        if !buffer.is_empty() {
+            let platform_name = platform_display_name(platform);
+            info!(
+                "发送{}平台剩余的 {} 条活动",
+                platform_name,
+                buffer.len()
+            );
+            let batch: Vec<AgentActivity> = std::mem::take(buffer);
+            flush_batch(batch, platform, &graph, &llm, &graph_label, &counters).await;
+        }
+    }
+
+    update_buffer_snapshot(&platform_buffers, &buffer_snapshot).await;
+}
+
+/// Update the buffer-size snapshot from the worker's current buffers.
+async fn update_buffer_snapshot(
+    platform_buffers: &HashMap<String, Vec<AgentActivity>>,
+    snapshot: &BufferSnapshot,
+) {
+    let mut guard = snapshot.lock().await;
+    *guard = platform_buffers
+        .iter()
+        .map(|(k, v)| (k.clone(), v.len()))
+        .collect();
+}
+
+/// Flush a batch of activities to the knowledge graph.
+///
+/// Port of `ZepGraphMemoryUpdater._send_batch_activities` (S-527, L396-433).
+///
+/// Observable contract:
+/// - `combined_text = batch.iter().map(to_episode_text).collect().join("\n")` (EXACT, observable).
+/// - On success: `total_sent += 1`, `total_items_sent += batch.len()`, info log w/ display_name.
+/// - On error: `failed_count += 1`, error log, worker continues (non-fatal).
+///
+/// `[≠]` MAX_RETRIES/RETRY_DELAY literal retry-loop: the 3-attempt Zep-network retry cadence
+/// is omitted (DECISION-14 §4). The *resilience* (continue-on-error + failed_count) IS ported.
+async fn flush_batch<L: LlmClient + Send + Sync + 'static>(
+    activities: Vec<AgentActivity>,
+    platform: &str,
+    graph: &Arc<Mutex<KnowledgeGraph>>,
+    llm: &Arc<L>,
+    graph_label: &str,
+    counters: &Arc<UpdaterCounters>,
+) {
+    if activities.is_empty() {
+        return;
+    }
+
+    // combined_text: observable join — exact port of L407-409.
+    let episode_texts: Vec<String> = activities.iter().map(AgentActivity::to_episode_text).collect();
+    let combined_text = episode_texts.join("\n");
+
+    debug!("批量内容预览: {}...", &combined_text[..combined_text.len().min(200)]);
+
+    // Extend the graph with the combined text.
+    // Holds the Mutex across the LLM await — required (async Mutex), and the lock is held
+    // only while extraction is active (one flush at a time in the single worker).
+    let result = {
+        let mut g = graph.lock().await;
+        g.extend_from_text(&combined_text, llm.as_ref()).await
+    };
+
+    match result {
+        Ok(_stats) => {
+            counters.total_sent.fetch_add(1, Ordering::Relaxed);
+            counters.total_items_sent.fetch_add(activities.len() as i64, Ordering::Relaxed);
+            let platform_name = platform_display_name(platform);
+            info!(
+                "成功批量发送 {} 条{}活动到图谱 {}",
+                activities.len(),
+                platform_name,
+                graph_label
+            );
+        }
+        Err(e) => {
+            // Non-fatal: increment failed_count and continue (port of L433, L392-394).
+            counters.failed_count.fetch_add(1, Ordering::Relaxed);
+            error!(
+                "批量发送到图谱失败: graph_label={}, error={}",
+                graph_label, e
+            );
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests for GraphMemoryUpdater (sub-cycle b)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod updater_tests {
+    use super::*;
+    use crate::error::{Result, TeriError};
+    use crate::graph::KnowledgeGraph;
+    use crate::llm::{ChatMessage, ChatOptions, LlmClient};
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    // ── Mock LLM ─────────────────────────────────────────────────────────────
+
+    /// Deterministic mock LLM for updater tests.
+    ///
+    /// Alternates between two canned responses: the first `complete()` call returns
+    /// `entity_response`, the second returns `relation_response`, cycling.
+    struct MockLlm {
+        entity_response: String,
+        relation_response: String,
+        call_count: tokio::sync::Mutex<usize>,
+    }
+
+    impl MockLlm {
+        fn new(entity_response: &str, relation_response: &str) -> Self {
+            Self {
+                entity_response: entity_response.to_string(),
+                relation_response: relation_response.to_string(),
+                call_count: tokio::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for MockLlm {
+        async fn complete(&self, _prompt: &str) -> Result<String> {
+            let mut count = self.call_count.lock().await;
+            let response = if *count % 2 == 0 {
+                self.entity_response.clone()
+            } else {
+                self.relation_response.clone()
+            };
+            *count += 1;
+            Ok(response)
+        }
+
+        async fn complete_json<T: serde::de::DeserializeOwned>(&self, prompt: &str) -> Result<T> {
+            let text = self.complete(prompt).await?;
+            serde_json::from_str(&text)
+                .map_err(|e| TeriError::Llm(format!("mock json parse: {e}")))
+        }
+
+        async fn stream(
+            &self,
+            _prompt: &str,
+        ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            Err(TeriError::Llm("not used".into()))
+        }
+
+        async fn chat(&self, _messages: &[ChatMessage], _opts: &ChatOptions) -> Result<String> {
+            Err(TeriError::Llm("not used".into()))
+        }
+
+        async fn chat_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _messages: &[ChatMessage],
+            _opts: &ChatOptions,
+        ) -> Result<T> {
+            Err(TeriError::Llm("not used".into()))
+        }
+    }
+
+    /// Build a test activity with the given platform and action_type.
+    fn make_activity(platform: &str, action_type: &str) -> AgentActivity {
+        AgentActivity {
+            platform: platform.to_string(),
+            agent_id: 1,
+            agent_name: "Agent1".to_string(),
+            action_type: action_type.to_string(),
+            action_args: serde_json::Map::new(),
+            round_num: 1,
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    // ── platform_display_name ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_platform_display_name_twitter() {
+        assert_eq!(platform_display_name("twitter"), "世界1");
+        assert_eq!(platform_display_name("TWITTER"), "世界1");
+    }
+
+    #[test]
+    fn test_platform_display_name_reddit() {
+        assert_eq!(platform_display_name("reddit"), "世界2");
+        assert_eq!(platform_display_name("Reddit"), "世界2");
+    }
+
+    #[test]
+    fn test_platform_display_name_unknown() {
+        assert_eq!(platform_display_name("discord"), "discord");
+    }
+
+    // ── add_activity: DO_NOTHING skip ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_add_activity_do_nothing_skipped() {
+        let graph = Arc::new(Mutex::new(KnowledgeGraph::new()));
+        let llm = Arc::new(MockLlm::new("[]", "[]"));
+        let mut updater = GraphMemoryUpdater::new(graph, llm, "test-graph".to_string());
+        updater.start();
+
+        let a = make_activity("twitter", "DO_NOTHING");
+        updater.add_activity(a);
+
+        let stats = updater.get_stats().await;
+        assert_eq!(stats.skipped_count, 1, "DO_NOTHING must increment skipped_count");
+        assert_eq!(stats.total_activities, 0, "DO_NOTHING must not increment total_activities");
+
+        updater.stop().await;
+    }
+
+    // ── add_activity: real activities are enqueued ────────────────────────────
+
+    #[tokio::test]
+    async fn test_add_activity_real_action_enqueued() {
+        let graph = Arc::new(Mutex::new(KnowledgeGraph::new()));
+        let llm = Arc::new(MockLlm::new("[]", "[]"));
+        let mut updater = GraphMemoryUpdater::new(graph, llm, "test-graph".to_string());
+        updater.start();
+
+        let a = make_activity("twitter", "CREATE_POST");
+        updater.add_activity(a);
+
+        // Give the worker a moment to pop (no flush threshold yet; just counters).
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let stats = updater.get_stats().await;
+        assert_eq!(stats.total_activities, 1);
+        assert_eq!(stats.skipped_count, 0);
+
+        updater.stop().await;
+    }
+
+    // ── add_activity_from_dict: event_type entries skipped ────────────────────
+
+    #[tokio::test]
+    async fn test_add_activity_from_dict_event_type_skipped() {
+        let graph = Arc::new(Mutex::new(KnowledgeGraph::new()));
+        let llm = Arc::new(MockLlm::new("[]", "[]"));
+        let mut updater = GraphMemoryUpdater::new(graph, llm, "test-graph".to_string());
+        updater.start();
+
+        let data = json!({ "event_type": "SIMULATION_START", "round": 1 });
+        updater.add_activity_from_dict(&data, "twitter");
+
+        let stats = updater.get_stats().await;
+        // event_type entries are skipped BEFORE add_activity, so no counter is bumped.
+        assert_eq!(stats.total_activities, 0);
+        assert_eq!(stats.skipped_count, 0);
+
+        updater.stop().await;
+    }
+
+    // ── add_activity_from_dict: valid entry is enqueued ───────────────────────
+
+    #[tokio::test]
+    async fn test_add_activity_from_dict_valid_entry() {
+        let graph = Arc::new(Mutex::new(KnowledgeGraph::new()));
+        let llm = Arc::new(MockLlm::new("[]", "[]"));
+        let mut updater = GraphMemoryUpdater::new(graph, llm, "test-graph".to_string());
+        updater.start();
+
+        let data = json!({
+            "agent_id": 42,
+            "agent_name": "Bob",
+            "action_type": "LIKE_POST",
+            "action_args": { "post_content": "hello" },
+            "round": 3
+        });
+        updater.add_activity_from_dict(&data, "reddit");
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let stats = updater.get_stats().await;
+        assert_eq!(stats.total_activities, 1);
+
+        updater.stop().await;
+    }
+
+    // ── Batching at BATCH_SIZE=5 triggers a flush ─────────────────────────────
+
+    #[tokio::test]
+    async fn test_batch_flush_at_batch_size() {
+        // LLM returns a simple entity for every entity-extraction call, empty relations.
+        let graph = Arc::new(Mutex::new(KnowledgeGraph::new()));
+        let llm = Arc::new(MockLlm::new(
+            r#"[{"name": "Entity1", "kind": "Concept"}]"#,
+            "[]",
+        ));
+        let mut updater = GraphMemoryUpdater::new(Arc::clone(&graph), llm, "batch-test".to_string());
+        updater.start();
+
+        // Add exactly BATCH_SIZE activities on the same platform.
+        for _ in 0..BATCH_SIZE {
+            updater.add_activity(make_activity("twitter", "CREATE_POST"));
+        }
+
+        // Give the worker enough time to flush the batch.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let stats = updater.get_stats().await;
+        assert_eq!(stats.total_activities, BATCH_SIZE as i64);
+        assert_eq!(stats.batches_sent, 1, "exactly one batch should have been flushed");
+        assert_eq!(stats.items_sent, BATCH_SIZE as i64);
+        assert_eq!(stats.failed_count, 0);
+
+        updater.stop().await;
+    }
+
+    // ── Per-platform independent batching ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_per_platform_independent_batching() {
+        let graph = Arc::new(Mutex::new(KnowledgeGraph::new()));
+        let llm = Arc::new(MockLlm::new(
+            r#"[{"name": "Entity1", "kind": "Concept"}]"#,
+            "[]",
+        ));
+        let mut updater = GraphMemoryUpdater::new(Arc::clone(&graph), llm, "platform-test".to_string());
+        updater.start();
+
+        // Add 5 twitter + 3 reddit activities.
+        for _ in 0..BATCH_SIZE {
+            updater.add_activity(make_activity("twitter", "CREATE_POST"));
+        }
+        for _ in 0..3 {
+            updater.add_activity(make_activity("reddit", "CREATE_POST"));
+        }
+
+        // Give worker time to flush the twitter batch (reddit not yet at threshold).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let stats = updater.get_stats().await;
+        assert_eq!(stats.batches_sent, 1, "only twitter batch should be flushed");
+        assert_eq!(stats.items_sent, BATCH_SIZE as i64);
+
+        updater.stop().await;
+
+        // After stop, reddit leftovers should have been flushed too.
+        let stats_final = updater.get_stats().await;
+        assert_eq!(stats_final.batches_sent, 2, "stop should flush reddit leftovers");
+        assert_eq!(stats_final.items_sent, (BATCH_SIZE + 3) as i64);
+    }
+
+    // ── _flush_remaining: sub-BATCH_SIZE leftovers sent on stop ──────────────
+
+    #[tokio::test]
+    async fn test_flush_remaining_on_stop() {
+        let graph = Arc::new(Mutex::new(KnowledgeGraph::new()));
+        let llm = Arc::new(MockLlm::new("[]", "[]"));
+        let mut updater = GraphMemoryUpdater::new(Arc::clone(&graph), llm, "flush-test".to_string());
+        updater.start();
+
+        // Add 3 activities (< BATCH_SIZE — no flush during running).
+        for _ in 0..3 {
+            updater.add_activity(make_activity("twitter", "CREATE_POST"));
+        }
+
+        // Stop triggers _flush_remaining.
+        updater.stop().await;
+
+        let stats = updater.get_stats().await;
+        assert_eq!(stats.total_activities, 3);
+        assert_eq!(stats.batches_sent, 1, "_flush_remaining must flush the sub-batch");
+        assert_eq!(stats.items_sent, 3);
+    }
+
+    // ── combined_text join is observable ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_combined_text_join() {
+        // Use a mock LLM that captures the prompts.
+        use std::sync::Mutex as StdMutex;
+
+        struct CapturingLlm {
+            prompts: Arc<StdMutex<Vec<String>>>,
+        }
+
+        #[async_trait]
+        impl LlmClient for CapturingLlm {
+            async fn complete(&self, prompt: &str) -> Result<String> {
+                self.prompts.lock().unwrap().push(prompt.to_string());
+                // Alternate: entity response then relation response.
+                let count = self.prompts.lock().unwrap().len();
+                if count % 2 == 1 {
+                    Ok(r#"[{"name": "TestEntity", "kind": "Concept"}]"#.to_string())
+                } else {
+                    Ok("[]".to_string())
+                }
+            }
+            async fn complete_json<T: serde::de::DeserializeOwned>(&self, p: &str) -> Result<T> {
+                let t = self.complete(p).await?;
+                serde_json::from_str(&t).map_err(|e| TeriError::Llm(e.to_string()))
+            }
+            async fn stream(&self, _: &str) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+                Err(TeriError::Llm("not used".into()))
+            }
+            async fn chat(&self, _: &[ChatMessage], _: &ChatOptions) -> Result<String> {
+                Err(TeriError::Llm("not used".into()))
+            }
+            async fn chat_json<T: serde::de::DeserializeOwned>(&self, _: &[ChatMessage], _: &ChatOptions) -> Result<T> {
+                Err(TeriError::Llm("not used".into()))
+            }
+        }
+
+        let prompts = Arc::new(StdMutex::new(Vec::new()));
+        let llm = Arc::new(CapturingLlm { prompts: Arc::clone(&prompts) });
+        let graph = Arc::new(Mutex::new(KnowledgeGraph::new()));
+        let mut updater = GraphMemoryUpdater::new(Arc::clone(&graph), llm, "join-test".to_string());
+        updater.start();
+
+        // Add 5 activities to trigger a flush.
+        let activities = vec![
+            make_activity("twitter", "CREATE_POST"),
+            make_activity("twitter", "LIKE_POST"),
+            make_activity("twitter", "FOLLOW"),
+            make_activity("twitter", "REPOST"),
+            make_activity("twitter", "MUTE"),
+        ];
+        // Build expected combined text.
+        let expected_text: Vec<String> = activities
+            .iter()
+            .map(|a| a.to_episode_text())
+            .collect();
+        let expected_combined = expected_text.join("\n");
+
+        for a in activities {
+            updater.add_activity(a);
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        updater.stop().await;
+
+        // The first prompt sent to the LLM should contain the combined text.
+        let captured = prompts.lock().unwrap();
+        assert!(!captured.is_empty(), "LLM must have received at least one prompt");
+        assert!(
+            captured[0].contains(&expected_combined),
+            "first prompt must contain the combined episode text joined by \\n;\n\
+             expected combined text:\n{expected_combined}\n\
+             actual first prompt:\n{}",
+            captured[0]
+        );
+    }
+
+    // ── get_stats key set ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_stats_key_set() {
+        let graph = Arc::new(Mutex::new(KnowledgeGraph::new()));
+        let llm = Arc::new(MockLlm::new("[]", "[]"));
+        let mut updater = GraphMemoryUpdater::new(graph, llm, "stats-test".to_string());
+        updater.start();
+
+        let stats = updater.get_stats().await;
+
+        // Verify all contractual keys are present (observable JSON contract).
+        let json = serde_json::to_value(&stats).expect("serialize stats");
+        for key in &["graph_id", "batch_size", "total_activities", "batches_sent",
+                     "items_sent", "failed_count", "skipped_count", "queue_size",
+                     "buffer_sizes", "running"] {
+            assert!(
+                json.get(key).is_some(),
+                "get_stats JSON must have key '{key}'"
+            );
+        }
+        assert_eq!(stats.graph_id, "stats-test");
+        assert_eq!(stats.batch_size, BATCH_SIZE);
+        assert!(stats.running);
+
+        updater.stop().await;
+
+        let stats_after = updater.get_stats().await;
+        assert!(!stats_after.running, "running must be false after stop");
+    }
+
+    // ── start() is idempotent ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_start_idempotent() {
+        let graph = Arc::new(Mutex::new(KnowledgeGraph::new()));
+        let llm = Arc::new(MockLlm::new("[]", "[]"));
+        let mut updater = GraphMemoryUpdater::new(graph, llm, "idempotent-test".to_string());
+
+        updater.start();
+        updater.start(); // Second call must be a no-op.
+
+        let stats = updater.get_stats().await;
+        assert!(stats.running);
+
+        updater.stop().await;
+    }
+
+    // ── S-530 regression: buffer_sizes always contains twitter + reddit ───────
+    //
+    // MiroFish seeds `self._platform_buffers = {'twitter': [], 'reddit': []}` in
+    // `__init__` (L252-255), so `get_stats()` at L463 ALWAYS returns at least
+    // {"twitter": 0, "reddit": 0} — even before any activity has been received.
+    // This test pins that contractual guarantee.
+
+    /// Right after `new()` + `start()`, before any activity, both platform keys
+    /// must be present with value 0.
+    #[tokio::test]
+    async fn test_buffer_sizes_seeded_twitter_reddit_at_start() {
+        let graph = Arc::new(Mutex::new(KnowledgeGraph::new()));
+        let llm = Arc::new(MockLlm::new("[]", "[]"));
+        let mut updater = GraphMemoryUpdater::new(graph, llm, "seed-test".to_string());
+        updater.start();
+
+        let stats = updater.get_stats().await;
+
+        assert!(
+            stats.buffer_sizes.contains_key("twitter"),
+            "buffer_sizes must contain 'twitter' key immediately after start(); got: {:?}",
+            stats.buffer_sizes
+        );
+        assert!(
+            stats.buffer_sizes.contains_key("reddit"),
+            "buffer_sizes must contain 'reddit' key immediately after start(); got: {:?}",
+            stats.buffer_sizes
+        );
+        assert_eq!(
+            stats.buffer_sizes["twitter"], 0,
+            "twitter buffer size must be 0 with no activities"
+        );
+        assert_eq!(
+            stats.buffer_sizes["reddit"], 0,
+            "reddit buffer size must be 0 with no activities"
+        );
+
+        updater.stop().await;
+    }
+
+    /// Only DO_NOTHING/event_type activities received — twitter and reddit still present at 0.
+    #[tokio::test]
+    async fn test_buffer_sizes_seeded_after_do_nothing_activities() {
+        let graph = Arc::new(Mutex::new(KnowledgeGraph::new()));
+        let llm = Arc::new(MockLlm::new("[]", "[]"));
+        let mut updater = GraphMemoryUpdater::new(graph, llm, "do-nothing-seed-test".to_string());
+        updater.start();
+
+        // DO_NOTHING activities are skipped before enqueue, so the worker never sees them.
+        updater.add_activity(make_activity("twitter", "DO_NOTHING"));
+        updater.add_activity(make_activity("reddit", "DO_NOTHING"));
+
+        // event_type activities are also skipped.
+        let event_data = serde_json::json!({ "event_type": "SIMULATION_START", "round": 1 });
+        updater.add_activity_from_dict(&event_data, "twitter");
+
+        // Brief yield to let the worker settle (though nothing was enqueued).
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let stats = updater.get_stats().await;
+
+        assert!(
+            stats.buffer_sizes.contains_key("twitter"),
+            "twitter key must be present even with only DO_NOTHING activities; got: {:?}",
+            stats.buffer_sizes
+        );
+        assert!(
+            stats.buffer_sizes.contains_key("reddit"),
+            "reddit key must be present even with only DO_NOTHING activities; got: {:?}",
+            stats.buffer_sizes
+        );
+        assert_eq!(stats.buffer_sizes["twitter"], 0);
+        assert_eq!(stats.buffer_sizes["reddit"], 0);
+
+        updater.stop().await;
+    }
+
+    /// A third-platform activity adds its key; twitter and reddit remain present.
+    #[tokio::test]
+    async fn test_buffer_sizes_third_platform_adds_key() {
+        let graph = Arc::new(Mutex::new(KnowledgeGraph::new()));
+        let llm = Arc::new(MockLlm::new("[]", "[]"));
+        let mut updater = GraphMemoryUpdater::new(graph, llm, "third-platform-test".to_string());
+        updater.start();
+
+        // Add one activity on a novel platform.
+        updater.add_activity(make_activity("discord", "CREATE_POST"));
+
+        // Give the worker time to receive and update the snapshot.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let stats = updater.get_stats().await;
+
+        // All three platform keys present.
+        assert!(
+            stats.buffer_sizes.contains_key("twitter"),
+            "twitter must still be present after a discord activity; got: {:?}",
+            stats.buffer_sizes
+        );
+        assert!(
+            stats.buffer_sizes.contains_key("reddit"),
+            "reddit must still be present after a discord activity; got: {:?}",
+            stats.buffer_sizes
+        );
+        assert!(
+            stats.buffer_sizes.contains_key("discord"),
+            "discord key must appear after a discord activity; got: {:?}",
+            stats.buffer_sizes
+        );
+
+        // discord has exactly 1 buffered activity (< BATCH_SIZE, so not flushed yet).
+        assert_eq!(stats.buffer_sizes["discord"], 1);
+        // twitter and reddit still at 0 (no activities sent on those platforms).
+        assert_eq!(stats.buffer_sizes["twitter"], 0);
+        assert_eq!(stats.buffer_sizes["reddit"], 0);
+
+        updater.stop().await;
+    }
+}

@@ -1517,3 +1517,125 @@ arg is not a contractual input here. Non-contractual edge, no parity impact.
 **PASS:** all 22 symbols S-493..S-514 exercised and byte-exact (0 `[≠]` — pure port, nothing skipped).
 S-493..S-514 → `- [x]`. No silent drop, no narrowed/reordered ladder, no wrong key, no weakened test.
 U-021 unit ledger stays `- [~]` (sub-cycles b = `ZepGraphMemoryUpdater` L202+, c = manager remain).
+
+---
+
+## 2026-06-17 — U-021 sub-cycle (b) `ZepGraphMemoryUpdater` (S-515..S-530) — VERDICT: **FAIL** (one observable divergence; 1 of 16 symbols left `- [~]`)
+
+**Verifier:** rust-port-parity-verifier (differential, cross-boundary).
+**Worktree:** `/home/drdave/Desktop/meta/.worktrees/mirofish-port/teri` (branch `port/mirofish`).
+**Source:** `MiroFish/backend/app/services/zep_graph_memory_updater.py` (L202-476).
+**Rust:** `src/services/graph_memory.rs` (GraphMemoryUpdater<L> L778-1289) + `src/graph/mod.rs` (extend_from_text/extract_and_merge_into/ExtendStats L559-858).
+**Design:** DECISION-14 (target-architecture.md:874-1036).
+**Tests run (all green):** `cargo test build_` → 23 pass (no U-015 regression); `extend_from_text` → 4 pass; `updater_tests` → 13 pass; `services::graph_memory` → 66 pass; full suite → **868 pass, 6 ignored**.
+
+### Adversarial checklist results
+
+1. **build byte-identical refactor — PASS.** `extract_and_merge_into` (graph/mod.rs:617) is the extracted 2-pass body; `build_with_progress_and_ontology` (:559) now builds a fresh graph and calls it (:584-594). 23 `build_` tests green; `test_build_still_byte_identical_after_refactor` (mod.rs:2616) confirms no regression. `build`/`build_with_progress`/`_and_ontology` present at :504/:527/:559.
+
+2. **`extend_from_text` no-drop — PASS.** Merge by exact case-sensitive name: `if !self.index.contains_key(&entity.name) { add_entity; added+=1 } else { merged+=1 }` (mod.rs:668-673) — gates BEFORE add_entity (which rejects dupes at :287). Pass-2 collects `self.get_all_entities()` AFTER Pass-1 merge (:687) → resolves relations against self's FULL post-merge set, so a relation to a PRE-EXISTING entity is NOT dropped. Proven by `test_extend_from_text_merge_semantics` (mod.rs:2509): base graph={Alice}; extend introduces Bob + relation Bob→Alice; asserts `relations_added==1` and `relation_count==1` (the extend-into-self beats throwaway-subgraph property). Existing-node kind preserved (`test_extend_from_text_duplicate_name_reused`).
+
+3. **retry `[≠]` — ADJUDICATED LEGAL.** Observable part PORTED: `flush_batch` Err arm → `failed_count.fetch_add(1)` + error log + worker continues (graph_memory.rs:1280-1287); worker never aborts. Literal 3x-backoff `[≠]` is **justified**: teri's LLM adapter `call_api` (llm.rs:317-356, used by `complete()` → `extend_from_text` → `flush_batch`) ALREADY retries internally — server-error + timeout retry with exponential backoff up to `self.max_retries` (:336-352). A second retry layer in flush_batch would be **redundant network-retry**. The source's MAX_RETRIES targeted Zep-network transients; teri's network-transient retry already lives one layer down. `[≠]` on S-519 stands. (S-518 SEND_INTERVAL, S-520 RETRY_DELAY likewise network-shaped, non-contractual — legal `[≠]`.)
+
+4. **concurrency observable contract — MOSTLY PASS, ONE FAIL (buffer_sizes empty-state).**
+   - batch-at-exactly-5: `test_batch_flush_at_batch_size` asserts `batches_sent==1, items_sent==5` for exactly 5 same-platform (one extend per 5). `test_per_platform_independent_batching` asserts 5 twitter flush=1 batch while 3 reddit waits, then stop flushes reddit → 2 batches. PASS.
+   - `combined_text = join("\n")`: graph_memory.rs:1255-1256 exact; `test_combined_text_join` asserts the LLM prompt contains the `\n`-joined episode text. PASS.
+   - DO_NOTHING skip BEFORE enqueue (skipped_count++, no total_activities): :1048-1051; `test_add_activity_do_nothing_skipped` asserts skipped=1/total=0. PASS.
+   - add_activity_from_dict event_type skip (no counter bumped): :1072-1074; `test_add_activity_from_dict_event_type_skipped` asserts both stay 0. PASS.
+   - `_flush_remaining` sends sub-5 leftovers on clean stop (no loss): worker channel-closed branch (:1203-1214) flushes every non-empty buffer; `test_flush_remaining_on_stop` asserts 3 activities → batches_sent=1/items_sent=3. PASS.
+   - get_stats TOP-LEVEL key set {graph_id,batch_size,total_activities,batches_sent,items_sent,failed_count,skipped_count,queue_size,buffer_sizes,running}: byte-exact (`test_get_stats_key_set`). PASS.
+   - **`buffer_sizes` nested-map content — FAIL (DIVERGENCE).** Source seeds `_platform_buffers={'twitter':[],'reddit':[]}` at `__init__` (L252-255); `get_stats` returns `buffer_sizes={p:len(b) for p,b}` (L463) → **always contains keys `twitter` and `reddit`**, even with zero activities. teri's `buffer_snapshot` starts `{}` (graph_memory.rs:966) and is only written by the worker on the first activity (`update_buffer_snapshot` is called inside the recv loop :1181 / drain :1216, NEVER at worker startup — even though the worker's own `platform_buffers` IS seeded twitter+reddit at :1166-1171, that seed never reaches the snapshot until an activity arrives). **Empirically confirmed** via temporary probe (reverted): `get_stats()` right after `start()` returns `buffer_sizes = {}` (no twitter/reddit keys) vs source `{"twitter":0,"reddit":0}`.
+     - **Input:** `new(...); start(); get_stats()` (or any path with only DO_NOTHING/event_type activities — the worker never receives anything).
+     - **Expected (source):** `buffer_sizes = {"twitter": 0, "reddit": 0}`.
+     - **Actual (Rust):** `buffer_sizes = {}`.
+     - **Offending symbol:** S-530 `get_stats` (and the worker-side snapshot init under S-527 `worker_loop`).
+     - **Why contractual:** DECISION-14 §Decision 3 explicitly classifies `get_stats` as "OBSERVABLE, served via API/U-049 → PORT" and `buffer_sizes` as a named field of that contract. The nested-map key set is observable output of a symbol claimed fully PORTED (not `[≠]`). This is a narrowing of the per-platform map's guaranteed key set — exactly the disguised-narrowing class the gate fails closed on, regardless of size.
+
+5. **U-050 locale — PASS.** `start()` captures `crate::i18n::get_locale()` (graph_memory.rs:982) BEFORE `tokio::spawn` (:995) and wraps the worker future in `crate::i18n::with_locale(locale, ...)` (:995-997). Faithful to source L281 (`current_locale = get_locale()` before Thread) + worker `set_locale(locale)` (L366).
+
+6. **Other `[≠]` — all legal.** ZEP_API_KEY check (S-516 `__init__` ValueError) → keyless native graph, substrate-absent, legal `[≠]`. SEND_INTERVAL (S-518) → not load-bearing (pure wall-clock pacing, no output), legal `[≠]`. Zep coreference entity-resolution → teri merges by exact name, NO entity dropped (every extracted entity IS added; only the resolution key differs), genuine substrate inexpressibility, legal `[≠]`. **PLATFORM_DISPLAY_NAMES PORTED** (not skipped): `platform_display_name` (graph_memory.rs:835) twitter→"世界1"/reddit→"世界2"/else→input, used in the flush + flush_remaining log lines (:1206, :1273); `test_platform_display_name_*` cover all 3 branches incl. case-insensitivity. Correct — this is the log-observable feature that MUST be ported, and it is.
+
+### Symbol roll-up (S-515..S-530, 16 rows)
+- `- [x]` S-515 GraphMemoryUpdater struct — type present, generic `<L>` (LlmClient not dyn-safe; observable contract identical, documented).
+- `- [x]` S-516 BATCH_SIZE=5 — `const BATCH_SIZE: usize = 5`; threshold proven by batch tests.
+- `- [x]` S-517 PLATFORM_DISPLAY_NAMES — PORTED (世界1/世界2), log-observable, 3 tests.
+- `- [≠]` S-518 SEND_INTERVAL — network rate-limit, non-contractual (no output). **Survives `[≠]` challenge.**
+- `- [≠]` S-519 MAX_RETRIES — redundant: adapter `call_api` already retries (llm.rs:336-352); failed_count+continue PORTED. **Survives.**
+- `- [≠]` S-520 RETRY_DELAY — network backoff cadence, non-contractual. **Survives.**
+- `- [x]` S-521 __init__/new — constructor; ZEP_API_KEY `[≠]` (keyless, substrate-absent — survives).
+- `- [x]` S-522 _get_platform_display_name — merged into S-517 fn.
+- `- [x]` S-523 start — locale capture + spawn + with_locale (U-050); idempotent (`test_start_idempotent`).
+- `- [x]` S-524 stop — drop tx + timeout-join + final log; flush-on-stop proven.
+- `- [x]` S-525 add_activity — DO_NOTHING skip before enqueue + counters (producer side).
+- `- [x]` S-526 add_activity_from_dict — event_type skip + Python-identical field defaults.
+- `- [x]` S-527 _worker_loop — recv→per-platform buffer→threshold flush (batch-at-5 proven). *(snapshot-init gap contributes to S-530 FAIL)*
+- `- [x]` S-528 _send_batch_activities — combined_text "\n".join + extend_from_text + counters; retry `[≠]` legal.
+- `- [x]` S-529 _flush_remaining — channel-closed drain flushes sub-5 leftovers per platform (no loss).
+- `- [~]` **S-530 get_stats — UNPROVEN / DIVERGENT.** Top-level key set byte-exact, but `buffer_sizes` nested map omits the guaranteed `twitter`/`reddit` keys in the empty/skip-only state (`{}` vs `{"twitter":0,"reddit":0}`).
+
+### VERDICT: **FAIL** — 15/16 symbols `- [x]`/`- [≠]` (all `[≠]` survived the challenge), **S-530 stays `- [~]`**.
+
+**Routed back to porter — the precise missing behavior:** seed `buffer_snapshot` with the two initial platforms at `start()` (or in `new`) so `get_stats().buffer_sizes` reports `{"twitter":0,"reddit":0}` from the first call — matching the source's `__init__`-seeded `_platform_buffers`. Two faithful options: (a) initialize `buffer_snapshot` to `{"twitter":0,"reddit":0}` when constructing it; OR (b) call `update_buffer_snapshot(&platform_buffers, &buffer_snapshot)` once at worker startup (before the recv loop) so the seeded twitter+reddit buffers (graph_memory.rs:1166-1171) are reflected immediately. Add a parity test asserting `buffer_sizes` contains `twitter` and `reddit` keys (both 0) immediately after `start()` with zero activities. Re-verify → flip S-530 to `- [x]`; then the unit may PASS.
+
+**Unit ledger:** U-021 stays `- [~]` (sub-cycle (b) not yet clean; sub-cycle (c) `ZepGraphMemoryManager` also remains). No commit on this unit.
+
+---
+
+## 2026-06-17 — U-021 sub-cycle (b) S-530 — **FIX RE-VERIFIED** — VERDICT: **PASS** (16/16 symbols covered)
+
+**Verifier:** rust-port-parity-verifier (differential re-verification of the single FAIL above).
+**Worktree:** `/home/drdave/Desktop/meta/.worktrees/mirofish-port/teri` (branch `port/mirofish`).
+**Source:** `MiroFish/backend/app/services/zep_graph_memory_updater.py` (L252-255 `__init__` seed, L376-377 dynamic-platform add, L463 `get_stats` comprehension).
+**Rust:** `src/services/graph_memory.rs` (`new` L956-975, `get_stats` L1129-1143, `worker_loop` L1162-1224).
+
+### The fix (matches the precise routed-back instruction, option a)
+
+The porter implemented **option (a)** from the prior FAIL: `GraphMemoryUpdater::new` now pre-seeds the buffer-size snapshot at construction —
+```
+let mut initial_snapshot = HashMap::new();
+initial_snapshot.insert("twitter".to_string(), 0usize);
+initial_snapshot.insert("reddit".to_string(), 0usize);
+... buffer_snapshot: Arc::new(Mutex::new(initial_snapshot)),
+```
+(graph_memory.rs:962-973). The worker's own `platform_buffers` was already seeded twitter+reddit (L1173-1178). `get_stats` clones this snapshot (L1130).
+
+### Re-verification (each point independently confirmed)
+
+1. **`buffer_sizes` ALWAYS contains `twitter`+`reddit` (=0 empty) from construction — CONFIRMED.** Snapshot seeded in `new()` BEFORE any worker activity → `get_stats().buffer_sizes` returns `{"twitter":0,"reddit":0}` from the very first call. Byte-faithful to source: `__init__` seeds `_platform_buffers={'twitter':[],'reddit':[]}` (L252-255); `get_stats` builds `{p:len(b) for p,b in self._platform_buffers.items()}` (L463) over that seeded dict. The prior divergence (`{}` vs `{"twitter":0,"reddit":0}`) is **resolved**.
+
+2. **Dynamic non-twitter/reddit platform path UNBROKEN — CONFIRMED.** Worker L1185 `platform_buffers.entry(platform.clone()).or_default().push(activity)` still ADDS a novel platform's key on first activity — mirrors source L376-377 (`if platform not in self._platform_buffers: self._platform_buffers[platform]=[]`). The seeding only *adds* the two initial keys; it does not gate or shadow the dynamic insert. Proven by `test_buffer_sizes_third_platform_adds_key` (discord→key added =1, twitter/reddit remain =0).
+
+3. **3 new regression tests RUN + PASS + assert the right thing — CONFIRMED (by name, not filtered):**
+   - `test_buffer_sizes_seeded_twitter_reddit_at_start` ... **ok** — both keys present AND =0 immediately after `start()`, zero activities.
+   - `test_buffer_sizes_seeded_after_do_nothing_activities` ... **ok** — only DO_NOTHING + event_type activities (which are skipped before enqueue and never reach the worker) → both keys still present =0.
+   - `test_buffer_sizes_third_platform_adds_key` ... **ok** — discord activity adds `discord`=1 while twitter+reddit remain present =0.
+   `test result: ok. 69 passed; 0 failed` (services::graph_memory suite). Assertions verified to test the correct contract (key-presence + zero-value + dynamic-add-without-loss).
+
+4. **No regression to the rest of (b) — CONFIRMED.** Fix is localized to snapshot seeding in `new()`. Full suite: **871 passed, 6 ignored, 0 failed** (lib 860 + bins 4+3+4) — grew exactly +3 from the prior 868 (the 3 new tests); all prior (b) tests (batch-at-5, per-platform, flush-remaining, combined_text join, DO_NOTHING/event_type skip, get_stats key set, locale, idempotent start) still green.
+
+### Symbol roll-up (S-515..S-530, 16 rows) — FINAL
+
+- `- [x]` S-515 GraphMemoryUpdater struct
+- `- [x]` S-516 BATCH_SIZE=5
+- `- [x]` S-517 PLATFORM_DISPLAY_NAMES (PORTED, 世界1/世界2, log-observable)
+- `- [≠]` S-518 SEND_INTERVAL — network rate-limit, non-contractual. Survives `[≠]` challenge.
+- `- [≠]` S-519 MAX_RETRIES — redundant (adapter `call_api` already retries); failed_count+continue PORTED. Survives.
+- `- [≠]` S-520 RETRY_DELAY — network backoff cadence, non-contractual. Survives.
+- `- [x]` S-521 __init__/new — constructor + **buffer-snapshot seed (the fix)**; ZEP_API_KEY `[≠]` keyless substrate-absent.
+- `- [x]` S-522 _get_platform_display_name
+- `- [x]` S-523 start — locale capture + spawn + with_locale (U-050); idempotent.
+- `- [x]` S-524 stop — drop tx + timeout-join + final log.
+- `- [x]` S-525 add_activity — DO_NOTHING skip before enqueue + counters.
+- `- [x]` S-526 add_activity_from_dict — event_type skip + Python-identical defaults.
+- `- [x]` S-527 _worker_loop — recv→per-platform buffer→threshold flush; snapshot seeded twitter+reddit. *(snapshot-init gap now closed)*
+- `- [x]` S-528 _send_batch_activities — combined_text "\n".join + extend + counters; retry `[≠]` legal.
+- `- [x]` S-529 _flush_remaining — channel-closed drain flushes sub-5 leftovers per platform (no loss).
+- `- [x]` **S-530 get_stats — NOW PASS.** Top-level key set byte-exact AND `buffer_sizes` nested map now reports `{"twitter":0,"reddit":0}` from construction (was `{}`). Flipped `- [~]` → `- [x]`.
+
+**Final tally: 13 `- [x]` + 3 `- [≠]` (all survived the challenge) = 16/16 covered. Zero `- [~]`, zero disguised-skip `[≠]`.**
+
+### VERDICT: **PASS**
+
+The single observable divergence from the prior FAIL is resolved by a faithful, localized fix; no other (b) behavior regressed; 871 tests green. **Sub-cycle (b) is parity-clean.** S-530 flips to `- [x]`.
+
+**Unit ledger:** U-021 still gated on sub-cycle (c) `ZepGraphMemoryManager` (S-531+) — sub-cycle (b) is now PASS but the unit cannot flip `- [x]` until (c) is verified. No change to ledger/symbol-map made here beyond this parity.md trail (per instruction).

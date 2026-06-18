@@ -636,22 +636,22 @@
 - [x] S-512 · `unit:U-021` · `method` · `AgentActivity._describe_search_user` · `zep_graph_memory_updater.py:184`
 - [x] S-513 · `unit:U-021` · `method` · `AgentActivity._describe_mute` · `zep_graph_memory_updater.py:189`
 - [x] S-514 · `unit:U-021` · `method` · `AgentActivity._describe_generic` · `zep_graph_memory_updater.py:197`
-- [ ] S-515 · `unit:U-021` · `type` · `ZepGraphMemoryUpdater` · daemon-threaded queue flusher · `zep_graph_memory_updater.py:202`
-- [ ] S-516 · `unit:U-021` · `field` · `ZepGraphMemoryUpdater.BATCH_SIZE` · 5 · `zep_graph_memory_updater.py:217`
-- [ ] S-517 · `unit:U-021` · `field` · `ZepGraphMemoryUpdater.PLATFORM_DISPLAY_NAMES` · `zep_graph_memory_updater.py:220`
-- [ ] S-518 · `unit:U-021` · `field` · `ZepGraphMemoryUpdater.SEND_INTERVAL` · 0.5s · `zep_graph_memory_updater.py:226`
-- [ ] S-519 · `unit:U-021` · `field` · `ZepGraphMemoryUpdater.MAX_RETRIES` · 3 · `zep_graph_memory_updater.py:229`
-- [ ] S-520 · `unit:U-021` · `field` · `ZepGraphMemoryUpdater.RETRY_DELAY` · 2s · `zep_graph_memory_updater.py:230`
-- [ ] S-521 · `unit:U-021` · `method` · `ZepGraphMemoryUpdater.__init__` · `zep_graph_memory_updater.py:232`
-- [ ] S-522 · `unit:U-021` · `method` · `ZepGraphMemoryUpdater._get_platform_display_name` · `zep_graph_memory_updater.py:271`
-- [ ] S-523 · `unit:U-021` · `method` · `ZepGraphMemoryUpdater.start` · spawns daemon thread, locale-captured before spawn · `zep_graph_memory_updater.py:275`
-- [ ] S-524 · `unit:U-021` · `method` · `ZepGraphMemoryUpdater.stop` · signals worker, flushes remaining · `zep_graph_memory_updater.py:293`
-- [ ] S-525 · `unit:U-021` · `method` · `ZepGraphMemoryUpdater.add_activity` · skips DO_NOTHING, enqueues · `zep_graph_memory_updater.py:310`
-- [ ] S-526 · `unit:U-021` · `method` · `ZepGraphMemoryUpdater.add_activity_from_dict` · skips event_type entries · `zep_graph_memory_updater.py:340`
-- [ ] S-527 · `unit:U-021` · `method` · `ZepGraphMemoryUpdater._worker_loop` · queue→per-platform buffers→flush at BATCH_SIZE · `zep_graph_memory_updater.py:364`
-- [ ] S-528 · `unit:U-021` · `method` · `ZepGraphMemoryUpdater._send_batch_activities` · merges to text episode, client.graph.add · `zep_graph_memory_updater.py:396`
-- [ ] S-529 · `unit:U-021` · `method` · `ZepGraphMemoryUpdater._flush_remaining` · `zep_graph_memory_updater.py:435`
-- [ ] S-530 · `unit:U-021` · `method` · `ZepGraphMemoryUpdater.get_stats` · `zep_graph_memory_updater.py:460`
+- [x] S-515 · `unit:U-021` · `type` · `ZepGraphMemoryUpdater` · daemon-threaded queue flusher · `zep_graph_memory_updater.py:202` → `teri::services::graph_memory::GraphMemoryUpdater<L>` (`src/services/graph_memory.rs`)
+- [x] S-516 · `unit:U-021` · `field` · `ZepGraphMemoryUpdater.BATCH_SIZE` · 5 · `zep_graph_memory_updater.py:217` → `const BATCH_SIZE: usize = 5` (`src/services/graph_memory.rs`)
+- [x] S-517 · `unit:U-021` · `field` · `ZepGraphMemoryUpdater.PLATFORM_DISPLAY_NAMES` · `zep_graph_memory_updater.py:220` → `fn platform_display_name(platform: &str) -> &str` (twitter→"世界1", reddit→"世界2") (`src/services/graph_memory.rs`)
+- [≠] S-518 · `unit:U-021` · `field` · `ZepGraphMemoryUpdater.SEND_INTERVAL` · 0.5s · `zep_graph_memory_updater.py:226` — Zep network rate-limit; non-contractual in-process (DECISION-14 Decision 4)
+- [≠] S-519 · `unit:U-021` · `field` · `ZepGraphMemoryUpdater.MAX_RETRIES` · 3 · `zep_graph_memory_updater.py:229` — Zep-network transient-retry; failed_count+continue-on-error IS ported; literal retry cadence is non-contractual (DECISION-14 Decision 4)
+- [≠] S-520 · `unit:U-021` · `field` · `ZepGraphMemoryUpdater.RETRY_DELAY` · 2s · `zep_graph_memory_updater.py:230` — Zep-network backoff delay; non-contractual (DECISION-14 Decision 4)
+- [x] S-521 · `unit:U-021` · `method` · `ZepGraphMemoryUpdater.__init__` · `zep_graph_memory_updater.py:232` → `GraphMemoryUpdater::new` (`src/services/graph_memory.rs`)
+- [x] S-522 · `unit:U-021` · `method` · `ZepGraphMemoryUpdater._get_platform_display_name` · `zep_graph_memory_updater.py:271` → `fn platform_display_name` (merged with S-517) (`src/services/graph_memory.rs`)
+- [x] S-523 · `unit:U-021` · `method` · `ZepGraphMemoryUpdater.start` · spawns daemon thread, locale-captured before spawn · `zep_graph_memory_updater.py:275` → `GraphMemoryUpdater::start` with U-050 `with_locale` locale-capture (`src/services/graph_memory.rs`)
+- [x] S-524 · `unit:U-021` · `method` · `ZepGraphMemoryUpdater.stop` · signals worker, flushes remaining · `zep_graph_memory_updater.py:293` → `GraphMemoryUpdater::stop` (drop tx + join) (`src/services/graph_memory.rs`)
+- [x] S-525 · `unit:U-021` · `method` · `ZepGraphMemoryUpdater.add_activity` · skips DO_NOTHING, enqueues · `zep_graph_memory_updater.py:310` → `GraphMemoryUpdater::add_activity` (DO_NOTHING skip before enqueue) (`src/services/graph_memory.rs`)
+- [x] S-526 · `unit:U-021` · `method` · `ZepGraphMemoryUpdater.add_activity_from_dict` · skips event_type entries · `zep_graph_memory_updater.py:340` → `GraphMemoryUpdater::add_activity_from_dict` (event_type skip) (`src/services/graph_memory.rs`)
+- [x] S-527 · `unit:U-021` · `method` · `ZepGraphMemoryUpdater._worker_loop` · queue→per-platform buffers→flush at BATCH_SIZE · `zep_graph_memory_updater.py:364` → `async fn worker_loop<L>` (`src/services/graph_memory.rs`)
+- [x] S-528 · `unit:U-021` · `method` · `ZepGraphMemoryUpdater._send_batch_activities` · merges to text episode, client.graph.add · `zep_graph_memory_updater.py:396` → `async fn flush_batch<L>` (combined_text "\n".join → `extend_from_text`) (`src/services/graph_memory.rs`)
+- [x] S-529 · `unit:U-021` · `method` · `ZepGraphMemoryUpdater._flush_remaining` · `zep_graph_memory_updater.py:435` → drain section at end of `worker_loop` (channel-closed branch) (`src/services/graph_memory.rs`)
+- [x] S-530 · `unit:U-021` · `method` · `ZepGraphMemoryUpdater.get_stats` · `zep_graph_memory_updater.py:460` → `GraphMemoryUpdater::get_stats` → `UpdaterStats` (10 serde fields, byte-identical JSON keys) (`src/services/graph_memory.rs`)
 - [ ] S-531 · `unit:U-021` · `type` · `ZepGraphMemoryManager` · class-level dict of updaters · `zep_graph_memory_updater.py:479`
 - [ ] S-532 · `unit:U-021` · `field` · `ZepGraphMemoryManager._updaters` · `zep_graph_memory_updater.py:486`
 - [ ] S-533 · `unit:U-021` · `field` · `ZepGraphMemoryManager._lock` · `zep_graph_memory_updater.py:487`

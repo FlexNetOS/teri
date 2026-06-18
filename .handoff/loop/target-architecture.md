@@ -868,3 +868,169 @@ unblocking U-017/U-021.
 **Owner-rule notes:** the platform display names {twitter:'世界1', reddit:'世界2'} (S-517) are console-display only →
 likely `[≠]` non-contractual (verify no consumer reads them). get_stats (S-538) IS observable (served via U-049/API) →
 port. DO_NOTHING skip in add_activity IS contractual (filters before queueing) → port.
+
+---
+
+## DECISION-14 — U-021 sub-cycle (b) `ZepGraphMemoryUpdater` (S-515..S-53x) → MAP-ONTO teri in-process graph extract-merge + tokio (refines DECISION-13 §b)
+
+**Lineage:** DECISION-1 (Zep→petgraph), DECISION-13 §b (sub-cycle split). Sub-cycle (a) (`AgentActivity` + `to_episode_text`, S-493..S-514) is DONE & tested in `src/services/graph_memory.rs`. This refines DECISION-13 §b into an implementable, no-downgrade design the porter executes verbatim.
+
+**Verified teri facts (read this cycle, file:line):**
+- `KnowledgeGraph::build_with_progress_and_ontology` (`graph/mod.rs:545`) is the 2-pass pipeline: Pass-1 per-chunk entity extraction with merge `if !graph.index.contains_key(&entity.name) { graph.add_entity(...) }` (`:613-618`); Pass-2 per-chunk relation extraction added by name-lookup, skipping relations whose `from`/`to` aren't in the graph (`:626-701`). It builds a **fresh** `KnowledgeGraph::new()` (`:561`).
+- `add_entity(&mut self, Entity) -> Result<NodeIndex>` (`:272`) **REJECTS duplicates by name** (`Err` if `self.index.contains_key(&entity.name)`, `:273-278`). So a merge MUST gate on `contains_key` first (never call `add_entity` on a present name) — this is exactly what Pass-1 already does.
+- `add_relation(&mut self, from, to, Relation)` (`:286`) appends blindly (no edge-dedup) — matches Pass-2.
+- `i18n::with_locale(locale: String, future) -> T` (`i18n/mod.rs:143`, async, `LOCALE.scope`), `get_locale() -> String` (`:174`, defaults "zh"). This is the U-050 site for `start()`'s pre-spawn locale capture.
+- Ownership idiom locked by DECISION-11: **caller-constructs-clients**; `&KnowledgeGraph` + `&L: LlmClient` are passed per-call; service structs hold NO llm/graph. The updater must follow this.
+- `Relation { kind: RelationKind, weight: f32, valid_at: Option<(u64,Option<u64>)> }` (`:82-93`); `get_all_entities -> Vec<&Entity>` (`:1046`), `get_all_edges -> Vec<(Uuid,Uuid,Relation)>` (`:830`), `entity_count` (`:1050`).
+
+---
+
+### Decision 1 — `graph.add(text)` → ADDITIVE `KnowledgeGraph::extend_from_text` (Option A), reusing the U-015 extraction pipeline
+
+**CHOSEN: Option (A).** Add ONE additive method to `src/graph/mod.rs`:
+
+```rust
+/// Merge stats returned by `extend_from_text` (observable surface for the updater's
+/// counters + differential parity).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtendStats {
+    pub entities_added: usize,    // names not already present → add_entity'd
+    pub entities_merged: usize,   // names already present → reused existing node (NOT added)
+    pub relations_added: usize,   // edges added in Pass-2
+}
+
+/// Extends an EXISTING graph with entities/relations extracted from free NL `text`,
+/// running the SAME 2-pass LLM extraction pipeline as `build_with_progress_and_ontology`,
+/// but merging into `self` instead of a fresh graph. The in-process analogue of Zep's
+/// server-side `graph.add(type="text", data=...)`.
+///
+/// Merge semantics (no-downgrade, matched as closely to Zep's entity-resolution as the
+/// substrate allows):
+///   - entity merge key = entity NAME (case-sensitive; same key the build pipeline + add_entity use).
+///     present name  → reuse existing node, do NOT mutate it (entities_merged += 1);
+///     absent name   → add_entity (entities_added += 1).
+///   - relations: Pass-2 over `self`'s post-merge entity set; an edge whose from/to name
+///     is not in `self` is skipped (identical to build's :664-672); else add_relation
+///     (relations_added += 1, no edge-dedup — matches build).
+/// Additive: `build`/`build_with_progress*`/`add_entity` are UNCHANGED; the existing 5 build
+/// tests + all graph tests stay green.
+pub async fn extend_from_text<L: LlmClient>(
+    &mut self,
+    text: &str,
+    llm: &L,
+) -> Result<ExtendStats>;
+```
+
+**Why A over B/C (faithful + lowest blast radius):**
+- **Faithfulness.** Zep `graph.add(text)` runs server-side LLM entity/relation extraction and MERGES into the existing graph by entity identity. teri's `build_with_progress_and_ontology` ALREADY embodies exactly that extraction + merge-by-name — it merges across chunks into one accumulating graph. Extending `&mut self` instead of a fresh graph is the same operation with a different target. The combined_text grouping (Decision 3) drives the same per-batch extraction Zep would run on the same NL blob.
+- **Lowest blast radius.** Option B (build a throwaway subgraph via `build()` then merge its nodes/edges) re-extracts then re-walks the subgraph to re-add — duplicating merge logic AND losing the Pass-2 "relations reference the merged entity set" property (B's Pass-2 only sees the subgraph's entities, not `self`'s, so a relation from a NEW entity to an ALREADY-PRESENT one would be dropped — a silent downgrade). A keeps Pass-2 against `self`'s full post-merge entity set, so cross-batch relations are preserved. B also can't carry `valid_at` cleanly. **Reject B.**
+- **Implementation (porter):** refactor the per-chunk extract+merge body of `build_with_progress_and_ontology` (`:580-701`) into a private `async fn extract_and_merge_into(&mut self, chunks, llm, custom_entity_kinds, custom_edge_kinds, progress, stats: &mut ExtendStats)` that operates on `&mut self`. Then `build_with_progress_and_ontology` becomes: `let mut g = KnowledgeGraph::new(); g.ontology_*=...; g.extract_and_merge_into(...).await?; Ok(g)` (its return is byte-identical → 5 build tests untouched, confirmed because the merge gate `if !contains_key` is already what it does). `extend_from_text` = `self.extract_and_merge_into(split_text(text,500,50), llm, &self.ontology_entity_types.clone(), &self.ontology_edge_types.clone(), &mut |_,_|{}, &mut stats).await?`. **Ontology types are read from `self`** (a graph that had `set_ontology` called keeps emitting Custom kinds on extend — faithful to Zep where set_ontology persists for subsequent adds). Chunking params reuse the pipeline constants (CHUNK_SIZE=500/OVERLAP=50) — the combined_text per batch is typically < 500 chars so it's a single chunk, but chunking is kept for parity with the build path and large batches.
+
+**Substrate limit (→ `[≠]`, see Decision 4):** Zep's server-side entity resolution does fuzzy/embedding-based coreference ("AI" ≡ "artificial intelligence"). teri merges by EXACT case-sensitive name only. Where two NL mentions resolve to the same Zep entity but to distinct teri names, teri creates two nodes. This is a **genuine substrate inexpressibility** (teri has no entity-resolution model at merge time), adjudicated `[≠]` — NOT a silent drop (every extracted entity IS added; the limit is only that exact-name is the resolution key). The differential parity (DECISION-1 note) compares the SET of entity *names* and edge structure, not Zep's internal coreference, so this is the correct boundary.
+
+---
+
+### Decision 2 — What the updater HOLDS (ownership/sharing) — follow DECISION-11 caller-constructs idiom
+
+The updater is in-process, so the Zep `graph_id: str` (a by-id remote handle) becomes an **explicit owned graph handle**. The extraction needs an `LlmClient`. Because `extend_from_text` takes `&mut self` on the graph AND the background flush task needs to outlive individual calls, the updater holds **shared, mutable** handles:
+
+```rust
+pub struct GraphMemoryUpdater {
+    graph: Arc<Mutex<KnowledgeGraph>>,        // the target graph (was Zep graph_id) — tokio::sync::Mutex
+    llm:   Arc<dyn LlmClient>,                 // extraction client (was Zep server-side pipeline)
+    graph_label: String,                       // for log lines (was graph_id; the "graph_{...}" string)
+    // ... buffers / stats / channel (Decision 3) ...
+}
+```
+
+- **`Arc<tokio::sync::Mutex<KnowledgeGraph>>`** (NOT `std::sync::Mutex`): the flush calls `extend_from_text(&mut *guard, ...).await` which holds the lock ACROSS an `.await` (LLM round-trip) — requires an async-aware mutex. This is acceptable here because flushes are serialized per-updater anyway (one worker task) and the sim writers (U-022) only `add_activity` (which touches buffers, not the graph). The graph lock is contended only between this updater's flush and any external graph reader; the sim itself does not read the graph during ticks.
+- **`Arc<dyn LlmClient>`**: matches teri's existing `Arc<dyn LlmClient>` usage; clonable into the spawned task. (`LlmClient: Send + Sync` per `llm.rs`.)
+- **Composability with U-022 / `prepare_simulation`:** the U-022 social-sim constructs the `KnowledgeGraph` (or receives `&KnowledgeGraph` per DECISION-11) and the `Arc<dyn LlmClient>`, wraps the graph in `Arc<Mutex<_>>`, and constructs the updater with clones. The updater is then handed `AgentActivity` records as the sim emits actions. This keeps service structs free of llm/graph fields at construction-of-manager time (DECISION-11) — only the updater, which IS the write-back binding, holds them, and only for its lifetime. The `graph_id`→graph resolution Zep does by-id is replaced by passing the actual `Arc<Mutex<KnowledgeGraph>>` at `GraphMemoryUpdater::new`.
+- **Constructor:** `GraphMemoryUpdater::new(graph: Arc<Mutex<KnowledgeGraph>>, llm: Arc<dyn LlmClient>, graph_label: String) -> Self`. No `api_key`, no `ZEP_API_KEY` check (S-516 `__init__` ValueError on missing key is **dropped — substrate-absent**, native graph needs no key; `[≠]`, Decision 4).
+
+---
+
+### Decision 3 — Concurrency model: tokio `mpsc` + ONE spawned worker task (faithful async background drain)
+
+**CHOSEN:** true async-spawned worker (mpsc channel + spawned task), NOT a synchronous flush-on-threshold. Justification: the observable contract includes `running` (S-538 get_stats), `queue_size`, and the start()/stop() lifecycle with `_flush_remaining` on stop — these only make sense with a real background drain. More decisively, U-022's sim loop calls `add_activity` on the hot tick path; making it block on an LLM extraction round-trip at every 5th activity would change sim timing and couple the sim to extraction latency (a behavior change). Python deliberately decouples via Queue + daemon thread; tokio mpsc + spawned task is the faithful map. The final graph state + stats are identical either way, but the decoupling IS part of the contract (the daemon thread exists precisely so the producer never blocks on the network/LLM).
+
+**Structure (maps each Python member):**
+```
+Python                                  teri
+------------------------------------    --------------------------------------------------
+Queue _activity_queue                   tokio::sync::mpsc::UnboundedSender<AgentActivity> (producer side)
+threading.Thread _worker_thread         tokio::task::JoinHandle<()> (the worker)
+_platform_buffers: Dict[str,List]       HashMap<String, Vec<AgentActivity>>   (OWNED BY THE WORKER TASK —
+                                          no _buffer_lock needed; single owner. seeds {"twitter":[],"reddit":[]})
+_buffer_lock                            (eliminated — buffers live solely in the worker; idiom: shared-lock→ownership)
+_running                               AtomicBool in Arc (read by get_stats; set false on stop)
+BATCH_SIZE = 5                          const BATCH_SIZE: usize = 5
+SEND_INTERVAL = 0.5                     [≠] dropped (Decision 4)
+MAX_RETRIES / RETRY_DELAY               [≠]→ but extraction-error handling kept (Decision 4)
+stats (5 counters)                      Arc<Mutex<UpdaterStats>> OR AtomicU64 set (shared; read by get_stats)
+```
+
+**Worker loop (faithful to `_worker_loop` :364-394 + flush-on-threshold :381-387):**
+- Wrapped in `i18n::with_locale(captured_locale, async move { ... }).await` so the whole worker runs under the locale captured at `start()` (U-050; mirrors `_worker_loop(locale)` + `set_locale(locale)` :366). `start()` captures `get_locale()` BEFORE spawn (mirrors :281).
+- Loop: `while let Some(activity) = rx.recv().await { push to buffers[platform.to_lowercase()] (insert empty Vec if new platform — :376-378); if buffers[platform].len() >= BATCH_SIZE { drain first BATCH_SIZE into a batch (:382-383), call flush_batch(batch, platform).await } }`. When the sender drops (stop), `recv()` returns `None` → exit loop → run `_flush_remaining` equivalent. **No SEND_INTERVAL sleep** between flushes (Decision 4).
+- `flush_batch(activities, platform)`: `combined_text = activities.iter().map(to_episode_text).collect::<Vec<_>>().join("\n")` (S-?? `_send_batch_activities` :407-409 — combined_text is OBSERVABLE, drives extraction grouping → exact). Then `{ let mut g = self.graph.lock().await; g.extend_from_text(&combined_text, &*self.llm).await }`. On Ok → `total_sent += 1; total_items_sent += activities.len()` + info log w/ display_name (Decision 4 on display_name). On Err → `failed_count += 1` + error log (Decision 4 on retry).
+
+**`add_activity` (S-?? :310-338) — runs on the PRODUCER side (sim thread), faithful:**
+- `if activity.action_type == "DO_NOTHING" { skipped_count += 1; return }` — **contractual filter BEFORE queueing** (verified DECISION-13 note). Then `total_activities += 1; self.tx.send(activity)` (ignore send error if worker gone). Counter increments happen on the producer side exactly as Python (`_total_activities` incremented in `add_activity`, not the worker).
+- `add_activity_from_dict(data: &serde_json::Value /*or Map*/, platform: &str)` (:340-362): **`if data.get("event_type").is_some() { return }`** (skip event-type entries — contractual, :349-350); else construct `AgentActivity` from the dict fields (`agent_id`/`agent_name`/`action_type`/`action_args`/`round`→round_num/`timestamp` with `datetime.now().isoformat()` default → use chrono RFC3339 now) and call `add_activity`. NOTE: the `round` key maps to `round_num` (Python `data.get("round", 0)`).
+
+**`start()` / `stop()` lifecycle:**
+- `start(&mut self)`: if already running, return (`:277-278`). Capture `let locale = get_locale();` (:281). Set `running=true`. Build the mpsc channel, move buffers + stats + graph + llm into the worker, `spawn(with_locale(locale, worker_future))`, store the `JoinHandle` + keep the `tx`.
+- `stop(&mut self) -> ` (async): set `running=false`; **drop the `tx`** (signals the worker `recv()` returns None → it runs the final flush of sub-BATCH_SIZE leftovers = `_flush_remaining` :435-458, sending each non-empty per-platform buffer even if < BATCH_SIZE); then `join_handle.await` (Python `join(timeout=10)` :301 — the timeout is a thread-join guard; in tokio `.await` the handle; a `tokio::time::timeout(10s, handle)` MAY be used to mirror the bound, but the 10s is a safety cap not a contract — note it, don't over-engineer). Final info log w/ all counters (:303-308). **`_flush_remaining` semantics:** since buffers live in the worker, the "drain queue into buffers then flush each buffer" two-step (:437-458) collapses to: worker drains remaining `rx` messages into buffers (the `while recv` already does this until channel empty+closed), then flushes every non-empty per-platform buffer once. The observable result (all leftover activities sent in per-platform sub-batches) is identical.
+
+**`get_stats()` (S-538 — OBSERVABLE, served via API/U-049 → PORT):** returns a serde struct/Map with `graph_id`(→graph_label), `batch_size`, `total_activities`, `batches_sent`(=total_sent), `items_sent`(=total_items_sent), `failed_count`, `skipped_count`, `queue_size`, `buffer_sizes`(per-platform map), `running`. `queue_size` = mpsc has no public len(); track an `AtomicUsize queued` (incr on send, decr when worker pops) OR document queue_size as best-effort. `buffer_sizes`: the worker owns buffers, so expose via a shared snapshot (worker writes a `Arc<Mutex<HashMap<String,usize>>>` after each buffer mutation) OR fold buffer_sizes into the shared stats updated by the worker. Keep the JSON key names byte-identical to Python (`batches_sent`, `items_sent`, etc.) for API contract parity.
+
+---
+
+### Decision 4 — `[≠]` adjudications (each under the owner's sharpened bar: legal only if substrate-inexpressible / non-contractual-unobservable / strict-superset)
+
+| Item (source) | Verdict | Justification |
+|---|---|---|
+| **`SEND_INTERVAL=0.5s` sleep** between flushes (:387) | **`[≠]` non-contractual** | A client-side rate-limit for a network SaaS API. In-process extraction has no remote rate to throttle; the sleep produces NO observable output (only wall-clock pacing). Omitting it changes nothing in the final graph or stats. LEGAL `[≠]`. Ledger: `- [≠] U-021 SEND_INTERVAL — Zep network rate-limit, non-contractual in-process`. |
+| **`MAX_RETRIES=3` / `RETRY_DELAY` retry loop** on `graph.add` (:412-433) | **SPLIT: retry `[≠]`, error-handling PORTED** | The retry *mechanism* (3 attempts + backoff) targets transient Zep NETWORK failures — substrate-absent in-process → `[≠]`. BUT the *observable outcome* — on final failure, increment `failed_count` and do NOT crash the worker (Python catches & continues :392-394, 433) — IS contractual (failed_count is in get_stats) and IS PORTED: `flush_batch` Err → `failed_count += 1` + error log + worker continues. An LLM extraction call CAN fail (timeout/parse), so the *resilience* is real; only the literal 3×-retry-with-2s-backoff is the network-shaped part dropped. Ledger: `- [≠] U-021 MAX_RETRIES/RETRY_DELAY literal retry-loop — Zep-network transient-retry; in-process keeps the failed_count + continue-on-error contract, drops the network retry cadence`. (If the verifier deems extraction-retry contractual, a single retry is a cheap re-port — flagged.) |
+| **`PLATFORM_DISPLAY_NAMES {twitter:'世界1', reddit:'世界2'}`** (S-517) + `_get_platform_display_name` (:271-273) | **PORT (do NOT `[≠]`)** | Used ONLY inside `logger.info(...)` lines (:422-423, :453-454) — console/log output. Per DECISION-13 note "verify no consumer reads them": confirmed only consumed by log strings, no return value / API / file. Log content is a thin observable surface but the owner rule says "do not `[≠]`-skip anything with an observable output" and a log line IS output. **PORT it** as a `fn platform_display_name(p) -> &str` mapping twitter→"世界1"/reddit→"世界2"/else→p, used in the same log lines, to stay safely inside the bar. Cheap, removes any disguised-skip risk. |
+| **`__init__` `ZEP_API_KEY` ValueError** (S-516, :243-244) | **`[≠]` substrate-absent** | Native graph requires no API key; the guard guards a credential that no longer exists. Genuinely inexpressible (nothing to validate). LEGAL `[≠]`. Ledger: `- [≠] U-021 ZEP_API_KEY check — native graph is keyless; substrate-absent`. |
+| **Zep server-side fuzzy entity-resolution / coreference** (implicit in `graph.add`) | **`[≠]` substrate-inexpressible** | Decision 1 limit: teri merges by exact case-sensitive name; Zep does embedding/LLM coreference. teri has no entity-resolution model at merge time → genuinely inexpressible. NO entity is dropped (all extracted entities are added); only the *resolution key* differs. Differential parity compares name-set + edge structure, not Zep coreference. LEGAL `[≠]`, verifier-adjudicated. Ledger: `- [≠] U-021 Zep coreference entity-resolution — teri merges by exact name; no resolution model. No entity dropped.` |
+
+**Nothing with a return value, file, API field, or distinct NL output is `[≠]`'d.** combined_text join, DO_NOTHING skip, event_type skip, all 5 stat counters, get_stats, _flush_remaining leftovers, platform display names → ALL PORTED.
+
+---
+
+### Decision 5 — Symbol coverage + placement; split assessment
+
+**Placement:** all of sub-cycle (b) lands in `src/services/graph_memory.rs` (alongside the DONE `AgentActivity`). The ONE additive graph method (`extend_from_text` + `ExtendStats` + private `extract_and_merge_into` refactor) lands in `src/graph/mod.rs` (additive; re-touches the build pipeline by extraction only — 5 build tests must stay green; this is a `[~]` re-open of U-015's `build_with_progress_and_ontology` body, re-verified).
+
+**Symbol map (S-515..S-53x, `unit:U-021`):**
+| Source symbol (zep_graph_memory_updater.py) | Lines | teri target |
+|---|---|---|
+| S-515 `ZepGraphMemoryUpdater` class | 202 | `GraphMemoryUpdater` struct (graph_memory.rs) |
+| S-516 `__init__` | 232-269 | `GraphMemoryUpdater::new(graph, llm, graph_label)` — ZEP_API_KEY check `[≠]` |
+| S-517 `PLATFORM_DISPLAY_NAMES` + `_get_platform_display_name` | 220-223,271-273 | `fn platform_display_name(&str)->&str` (PORTED) |
+| S-518 `start` | 275-291 | `start(&mut self)` — `get_locale()` capture + `spawn(with_locale(...))` (U-050) |
+| S-519 `stop` | 293-308 | `stop(&mut self)` async — drop tx + join + final-flush + log |
+| S-520 `add_activity` | 310-338 | `add_activity(&self, AgentActivity)` — DO_NOTHING skip + send (producer side) |
+| S-521 `add_activity_from_dict` | 340-362 | `add_activity_from_dict(&self, &Value, &str)` — event_type skip |
+| S-522 `_worker_loop` | 364-394 | the spawned worker future (recv → buffer → threshold flush) |
+| S-523 `_send_batch_activities` | 396-433 | `flush_batch(&self, Vec<AgentActivity>, &str)` — combined_text join + `extend_from_text` + counters; retry `[≠]` |
+| S-524 `_flush_remaining` | 435-458 | worker drain-on-close + flush each non-empty buffer |
+| S-525 `get_stats` | 460-476 | `get_stats(&self) -> UpdaterStats` (serde; byte-identical JSON keys) |
+| (graph-side, U-015 re-open) | — | `KnowledgeGraph::extend_from_text` + `ExtendStats` + private `extract_and_merge_into` (graph/mod.rs) |
+
+(Exact S-numbers within 515..53x to be reconciled against the symbol-map rows by the porter; the class spans 5 methods + 2 helpers + the dunder init, all mapped above.)
+
+**Split assessment:** sub-cycle (b) is **borderline but does NOT need b1/b2** if the `extend_from_text` graph refactor is treated as a tight, pre-landed `[~]` re-open of U-015 (it's a mechanical extract-method refactor + one new public method, ~40 LOC, fully covered by reusing the existing pipeline). The updater itself is ~5 methods of straightforward tokio plumbing. **Recommended order within the cycle:** (b-i) land `extend_from_text` in graph/mod.rs first, re-verify the 5 build tests + add an extend-merge unit test (build a graph, extend with text mentioning a present + a new entity → assert entities_merged/added + cross-batch relation kept); THEN (b-ii) the `GraphMemoryUpdater` tokio worker. If the porter finds the graph refactor contentious (e.g. the `extract_and_merge_into` signature fights the borrow checker on `self.ontology_*.clone()`), THEN split b1=graph method / b2=updater — but the default is one cycle.
+
+**Parity (differential) for (b):** feed a fixed sequence of `AgentActivity` records (incl. one DO_NOTHING, one event_type dict, ≥5 same-platform to trigger a batch, leftovers < 5) through (a) a recorded MiroFish golden (the combined_text blobs MiroFish would have sent to Zep, captured from fixtures) and (b) teri: assert (1) the combined_text per batch is byte-identical (join "\n", per-platform grouping at 5), (2) DO_NOTHING/event_type are skipped (skipped_count + absent from any batch), (3) final stats counters match (total_activities/total_sent/total_items_sent/skipped_count; failed_count=0 on happy path), (4) leftovers flushed on stop, (5) the resulting graph's entity-NAME set ⊇ the entities extractable from the combined_text (extraction is LLM-stochastic → compare name-set membership + that no batch was dropped, not exact entity counts — same boundary as DECISION-1's parity note). The Zep-coreference `[≠]` is the only adjudicated divergence.
+
+### DECISION-14 — 6-line actionable summary
+1. `graph.add(text)` → ADD `KnowledgeGraph::extend_from_text(&mut self, text, &L) -> Result<ExtendStats>` (Option A): refactor the U-015 2-pass body into `extract_and_merge_into(&mut self,...)`, merge by EXACT entity NAME (`if !index.contains_key → add_entity`, else reuse), Pass-2 relations against self's full set; additive, 5 build tests stay green.
+2. Updater holds `Arc<tokio::sync::Mutex<KnowledgeGraph>>` + `Arc<dyn LlmClient>` + `graph_label` (caller-constructs per DECISION-11; graph_id-by-id → explicit handle); no API key.
+3. Concurrency: tokio `mpsc::UnboundedSender` + ONE spawned worker task that OWNS the per-platform buffers (no lock), flushes at BATCH_SIZE=5, `combined_text = episode_texts.join("\n")` (observable, exact), `extend_from_text` under the graph lock; producer-side `add_activity` does the DO_NOTHING skip + counter; `stop` drops tx → worker final-flushes leftovers.
+4. U-050: `start()` captures `get_locale()` then `spawn(with_locale(locale, worker))`.
+5. `[≠]`: SEND_INTERVAL (network rate-limit), literal MAX_RETRIES retry-loop (network-transient; failed_count+continue-on-error IS ported), ZEP_API_KEY check (keyless substrate), Zep coreference entity-resolution (no resolution model; no entity dropped). PORTED (not `[≠]`): platform display names (log output), get_stats, all 5 counters, event_type skip.
+6. All in `src/services/graph_memory.rs` (+ graph method in `src/graph/mod.rs`); ONE cycle (split b1/b2 only if the graph refactor fights the borrow checker).

@@ -17,7 +17,22 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 0   # RESUMED 2026-06-17 (10th resume, reset 0); baseline re-verified 797 green. Target: U-021 zep_graph_memory_updater (architect decomposition DECISION-13).
+cycles_this_session: 2   # RESUMED 2026-06-17 (10th resume, reset 0); baseline re-verified 797 green.
+# CYCLE1 (10th resume) 2026-06-17: U-021 sub-cycle (a) AgentActivity + to_episode_text + 12 _describe_* (S-493..S-514,
+#   22/22 [x]) — opus PASS (DECISION-13). NEW src/services/graph_memory.rs. PURE PORT byte-exact (verifier set-diffed
+#   41 Chinese literals); 4-way ladders, create_comment 5-branch, colon-vs-no-colon crux, Python-falsy or-fallbacks.
+#   AgentActivity = distinct loggable record (action_type String + action_args Map), NOT coupled to SocialAction. 53
+#   tests, 850 green.
+# CYCLE2 (10th resume) 2026-06-17: U-021 sub-cycle (b) ZepGraphMemoryUpdater (S-515..S-530, 16/16: 13 [x] + 3 [≠]) —
+#   opus FAIL→fix→PASS (DECISION-14, architect). Map-onto-substrate: NEW additive KnowledgeGraph::extend_from_text
+#   (refactored build's per-chunk extract+merge into private extract_and_merge_into; build* byte-identical, 23 build
+#   tests green; extend_from_text merges into self by exact name, Pass-2 relations vs full post-merge set = no drop).
+#   GraphMemoryUpdater<L>: Arc<tokio::Mutex<KnowledgeGraph>> + Arc LlmClient; true async worker (mpsc + 1 task owning
+#   per-platform buffers); batch-at-5; combined_text join; DO_NOTHING/event_type skips; get_stats 10-key; U-050
+#   with_locale at start(). GATE CAUGHT real downgrade: get_stats().buffer_sizes returned {} vs seeded {twitter:0,
+#   reddit:0} — fixed (pre-seed at new + 3 regression tests). 3 [≠] survived: SEND_INTERVAL + MAX_RETRIES/RETRY_DELAY
+#   (redundant — adapter call_api already retries) + ZEP_API_KEY keyless + Zep coreference (exact-name merge, no drop).
+#   871 green, clippy --all-targets clean. U-021 STAYS [~] (only sub-cycle c ZepGraphMemoryManager S-531..S-539 remains).
 # CYCLE2 (9th resume) 2026-06-17: U-007 zep_paging COMPLETE — opus PASS (DECISION-12, map-onto-substrate, NO new code).
 #   Whole module is Zep-Cloud network pagination; teri's in-process petgraph has no network/cursor/pages/I/O. S-054
 #   fetch_all_nodes / S-055 fetch_all_edges [x] map-onto (subsumed by U-016 KnowledgeGraphEntityReader::get_all_nodes/
