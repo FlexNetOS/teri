@@ -8,7 +8,7 @@
 //! - `interview_agents`: Agent selection and interview orchestration
 
 use crate::error::{Result, TeriError};
-use crate::graph::{KnowledgeGraph, EdgeTriple};
+use crate::graph::{EdgeTriple, KnowledgeGraph};
 use crate::llm::LlmClient;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
