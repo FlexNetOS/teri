@@ -666,65 +666,65 @@
 
 ## U-022 — `backend/app/services/simulation_runner.py`
 
-- [ ] S-540 · `unit:U-022` · `const` · `IS_WINDOWS` · platform check · `simulation_runner.py:33`
-- [ ] S-541 · `unit:U-022` · `type` · `RunnerStatus` · enum: IDLE/STARTING/RUNNING/PAUSED/STOPPING/STOPPED/COMPLETED/FAILED · `simulation_runner.py:36`
-- [ ] S-542 · `unit:U-022` · `variant` · `RunnerStatus.IDLE` · `simulation_runner.py:38`
-- [ ] S-543 · `unit:U-022` · `variant` · `RunnerStatus.STARTING` · `simulation_runner.py:39`
-- [ ] S-544 · `unit:U-022` · `variant` · `RunnerStatus.RUNNING` · `simulation_runner.py:40`
-- [ ] S-545 · `unit:U-022` · `variant` · `RunnerStatus.PAUSED` · `simulation_runner.py:41`
-- [ ] S-546 · `unit:U-022` · `variant` · `RunnerStatus.STOPPING` · `simulation_runner.py:42`
-- [ ] S-547 · `unit:U-022` · `variant` · `RunnerStatus.STOPPED` · `simulation_runner.py:43`
-- [ ] S-548 · `unit:U-022` · `variant` · `RunnerStatus.COMPLETED` · `simulation_runner.py:44`
-- [ ] S-549 · `unit:U-022` · `variant` · `RunnerStatus.FAILED` · `simulation_runner.py:45`
-- [ ] S-550 · `unit:U-022` · `type` · `AgentAction` · dataclass with to_dict · `simulation_runner.py:49`
-- [ ] S-551 · `unit:U-022` · `field` · `AgentAction.round_num` · `simulation_runner.py:51`
-- [ ] S-552 · `unit:U-022` · `field` · `AgentAction.timestamp` · `simulation_runner.py:52`
-- [ ] S-553 · `unit:U-022` · `field` · `AgentAction.platform` · `simulation_runner.py:53`
-- [ ] S-554 · `unit:U-022` · `field` · `AgentAction.agent_id` · `simulation_runner.py:54`
-- [ ] S-555 · `unit:U-022` · `field` · `AgentAction.agent_name` · `simulation_runner.py:55`
-- [ ] S-556 · `unit:U-022` · `field` · `AgentAction.action_type` · `simulation_runner.py:56`
-- [ ] S-557 · `unit:U-022` · `field` · `AgentAction.action_args` · `simulation_runner.py:57`
-- [ ] S-558 · `unit:U-022` · `field` · `AgentAction.result` · `simulation_runner.py:58`
-- [ ] S-559 · `unit:U-022` · `field` · `AgentAction.success` · `simulation_runner.py:59`
-- [ ] S-560 · `unit:U-022` · `method` · `AgentAction.to_dict` · `simulation_runner.py:61`
-- [ ] S-561 · `unit:U-022` · `type` · `RoundSummary` · dataclass with to_dict · `simulation_runner.py:76`
-- [ ] S-562 · `unit:U-022` · `field` · `RoundSummary.round_num` · `simulation_runner.py:78`
-- [ ] S-563 · `unit:U-022` · `field` · `RoundSummary.start_time` · `simulation_runner.py:79`
-- [ ] S-564 · `unit:U-022` · `field` · `RoundSummary.end_time` · `simulation_runner.py:80`
-- [ ] S-565 · `unit:U-022` · `field` · `RoundSummary.simulated_hour` · `simulation_runner.py:81`
-- [ ] S-566 · `unit:U-022` · `field` · `RoundSummary.twitter_actions` · `simulation_runner.py:82`
-- [ ] S-567 · `unit:U-022` · `field` · `RoundSummary.reddit_actions` · `simulation_runner.py:83`
-- [ ] S-568 · `unit:U-022` · `field` · `RoundSummary.active_agents` · `simulation_runner.py:84`
-- [ ] S-569 · `unit:U-022` · `field` · `RoundSummary.actions` · `simulation_runner.py:85`
-- [ ] S-570 · `unit:U-022` · `method` · `RoundSummary.to_dict` · `simulation_runner.py:87`
-- [ ] S-571 · `unit:U-022` · `type` · `SimulationRunState` · full run state dataclass · `simulation_runner.py:102`
-- [ ] S-572 · `unit:U-022` · `field` · `SimulationRunState.simulation_id` · `simulation_runner.py:104`
-- [ ] S-573 · `unit:U-022` · `field` · `SimulationRunState.runner_status` · `simulation_runner.py:105`
-- [ ] S-574 · `unit:U-022` · `field` · `SimulationRunState.current_round` · `simulation_runner.py:108`
-- [ ] S-575 · `unit:U-022` · `field` · `SimulationRunState.total_rounds` · `simulation_runner.py:109`
-- [ ] S-576 · `unit:U-022` · `field` · `SimulationRunState.simulated_hours` · `simulation_runner.py:110`
-- [ ] S-577 · `unit:U-022` · `field` · `SimulationRunState.total_simulation_hours` · `simulation_runner.py:111`
-- [ ] S-578 · `unit:U-022` · `field` · `SimulationRunState.twitter_current_round` · `simulation_runner.py:114`
-- [ ] S-579 · `unit:U-022` · `field` · `SimulationRunState.reddit_current_round` · `simulation_runner.py:115`
-- [ ] S-580 · `unit:U-022` · `field` · `SimulationRunState.twitter_simulated_hours` · `simulation_runner.py:116`
-- [ ] S-581 · `unit:U-022` · `field` · `SimulationRunState.reddit_simulated_hours` · `simulation_runner.py:117`
-- [ ] S-582 · `unit:U-022` · `field` · `SimulationRunState.twitter_running` · `simulation_runner.py:120`
-- [ ] S-583 · `unit:U-022` · `field` · `SimulationRunState.reddit_running` · `simulation_runner.py:121`
-- [ ] S-584 · `unit:U-022` · `field` · `SimulationRunState.twitter_actions_count` · `simulation_runner.py:122`
-- [ ] S-585 · `unit:U-022` · `field` · `SimulationRunState.reddit_actions_count` · `simulation_runner.py:123`
-- [ ] S-586 · `unit:U-022` · `field` · `SimulationRunState.twitter_completed` · `simulation_runner.py:126`
-- [ ] S-587 · `unit:U-022` · `field` · `SimulationRunState.reddit_completed` · `simulation_runner.py:127`
-- [ ] S-588 · `unit:U-022` · `field` · `SimulationRunState.rounds` · `simulation_runner.py:130`
-- [ ] S-589 · `unit:U-022` · `field` · `SimulationRunState.recent_actions` · `simulation_runner.py:133`
-- [ ] S-590 · `unit:U-022` · `field` · `SimulationRunState.max_recent_actions` · `simulation_runner.py:134`
-- [ ] S-591 · `unit:U-022` · `field` · `SimulationRunState.started_at` · `simulation_runner.py:137`
-- [ ] S-592 · `unit:U-022` · `field` · `SimulationRunState.updated_at` · `simulation_runner.py:138`
-- [ ] S-593 · `unit:U-022` · `field` · `SimulationRunState.completed_at` · `simulation_runner.py:139`
-- [ ] S-594 · `unit:U-022` · `field` · `SimulationRunState.error` · `simulation_runner.py:142`
-- [ ] S-595 · `unit:U-022` · `field` · `SimulationRunState.process_pid` · `simulation_runner.py:145`
-- [ ] S-596 · `unit:U-022` · `method` · `SimulationRunState.add_action` · `simulation_runner.py:147`
-- [ ] S-597 · `unit:U-022` · `method` · `SimulationRunState.to_dict` · `simulation_runner.py:160`
-- [ ] S-598 · `unit:U-022` · `method` · `SimulationRunState.to_detail_dict` · `simulation_runner.py:188`
+- [≠] S-540 · `unit:U-022` · `const` · `IS_WINDOWS` · platform check · `simulation_runner.py:33` · **[≠] non-contractual:** used only to select `taskkill` vs `killpg` in subprocess-terminate path; teri's stop is OS-agnostic (cooperative `shutdown` flag + `task.abort()`), so no branch exists. No observable output. (DECISION-17 §17.4)
+- [x] S-541 · `unit:U-022` · `type` · `RunnerStatus` · enum: IDLE/STARTING/RUNNING/PAUSED/STOPPING/STOPPED/COMPLETED/FAILED · `simulation_runner.py:36` · **rust-target:** `RunnerStatus` at `src/services/simulation_runner.rs`; `#[serde(rename_all="lowercase")]`; 8 variants; `as_str()` + `Display`; ported sub-cycle (a) 2026-06-17
+- [x] S-542 · `unit:U-022` · `variant` · `RunnerStatus.IDLE` · `simulation_runner.py:38` · **rust-target:** `RunnerStatus::Idle` → `"idle"`
+- [x] S-543 · `unit:U-022` · `variant` · `RunnerStatus.STARTING` · `simulation_runner.py:39` · **rust-target:** `RunnerStatus::Starting` → `"starting"`
+- [x] S-544 · `unit:U-022` · `variant` · `RunnerStatus.RUNNING` · `simulation_runner.py:40` · **rust-target:** `RunnerStatus::Running` → `"running"`
+- [x] S-545 · `unit:U-022` · `variant` · `RunnerStatus.PAUSED` · `simulation_runner.py:41` · **rust-target:** `RunnerStatus::Paused` → `"paused"`
+- [x] S-546 · `unit:U-022` · `variant` · `RunnerStatus.STOPPING` · `simulation_runner.py:42` · **rust-target:** `RunnerStatus::Stopping` → `"stopping"`
+- [x] S-547 · `unit:U-022` · `variant` · `RunnerStatus.STOPPED` · `simulation_runner.py:43` · **rust-target:** `RunnerStatus::Stopped` → `"stopped"`
+- [x] S-548 · `unit:U-022` · `variant` · `RunnerStatus.COMPLETED` · `simulation_runner.py:44` · **rust-target:** `RunnerStatus::Completed` → `"completed"`
+- [x] S-549 · `unit:U-022` · `variant` · `RunnerStatus.FAILED` · `simulation_runner.py:45` · **rust-target:** `RunnerStatus::Failed` → `"failed"`
+- [x] S-550 · `unit:U-022` · `type` · `AgentAction` · dataclass with to_dict · `simulation_runner.py:49` · **rust-target:** `AgentAction` struct at `src/services/simulation_runner.rs`; 9 fields + `to_dict()` 9-key ordered map; ported sub-cycle (a) 2026-06-17
+- [x] S-551 · `unit:U-022` · `field` · `AgentAction.round_num` · `simulation_runner.py:51` · **rust-target:** `AgentAction::round_num: i64`
+- [x] S-552 · `unit:U-022` · `field` · `AgentAction.timestamp` · `simulation_runner.py:52` · **rust-target:** `AgentAction::timestamp: String`
+- [x] S-553 · `unit:U-022` · `field` · `AgentAction.platform` · `simulation_runner.py:53` · **rust-target:** `AgentAction::platform: String`
+- [x] S-554 · `unit:U-022` · `field` · `AgentAction.agent_id` · `simulation_runner.py:54` · **rust-target:** `AgentAction::agent_id: i64`
+- [x] S-555 · `unit:U-022` · `field` · `AgentAction.agent_name` · `simulation_runner.py:55` · **rust-target:** `AgentAction::agent_name: String`
+- [x] S-556 · `unit:U-022` · `field` · `AgentAction.action_type` · `simulation_runner.py:56` · **rust-target:** `AgentAction::action_type: String`
+- [x] S-557 · `unit:U-022` · `field` · `AgentAction.action_args` · `simulation_runner.py:57` · **rust-target:** `AgentAction::action_args: Map<String, Value>`; default empty map
+- [x] S-558 · `unit:U-022` · `field` · `AgentAction.result` · `simulation_runner.py:58` · **rust-target:** `AgentAction::result: Option<String>`; emits `null` when None
+- [x] S-559 · `unit:U-022` · `field` · `AgentAction.success` · `simulation_runner.py:59` · **rust-target:** `AgentAction::success: bool`; default `true`
+- [x] S-560 · `unit:U-022` · `method` · `AgentAction.to_dict` · `simulation_runner.py:61` · **rust-target:** `AgentAction::to_dict() -> Map<String, Value>`; 9-key ordered map; byte-exact key order; `result: None` → `Value::Null`
+- [x] S-561 · `unit:U-022` · `type` · `RoundSummary` · dataclass with to_dict · `simulation_runner.py:76` · **rust-target:** `RoundSummary` struct at `src/services/simulation_runner.rs`; 8 fields + `to_dict()` 9-key map (computed `actions_count`); ported sub-cycle (a) 2026-06-17
+- [x] S-562 · `unit:U-022` · `field` · `RoundSummary.round_num` · `simulation_runner.py:78` · **rust-target:** `RoundSummary::round_num: i64`
+- [x] S-563 · `unit:U-022` · `field` · `RoundSummary.start_time` · `simulation_runner.py:79` · **rust-target:** `RoundSummary::start_time: String`
+- [x] S-564 · `unit:U-022` · `field` · `RoundSummary.end_time` · `simulation_runner.py:80` · **rust-target:** `RoundSummary::end_time: Option<String>`; emits `null` when None
+- [x] S-565 · `unit:U-022` · `field` · `RoundSummary.simulated_hour` · `simulation_runner.py:81` · **rust-target:** `RoundSummary::simulated_hour: i64`; default 0
+- [x] S-566 · `unit:U-022` · `field` · `RoundSummary.twitter_actions` · `simulation_runner.py:82` · **rust-target:** `RoundSummary::twitter_actions: i64`; default 0
+- [x] S-567 · `unit:U-022` · `field` · `RoundSummary.reddit_actions` · `simulation_runner.py:83` · **rust-target:** `RoundSummary::reddit_actions: i64`; default 0
+- [x] S-568 · `unit:U-022` · `field` · `RoundSummary.active_agents` · `simulation_runner.py:84` · **rust-target:** `RoundSummary::active_agents: Vec<i64>`; default empty
+- [x] S-569 · `unit:U-022` · `field` · `RoundSummary.actions` · `simulation_runner.py:85` · **rust-target:** `RoundSummary::actions: Vec<AgentAction>`; default empty
+- [x] S-570 · `unit:U-022` · `method` · `RoundSummary.to_dict` · `simulation_runner.py:87` · **rust-target:** `RoundSummary::to_dict() -> Map<String, Value>`; 9-key map; `actions_count = len(actions)` computed; nested actions via `a.to_dict()`; `end_time: None` → `Value::Null`
+- [x] S-571 · `unit:U-022` · `type` · `SimulationRunState` · full run state dataclass · `simulation_runner.py:102` · **rust-target:** `SimulationRunState` struct at `src/services/simulation_runner.rs`; all 24 fields + 3 methods; ported sub-cycle (a) 2026-06-17
+- [x] S-572 · `unit:U-022` · `field` · `SimulationRunState.simulation_id` · `simulation_runner.py:104` · **rust-target:** `SimulationRunState::simulation_id: String`
+- [x] S-573 · `unit:U-022` · `field` · `SimulationRunState.runner_status` · `simulation_runner.py:105` · **rust-target:** `SimulationRunState::runner_status: RunnerStatus`; default `Idle`
+- [x] S-574 · `unit:U-022` · `field` · `SimulationRunState.current_round` · `simulation_runner.py:108` · **rust-target:** `SimulationRunState::current_round: i64`; default 0
+- [x] S-575 · `unit:U-022` · `field` · `SimulationRunState.total_rounds` · `simulation_runner.py:109` · **rust-target:** `SimulationRunState::total_rounds: i64`; default 0
+- [x] S-576 · `unit:U-022` · `field` · `SimulationRunState.simulated_hours` · `simulation_runner.py:110` · **rust-target:** `SimulationRunState::simulated_hours: i64`; default 0
+- [x] S-577 · `unit:U-022` · `field` · `SimulationRunState.total_simulation_hours` · `simulation_runner.py:111` · **rust-target:** `SimulationRunState::total_simulation_hours: i64`; default 0
+- [x] S-578 · `unit:U-022` · `field` · `SimulationRunState.twitter_current_round` · `simulation_runner.py:114` · **rust-target:** `SimulationRunState::twitter_current_round: i64`; default 0
+- [x] S-579 · `unit:U-022` · `field` · `SimulationRunState.reddit_current_round` · `simulation_runner.py:115` · **rust-target:** `SimulationRunState::reddit_current_round: i64`; default 0
+- [x] S-580 · `unit:U-022` · `field` · `SimulationRunState.twitter_simulated_hours` · `simulation_runner.py:116` · **rust-target:** `SimulationRunState::twitter_simulated_hours: i64`; default 0
+- [x] S-581 · `unit:U-022` · `field` · `SimulationRunState.reddit_simulated_hours` · `simulation_runner.py:117` · **rust-target:** `SimulationRunState::reddit_simulated_hours: i64`; default 0
+- [x] S-582 · `unit:U-022` · `field` · `SimulationRunState.twitter_running` · `simulation_runner.py:120` · **rust-target:** `SimulationRunState::twitter_running: bool`; default false
+- [x] S-583 · `unit:U-022` · `field` · `SimulationRunState.reddit_running` · `simulation_runner.py:121` · **rust-target:** `SimulationRunState::reddit_running: bool`; default false
+- [x] S-584 · `unit:U-022` · `field` · `SimulationRunState.twitter_actions_count` · `simulation_runner.py:122` · **rust-target:** `SimulationRunState::twitter_actions_count: i64`; default 0; incremented by `add_action` when platform="twitter"
+- [x] S-585 · `unit:U-022` · `field` · `SimulationRunState.reddit_actions_count` · `simulation_runner.py:123` · **rust-target:** `SimulationRunState::reddit_actions_count: i64`; default 0; incremented by `add_action` when platform!="twitter"
+- [x] S-586 · `unit:U-022` · `field` · `SimulationRunState.twitter_completed` · `simulation_runner.py:126` · **rust-target:** `SimulationRunState::twitter_completed: bool`; default false
+- [x] S-587 · `unit:U-022` · `field` · `SimulationRunState.reddit_completed` · `simulation_runner.py:127` · **rust-target:** `SimulationRunState::reddit_completed: bool`; default false
+- [x] S-588 · `unit:U-022` · `field` · `SimulationRunState.rounds` · `simulation_runner.py:130` · **rust-target:** `SimulationRunState::rounds: Vec<RoundSummary>`; default empty
+- [x] S-589 · `unit:U-022` · `field` · `SimulationRunState.recent_actions` · `simulation_runner.py:133` · **rust-target:** `SimulationRunState::recent_actions: Vec<AgentAction>`; newest-first; default empty
+- [x] S-590 · `unit:U-022` · `field` · `SimulationRunState.max_recent_actions` · `simulation_runner.py:134` · **rust-target:** `SimulationRunState::max_recent_actions: usize`; default 50
+- [x] S-591 · `unit:U-022` · `field` · `SimulationRunState.started_at` · `simulation_runner.py:137` · **rust-target:** `SimulationRunState::started_at: Option<String>`; default None → `null`
+- [x] S-592 · `unit:U-022` · `field` · `SimulationRunState.updated_at` · `simulation_runner.py:138` · **rust-target:** `SimulationRunState::updated_at: String`; default `python_isoformat_local()`; refreshed by `add_action`
+- [x] S-593 · `unit:U-022` · `field` · `SimulationRunState.completed_at` · `simulation_runner.py:139` · **rust-target:** `SimulationRunState::completed_at: Option<String>`; default None → `null`
+- [x] S-594 · `unit:U-022` · `field` · `SimulationRunState.error` · `simulation_runner.py:142` · **rust-target:** `SimulationRunState::error: Option<String>`; default None → `null`
+- [x] S-595 · `unit:U-022` · `field` · `SimulationRunState.process_pid` · `simulation_runner.py:145` · **rust-target:** `SimulationRunState::process_pid: Option<i64>`; field + `to_dict` key PORTED for shape parity; value always `null` in teri (no OS subprocess). `[≠]` value-only per DECISION-17 §17.4.
+- [x] S-596 · `unit:U-022` · `method` · `SimulationRunState.add_action` · `simulation_runner.py:147` · **rust-target:** `SimulationRunState::add_action(&mut self, action: AgentAction)`; insert-at-front, truncate to cap, per-platform counter bump, refresh `updated_at`
+- [x] S-597 · `unit:U-022` · `method` · `SimulationRunState.to_dict` · `simulation_runner.py:160` · **rust-target:** `SimulationRunState::to_dict() -> Map<String, Value>`; 23-key ordered map; `progress_percent = round(current_round / max(total_rounds,1) * 100, 1)` computed; `total_actions_count = twitter+reddit` computed; all Option fields emit `null` when None
+- [x] S-598 · `unit:U-022` · `method` · `SimulationRunState.to_detail_dict` · `simulation_runner.py:188` · **rust-target:** `SimulationRunState::to_detail_dict() -> Map<String, Value>`; superset of `to_dict` + `recent_actions: [..to_dict()]` + `rounds_count: len(rounds)` (25 keys total); used by `save_run_state`
 - [ ] S-599 · `unit:U-022` · `type` · `SimulationRunner` · subprocess orchestrator · `simulation_runner.py:196`
 - [ ] S-600 · `unit:U-022` · `field` · `SimulationRunner.RUN_STATE_DIR` · `simulation_runner.py:208`
 - [ ] S-601 · `unit:U-022` · `field` · `SimulationRunner.SCRIPTS_DIR` · `simulation_runner.py:214`
@@ -736,8 +736,8 @@
 - [ ] S-607 · `unit:U-022` · `field` · `SimulationRunner._stderr_files` · `simulation_runner.py:225`
 - [ ] S-608 · `unit:U-022` · `field` · `SimulationRunner._graph_memory_enabled` · `simulation_runner.py:228`
 - [ ] S-609 · `unit:U-022` · `method` · `SimulationRunner.get_run_state` · `simulation_runner.py:231`
-- [ ] S-610 · `unit:U-022` · `method` · `SimulationRunner._load_run_state` · `simulation_runner.py:243`
-- [ ] S-611 · `unit:U-022` · `method` · `SimulationRunner._save_run_state` · `simulation_runner.py:299`
+- [x] S-610 · `unit:U-022` · `method` · `SimulationRunner._load_run_state` · `simulation_runner.py:243`
+- [x] S-611 · `unit:U-022` · `method` · `SimulationRunner._save_run_state` · `simulation_runner.py:299`
 - [ ] S-612 · `unit:U-022` · `method` · `SimulationRunner.start_simulation` · spawns subprocess + monitor thread · `simulation_runner.py:313`
 - [ ] S-613 · `unit:U-022` · `method` · `SimulationRunner._monitor_simulation` · polls JSONL every 2s by file offset · `simulation_runner.py:482`
 - [ ] S-614 · `unit:U-022` · `method` · `SimulationRunner._read_action_log` · seek-and-readline · `simulation_runner.py:584`

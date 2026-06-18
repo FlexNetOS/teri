@@ -1235,3 +1235,223 @@ a mock loop, no dependency on U-022. **No split needed.**
    timeout message. `poll_commands` = `rx.try_recv().ok()`. `send_success`/`send_error` = fire the envelope oneshot.
 4. Apply the per-symbol table (§16.3) and the `[≠]` table (§16.5) exactly. command_id stays populated (§16.4).
 5. Tests: mock-loop task (start → poll → reply) + client assertions, incl. a timeout case. No SimEngine, no files.
+
+---
+
+## DECISION-17 — U-022 `SimulationRunner` (S-540..S-635, 96 symbols) → MAP-ONTO in-process tokio runner (refines DECISION-2; wires DECISION-16 IPC channel + U-021 graph mgr + U-010 logger + U-023 manager)
+
+**Lineage:** DECISION-2 (OASIS subprocess → native `SimEngine`, REIMPLEMENT-as-UPGRADE; substrate LOCKED), DECISION-16
+(`channel()`→`SimulationIPCClient`/`SimulationIPCServer` in-process transport — U-022's interview methods delegate here),
+DECISION-13/14 (`GraphMemoryManager<L>`/`GraphMemoryUpdater<L>` async worker — the monitor fires it), U-023 (`SimulationManager`
+owns `{sim_data_dir}/{sim_id}/` FS layout + `SimulationState`/`state.json` — the run-state ties here). Source-authoritative:
+read against `simulation_runner.py` in full (1768 lines).
+
+### 17.0 Landing + the central substrate map (the four owner-posed areas)
+
+teri runs the sim **in-process** (`SimEngine::run` is a tokio future, `src/sim/mod.rs:492`). MiroFish's `SimulationRunner` is
+a process **supervisor**: it `subprocess.Popen`s `run_{twitter,reddit,parallel}_simulation.py`, polls their JSONL output
+files, and process-group-kills them. The supervisor's *transport* (OS subprocess, Popen, pgid, JSONL files between processes)
+is structurally absent in teri — same inexpressibility class as Zep-network→petgraph (DECISION-1) and file-IPC→channel
+(DECISION-16). But the supervisor's **observable contract** (start→running state, stop→terminate+clean, dual-platform needs
+both, idempotent cleanup, per-action graph-memory firing, `simulation_end`→completed, action/timeline/stat readers,
+interview round-trip, run-state `to_dict` shapes) is FULLY PORTED. New module `src/services/simulation_runner.rs`.
+
+**Class-level `_run_states`/`_processes`/… dicts → an OWNED `SimulationRunner` struct** (NOT process-global statics — same
+forcing function as U-021/U-023: generic-over-`L: LlmClient` statics are impossible, `LlmClient` not dyn-safe; class-level
+singleton → one instance in app state, observable "one registry per process" contract preserved). The struct holds a
+`Mutex<HashMap<String, RunHandle>>` where each `RunHandle` bundles what the six Python dicts keyed by `simulation_id`:
+
+```text
+struct RunHandle {
+    state:        SimulationRunState,                  // _run_states[id]   (S-602)
+    task:         tokio::task::JoinHandle<()>,         // _processes[id]    (S-603) — the sim task, NOT a Popen
+    shutdown:     Arc<AtomicBool>,  // or watch::Sender<bool> — cooperative stop signal  ([≠] replaces pgid/SIGTERM)
+    ipc_client:   SimulationIPCClient,                 // DECISION-16 — interview/close delegate target
+    monitor:      tokio::task::JoinHandle<()>,         // _monitor_threads[id] (S-605) — the JSONL/snapshot monitor task
+    graph_enabled: bool,                               // _graph_memory_enabled[id] (S-608)
+}
+```
+
+`_action_queues` (S-604), `_stdout_files`/`_stderr_files` (S-606/S-607) are **subprocess-transport `[≠]`** (see §17.4):
+`Queue` was thread→thread handoff (in-process tokio uses the broadcast/oneshot channels directly); the stdout/stderr file
+handles existed only to drain a child process's pipes — there is no child pipe in-process.
+
+**(Area 1) `_processes`/Popen lifecycle → JoinHandle + cooperative shutdown.**
+| Observable contract (PORTED) | OS-subprocess mechanism (`[≠]` inexpressible) |
+|---|---|
+| `start_simulation` returns a state with `runner_status=RUNNING`, `twitter_running`/`reddit_running` set per platform, persisted to `state.json` (S-612) | `subprocess.Popen(cmd, start_new_session=True)`, `sys.executable`, `run_*_simulation.py` script path, `PYTHONUTF8`/`PYTHONIOENCODING` env, `bufsize=1`, stdout→`simulation.log` file — there is no child process or interpreter to spawn (S-612 partial) |
+| `stop_simulation` transitions RUNNING→STOPPING→STOPPED, sets `twitter/reddit_running=false`, `completed_at`, stops graph updater, persists (S-617) | `_terminate_process` (S-616): `taskkill /F /T` (Windows), `os.killpg(pgid, SIGTERM)` then `SIGKILL` after 5s (Unix), `os.getpgid` — **no OS process to signal**; replaced by `shutdown.store(true)` (cooperative) + `task.abort()` (hard, the SIGKILL analog) + `task.await` bounded by `tokio::time::timeout(5s)` (the SIGTERM-then-SIGKILL-after-5s timing IS observable → preserve the *timing semantics* via a graceful-then-abort window) |
+| dual-platform requires BOTH twitter+reddit to terminate (S-615 `_check_all_platforms_completed`) | (pure logic — fully ported) |
+| `cleanup_all_simulations` idempotent (S-624 `_cleanup_done` flag), terminates ALL, stops `GraphMemoryManager.stop_all`, sets each state STOPPED + error "服务器关闭，模拟被终止", persists (S-625) | per-process `taskkill`/`killpg`; the `state.json` secondary write (S-625 L1244-1259) is U-023's `SimulationState` file — write via the `SimulationManager`, not a raw json edit |
+| `get_running_simulations` lists ids whose task is not finished (S-627) | `process.poll() is None` → `!handle.task.is_finished()` |
+
+`_terminate_process` (S-616): the **observable** is "the running simulation stops within ~5s, gracefully if possible else
+forcibly." Map: set `shutdown`→true (sim loop checks between ticks, like the existing `inject_fn` hook point at
+`mod.rs:542`), `tokio::time::timeout(Duration::from_secs(5), &mut task)`; on elapsed → `task.abort()` (the SIGKILL analog).
+The Windows/Unix branch split, `taskkill`/`killpg`/`SIGTERM`/`SIGKILL`/pgid are **`[≠]` inexpressible** (no OS process) — but
+the **5s grace-then-force window is contractual and IS preserved.** `IS_WINDOWS` (S-540) → `[≠]` (no cross-platform process
+API needed; teri's stop is OS-agnostic).
+
+**(Area 2) `_monitor_simulation` (S-613) + `_read_action_log` (S-614) → tail U-010's `actions.jsonl` by offset AND/OR consume SimEngine channels.**
+The monitor's three observable duties, each PRESERVED:
+1. **per-action graph-memory firing** when enabled (L683-684: `graph_updater.add_activity_from_dict(action_data, platform)`)
+   → `GraphMemoryUpdater::add_activity_from_dict(&data, platform)` (already ported, U-021 S-... ; non-blocking mpsc send).
+2. **`simulation_end` → COMPLETED** (L622-640) → **REUSE U-048 (already PARITY-PASSED): `SimEngine::subscribe_completion()`
+   `watch::Receiver<Option<SimCompletion>>`** is the in-band terminal signal; `_check_all_platforms_completed` (S-615) gates
+   COMPLETED on both platforms' completion. `round_end` event → `current_round`/`simulated_hours` updates (L642-661).
+3. **`add_action` into `recent_actions`** (cap 50, S-596) + per-platform counts (L665-680).
+
+**Monitor source decision — CHOSEN: tail U-010 `actions.jsonl` by byte offset (realizes U-047 JSONL_TAIL_CONTRACT here).**
+Rationale: the monitor's job is to *re-derive run-state from the action log the sim writes* — exactly MiroFish's design
+(`f.seek(position)` → readline → `f.tell()`, L610-688). teri's `SimEngine` writes the SAME `actions.jsonl` via
+`PlatformActionLogger` (U-010, `log_action`/`log_round_end`/`log_simulation_end`). So U-022's monitor:
+- spawns a `tokio::task` per run that, in a `loop { … tokio::time::sleep(Duration::from_secs(2)).await }` (the 2s poll IS
+  observable cadence — preserve), tails `{sim_dir}/twitter/actions.jsonl` and `{sim_dir}/reddit/actions.jsonl` from a
+  per-file `u64` offset, parses each new line, and dispatches event_type/action exactly as `_read_action_log` does;
+- terminates the loop when `subscribe_completion()` fires (U-048) OR the sim task finishes — then does ONE final tail pass
+  (mirrors L518-522 "进程结束后最后读取一次") so no trailing action is lost.
+
+**This realizes U-047 `JSONL_TAIL_CONTRACT` HERE** (do not defer): the offset-tailing reader (seek + readline + tell, never
+re-read a processed line, no line lost) is U-022's monitor. **Preserve exactly:** offset monotonic per file, partial last
+line not consumed until newline-terminated (mirror `json.loads` skipping `JSONDecodeError`), graph-memory fired once per
+action, `simulation_end`→completed, `add_action`'s 50-cap + counts. The 2s `sleep` + final-pass-after-end are contractual.
+*Why tail-the-file over consume-the-broadcast:* the file is the single source MiroFish derives state from; the broadcast
+channel carries `WorldState` snapshots (tick-grain), not per-action JSONL records — tailing the log is the faithful map and
+keeps the offset-no-double-read invariant the source guarantees. (U-048's `subscribe_completion` is used ONLY for the
+loop-exit signal, replacing `process.poll()`.)
+
+**(Area 3) `get_interview_history` (S-635) + `_get_interview_history_from_db` (S-634) → SQLite `trace` table read.**
+Source reads `{sim_dir}/{platform}_simulation.db` SQLite, `SELECT user_id, info, created_at FROM trace WHERE action='interview'`
+ordered desc, limit, optional `user_id=agent_id` filter, JSON-decodes `info` → `{agent_id, response, prompt, timestamp, platform}`.
+**Substrate decision — CHOSEN: the in-process IPC interview store (a teri-side interview-trace log), NOT redb, NOT raw SQLite.**
+Rationale + boundary (this is a **carry-forward gate**, NOT a `[≠]`): in teri the interview round-trip is the in-process IPC
+path (DECISION-16). MiroFish's OASIS subprocess WROTE each interview to its SQLite `trace` table as a side effect; the history
+read is "give me the interviews that happened." teri has no OASIS SQLite — but the interview RESULT is observable and
+contractual (it is served to the frontend by U-026), so it is **PORTED, not dropped.** Decision: U-022's interview handler
+(sub-cycle e/f) appends each completed interview to a teri-native interview-trace sink — **realize as a JSONL trace file
+`{sim_dir}/{platform}_interviews.jsonl`** (consistent with U-010's JSONL substrate; avoids pulling a SQLite dep solely to
+mimic OASIS's storage), and `get_interview_history` reads/merges/sorts/limits from THAT. The `trace`-table SQL, `sqlite3`
+import, `user_id`/`info`/`created_at` column names are **`[≠]` inexpressible** (OASIS's schema, no OASIS DB) — but the
+returned dict shape `{agent_id, response, prompt, timestamp, platform}`, the desc-sort, the per-platform + merged-limit
+behavior (L1760-1766) are PORTED and differential-testable. **CARRY-FORWARD GATE → sub-cycle (f) + U-026:** the
+interview-history reader is only meaningful if the interview HANDLER writes the trace; the parity gate for (f) MUST verify a
+write-then-read round-trip (interview an agent → it appears in `get_interview_history`), or the history contract is a hollow
+`[≠]`. Until the handler writes, `get_interview_history` returns `[]` faithfully (matches Python when no DB exists, L1669).
+
+**(Area 4) `register_cleanup` (S-626) + `cleanup_all_simulations` (S-625) → U-049 boundary.**
+Source `register_cleanup` installs SIGTERM/SIGINT/SIGHUP signal handlers + `atexit`, all calling `cleanup_all_simulations`;
+guards on `WERKZEUG_RUN_MAIN`/`FLASK_DEBUG` reloader detection; `_cleanup_registered` global idempotency. **Boundary
+decision:** U-022 OWNS `cleanup_all_simulations` (S-625) — it is the *what-to-clean* logic (terminate all run tasks, stop
+`GraphMemoryManager`, persist STOPPED states) and lives on the `SimulationRunner` struct as `async fn cleanup_all`. U-049
+OWNS the *signal-handler installation* (`register_cleanup` S-626) — it wires teri's existing graceful-shutdown path
+(U-002's `axum::serve().with_graceful_shutdown(ctrl_c)`, parity-verified) to CALL `runner.cleanup_all().await`. So:
+- **S-625 `cleanup_all_simulations` → U-022** (`SimulationRunner::cleanup_all`, idempotent via `AtomicBool` compare_exchange
+  mirroring `_cleanup_done`, mirroring U-021's `stop_all` idempotency pattern — DECISION-13).
+- **S-626 `register_cleanup` → routed to U-049** as a `[deferred-to-U-049]` symbol (NOT `[≠]`, NOT dropped): the
+  SIGTERM/SIGINT/SIGHUP/atexit/`WERKZEUG_RUN_MAIN` mechanism is Flask-WSGI-specific; teri's analog is one tokio `ctrl_c`
+  (already in U-002) extended (in U-049) to also fire `runner.cleanup_all()` + `graph_mgr.stop_all()`. The DOUBLE-signal /
+  SIGHUP / atexit-backup are `[≠]` only insofar as tokio's single `signal::unix::SignalKind` set covers them (U-049 decides;
+  SIGHUP IS expressible via `tokio::signal::unix`). U-022's DONE gate does NOT require S-626 to ship — it ships in U-049 — but
+  U-022 MUST expose `cleanup_all` as the callable U-049 wires. Record S-626 in U-022's ledger as `[→U-049]` so the symbol is
+  not lost.
+
+### 17.1 Run-state types — byte-exact `to_dict` shapes (S-541..S-598)
+
+`RunnerStatus` (S-541..S-549): `str` enum → `#[derive(Serialize)] #[serde(rename_all="lowercase")] enum RunnerStatus { Idle,
+Starting, Running, Paused, Stopping, Stopped, Completed, Failed }` with `.value` strings `idle/starting/running/paused/
+stopping/stopped/completed/failed` byte-exact (the `to_dict` writes `.value`, L163).
+`AgentAction` (S-550..S-560): struct + `to_dict` 9-key map (`round_num, timestamp, platform, agent_id, agent_name,
+action_type, action_args, result, success`) — `result: Option<String>` → JSON null when None; `action_args: Map`. **Byte-exact
+differential-testable.** Note this `AgentAction` is U-022's own (distinct from U-010's logger record shape — they share the
+JSONL field set, which is WHY the monitor can parse the logger's output; verify field-name alignment with U-010 in (c)).
+`RoundSummary` (S-561..S-570): + `to_dict` with the computed `actions_count: len(actions)` key AND nested `actions: [..to_dict]`.
+`SimulationRunState` (S-571..S-598): the big one. `add_action` (S-596): insert-at-front, truncate to `max_recent_actions=50`,
+bump per-platform count, refresh `updated_at`. `to_dict` (S-597): note the **computed** `progress_percent =
+round(current_round / max(total_rounds,1) * 100, 1)` and `total_actions_count = twitter+reddit` keys (not stored fields —
+compute them) — these are observable outputs, PORT exactly incl. the `round(…,1)` one-decimal rounding. `to_detail_dict`
+(S-598): `to_dict` + `recent_actions: [..to_dict]` + `rounds_count: len(rounds)`. `_load_run_state`/`_save_run_state`
+(S-610/S-611): persist `to_detail_dict()` to `{sim_dir}/run_state.json` (this is U-022's OWN file, distinct from U-023's
+`state.json` — both coexist, source writes both, L302-310 vs L1244-1259). `get_run_state` (S-609): memory-cache-then-file-load.
+`process_pid` field (S-595): kept in the struct + `to_dict` for shape parity, but **populated as `[≠]`** — there is no OS pid;
+serialize as `null` (faithful: Python sets it to `process.pid`, an OS artifact; the FIELD is contractual in `to_dict`, the
+VALUE is OS-mechanism). Flag for verifier: this is shape-preserving, value-`[≠]`.
+
+### 17.2 Action readers (S-618..S-622) — pure file-read logic, fully PORTED
+
+`_read_actions_from_file` (S-618), `get_all_actions` (S-619), `get_actions` (S-620, limit/offset pagination), `get_timeline`
+(S-621, round-grouped aggregation with `active_agents` set, `action_types` histogram, first/last time), `get_agent_stats`
+(S-622, per-agent histogram sorted desc by total). **All pure JSONL-read + aggregation — NO substrate decision, NO `[≠]`.**
+Reads the SAME `{sim_dir}/{platform}/actions.jsonl` U-010 writes; preserve: skip `event_type` records, skip records w/o
+`agent_id`, `default_platform` fallback, twitter-then-reddit order, legacy single-file fallback (L938-947), timestamp-desc
+sort. `cleanup_simulation_logs` (S-623): deletes `run_state.json`/`simulation.log`/`stdout.log`/`stderr.log`/`*_simulation.db`/
+`env_status.json` + `{platform}/actions.jsonl`, returns `{success, cleaned_files, errors}` — PORT the file-deletion set
+(the `.db` / `stdout.log` / `stderr.log` / `env_status.json` filenames are deleted-if-present, harmless if teri never created
+them — keep the names for forward-compat with logs from a mixed run; `success = errors empty`).
+
+### 17.3 Interview wiring (S-628..S-633) — delegate to DECISION-16 IPC
+
+`check_env_alive` (S-628) → `ipc_client.check_env_alive()` (AtomicBool read). `get_env_status_detail` (S-629): source reads
+`env_status.json` → `{status, twitter_available, reddit_available, timestamp}`; teri has no env_status.json (DECISION-16
+replaced it with the `alive` AtomicBool) → **derive the same dict from the live `RunHandle`** (status from
+`state.runner_status`, twitter/reddit_available from `state.twitter_running`/`reddit_running`, timestamp = now) — the
+`env_status.json` FILE is `[≠]`, the returned dict shape is PORTED. `interview_agent` (S-630, timeout 60s),
+`interview_agents_batch` (S-631, timeout 120s), `close_simulation_env` (S-633, timeout 30s) → delegate to
+`ipc_client.send_interview`/`send_batch_interview`/`send_close_env` (DECISION-16, real `tokio::time::timeout`); PORT the
+result-dict shapes (`{success, agent_id, prompt, result, timestamp}` etc.) and the `check_env_alive`-guard-raises-ValueError
+precondition (→ `Err(TeriError::Sim)`). `interview_all_agents` (S-632) → reads `simulation_config.json` `agent_configs`,
+builds the interview list, delegates to `interview_agents_batch` (timeout 180s). **The interview HANDLER (what the sim loop
+DOES on receiving an Interview command — inject prompt, capture next `prepare_action`) is U-022 sub-cycle (e/f) and writes the
+interview-trace (Area 3).**
+
+### 17.4 Candidate `[≠]` symbols — WITH per-symbol inexpressible/non-contractual/superset justification
+
+| S | Symbol | `[≠]` class | Justification (verifier re-checks adversarially) |
+|---|--------|-------------|--------------------------------------------------|
+| S-540 | `IS_WINDOWS` | non-contractual | platform-branch selector for `taskkill` vs `killpg`; teri's stop is OS-agnostic (cooperative+abort), so no branch exists. No observable output. |
+| S-604 | `_action_queues` (`Queue`) | inexpressible-substrate | thread→thread handoff between Popen-monitor-thread and main; in-process tokio uses the broadcast/oneshot channels directly — there is no second thread to hand off to. No observable. |
+| S-606/S-607 | `_stdout_files`/`_stderr_files` | inexpressible-substrate | file handles existed ONLY to drain a child process's stdout/stderr pipes (avoid pipe-buffer deadlock, L426-428); no child pipe in-process. No observable output (the `simulation.log` content is OASIS's own logging, not a contract teri reproduces — teri logs via its own tracing). |
+| S-616 (partial) | `_terminate_process` Win/Unix branches, `taskkill`/`killpg`/pgid/SIGTERM/SIGKILL | inexpressible-substrate | no OS process to signal. **The 5s grace-then-force WINDOW is PORTED** (shutdown-signal then `task.abort()` after `timeout(5s)`); only the signal MECHANISM is `[≠]`. |
+| S-612 (partial) | `start_simulation` Popen/`sys.executable`/script-path/`PYTHONUTF8`/`bufsize`/`start_new_session` | inexpressible-substrate | no interpreter/script to spawn; teri spawns a tokio task running `SimEngine::run`. **The returned RUNNING state + platform flags + persistence are PORTED.** |
+| S-595 (value only) | `SimulationRunState.process_pid` value | non-contractual value, shape PORTED | field stays in struct + `to_dict` (shape parity); value is `null` (no OS pid). |
+| S-629 (file only) | `get_env_status_detail` reading `env_status.json` | inexpressible-substrate, dict PORTED | the FILE is the subprocess-liveness artifact (DECISION-16 `[≠]`); the returned dict is derived from live state. |
+| S-634/S-635 (SQL only) | `_get_interview_history_from_db` `sqlite3`/`trace`-table SQL/column names | inexpressible-substrate, dict + sort + merge PORTED | no OASIS SQLite DB; teri's interview-trace is a JSONL sink (Area 3). The returned record shape, desc-sort, per-platform+merged-limit are PORTED. **Carry-forward gate: handler must write the trace.** |
+| S-626 | `register_cleanup` SIGTERM/SIGINT/SIGHUP/atexit/`WERKZEUG_RUN_MAIN` | `[→U-049]` (NOT `[≠]`, deferred) | the signal-installation belongs to U-049, which wires teri's `ctrl_c` shutdown to call `cleanup_all`. U-022 ships the callable; the installer ships in U-049. |
+
+**Everything not in this table is PORTED** (no other downgrades). In particular: every `to_dict`/`to_detail_dict` shape, all
+action/timeline/stat readers, all interview delegations, dual-platform completion logic, the 2s monitor cadence, the offset-no-
+double-read tailing, the per-action graph-memory firing, the 5s grace window, `cleanup_simulation_logs`, idempotent cleanup.
+
+### 17.5 Sub-cycle decomposition (6 cycles; one porter cycle each, opus-gated)
+
+| Cycle | Symbols (S) | What | Reuse points | Risk / escalation |
+|-------|-------------|------|--------------|-------------------|
+| **(a)** run-state types | S-541..S-598 (RunnerStatus, AgentAction, RoundSummary, SimulationRunState + add_action/to_dict/to_detail_dict/_load/_save/get_run_state) | the dataclasses + byte-exact serde shapes + FS run_state.json persistence | U-023 `SimulationManager` dir layout (`{sim_data_dir}/{id}/`); U-010 JSONL field set (align `AgentAction` fields) | LOW. Watch `progress_percent` rounding + computed `total_actions_count`; `process_pid` null-value `[≠]`. |
+| **(b)** lifecycle | S-599..S-603, S-608, S-612, S-616, S-617, S-624, S-625, S-627 (struct, RunHandle, start/stop/_terminate/cleanup_all/get_running) | spawn `SimEngine::run` as tokio task + cooperative-shutdown+abort lifecycle; idempotent cleanup | DECISION-16 `channel()` (build ipc_client per run); U-021 `GraphMemoryManager::create_updater`/`stop_updater`/`stop_all`; U-023 manager for the `state.json` secondary write; `SimEngine::run`/`subscribe_completion` | MED. The shutdown signal must be honored by `SimEngine`'s tick loop — needs a `shutdown` check at the `inject_fn` hook point (`mod.rs:542`). If SimEngine has no cooperative-stop hook, ESCALATE (may need a tiny SimEngine `watch<bool>` shutdown input — additive, no downgrade). The 5s grace-then-abort timing. |
+| **(c)** monitor + tail + graph-fire | S-613, S-614, S-615 (_monitor_simulation, _read_action_log, _check_all_platforms_completed) | per-run monitor task: 2s offset-tail of both `actions.jsonl`, event/action dispatch, graph-memory fire, completion detect | U-010 `PlatformActionLogger` output (the file it tails); U-021 `GraphMemoryUpdater::add_activity_from_dict`; U-048 `subscribe_completion` (loop-exit signal); realizes **U-047** JSONL_TAIL_CONTRACT | MED-HIGH. Offset-no-double-read + final-pass-after-end + partial-line safety are the parity-critical invariants. Confirm U-010 writes the exact field names `AgentAction` parses (round/timestamp/agent_id/agent_name/action_type/action_args/result/success + event_type/round_end/simulation_end). If field drift, ESCALATE to align U-010. |
+| **(d)** action readers | S-618..S-623 (_read_actions_from_file, get_all_actions, get_actions, get_timeline, get_agent_stats, cleanup_simulation_logs) | pure JSONL read + aggregation + pagination + log cleanup | U-010 `actions.jsonl` layout | LOW. No substrate decision. Preserve sort order, event/no-agent_id skips, legacy single-file fallback. |
+| **(e)** interview wiring | S-628, S-630, S-631, S-633 (check_env_alive, interview_agent, interview_agents_batch, close_simulation_env) | delegate to DECISION-16 IPC client; result-dict shapes; check-alive-guard | DECISION-16 `SimulationIPCClient::check_env_alive`/`send_interview`/`send_batch_interview`/`send_close_env` | LOW-MED. Pure delegation; the HANDLER side (what the loop does on a command) is the (b)/(c) sim-loop dispatch (DECISION-16 §16.2) — confirm the loop services commands. |
+| **(f)** interview history + env-status + cleanup boundary | S-629, S-632, S-634, S-635, S-626 (get_env_status_detail, interview_all_agents, _get_interview_history_from_db, get_interview_history, register_cleanup→U-049) | interview-trace JSONL sink + history reader; derived env-status; interview_all (config read→batch); S-626 boundary to U-049 | U-023 `get_simulation_config`/`get_profiles` (agent_configs for interview_all); the interview-trace sink wired in (e) | MED. **Carry-forward gate:** verify interview write→read round-trip (Area 3). S-626 lands in U-049, recorded `[→U-049]` here. |
+
+### 17.6 First sub-cycle recommendation — **(a) run-state types FIRST.**
+
+Dependency order: (a) has zero upstream deps (pure dataclasses + serde + FS persistence on U-023's already-built dir layout)
+and EVERY later cycle consumes its types — (b)/(c) read/write `SimulationRunState`, (d) returns `AgentAction`, (e)/(f) return
+interview dicts that reference run-state. It is also the highest byte-exact differential-test value (the `to_dict`/`to_detail_dict`
+shapes are the frontend contract via U-026) and lowest risk, so it locks the observable JSON surface before the
+substrate-heavy lifecycle/monitor cycles build on it. Then (b) lifecycle (needs (a)'s state + the SimEngine-task spawn — the
+central substrate work + the one likely escalation), (c) monitor (needs (b)'s RunHandle + (a)'s add_action), (d) readers
+(independent, can interleave), (e) interviews (needs the (b) IPC-client-per-run), (f) history+boundary last.
+
+### DECISION-17 — 6-line actionable summary
+1. New `src/services/simulation_runner.rs`; class-dicts → owned `SimulationRunner { Mutex<HashMap<String, RunHandle>> }`; sim
+   = tokio task running `SimEngine::run`, NOT a subprocess (LOCKED by DECISION-2).
+2. Lifecycle: `_processes`/Popen → `JoinHandle` + cooperative `shutdown` flag + `task.abort()` after `timeout(5s)`; the 5s
+   grace-then-force window is PORTED, the taskkill/killpg/pgid/SIGTERM/SIGKILL mechanism is `[≠]` (no OS process).
+3. Monitor (c) tails U-010's `actions.jsonl` by byte offset every 2s (realizes U-047), fires U-021 `add_activity_from_dict`,
+   uses U-048 `subscribe_completion` for loop-exit; offset-no-double-read + final-pass are parity-critical.
+4. Interviews delegate to DECISION-16 IPC client; `get_interview_history` reads a teri-native interview-trace JSONL sink
+   (SQLite `trace`-table SQL is `[≠]`, the record shape/sort/merge are PORTED) — carry-forward gate: handler must write it.
+5. `cleanup_all` (S-625) owned by U-022 (idempotent AtomicBool); `register_cleanup` (S-626) deferred `[→U-049]` which wires
+   teri's `ctrl_c` to call it — NOT a `[≠]`, NOT dropped.
+6. Port in order **(a)→(b)→(c)→(d)→(e)→(f)**; start with **(a) run-state types** (zero deps, all cycles consume it, byte-exact
+   frontend contract). `[≠]` set is exactly §17.4 — everything else PORTED.

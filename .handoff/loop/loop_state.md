@@ -17,7 +17,21 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 2   # RESUMED 2026-06-17 (11th resume, reset 0); baseline re-verified 880 green.
+cycles_this_session: 1   # RESUMED 2026-06-17 (12th resume, reset 0); baseline re-verified 917 green. Next: U-022 SimulationRunner via architect decomposition.
+# CYCLE1 (12th resume) 2026-06-17: U-022 sub-cycle (a) run-state types (S-540..S-598 + S-610/611) — opus FAIL→fix→PASS
+#   (DECISION-17, architect). NEW src/services/simulation_runner.rs. RunnerStatus (8 variants, lowercase .value),
+#   AgentAction (9-field + to_dict 9-key), RoundSummary (8-field + to_dict 9-key, computed actions_count + nested
+#   actions), SimulationRunState (24-field + add_action front-insert/cap-50/per-platform-counter + to_dict 23-key +
+#   to_detail_dict 25-key superset incl recent_actions/rounds_count + computed progress_percent/total_actions_count),
+#   load_run_state (tolerant .get defaults, missing→None) + save_run_state (create_dir_all, 2-space pretty, raw UTF-8).
+#   GATE CAUGHT a real downgrade: progress_percent used Rust f64::round() (half-away-from-zero) vs CPython round(x,1)
+#   (half-to-EVEN) — 243 reachable (current_round,total_rounds) pairs in 1..400 diverged (raw 6.25→Py 6.2 vs Rust 6.3,
+#   a contractual to_dict frontend key). FIXED: new round_half_even_1dp helper decoding the f64 mantissa to resolve
+#   ties via exact u128 integer compare (Less→down/Greater→up/Equal→half-to-even), VERIFIED by empirical golden diff
+#   vs real CPython 3.14.4 (82,828 values 0 mismatches; 243/243 boundary pairs now match) + Less/Greater branch proven
+#   on 50 constructed non-midpoint cases. 2 [≠] survived challenge: S-540 IS_WINDOWS (non-contractual platform branch),
+#   S-595 process_pid VALUE (key/shape PORTED → emits null, value is OS artifact). 60 symbols [x] + 2 [≠]. U-022 unit
+#   STAYS [ ] (sub-cycles b-f remain). teri 962 green, clippy --all-targets clean. HEAD pending commit.
 # GIT/PR DISCIPLINE (owner-mandated 2026-06-17, post-cycle-2): owner flagged that work was committed locally but
 #   NEVER pushed (38 commits unpushed) + no PRs = DANGEROUS. ACTIONS TAKEN: (1) cargo fmt whole branch (porters ran
 #   clippy not fmt → CI Format gate would've blocked) commit 1afbe0c; (2) PUSHED port/mirofish to origin (fe9d855..

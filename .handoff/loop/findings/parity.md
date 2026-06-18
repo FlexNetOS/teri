@@ -1798,3 +1798,75 @@ The entire file-transport mechanism exists ONLY to cross the OASIS-subprocess↔
 
 ### VERDICT: **PASS** — sub-cycle (b) done.
 S-477..S-487, S-489..S-492 = `[x]`; S-488 = `[≠]` (genuinely inexpressible, CHALLENGE survived). Sub-cycle (a) S-453..S-476 already `[x]` (2026-06-17 PASS above). **All U-020 symbols S-453..S-492 are now `[x]`/`[≠]` ⇒ U-020 COMPLETE — unit ledger may flip `- [x]` and commit.** No protocol behavior lost (timeout defaults, conditional platform, FIFO, liveness, command_id all preserved + differentially tested). Symbol-map updated for S-477..S-492 only.
+
+---
+
+## 2026-06-17 — U-022 sub-cycle (a): run-state types (S-540..S-598, S-610/S-611) — **FAIL**
+
+**Verifier:** rust-port-parity-verifier (opus, fail-closed). Method: golden differential — real CPython `to_dict/to_detail_dict` (dataclasses extracted from `simulation_runner.py`) vs real compiled-Rust `to_detail_dict`, byte-for-byte JSON diff; + full enumeration of `progress_percent` over all reachable round ratios.
+
+### Confirmed divergence (downgrade) — `progress_percent` rounding
+- **Symbol:** S-597 `SimulationRunState.to_dict` (computed key `progress_percent`).
+- **File:line:** `src/services/simulation_runner.rs:482-484`.
+- **Python (`simulation_runner.py:168`):** `round(current_round / max(total_rounds,1) * 100, 1)` — CPython `round()` is **round-half-to-even (banker's)** on the IEEE-754 value.
+- **Rust:** `(raw_pct * 10.0).round() / 10.0` — `f64::round()` is **round-half-away-from-zero**.
+- **Golden diff (identical inputs, real both sides):** `current_round=1, total_rounds=16` (raw 6.25) → **Python `6.2`**, **Rust `6.3`**. The two `to_detail_dict` JSON blobs are identical on all 25 keys/order/types EXCEPT this one line.
+- **Scope of break:** 243 distinct `(current_round, total_rounds)` pairs in round counts 1..400 diverge — every `.x5` half-cent boundary (6.25→6.2/6.3, 31.25, 81.25, 1.25, 11.25, …). Reachable: `total_rounds = int(total_hours*60/minutes_per_round)` yields 16/80/etc. for ordinary configs; `current_round` walks 0→total, so boundaries ARE hit.
+- **Why a downgrade (not a `[≠]`):** `progress_percent` is a contractual `to_dict` key served to the frontend (DECISION-17.1: "PORT exactly incl. the round(…,1) one-decimal rounding"). The Rust comment at L482 even STATES Python uses round-half-to-even, then fails to implement it. This is a portable-feature narrowing, not an inexpressible/non-contractual divergence.
+- **Why tests missed it:** `to_dict_progress_percent_one_decimal_rounding` only tests `1/3 = 33.3` (a non-boundary). No `.5`-tie case is exercised.
+
+**Fix routed to porter:** implement Python `round(x, 1)` semantics (round-half-to-even on the scaled value), e.g. via `rust_decimal` banker's rounding or an explicit half-to-even scale/round/unscale, and add a parity test covering 6.25→6.2, 0.25→0.2, 6.45→6.5, 0.05→0.1.
+
+### Everything else: PASS (shape parity confirmed by golden diff)
+- **RunnerStatus (S-541..S-549):** 8 variants, exact lowercase `.value` strings, `as_str`/`Display`/serde all match. ✓
+- **AgentAction.to_dict (S-550..S-560):** 9 keys, exact order, `result: None`→`null`, `action_args` object. Byte-identical. ✓
+- **RoundSummary.to_dict (S-561..S-570):** 9 keys, exact order, computed `actions_count=len(actions)`, nested `actions:[to_dict]`, `end_time: None`→`null`. ✓
+- **SimulationRunState.to_dict (S-571..S-597):** 23 keys, exact insertion order matches Python L161-186; `runner_status` emits `.value` string; `total_actions_count` computed; all `Option`→`null` (started_at/completed_at/error/process_pid). ✓ (except progress_percent value, above)
+- **to_detail_dict (S-598):** 25-key superset + `recent_actions:[to_dict]` + computed `rounds_count`. ✓
+- **add_action (S-596):** front-insert, cap-50 truncation (drops the OLDEST = tail, matching Python `[:max]` since insert was at front), per-platform counter, updated_at refresh. ✓
+- **Persistence (S-610/S-611):** `save_run_state` create_dir_all + 2-space pretty + raw UTF-8; `load_run_state` `.get(key,default)` tolerance, missing file→None, parse error→None. Round-trip verified. ✓
+
+### `[≠]` adjudication (both CHALLENGE-survived)
+- **S-540 `IS_WINDOWS`** — `[≠]` non-contractual CONFIRMED: used only to select `taskkill`/`killpg` in the terminate path; no observable output, no serialized field. teri's stop is OS-agnostic.
+- **S-595 `process_pid` value** — `[≠]` value-only CONFIRMED: struct field + `to_dict` key PORTED (golden shows `"process_pid": null`); value is `null` (no OS subprocess) — faithful to Python's `None` before a process is spawned; no consumer contract broken (Optional[int]).
+
+### Coverage
+Shape-verified: S-541..S-594, S-596, S-598, S-610, S-611 (would be `[x]`). `[≠]` confirmed: S-540, S-595. **BLOCKED by S-597** (progress_percent value divergence) — leave S-597 `- [~]`. Because one in-scope symbol fails parity, the unit does NOT pass; symbols NOT flipped to `[x]` this cycle.
+
+### VERDICT: **FAIL** — return to porter.
+Single defect: S-597 `progress_percent` uses round-half-away-from-zero; Python uses round-half-to-even. Fix the rounding + add `.5`-tie parity test, then re-verify. All other S-540..S-611 symbols are shape-parity-clean and ready to clear once S-597 matches.
+
+---
+
+## 2026-06-17 · U-022 sub-cycle (a) — RE-VERIFY of S-597 rounding fix → `SimulationRunState` + persistence
+
+**Verdict: PASS** (differential, empirical golden diff vs real CPython 3.14.4). Re-verification of the single prior FAIL (`progress_percent` round-half-away-from-zero vs CPython `round(x,1)` half-to-even). FIX CONFIRMED CORRECT; no regression.
+
+**The fix under test:** `round_half_even_1dp` (`src/services/simulation_runner.rs:336-397`) now backs `progress_percent` in `SimulationRunState::to_dict()` (L568-574). Algorithm: `scaled=x*10`; `frac<0.5` down / `frac>0.5` up; on IEEE `frac==0.5`, decode mantissa bits and compare `mantissa*20` vs `(2n+1)*2^(-exp)` in u128 exact integer arithmetic → Less=down / Greater=up / Equal=half-to-even.
+
+**Empirical golden diff (decisive evidence — did NOT take the porter's word):**
+- Tool: real CPython 3.14.4 `round(x,1)` vs the verbatim Rust helper (compiled standalone, bit-exact hex-float inputs).
+- **Full domain sweep: 82,828 values checked → 0 mismatches.** Covers every `(current_round,total_rounds)` raw percentage for total∈0..400 plus dense `.x5` tie batteries and named edges (6.25→6.2, 0.25→0.2, 6.45→6.5, 0.05→0.1, 0.15→0.1, 0.45→0.5, 31.25→31.2, 81.25→81.2, 2.55→2.5, 2.675→2.7, etc.). Every value matches CPython.
+- Hex-float parser independently bit-verified (82,828/82,828 round-trip to identical IEEE bits via Python `struct`), so the diff cannot be masked by a parse error.
+
+**Original 243-divergence set: 0 remaining.**
+- Re-enumerated counts 1..400: exactly **243** pairs where CPython diverges from round-half-away-from-zero (reproduces the original FAIL figure precisely; first pair cr=1,tr=16 raw=6.25 → CPython 6.2, old Rust 6.3).
+- New helper vs CPython on all 243: **243/243 match, 0 bad.** The exact issue the prior FAIL flagged is resolved.
+
+**`[≠]` Less/Greater branch correctness (not just "unused-and-lucky"):**
+- In the percentage domain, all 481 `frac==0.5` cases are TRUE exact ties (verified via `fractions.Fraction`), so they resolve via half-to-even only. To prove the exact-compare path is *correct* (helper is documented general/reusable), constructed 50 values where IEEE `x*10` lands on `n+0.5` but the true product differs (e.g. 0.05 GT→0.1, 0.15 LT→0.1, 0.35 LT→0.3, 0.45 GT→0.5). Rust: **50/50 match CPython, 0 bad.** Less/Greater logic is genuinely correct.
+
+**Edge cases:** `0.0→0`, `100.0→100` (no panic); `NaN→NaN`, `±inf` pass through (non-finite guard); negatives via recursion match CPython (`-2.5→-2.5`, `-6.25→-6.2`, `-0.05→-0.1`, `-0.15→-0.1`). Overflow: exp range over percentages is −54..0, so the `exp>=0` `1u128<<exp` path shifts by at most 0 in-domain — no overflow risk for the contract.
+
+**No regression / no collateral edits:** `git diff` shows only `src/services/mod.rs` (+1 line: `pub mod simulation_runner;`); `simulation_runner.rs` is the new sub-cycle (a) file. Rest of sub-cycle (a) unchanged and shape-correct vs `MiroFish/backend/app/services/simulation_runner.py`:
+- RunnerStatus (8 variants, lowercase serde, `as_str`/`Display`), AgentAction (9-key `to_dict`, null result, serde roundtrip), RoundSummary (9-key `to_dict`, computed `actions_count`, nested actions, null `end_time`), SimulationRunState defaults + `add_action` (insert-at-front, cap=50, per-platform counter, `updated_at` refresh), `to_dict` (23-key order matches source dict literal; `total_actions_count` computed), `to_detail_dict` (25 keys = superset + `recent_actions` + `rounds_count`).
+- Persistence S-610/S-611 (`load_run_state`/`save_run_state`): save via `to_detail_dict()` + indent=2 (verified 2-space pretty-print), load with `.get(k,default)` exact defaults (tolerates-missing-fields test), missing-file→None. Faithful to Python `_load_run_state`/`_save_run_state`.
+- **Full `cargo test --lib` = 948 passed, 0 failed.** Module suite 44 passed; 7 dedicated `round_half_even_1dp*` parity-regression tests pass.
+
+**`[≠]` challenge (both survive):**
+- **S-540 `IS_WINDOWS`** — non-contractual: feeds only the `taskkill` vs `killpg` subprocess-terminate selection; teri stop is OS-agnostic (cooperative shutdown + `task.abort()`), no branch, no observable output. (Subprocess orchestration S-599+ is sub-cycle (b), still `- [ ]`.) Confirmed `[≠]`.
+- **S-595 `process_pid` value** — value-only non-contractual: field AND `to_dict` key ARE ported (shape parity; `"process_pid": null` emitted, covered by `to_dict_null_optional_fields`); only the VALUE is always null (teri has no OS subprocess PID). JSON shape identical to source → not a skipped feature. Confirmed `[≠]` value-only.
+
+**Symbols cleared to `- [x]` (60):** S-541..S-598 (RunnerStatus + variants S-542..549, AgentAction + fields/method S-550..560, RoundSummary + fields/method S-561..570, SimulationRunState + fields/methods S-571..598), S-610, S-611. **`[≠]` confirmed:** S-540, S-595 (value-only). S-599 (`SimulationRunner` orchestrator) correctly remains `- [ ]` — sub-cycle (b).
+
+**Sub-cycle (a) coverage: 60/60 cleared + 2 `[≠]` confirmed → unit sub-cycle (a) PASS.**
