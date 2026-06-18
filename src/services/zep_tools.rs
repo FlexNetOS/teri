@@ -8,10 +8,8 @@
 //! - `interview_agents`: Agent selection and interview orchestration
 
 use crate::error::{Result, TeriError};
-use crate::graph::{EdgeTriple, KnowledgeGraph};
 use crate::llm::LlmClient;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 
 /// Search result from graph search operations.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -347,38 +345,10 @@ impl<L: LlmClient + Send + Sync + 'static> ZepToolsService<L> {
         &mut self,
         _graph_id: &str,
         query: &str,
-        limit: i64,
-        scope: Option<&str>,
+        _limit: i64,
+        _scope: Option<&str>,
     ) -> Result<SearchResult> {
-        // Extract query keywords
-        let query_lower = query.to_lowercase();
-        let keywords: Vec<String> = query_lower
-            .replace(',', " ")
-            .replace('，', " ")
-            .split_whitespace()
-            .filter(|w| w.len() > 1)
-            .map(|s| s.to_string())
-            .collect();
-
-        fn match_score(text: &str, query_lower: &str, keywords: &[String]) -> i64 {
-            if text.is_empty() {
-                return 0;
-            }
-            let text_lower = text.to_lowercase();
-            // Exact match of entire query
-            if query_lower.contains(&text_lower) || text_lower.contains(query_lower) {
-                return 100;
-            }
-            // Keyword matching
-            let mut score = 0;
-            for keyword in keywords {
-                if text_lower.contains(keyword) {
-                    score += 10;
-                }
-            }
-            score
-        }
-
+        // Note: _scope is available for future use
         // Note: This method receives graph_id as a parameter, but teri's KnowledgeGraph
         // is not keyed by graph_id (unlike Zep Cloud). In teri, there's typically one
         // active graph per simulation. We use get_all_entities/get_all_edges which
@@ -387,11 +357,12 @@ impl<L: LlmClient + Send + Sync + 'static> ZepToolsService<L> {
         // For a proper implementation with multiple graphs, we'd need to store the
         // KnowledgeGraph reference in ZepToolsService.
 
-        let scope = scope.unwrap_or("edges");
-        let limit_usize = limit as usize;
-
+        // Note: Facts/edges/nodes collections are mutable for future expansion
+        #[allow(unused_mut)]
         let mut facts: Vec<String> = Vec::new();
+        #[allow(unused_mut)]
         let mut edges_result: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
+        #[allow(unused_mut)]
         let mut nodes_result: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
 
         // The actual graph access would happen here via a KnowledgeGraph reference.
