@@ -17,7 +17,7 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 1   # NEW SESSION 2026-06-18; CYCLE 11 = U-024 sub-cycle (d) plan_outline
+cycles_this_session: 2   # NEW SESSION 2026-06-18; CYCLE 11=U-024(d), CYCLE 12=U-024(e) ReACT loop
 # CYCLE3 (12th resume) 2026-06-17: U-022 sub-cycle (c) MONITOR + offset-tail + graph-fire (S-605/613/614/615 + S-1056/U-047,
 #   5 [x]) — opus PASS (DECISION-17 Area 2, porter@opus). src/services/simulation_runner.rs: monitor_simulation (2s
 #   MONITOR_POLL_INTERVAL poll loop, per-platform file-exists guard, save_run_state per poll, loop-exit on U-048
@@ -456,3 +456,26 @@ next_iterate: U-022 [x] complete → U-017 port-fresh full implementation
 # prev-section 4000-char truncation; ALL prompt consts (SECTION_SYSTEM_PROMPT_TEMPLATE, REACT_OBSERVATION_TEMPLATE,
 # REACT_FORCE_FINAL_MSG etc) verbatim. Deps (a)(c)(d) done. interview_agents tool still honest-err (U-020 dep). Then (f)
 # ReportManager, (g) loggers/Sink, (h) generate_report, (i) chat. (b2 insight_forge OQ-3 still pending).
+
+
+# CYCLE 12 (2026-06-18, 12th resume): U-024 sub-cycle (e) generate_section_react — THE bounded ReACT loop.
+# porter@porter, parity@opus PASS (12 surfaces, programmatic char/AST diff of all constants). src/report/mod.rs:
+# generate_section_react<L>(&self, section, outline, previous_sections, tools, llm, progress, section_index) — full
+# branch ladder: setup (SECTION_SYSTEM_PROMPT_TEMPLATE + lang_instruction; previous_content 4000-CHAR truncate via
+# char_indices + "\n\n---\n\n" join; "（这是第一个章节）"), loop 0..5 (max_iterations=5, min_tool_calls=3,
+# MAX_TOOL_CALLS_PER_SECTION=5): None=Err|empty (retry「响应为空」/「请继续生成内容」 then break), CONFLICT×3
+# (1st/2nd re-ask 格式错误, 3rd truncate-to-</tool_call>+fall-through-execute), Situation-1 Final-Answer (reject<3
+# tools REACT_INSUFFICIENT_TOOLS_MSG / accept rsplit("Final Answer:").trim), Situation-2 tool (quota REACT_TOOL_LIMIT_MSG
+# / execute FIRST only + observation REACT_OBSERVATION_TEMPLATE + used_tools), Situation-3 neither (reject ALT / accept
+# trim), post-loop FORCE-FINAL (REACT_FORCE_FINAL_MSG; None→i18n sectionGenFailedContent / Final-Answer→trim / else→RAW
+# no-trim). 8 prompt consts + 3 inline msgs VERBATIM. chat temp=0.5 max_tokens=4096 both calls. +ChatMessage::assistant
+# (additive, llm.rs). 12 new tests (scripted-mock LLM), 1099 green, clippy clean. 7 report_logger sites DEFERRED to (g)
+# via // (g): markers (tracked not dropped — verifier ruled LEGIT). set-order canonical-deterministic (Python set
+# nondeterministic too — LEGIT). 1 documented mapping divergence Ok("")→None (architecture-doc recorded, convergent,
+# not downgrade). Atomic gate: X-parity PASS + Y-green + Y-not-regressed. Y-drift clean.
+# NEXT: U-024 sub-cycle (f) ReportManager (new src/report/manager.rs): folder layout reports/{id}/, save_outline/
+# save_section (+_clean_section_content), update_progress/get_progress, assemble_full_report (+_post_process_report
+# heading-normalization regex), save_report/get_report/get_report_by_simulation/list_reports/delete_report, get_agent_log/
+# get_console_log (+_stream), back-compat old-format {id}.json/{id}.md paths. Config.UPLOAD_FOLDER→teri env config. Deps
+# (a) only — graph-independent, parallelizable. Then (g) loggers/ReportSink (wires the // (g): markers from e), (h)
+# generate_report (orchestration), (i) chat. (b2 insight_forge OQ-3 still pending; interview_agents needs U-020 at h).

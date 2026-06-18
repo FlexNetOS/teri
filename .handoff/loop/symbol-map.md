@@ -876,14 +876,14 @@
 - [ ] S-737 · `unit:U-024` · `const` · `TOOL_DESC_INTERVIEW_AGENTS` · `report_agent.py:523`
 - [x] S-738 · `unit:U-024` · `const` · `PLAN_SYSTEM_PROMPT` · LLM prompt for outline planning · `report_agent.py:552` → `src/report/mod.rs:92` — VERBATIM (691 chars byte-identical, parity 2026-06-18)
 - [x] S-739 · `unit:U-024` · `const` · `PLAN_USER_PROMPT_TEMPLATE` · `report_agent.py:591` → `src/report/mod.rs:130` — VERBATIM (367 chars byte-identical) + all 6 slot substitutions verified (parity 2026-06-18)
-- [ ] S-740 · `unit:U-024` · `const` · `SECTION_SYSTEM_PROMPT_TEMPLATE` · `report_agent.py:615`
-- [ ] S-741 · `unit:U-024` · `const` · `SECTION_USER_PROMPT_TEMPLATE` · `report_agent.py:769`
-- [ ] S-742 · `unit:U-024` · `const` · `REACT_OBSERVATION_TEMPLATE` · `report_agent.py:796`
-- [ ] S-743 · `unit:U-024` · `const` · `REACT_INSUFFICIENT_TOOLS_MSG` · `report_agent.py:808`
-- [ ] S-744 · `unit:U-024` · `const` · `REACT_INSUFFICIENT_TOOLS_MSG_ALT` · `report_agent.py:813`
-- [ ] S-745 · `unit:U-024` · `const` · `REACT_TOOL_LIMIT_MSG` · `report_agent.py:818`
-- [ ] S-746 · `unit:U-024` · `const` · `REACT_UNUSED_TOOLS_HINT` · `report_agent.py:823`
-- [ ] S-747 · `unit:U-024` · `const` · `REACT_FORCE_FINAL_MSG` · `report_agent.py:825`
+- [x] S-740 · `unit:U-024` · `const` · `SECTION_SYSTEM_PROMPT_TEMPLATE` · `report_agent.py:615`
+- [x] S-741 · `unit:U-024` · `const` · `SECTION_USER_PROMPT_TEMPLATE` · `report_agent.py:769`
+- [x] S-742 · `unit:U-024` · `const` · `REACT_OBSERVATION_TEMPLATE` · `report_agent.py:796`
+- [x] S-743 · `unit:U-024` · `const` · `REACT_INSUFFICIENT_TOOLS_MSG` · `report_agent.py:808`
+- [x] S-744 · `unit:U-024` · `const` · `REACT_INSUFFICIENT_TOOLS_MSG_ALT` · `report_agent.py:813`
+- [x] S-745 · `unit:U-024` · `const` · `REACT_TOOL_LIMIT_MSG` · `report_agent.py:818`
+- [x] S-746 · `unit:U-024` · `const` · `REACT_UNUSED_TOOLS_HINT` · `report_agent.py:823`
+- [x] S-747 · `unit:U-024` · `const` · `REACT_FORCE_FINAL_MSG` · `report_agent.py:825`
 - [ ] S-748 · `unit:U-024` · `const` · `CHAT_SYSTEM_PROMPT_TEMPLATE` · `report_agent.py:829`
 - [ ] S-749 · `unit:U-024` · `const` · `CHAT_OBSERVATION_SUFFIX` · `report_agent.py:857`
 - [ ] S-750 · `unit:U-024` · `type` · `ReportAgent` · ReACT-pattern report generator · `report_agent.py:865`
@@ -898,7 +898,7 @@
 - [ ] S-759 · `unit:U-024` · `method` · `ReportAgent._is_valid_tool_call` · `report_agent.py:1114`
 - [ ] S-760 · `unit:U-024` · `method` · `ReportAgent._get_tools_description` · `report_agent.py:1127`
 - [x] S-761 · `unit:U-024` · `method` · `ReportAgent.plan_outline` · ZepTools.get_simulation_context + LLM → 2-5 section outline · `report_agent.py:1137` → `ReportAgent::plan_outline` (`src/report/mod.rs:388`) — PARITY PASS 2026-06-18: PLAN_SYSTEM_PROMPT+PLAN_USER_PROMPT_TEMPLATE verbatim, all 4 progress emissions (0/30/80/100; error path skips 80/100), entity_types Python list-repr, related_facts_json serde pretty≤10 byte-identical to json.dumps(ensure_ascii=False,indent=2), try/except boundary ({"sections":[]}→empty outline NOT fallback), 3-section fallback byte-identical on chat_json Err. 8 differential tests green; 1087/1087 lib tests pass. NOTE: upstream entity_types key-order randomness lives in zep_tools get_graph_statistics (HashMap), out of scope for this symbol.
-- [ ] S-762 · `unit:U-024` · `method` · `ReportAgent._generate_section_react` · up to 5 ReACT iterations per section; min 3 tool calls enforced · `report_agent.py:1221`
+- [x] S-762 · `unit:U-024` · `method` · `ReportAgent._generate_section_react` · up to 5 ReACT iterations per section; min 3 tool calls enforced · `report_agent.py:1221`
 - [ ] S-763 · `unit:U-024` · `method` · `ReportAgent.generate_report` · planning + sections + assembly · `report_agent.py:1532`
 - [ ] S-764 · `unit:U-024` · `method` · `ReportAgent.chat` · tool-assisted chat against report, max 2 tool calls · `report_agent.py:1766`
 - [ ] S-765 · `unit:U-024` · `type` · `ReportManager` · FS-based report persistence · `report_agent.py:1884`

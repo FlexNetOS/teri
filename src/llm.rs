@@ -230,6 +230,14 @@ impl ChatMessage {
     pub fn user(content: impl Into<String>) -> Self {
         Self { role: ChatRole::User, content: content.into() }
     }
+
+    /// Construct an assistant-role message.
+    ///
+    /// Used by the ReACT loop to append prior model turns to the conversation
+    /// history (`{"role": "assistant", "content": "..."}` dicts in Python).
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self { role: ChatRole::Assistant, content: content.into() }
+    }
 }
 
 /// Optional per-call tuning knobs.
