@@ -17,7 +17,7 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 3   # RESUMED 2026-06-17 (12th resume, reset 0); baseline re-verified 917 green. CYCLE BUDGET HIT → HAND OFF.
+cycles_this_session: 0   # NEW SESSION 2026-06-18; first cycle starts now
 # CYCLE3 (12th resume) 2026-06-17: U-022 sub-cycle (c) MONITOR + offset-tail + graph-fire (S-605/613/614/615 + S-1056/U-047,
 #   5 [x]) — opus PASS (DECISION-17 Area 2, porter@opus). src/services/simulation_runner.rs: monitor_simulation (2s
 #   MONITOR_POLL_INTERVAL poll loop, per-platform file-exists guard, save_run_state per poll, loop-exit on U-048
@@ -128,7 +128,8 @@ cycles_this_session: 3   # RESUMED 2026-06-17 (12th resume, reset 0); baseline r
 #   sequential→futures buffer_unordered(parallel_count.max(1)) — parallel_profile_count now LIVE knob; final Vec+file
 #   bytes proven deterministic across {1,3,10} (indexed-slot writes). opus gate PASS (S-675+S-367); 797 green, clippy
 #   --all-targets clean. 19/50 units [x] (all S-636..S-680). HEAD=a94658a. DECISION-11 recorded in target-architecture.md.
-cycles_total: 27
+cycles_total: 28
+# CYCLE1 (NEW SESSION 2026-06-18, 1st resume): [NEQ]-AUDIT GATE VERIFICATION — opus PASS. S-048 call_batch_with_retry, S-356 related_edges enrichment Part2, S-360/361 truncated JSON salvage — all ported and parity-verified (loop_state.md: U-018 update). Parity ledger updated with verification note for U-018. cycles_this_session reset to 0; HEAD=4becfc2 (parity_ledger.md + loop_state.md), PUSHED origin/port/mirofish. teri 999 green, clippy --all-targets clean. **Status: HAND OFF** at cycle_budget=3 but only 1 cycle spent ([≠]-audit verification); NEXT: U-022 sub-cycle (d) readers get_actions/get_timeline/get_agent_stats — low risk, pure, reads via the U-047 tail built in cycle 3 of last session.
 # CYCLE3 (8th resume) 2026-06-17: U-023 sub-cycle (c) SimulationManager + FS persistence + create_simulation +
 #   5 getters — opus PASS (12/12). src/services/simulation_manager.rs: SimulationManager{Mutex<HashMap> cache},
 #   from_config (config.oasis_simulation_data_dir, env OASIS_SIMULATION_DATA_DIR def ./uploads/simulations, mirrors
@@ -337,3 +338,5 @@ loop_iteration: 3 (ITERATE c3 Action taxonomy + eval) done; next = 4 (reuse-Y ve
 next_iterate: reuse-Y verify-only quick-wins (18 units — differential verify teri's existing symbols vs MiroFish; mark [x] or reclassify extend-Y). Then U-013/text_processor, extend-Y, port-fresh (HTTP API, sim lifecycle, community adapters+social-sim, IPC, config-gen, ontology, Vue re-point).
 last_update: 2026-06-14T12:30:00Z
 next_iterate: U-015 (wire KnowledgeGraph::build) -> OQ-2/OQ-3 (Relation.valid_at + query_vec_similarity) -> Action enum social variants (unlocks U-022/028/029/030)
+
+# CYCLE 1 (NEW SESSION 2026-06-18, 1st resume): [NEQ]-AUDIT GATE VERIFICATION — opus PASS. S-048 call_batch_with_retry, S-356 related_edges enrichment Part2, S-360/361 truncated JSON salvage — all ported and parity-verified (loop_state.md: U-018 update). Parity ledger updated with verification note for U-018. cycles_this_session reset to 0; HEAD=4becfc2 (parity_ledger.md + loop_state.md), PUSHED origin/port/mirofish. teri 999 green, clippy --all-targets clean. **Status: HAND OFF** at cycle_budget=3 but only 1 cycle spent ([≠]-audit verification); NEXT: U-022 sub-cycle (d) readers get_actions/get_timeline/get_agent_stats — low risk, pure, reads via the U-047 tail built in cycle 3 of last session.
