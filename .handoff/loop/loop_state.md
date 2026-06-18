@@ -17,7 +17,7 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 3   # BUDGET REACHED; CYCLE 8=U-024(a), 9=U-024(b), 10=U-024(c) — hand off after
+cycles_this_session: 1   # NEW SESSION 2026-06-18; CYCLE 11 = U-024 sub-cycle (d) plan_outline
 # CYCLE3 (12th resume) 2026-06-17: U-022 sub-cycle (c) MONITOR + offset-tail + graph-fire (S-605/613/614/615 + S-1056/U-047,
 #   5 [x]) — opus PASS (DECISION-17 Area 2, porter@opus). src/services/simulation_runner.rs: monitor_simulation (2s
 #   MONITOR_POLL_INTERVAL poll loop, per-platform file-exists guard, save_run_state per poll, loop-exit on U-048
@@ -437,3 +437,22 @@ next_iterate: U-022 [x] complete → U-017 port-fresh full implementation
 # Sink, (h) generate_report, (i) chat. (b2 insight_forge needs OQ-3; interview_agents arm needs U-020 IPC at (e)/(h)).
 # HARNESS NOTE: architect-in-loop upgrade (PR #44 harness_hub) now governs — every extend-Y/structural unit routes
 # through rust-port-architect for a recorded findings/<unit>-architecture.md before porting (proven across a/b/c).
+
+
+# CYCLE 11 (2026-06-18, 11th resume): U-024 sub-cycle (d) plan_outline — porter@porter, parity@opus PASS (all 7 surfaces).
+# src/report/mod.rs: ReportAgent now STATEFUL (graph_id/simulation_id/simulation_requirement fields; new()=empty so
+# template assoc-fns + Default unchanged; new_react(g,s,r)). plan_outline<L>(&self, tools, llm, progress): get_simulation_context
+# → PLAN_SYSTEM_PROMPT + get_language_instruction() + PLAN_USER_PROMPT_TEMPLATE (entity_types=python_list_repr str(list),
+# related_facts_json=to_string_pretty[:10] ensure_ascii=False byte-identical) → chat_json(temp 0.3) → ReportOutline;
+# defaults (title 模拟分析报告/summary ""/section ""); on-error 3-section fallback (未来预测报告). progress 0/30/80/100
+# stage=planning, error-path fires 0/30 skips 80/100 (Python except boundary). PLAN_* consts verbatim (char-diffed).
+# 18 new tests, 1087 green. GATE FOUND a real cross-symbol downgrade: get_graph_statistics built entity_types/relation_types
+# in std HashMap → NONDETERMINISTIC key order vs Python dict insertion order (observable in the {entity_types} prompt slot)
+# → FIXED to serde_json::Map (preserve_order = first-seen insertion order, Python-faithful). Atomic gate: X-parity PASS +
+# Y-green + Y-not-regressed. Y-drift checked clean (develop 7c354a5 config/main only).
+# NEXT: U-024 sub-cycle (e) generate_section_react — THE bounded ReACT loop (report_agent.py _generate_section_react):
+# for iteration in 0..max_iterations(5), min_tool_calls=3; full branch ladder (None/empty retry, conflict×3 downgrade,
+# Final-Answer<min-tools reject, quota REACT_TOOL_LIMIT_MSG, observation append + used_tools, no-prefix accept, force-final);
+# prev-section 4000-char truncation; ALL prompt consts (SECTION_SYSTEM_PROMPT_TEMPLATE, REACT_OBSERVATION_TEMPLATE,
+# REACT_FORCE_FINAL_MSG etc) verbatim. Deps (a)(c)(d) done. interview_agents tool still honest-err (U-020 dep). Then (f)
+# ReportManager, (g) loggers/Sink, (h) generate_report, (i) chat. (b2 insight_forge OQ-3 still pending).

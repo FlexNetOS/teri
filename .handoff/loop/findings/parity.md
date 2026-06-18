@@ -2013,3 +2013,39 @@ Re-verify ONLY the two fixes that FAILed the prior block. The three structural c
 
 ### Verdict
 **PASS — U-024 sub-cycle (b) is parity-verified, no downgrade.** Every re-homed graph method matches Python (scoring constants, sort order, caps, partition boundary, key order, temporal mapping). Every `[≠]` is genuinely inexpressible (substrate-true), not a portable-feature skip. Both deferrals are honest (structure preserved / honest error). 1020/1020 lib tests pass — Y not regressed.
+
+---
+
+## 2026-06-18 · U-024 sub-cycle (d) · `ReportAgent.plan_outline` (+ PLAN_SYSTEM_PROMPT / PLAN_USER_PROMPT_TEMPLATE) → `src/report/mod.rs`
+
+**Verdict: PASS** — differential parity proven across all 7 verification surfaces. Symbols verified: **3/3** (S-738, S-739, S-761).
+**Baseline / no-downgrade:** full `cargo test --lib` = **1087 passed, 0 failed** (incl. 8 plan_outline sub-cycle-d tests + template assoc-fns + data-model tests). Y not regressed.
+**Method:** char-level diff of both prompt consts via a Python extractor (`eval` of the triple-quoted literals) vs the Rust raw strings; Python `str(list(...))` and `json.dumps(...,ensure_ascii=False,indent=2)` run live and compared against the Rust `python_list_repr` + `serde_json::to_string_pretty` (temp in-crate test, since removed).
+
+### Surface-by-surface evidence
+1. **PLAN_SYSTEM_PROMPT + PLAN_USER_PROMPT_TEMPLATE verbatim — PASS.** Byte-identical. SYS = 691 chars, USER = 367 chars, `==` True both. Python `"""\` line-continuation eats the leading newline and the closing `"""` adds no trailing newline; the Rust `r#"你是…!"#` / `r#"【预测场景设定】…发现。"#` match exactly (Chinese body, JSON example block, 章节数量 reminder lines, the trailing `！` with no newline). py:552-589 / py:591-611 ≡ mod.rs:92-128 / mod.rs:130-149.
+2. **system_prompt assembly — PASS.** Python `f"{PLAN_SYSTEM_PROMPT}\n\n{get_language_instruction()}"` (py:1166) ≡ Rust `format!("{}\n\n{}", PLAN_SYSTEM_PROMPT, get_language_instruction())` (mod.rs:409). Order + `\n\n` separator exact.
+3. **user_prompt substitution — PASS.** All 6 slots map:
+   - simulation_requirement; total_nodes/total_edges from `graph_statistics` (default 0 via `unwrap_or(0)`); total_entities from context (default 0). ✓
+   - **entity_types** = `python_list_repr(keys)`: matches Python `str(list(...keys()))` exactly for `[]`, `['Person']`, `['Person', 'Organization']`, Chinese `['人物', '组织']` (single quotes, `", "` sep, `[]` empty). ✓
+   - **related_facts_json** = `to_string_pretty(facts[:10])`: **byte-identical** to Python `json.dumps(facts[:10], ensure_ascii=False, indent=2)` for a multi-fact Chinese input — 2-space indent, non-ASCII unescaped (`未来事实1：群体迁移`/`危机`/`时间`), float `0.8`, key order preserved, `[:10]` truncation (`test_…truncated_to_10`), empty → `"[]"` on both. The `[≠]`-watch is **resolved as truly identical**, not a divergence. ✓
+4. **chat_json call — PASS.** `vec![ChatMessage::system(sys), ChatMessage::user(user)]` → `[{role:system},{role:user}]` same order as Python `messages=[{system},{user}]`; `ChatOptions{temperature:Some(0.3)}` ≡ `temperature=0.3`; returns `serde_json::Value`. (llm.rs:217-248)
+5. **outline parsing + defaults — PASS.** title default `"模拟分析报告"`, summary default `""`, section title `.get("title").unwrap_or("")` + content `""`, sections from `response["sections"]` in order; missing/empty sections → empty Vec. `test_plan_outline_happy_path` + `test_plan_outline_defaults_on_empty_sections`. py:1190-1200 ≡ mod.rs:438-467.
+6. **fallback outline + try/except boundary — PASS.** On chat_json `Err` → 3-section fallback, byte-identical: title `"未来预测报告"`, summary `"基于模拟预测的未来趋势与风险分析"`, sections `["预测场景与核心发现","人群行为预测分析","趋势展望与风险提示"]` (`test_plan_outline_fallback_on_llm_error`, py:1211-1218). **Boundary confirmed:** Python's `try` starts at py:1176 (AFTER user_prompt build); a `{"sections":[]}` response parses via `.get(...,default)` and yields an empty-section outline, **NOT** the fallback — Rust matches (`test_plan_outline_defaults_on_empty_sections` → title "模拟分析报告", 0 sections, not fallback). ✓
+7. **progress emissions — PASS.** Happy path: exactly 4 emissions at 0/30/80/100, all stage="planning", keys `progress.{analyzingRequirements,generatingOutline,parsingOutline,outlinePlanComplete}` (all 4 resolve in en.json + zh.json) (`test_plan_outline_progress_emissions`). Error path: 0 + 30 fire, 80 + 100 SKIPPED — matches Python's except returning before the inner callbacks (`test_plan_outline_fallback_no_progress_after_failure`). ✓
+
+### Non-contractual divergences inspected (none block parity)
+- **`python_list_repr` apostrophe edge:** Python `repr()` switches a single-quote-containing string to double-quotes (`["O'Brien"]`); Rust always single-quotes (`['O'Brien']`). **Non-contractual / unreachable:** entity_types keys are graph entity-type *labels* (ontology class names — Person/Organization/Chinese categories, zep_tools.py:874 node.labels), never free-form apostrophe'd text. Confirmed source = node labels excluding Entity/Node. Does not affect any realistic input.
+- **`build_plan_user_prompt` Err → fallback:** Python builds user_prompt OUTSIDE the try, so a `json.dumps` raise would propagate (not fallback). In practice `to_string_pretty` on `Vec<Value>` is infallible and `json.dumps(ensure_ascii=False)` on JSON-derived facts never raises → the `Err` arm is effectively dead on both sides. Non-contractual.
+- **present-but-null `title`:** Python `dict.get("title", default)` returns the present `None`; Rust `.and_then(as_str).unwrap_or(default)` returns the default. Only diverges if the LLM returns a non-string title — non-contractual (LLM returns strings); absent-key default (the real contract) matches exactly.
+
+### Out-of-scope upstream note (NOT a sub-cycle-d defect, flag for zep_tools owner)
+`get_graph_statistics` (`src/services/zep_tools.rs:691,713`) builds `entity_types` in a `std::collections::HashMap` then `serde_json::to_value(...)` — the into-IndexMap insertion order is the HashMap's **randomized** iteration order, whereas Python's dict preserves **node-iteration insertion order**. So the `{entity_types}` slot's key ORDER can differ run-to-run. This originates in the zep_tools symbol, NOT in S-761/S-739: `build_plan_user_prompt` faithfully preserves whatever order it is handed. Recommend the zep_tools owner switch `entity_types`/`relation_types` to an insertion-ordered map (IndexMap/Vec-of-pairs) to match Python dict order. Tracked as a follow-up; does not gate sub-cycle (d).
+
+### Symbols
+- S-738 `PLAN_SYSTEM_PROMPT` → `- [x]` (verbatim, 691 chars byte-identical)
+- S-739 `PLAN_USER_PROMPT_TEMPLATE` → `- [x]` (verbatim 367 chars + all 6 substitutions verified)
+- S-761 `ReportAgent.plan_outline` → `- [x]` (all 7 surfaces match; 8 differential tests green)
+
+### Verdict
+**PASS — U-024 sub-cycle (d) is parity-verified, no downgrade.** Prompts verbatim; substitutions + defaults + fallback + try/except boundary + progress-emission pattern all match Python. The one flagged `[≠]`-watch (related_facts_json) resolved to byte-identical. The only real ordering divergence is upstream in zep_tools (out of scope, flagged). 1087/1087 lib tests pass — Y not regressed.

@@ -841,41 +841,41 @@
 - [ ] S-702 · `unit:U-024` · `method` · `ReportConsoleLogger._setup_file_handler` · dynamically attaches handler · `report_agent.py:335`
 - [ ] S-703 · `unit:U-024` · `method` · `ReportConsoleLogger.close` · detaches handler — must be called explicitly · `report_agent.py:366`
 - [ ] S-704 · `unit:U-024` · `method` · `ReportConsoleLogger.__del__` · `report_agent.py:384`
-- [ ] S-705 · `unit:U-024` · `type` · `ReportStatus` · enum: PENDING/PLANNING/GENERATING/COMPLETED/FAILED · `report_agent.py:389`
-- [ ] S-706 · `unit:U-024` · `variant` · `ReportStatus.PENDING` · `report_agent.py:391`
-- [ ] S-707 · `unit:U-024` · `variant` · `ReportStatus.PLANNING` · `report_agent.py:392`
-- [ ] S-708 · `unit:U-024` · `variant` · `ReportStatus.GENERATING` · `report_agent.py:393`
-- [ ] S-709 · `unit:U-024` · `variant` · `ReportStatus.COMPLETED` · `report_agent.py:394`
-- [ ] S-710 · `unit:U-024` · `variant` · `ReportStatus.FAILED` · `report_agent.py:395`
-- [ ] S-711 · `unit:U-024` · `type` · `ReportSection` · dataclass with to_dict/to_markdown · `report_agent.py:399`
-- [ ] S-712 · `unit:U-024` · `field` · `ReportSection.title` · `report_agent.py:401`
-- [ ] S-713 · `unit:U-024` · `field` · `ReportSection.content` · `report_agent.py:402`
-- [ ] S-714 · `unit:U-024` · `method` · `ReportSection.to_dict` · `report_agent.py:404`
-- [ ] S-715 · `unit:U-024` · `method` · `ReportSection.to_markdown` · `report_agent.py:410`
-- [ ] S-716 · `unit:U-024` · `type` · `ReportOutline` · dataclass: title,summary,sections · `report_agent.py:419`
-- [ ] S-717 · `unit:U-024` · `field` · `ReportOutline.title` · `report_agent.py:421`
-- [ ] S-718 · `unit:U-024` · `field` · `ReportOutline.summary` · `report_agent.py:422`
-- [ ] S-719 · `unit:U-024` · `field` · `ReportOutline.sections` · `report_agent.py:423`
-- [ ] S-720 · `unit:U-024` · `method` · `ReportOutline.to_dict` · `report_agent.py:425`
-- [ ] S-721 · `unit:U-024` · `method` · `ReportOutline.to_markdown` · `report_agent.py:432`
-- [ ] S-722 · `unit:U-024` · `type` · `Report` · dataclass · `report_agent.py:442`
-- [ ] S-723 · `unit:U-024` · `field` · `Report.report_id` · `report_agent.py:444`
-- [ ] S-724 · `unit:U-024` · `field` · `Report.simulation_id` · `report_agent.py:445`
-- [ ] S-725 · `unit:U-024` · `field` · `Report.graph_id` · `report_agent.py:446`
-- [ ] S-726 · `unit:U-024` · `field` · `Report.simulation_requirement` · `report_agent.py:447`
-- [ ] S-727 · `unit:U-024` · `field` · `Report.status` · `report_agent.py:448`
-- [ ] S-728 · `unit:U-024` · `field` · `Report.outline` · `report_agent.py:449`
-- [ ] S-729 · `unit:U-024` · `field` · `Report.markdown_content` · `report_agent.py:450`
-- [ ] S-730 · `unit:U-024` · `field` · `Report.created_at` · `report_agent.py:451`
-- [ ] S-731 · `unit:U-024` · `field` · `Report.completed_at` · `report_agent.py:452`
-- [ ] S-732 · `unit:U-024` · `field` · `Report.error` · `report_agent.py:453`
-- [ ] S-733 · `unit:U-024` · `method` · `Report.to_dict` · `report_agent.py:455`
+- [~] S-705 · `unit:U-024` · `type` · `ReportStatus` · enum: PENDING/PLANNING/GENERATING/COMPLETED/FAILED · `report_agent.py:389` → `teri::report::ReportStatus` (`src/report/mod.rs`)
+- [~] S-706 · `unit:U-024` · `variant` · `ReportStatus.PENDING` · `report_agent.py:391` → `teri::report::ReportStatus::Pending`
+- [~] S-707 · `unit:U-024` · `variant` · `ReportStatus.PLANNING` · `report_agent.py:392` → `teri::report::ReportStatus::Planning`
+- [~] S-708 · `unit:U-024` · `variant` · `ReportStatus.GENERATING` · `report_agent.py:393` → `teri::report::ReportStatus::Generating`
+- [~] S-709 · `unit:U-024` · `variant` · `ReportStatus.COMPLETED` · `report_agent.py:394` → `teri::report::ReportStatus::Completed`
+- [~] S-710 · `unit:U-024` · `variant` · `ReportStatus.FAILED` · `report_agent.py:395` → `teri::report::ReportStatus::Failed`
+- [~] S-711 · `unit:U-024` · `type` · `ReportSection` · dataclass with to_dict/to_markdown · `report_agent.py:399` → `teri::report::ReportSection` (`src/report/mod.rs`)
+- [~] S-712 · `unit:U-024` · `field` · `ReportSection.title` · `report_agent.py:401` → `ReportSection.title`
+- [~] S-713 · `unit:U-024` · `field` · `ReportSection.content` · `report_agent.py:402` → `ReportSection.content`
+- [~] S-714 · `unit:U-024` · `method` · `ReportSection.to_dict` · `report_agent.py:404` → `ReportSection::to_dict`
+- [~] S-715 · `unit:U-024` · `method` · `ReportSection.to_markdown` · `report_agent.py:410` → `ReportSection::to_markdown(level)`
+- [~] S-716 · `unit:U-024` · `type` · `ReportOutline` · dataclass: title,summary,sections · `report_agent.py:419` → `teri::report::ReportOutline` (`src/report/mod.rs`)
+- [~] S-717 · `unit:U-024` · `field` · `ReportOutline.title` · `report_agent.py:421` → `ReportOutline.title`
+- [~] S-718 · `unit:U-024` · `field` · `ReportOutline.summary` · `report_agent.py:422` → `ReportOutline.summary`
+- [~] S-719 · `unit:U-024` · `field` · `ReportOutline.sections` · `report_agent.py:423` → `ReportOutline.sections`
+- [~] S-720 · `unit:U-024` · `method` · `ReportOutline.to_dict` · `report_agent.py:425` → `ReportOutline::to_dict`
+- [~] S-721 · `unit:U-024` · `method` · `ReportOutline.to_markdown` · `report_agent.py:432` → `ReportOutline::to_markdown`
+- [~] S-722 · `unit:U-024` · `type` · `Report` · dataclass · `report_agent.py:442` → `teri::report::Report` (`src/report/mod.rs`)
+- [~] S-723 · `unit:U-024` · `field` · `Report.report_id` · `report_agent.py:444` → `Report.report_id`
+- [~] S-724 · `unit:U-024` · `field` · `Report.simulation_id` · `report_agent.py:445` → `Report.simulation_id`
+- [~] S-725 · `unit:U-024` · `field` · `Report.graph_id` · `report_agent.py:446` → `Report.graph_id`
+- [~] S-726 · `unit:U-024` · `field` · `Report.simulation_requirement` · `report_agent.py:447` → `Report.simulation_requirement`
+- [~] S-727 · `unit:U-024` · `field` · `Report.status` · `report_agent.py:448` → `Report.status`
+- [~] S-728 · `unit:U-024` · `field` · `Report.outline` · `report_agent.py:449` → `Report.outline`
+- [~] S-729 · `unit:U-024` · `field` · `Report.markdown_content` · `report_agent.py:450` → `Report.markdown_content`
+- [~] S-730 · `unit:U-024` · `field` · `Report.created_at` · `report_agent.py:451` → `Report.created_at`
+- [~] S-731 · `unit:U-024` · `field` · `Report.completed_at` · `report_agent.py:452` → `Report.completed_at`
+- [~] S-732 · `unit:U-024` · `field` · `Report.error` · `report_agent.py:453` → `Report.error`
+- [~] S-733 · `unit:U-024` · `method` · `Report.to_dict` · `report_agent.py:455` → `Report::to_dict`
 - [ ] S-734 · `unit:U-024` · `const` · `TOOL_DESC_INSIGHT_FORGE` · tool description string for ReACT prompt · `report_agent.py:476`
 - [ ] S-735 · `unit:U-024` · `const` · `TOOL_DESC_PANORAMA_SEARCH` · `report_agent.py:494`
 - [ ] S-736 · `unit:U-024` · `const` · `TOOL_DESC_QUICK_SEARCH` · `report_agent.py:511`
 - [ ] S-737 · `unit:U-024` · `const` · `TOOL_DESC_INTERVIEW_AGENTS` · `report_agent.py:523`
-- [ ] S-738 · `unit:U-024` · `const` · `PLAN_SYSTEM_PROMPT` · LLM prompt for outline planning · `report_agent.py:552`
-- [ ] S-739 · `unit:U-024` · `const` · `PLAN_USER_PROMPT_TEMPLATE` · `report_agent.py:591`
+- [x] S-738 · `unit:U-024` · `const` · `PLAN_SYSTEM_PROMPT` · LLM prompt for outline planning · `report_agent.py:552` → `src/report/mod.rs:92` — VERBATIM (691 chars byte-identical, parity 2026-06-18)
+- [x] S-739 · `unit:U-024` · `const` · `PLAN_USER_PROMPT_TEMPLATE` · `report_agent.py:591` → `src/report/mod.rs:130` — VERBATIM (367 chars byte-identical) + all 6 slot substitutions verified (parity 2026-06-18)
 - [ ] S-740 · `unit:U-024` · `const` · `SECTION_SYSTEM_PROMPT_TEMPLATE` · `report_agent.py:615`
 - [ ] S-741 · `unit:U-024` · `const` · `SECTION_USER_PROMPT_TEMPLATE` · `report_agent.py:769`
 - [ ] S-742 · `unit:U-024` · `const` · `REACT_OBSERVATION_TEMPLATE` · `report_agent.py:796`
@@ -897,7 +897,7 @@
 - [ ] S-758 · `unit:U-024` · `method` · `ReportAgent._parse_tool_calls` · parses `<tool_call>{...}</tool_call>` blocks + bare-JSON fallback · `report_agent.py:1067`
 - [ ] S-759 · `unit:U-024` · `method` · `ReportAgent._is_valid_tool_call` · `report_agent.py:1114`
 - [ ] S-760 · `unit:U-024` · `method` · `ReportAgent._get_tools_description` · `report_agent.py:1127`
-- [ ] S-761 · `unit:U-024` · `method` · `ReportAgent.plan_outline` · ZepTools.get_simulation_context + LLM → 2-5 section outline · `report_agent.py:1137`
+- [x] S-761 · `unit:U-024` · `method` · `ReportAgent.plan_outline` · ZepTools.get_simulation_context + LLM → 2-5 section outline · `report_agent.py:1137` → `ReportAgent::plan_outline` (`src/report/mod.rs:388`) — PARITY PASS 2026-06-18: PLAN_SYSTEM_PROMPT+PLAN_USER_PROMPT_TEMPLATE verbatim, all 4 progress emissions (0/30/80/100; error path skips 80/100), entity_types Python list-repr, related_facts_json serde pretty≤10 byte-identical to json.dumps(ensure_ascii=False,indent=2), try/except boundary ({"sections":[]}→empty outline NOT fallback), 3-section fallback byte-identical on chat_json Err. 8 differential tests green; 1087/1087 lib tests pass. NOTE: upstream entity_types key-order randomness lives in zep_tools get_graph_statistics (HashMap), out of scope for this symbol.
 - [ ] S-762 · `unit:U-024` · `method` · `ReportAgent._generate_section_react` · up to 5 ReACT iterations per section; min 3 tool calls enforced · `report_agent.py:1221`
 - [ ] S-763 · `unit:U-024` · `method` · `ReportAgent.generate_report` · planning + sections + assembly · `report_agent.py:1532`
 - [ ] S-764 · `unit:U-024` · `method` · `ReportAgent.chat` · tool-assisted chat against report, max 2 tool calls · `report_agent.py:1766`

@@ -688,21 +688,31 @@ impl<'g, L: LlmClient> ReportTools<'g, L> {
         let edges = self.get_all_edges(graph_id, false);
 
         // Count entity types (exclude "Entity"/"Node" base labels — mirrors Python L874).
-        let mut entity_types: std::collections::HashMap<String, i64> =
-            std::collections::HashMap::new();
+        // Python uses a plain dict, so the key order is FIRST-SEEN insertion order
+        // (zep_tools.py:870–874). Count into a `serde_json::Map` (the crate is built with
+        // `preserve_order` → IndexMap-backed) so the `{entity_types}` order is DETERMINISTIC
+        // and matches Python's insertion order — NOT a randomized `HashMap`.
+        let mut entity_types = serde_json::Map::new();
         for node in &nodes {
             for label in &node.labels {
                 if label != "Entity" && label != "Node" {
-                    *entity_types.entry(label.clone()).or_insert(0) += 1;
+                    let e = entity_types
+                        .entry(label.clone())
+                        .or_insert_with(|| serde_json::Value::from(0i64));
+                    let next = e.as_i64().unwrap_or(0) + 1;
+                    *e = serde_json::Value::from(next);
                 }
             }
         }
 
-        // Count relation types by edge name.
-        let mut relation_types: std::collections::HashMap<String, i64> =
-            std::collections::HashMap::new();
+        // Count relation types by edge name (same first-seen insertion-order contract).
+        let mut relation_types = serde_json::Map::new();
         for edge in &edges {
-            *relation_types.entry(edge.name.clone()).or_insert(0) += 1;
+            let e = relation_types
+                .entry(edge.name.clone())
+                .or_insert_with(|| serde_json::Value::from(0i64));
+            let next = e.as_i64().unwrap_or(0) + 1;
+            *e = serde_json::Value::from(next);
         }
 
         let mut m = serde_json::Map::new();
@@ -710,11 +720,8 @@ impl<'g, L: LlmClient> ReportTools<'g, L> {
         m.insert("graph_id".into(), graph_id.into());
         m.insert("total_nodes".into(), (nodes.len() as i64).into());
         m.insert("total_edges".into(), (edges.len() as i64).into());
-        m.insert("entity_types".into(), serde_json::to_value(entity_types).unwrap_or_default());
-        m.insert(
-            "relation_types".into(),
-            serde_json::to_value(relation_types).unwrap_or_default(),
-        );
+        m.insert("entity_types".into(), serde_json::Value::Object(entity_types));
+        m.insert("relation_types".into(), serde_json::Value::Object(relation_types));
         m
     }
 
