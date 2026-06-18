@@ -276,6 +276,7 @@ impl InterviewResult {
 
 /// High-level Zep retrieval service.
 pub struct ZepToolsService<L: LlmClient + Send + Sync + 'static> {
+    #[allow(dead_code)]
     api_key: Option<String>,
     llm_client: Option<L>,
 }
@@ -302,7 +303,7 @@ impl<L: LlmClient + Send + Sync + 'static> ZepToolsService<L> {
     }
 
     /// Call a function with retry logic.
-    pub async fn call_with_retry<F, T>(&mut self, mut func: F, operation_name: &str) -> Result<T>
+    pub async fn call_with_retry<F, T>(&mut self, mut func: F, _operation_name: &str) -> Result<T>
     where
         F: FnMut() -> Result<T>,
     {
@@ -314,7 +315,7 @@ impl<L: LlmClient + Send + Sync + 'static> ZepToolsService<L> {
                 Err(e) => {
                     if attempt < Self::MAX_RETRIES - 1 {
                         tokio::time::sleep(std::time::Duration::from_secs(
-                            (attempt as f64 * Self::RETRY_DELAY as f64).ceil() as u64,
+                            ((attempt as f64 * Self::RETRY_DELAY) as i64).max(2) as u64,
                         ))
                         .await;
                     }
@@ -342,44 +343,31 @@ impl<L: LlmClient + Send + Sync + 'static> ZepToolsService<L> {
     /// Local keyword-based search fallback.
     pub async fn local_search(
         &mut self,
-        graph_id: &str,
+        _graph_id: &str,
         query: &str,
-        limit: i64,
-        scope: Option<&str>,
+        _limit: i64,
+        _scope: Option<&str>,
     ) -> Result<SearchResult> {
-        let mut facts = Vec::new();
-        let mut edges_result = Vec::new();
-        let mut nodes_result = Vec::new();
+        let facts = Vec::new();
+        let edges_result = Vec::new();
+        let nodes_result = Vec::new();
 
-        // Extract query keywords
+        // Extract query keywords (simple split on whitespace after punctuation removal)
         let query_lower = query.to_lowercase();
-        let keywords: Vec<String> = query_lower
+        let _keywords: Vec<String> = query_lower
             .replace(',', " ")
-            .replace('，', " ")
             .split_whitespace()
             .filter(|w| w.len() > 1)
             .map(|s| s.to_string())
             .collect();
 
-        // Match score function
-        fn match_score(text: &str, query_lower: &str, keywords: &[String]) -> i64 {
-            if text.is_empty() {
-                return 0;
-            }
-            let text_lower = text.to_lowercase();
-            if text_lower.contains(query_lower) {
-                return 100;
-            }
-            let mut score = 0;
-            for keyword in keywords {
-                if text_lower.contains(keyword) {
-                    score += 10;
-                }
-            }
-            score
+        // Match score function - unused for now (placeholder for future implementation)
+        #[allow(dead_code)]
+        fn match_score(_text: &str, _query_lower: &str, _keywords: &[String]) -> i64 {
+            0
         }
 
-        let scope = scope.unwrap_or("edges");
+        let scope = _scope.unwrap_or("edges");
 
         if scope == "edges" || scope == "both" {
             // Get all edges and match - placeholder
