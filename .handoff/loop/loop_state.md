@@ -17,7 +17,17 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 1   # RESUMED 2026-06-17 (11th resume, reset 0); baseline re-verified 880 green.
+cycles_this_session: 2   # RESUMED 2026-06-17 (11th resume, reset 0); baseline re-verified 880 green.
+# CYCLE2 (11th resume) 2026-06-17: U-020 sub-cycle (b) SimulationIPCClient + SimulationIPCServer (S-477..S-492, 15 [x]
+#   + S-488 [≠]) — opus PASS (DECISION-16 architect, map-onto-substrate) → U-020 COMPLETE. file-based subprocess IPC →
+#   in-process tokio::mpsc<IpcEnvelope> + per-command oneshot<IPCResponse>; client clonable Sender, server Receiver
+#   (=sim loop), liveness Arc<AtomicBool>; channel(buffer) factory. PORTED: command types/arg shapes, conditional
+#   platform-key (only when Some), timeouts as real tokio::time::timeout awaits (60/120/30s), status/result/error +
+#   command_id round-trip, FIFO oldest-first, check_env_alive start/stop. [≠] (locked in-process substrate, no FS
+#   boundary): ipc dirs/makedirs, env_status.json+timestamp (S-488 read only cross-process by unported U-022), os.remove,
+#   mtime-scan, poll_interval, JSONDecodeError-retry. Fixed cosmetic gate-flag: timeout msg {:.0}秒→{:?}秒 (renders
+#   60.0秒 matching Python str(float)). 35 simulation_ipc tests, 917 green, clippy clean. 22/50 units [x]. Unblocks
+#   U-022 (deps U-020+U-021 BOTH met now), U-028/029/030, U-047.
 # CYCLE1 (11th resume) 2026-06-17: U-020 sub-cycle (a) IPC protocol types (S-453..S-476, 24/24 [x]) — opus PASS
 #   (DECISION-15). NEW src/services/simulation_ipc.rs: CommandType (interview/batch_interview/close_env), CommandStatus
 #   (pending/processing/completed/failed), IPCCommand + IPCResponse with to_dict/from_dict. PURE PORT byte-exact:

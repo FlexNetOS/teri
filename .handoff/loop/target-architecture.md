@@ -1068,3 +1068,170 @@ status/result/error + JSON round-trip) IS the observable contract U-022/U-047 co
 **Owner-rule note:** the file-transport `[≠]` rests on the LOCKED OASIS-subprocess→in-process-SimEngine substrate
 decision (genuine inexpressibility — no second process to bridge), NOT on "the destination won't use it". The
 observable interview/close protocol is fully ported. Sub-cycle (b) verifier must confirm no protocol behavior is lost.
+
+---
+
+## DECISION-16 — U-020 sub-cycle (b): `SimulationIPCClient` + `SimulationIPCServer` (S-477..S-492) → in-process async transport (refines DECISION-15 §b)
+
+**Lineage:** DECISION-15 §b (sub-cycle split; substrate LOCKED), DECISION-14 (the async-worker mpsc+spawned-task
+precedent for `ZepGraphMemoryUpdater`). Protocol types (S-453..S-476) are DONE + parity-verified in
+`src/services/simulation_ipc.rs` — **REUSE verbatim** (`IPCCommand`/`IPCResponse`/`CommandType`/`CommandStatus`).
+Sub-cycle (b) adds the **transport** (client + server) in the **same file**, below the protocol types.
+
+### 16.0 The transport map-onto decision — **CHOSEN: (A) `mpsc<Envelope>` + per-command embedded `oneshot` reply.**
+
+Rejected: **(B) shared `Mutex<HashMap<cmd_id, slot>>` + `Notify`** — reimplements id-correlation, liveness scanning,
+and wakeup that the channel pair gives for free; it is a transliteration of the file-map, not idiomatic. **(C) keep
+the file impl verbatim** — would manufacture a filesystem round-trip between two halves of ONE process: pure overhead,
+race-prone (the very `JSONDecodeError`-on-partial-write the source defends against), and not faithful (the file
+transport exists ONLY to cross the OS-process boundary that teri does not have).
+
+**(A) is the faithful + idiomatic map-onto.** The OBSERVABLE protocol contract is: *a command of a given `command_type`
++ `args`, submitted with a `timeout`, yields exactly one `IPCResponse` (matching `command_id`, with `status`/`result`/
+`error`), OR a timeout error.* That request-response-with-timeout shape is **exactly** `tokio::sync::oneshot` for the
+reply embedded in an `mpsc`-delivered command envelope:
+
+- **client `send_command`** = build `IPCCommand` (with a fresh `command_id`) → create a `oneshot::channel()` → send
+  `Envelope { command: IPCCommand, reply: oneshot::Sender<IPCResponse> }` on the mpsc tx → `tokio::time::timeout(timeout,
+  reply_rx).await`. Elapsed → timeout error; `Ok(Ok(resp))` → the `IPCResponse`.
+- **server `poll_commands`** = `try_recv()` (non-blocking, for the between-ticks sim loop) from the mpsc rx, returning
+  `Option<Envelope>` (the loop holds the live `reply` sender to fire later).
+- **server `send_response`/`send_success`/`send_error`** = fire the `oneshot` reply for that envelope.
+
+This preserves every observable: the command type+args reach the server, the response status/result/error return to the
+caller, and the timeout is a **real elapsed-time await** (`tokio::time::timeout` over the same default seconds:
+interview 60, batch 120, close 30). **Genuine inexpressibility confirmed:** the file paths exist solely to bridge two OS
+processes via the filesystem; teri runs the sim in-process, so there is no filesystem boundary to bridge — the transport
+files are not "unused", they are **structurally absent** (same class as Zep-network→petgraph). This is the owner-rule
+"genuinely inexpressible given the locked substrate" case, NOT a "won't use it" skip.
+
+### 16.1 Handle / ownership split (client holds tx, server holds rx)
+
+```rust
+/// The command envelope crossing the in-process channel. Carries the protocol
+/// IPCCommand PLUS the oneshot reply sink (replaces the {cmd_id}.json response file).
+pub struct IpcEnvelope {
+    pub command: IPCCommand,
+    reply: tokio::sync::oneshot::Sender<IPCResponse>,
+}
+
+pub struct SimulationIPCClient {
+    tx: tokio::sync::mpsc::Sender<IpcEnvelope>,     // [≠] replaces commands_dir
+    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,  // [≠] replaces env_status.json read
+}
+
+pub struct SimulationIPCServer {
+    rx: tokio::sync::mpsc::Receiver<IpcEnvelope>,   // [≠] replaces commands_dir scan
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>, // [≠] replaces env_status.json write + _running
+}
+
+/// Factory — the in-process analog of "both halves point at the same simulation_dir".
+/// Replaces `__init__(simulation_dir)` on BOTH sides: the shared directory pair becomes
+/// the shared channel + shared AtomicBool. Returns the paired client+server.
+pub fn channel(buffer: usize) -> (SimulationIPCClient, SimulationIPCServer) { … }
+```
+
+**Ownership:** client owns the **mpsc `Sender`** (clonable → multiple Flask-route-equivalent callers can submit; matches
+MiroFish where many requests write into one `commands_dir`); server owns the **mpsc `Receiver`** (single consumer = the
+sim loop, matching the single sim subprocess). The `oneshot::Sender` is created per-command by the client and **moved
+into the envelope** to the server — so reply correlation is automatic (no id-matching needed; see §16.4). Liveness is a
+shared `Arc<AtomicBool>` written by the server (`start`→true, `stop`→false) and read by the client (`check_env_alive`),
+replacing `env_status.json`. Buffer size: a bounded channel (e.g. 64, matching the SimEngine `broadcast` buffer) for
+backpressure parity; `send` is `.await`ed.
+
+### 16.2 Standalone testability + U-022 wiring (does NOT require U-022 to land/test)
+
+The server is a **self-contained handle**: it owns the rx and exposes `poll_commands(&mut self) -> Option<IpcEnvelope>`
+(`try_recv`) plus the `start`/`stop`/`send_*` methods. **It does not reference `SimEngine` at all.** Therefore (b) lands
++ tests NOW against a **mock loop**: a test spawns the server in a `tokio::task` that `start()`s, loops calling
+`poll_commands()`, and replies `send_success`/`send_error`; the client (on the test task) calls `send_interview` /
+`send_batch_interview` / `send_close_env` and asserts the returned `IPCResponse` (and a timeout when the mock declines to
+reply). No second process, no SimEngine, no filesystem.
+
+**U-022 wiring (later, no API change needed):** `SimEngine::run` (`src/sim/mod.rs:493`) already runs as an async task
+with `broadcast`/`watch` channels. U-022 holds the `SimulationIPCServer` and, **between rounds** (after the Phase-2
+commit, alongside the existing `inject_fn` hook at `mod.rs:542`), drains commands:
+```text
+while let Some(env) = ipc_server.poll_commands() {
+    match env.command.command_type {
+        Interview      => { run interview over agents; env reply send_success(result) }
+        BatchInterview => { … }
+        CloseEnv       => { env reply send_success({}); break the tick loop }
+    }
+}
+```
+`poll_commands` returning `Option` (not blocking) is exactly why the loop can interleave IPC servicing with ticking —
+the source's `poll_commands` was likewise a single non-blocking dir scan called inside the sim's own loop. U-022 owns the
+*command-handler* logic (what an interview DOES); (b) owns only the *transport + dispatch surface*.
+
+### 16.3 Per-symbol mapping (S-477..S-492)
+
+**Client (S-477..S-483):**
+| S | Python | teri |
+|---|--------|------|
+| S-477 | `class SimulationIPCClient` | `pub struct SimulationIPCClient { tx, alive }` |
+| S-478 | `__init__(simulation_dir)` (mk `commands_dir`/`responses_dir`) | via `channel()` factory; dirs → channel handle + `alive` `[≠]` |
+| S-479 | `send_command(command_type, args, timeout=60.0, poll_interval=0.5)` | `async fn send_command(&self, command_type, args, timeout: Duration) -> Result<IPCResponse>`; build `IPCCommand`+fresh `command_id`, oneshot, `tx.send(env).await`, `tokio::time::timeout(timeout, reply_rx)`. `poll_interval` `[≠]` (irrelevant to a channel). Elapsed → `Err(TeriError::Sim("…timeout… (N s)"))` (mirrors `TimeoutError`; same `Result` error path callers already handle) |
+| S-480 | `send_interview(agent_id, prompt, platform=None, timeout=60.0)` | `async fn send_interview(&self, agent_id: i64, prompt: &str, platform: Option<&str>, timeout: Duration) -> Result<IPCResponse>`; args map `{agent_id, prompt, [platform]}` — platform key inserted **only when Some** (matches `if platform:`); `send_command(Interview, …, 60s)` |
+| S-481 | `send_batch_interview(interviews, platform=None, timeout=120.0)` | `async fn send_batch_interview(&self, interviews: Vec<Value>/Map, platform: Option<&str>, timeout)`; args `{interviews, [platform]}`; `send_command(BatchInterview, …, 120s)` |
+| S-482 | `send_close_env(timeout=30.0)` | `async fn send_close_env(&self, timeout) -> Result<IPCResponse>`; args `{}`; `send_command(CloseEnv, …, 30s)` |
+| S-483 | `check_env_alive() -> bool` (read `env_status.json`, `status=="alive"`) | `fn check_env_alive(&self) -> bool` = `self.alive.load(Ordering::SeqCst)`; the `env_status.json` file → in-process `AtomicBool` `[≠]` |
+
+Default-timeout fidelity: keep the per-method defaults (60/120/30 s). Recommended ergonomic form: `timeout: Duration`
+with the source defaults documented; a thin `_default` wrapper or `Option<Duration>` (None → default) may be used so the
+call sites stay terse — verifier checks the *effective* default seconds, not the signature shape.
+
+**Server (S-484..S-492):**
+| S | Python | teri |
+|---|--------|------|
+| S-484 | `class SimulationIPCServer` | `pub struct SimulationIPCServer { rx, running }` |
+| S-485 | `__init__(simulation_dir)` (mk dirs; `_running=False`) | via `channel()` factory; `running` starts `false` |
+| S-486 | `start()` (`_running=True`; `_update_env_status("alive")`) | `fn start(&self)` = `running.store(true)`; the `"alive"` status → the bool `[≠]` |
+| S-487 | `stop()` (`_running=False`; `_update_env_status("stopped")`) | `fn stop(&self)` = `running.store(false)` |
+| S-488 | `_update_env_status(status)` (write `env_status.json` w/ timestamp) | **`[≠]`** — collapses into the `AtomicBool` store; no file, no timestamp (file artifact) |
+| S-489 | `poll_commands() -> Optional[IPCCommand]` (mtime-sorted dir scan, oldest first) | `fn poll_commands(&mut self) -> Option<IpcEnvelope>` = `rx.try_recv().ok()`. **FIFO preserves "oldest first"** — mpsc delivers in send order, the same ordering the mtime-sort imposed. mtime scan/`JSONDecodeError`-retry `[≠]` (file-race artifacts). NOTE: returns `IpcEnvelope` (command + reply sink), not bare `IPCCommand`, because the reply target travels with the command (file impl re-derived it from `command_id`+`responses_dir`) |
+| S-490 | `send_response(response)` (write `{cmd_id}.json`; rm command file) | replies via the envelope's `oneshot`. Either a free `send_response(env: IpcEnvelope, resp: IPCResponse)` or methods on a held envelope; `env.reply.send(resp)`. os.remove cleanup `[≠]` (the oneshot consumes itself) |
+| S-491 | `send_success(command_id, result)` | `fn send_success(env: IpcEnvelope, result: Map)` → fires `IPCResponse{command_id: env.command.command_id, status: Completed, result: Some(result), error: None}`. **command_id preserved** for protocol/log fidelity (§16.4) |
+| S-492 | `send_error(command_id, error)` | `fn send_error(env: IpcEnvelope, error: String)` → `IPCResponse{…, status: Failed, error: Some(error), result: None}` |
+
+### 16.4 command_id — stays meaningful
+
+With the embedded oneshot, reply correlation is **automatic** (the reply sink is bound to the request; no
+id-→-file matching). But `command_id` **stays in `IPCCommand`/`IPCResponse`** (it already does, S-463/S-470, parity-
+verified): it is part of the serialized protocol contract, it is logged on both send + receive in the source
+(`logger.info(… command_id=…)`), and `send_success`/`send_error` echo it back into the response so the response is
+self-describing. So: correlation no longer *needs* it, but the protocol *keeps* it — porter populates
+`response.command_id = envelope.command.command_id` and preserves the send/receive log lines.
+
+### 16.5 `[≠]` list (each justified under the owner's sharpened rule — all rest on the LOCKED in-process substrate, none on "won't use it")
+
+| `[≠]` artifact | Source role | Why genuinely inexpressible in-process (not a feature skip) |
+|----------------|-------------|------------------------------------------------------------|
+| `ipc_commands/` + `ipc_responses/` dirs (+ `os.makedirs`) | filesystem channel between 2 processes | one process → no FS boundary to bridge; replaced by the mpsc+oneshot (same delivery, no observable change) |
+| `env_status.json` file + `_update_env_status` timestamp | cross-process liveness signal | liveness is now a shared in-memory `AtomicBool`; the file is purely the cross-process delivery of the same boolean |
+| `os.remove` cleanup (command/response files) | reclaim files after delivery | nothing to clean up — mpsc consumes the envelope, oneshot consumes itself |
+| mtime-ordered directory scan | impose oldest-first over an unordered FS dir | mpsc is already FIFO → oldest-first **preserved**, the *mechanism* (mtime sort) is moot |
+| `poll_interval` (0.5 s) | how often to re-scan the FS for a reply | a channel wakes the awaiter immediately; there is nothing to poll. The OBSERVABLE (`timeout`) is preserved as a real await |
+| `JSONDecodeError`-retry-on-partial-file | defend against reading a half-written file mid-write | a file-write-race artifact; in-process values are moved whole, never partially observable |
+
+**PORTED (the contract — NOT `[≠]`):** command types + arg shapes (interview/batch_interview/close_env, the
+`{agent_id, prompt, platform?}` / `{interviews, platform?}` / `{}` dicts incl. the conditional-platform-key behavior);
+the timeouts as REAL elapsed awaits with the source defaults (60/120/30); `IPCResponse` status/result/error
+construction; the **FIFO oldest-first** delivery ordering; `command_id` round-trip + the send/receive log lines;
+`check_env_alive` semantics; success/error response construction.
+
+### 16.6 Coverage + cycle count
+
+**16/16 symbols mapped** (S-477..S-492; client 7, server 9). All in **one cycle** — this is a single cohesive file
+addition (~one struct pair + a factory + ~9 methods, all REUSING the verified protocol types), standalone-testable with
+a mock loop, no dependency on U-022. **No split needed.**
+
+### DECISION-16 — actionable summary for the porter
+1. Add `SimulationIPCClient`, `SimulationIPCServer`, `IpcEnvelope`, and `pub fn channel(buffer)` to
+   `src/services/simulation_ipc.rs`, **below** the existing (reused) protocol types.
+2. Transport = `tokio::sync::mpsc<IpcEnvelope>` (client tx, server rx) + per-command `tokio::sync::oneshot<IPCResponse>`
+   embedded in the envelope; liveness = shared `Arc<AtomicBool>`.
+3. `send_command` = build cmd → oneshot → `tx.send` → `tokio::time::timeout(timeout, reply_rx)`; elapsed → `TeriError::Sim`
+   timeout message. `poll_commands` = `rx.try_recv().ok()`. `send_success`/`send_error` = fire the envelope oneshot.
+4. Apply the per-symbol table (§16.3) and the `[≠]` table (§16.5) exactly. command_id stays populated (§16.4).
+5. Tests: mock-loop task (start → poll → reply) + client assertions, incl. a timeout case. No SimEngine, no files.

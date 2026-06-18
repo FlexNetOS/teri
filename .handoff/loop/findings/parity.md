@@ -1733,3 +1733,68 @@ Sub-cycle (a) S-493..S-514 = `[x]` (verified prior). Sub-cycle (b) S-515..S-530 
 **Symbols (24/24 → `- [x]`):** S-453 S-454 S-455 S-456 S-457 S-458 S-459 S-460 S-461 S-462 S-463 S-464 S-465 S-466 S-467 S-468 S-469 S-470 S-471 S-472 S-473 S-474 S-475 S-476 — all `- [x]`, zero `- [~]`, zero `- [≠]`.
 
 ### VERDICT: **PASS** — sub-cycle (a) done. S-453..S-476 = `[x]`. **U-020 stays `- [~]`** (sub-cycle b `SimulationIPCClient`/`SimulationIPCServer` S-477..S-492 remains). Symbol-map updated for these 24 symbols only; unit ledger NOT flipped.
+
+---
+
+## 2026-06-17 — U-020 sub-cycle (b): `SimulationIPCClient` + `SimulationIPCServer` (S-477..S-492) — opus PARITY GATE
+
+**Unit:** U-020 sub-cycle (b). **Class:** map-onto-substrate (file-based subprocess IPC → in-process tokio mpsc+oneshot, DECISION-16; substrate LOCKED in DECISION-15).
+**Source:** `MiroFish/backend/app/services/simulation_ipc.py:95-395` (read in full).
+**Rust:** `src/services/simulation_ipc.rs:797-1797` (appended client/server + `IpcEnvelope` + `channel()` + `ipc_transport_tests`).
+**Test run (from worktree):** `cargo test simulation_ipc` → **35 passed, 0 failed** (14 new ipc_transport_tests + 21 existing protocol tests in the same file).
+
+### Differential parity — PORTED contract behaviors (all MATCH)
+
+| Behavior | Source (Python) | Rust port | Verdict |
+|---|---|---|---|
+| `send_command` command_id | `str(uuid.uuid4())` | `Uuid::new_v4().to_string()` | MATCH (test asserts response.command_id parses as UUID) |
+| timeout = REAL elapsed await | wall-clock `while time.time()-start < timeout` busy-poll | `tokio::time::timeout(timeout, reply_rx).await` | MATCH (test: undraining server + 50ms timeout → Err) |
+| timeout defaults | interview 60 / batch 120 / close_env 30 | `INTERVIEW_TIMEOUT=60s`, `BATCH_INTERVIEW_TIMEOUT=120s`, `CLOSE_ENV_TIMEOUT=30s` consts; methods take `Duration` (effective defaults preserved per DECISION-16 §16.3 note) | MATCH |
+| timeout → error | `raise TimeoutError("等待命令响应超时 (N秒)")` | `Err(TeriError::Sim("等待命令响应超时 ({:.0}秒)"))` | MATCH (Chinese prefix + parenthesized seconds preserved). NOTE: float→int render (`60.0秒`→`60秒`) is COSMETIC display text only — surfaced via `str(e)` into user-facing JSON `api.interviewTimeout`, never parsed/matched by any consumer (verified across `simulation.py`). Non-contractual; not a downgrade. |
+| `send_interview` args + conditional platform | `{agent_id,prompt}` + `if platform: args["platform"]=platform` | `Map{agent_id,prompt}` + `if let Some(p)=platform { insert }` | MATCH (2 tests: with-platform → 3 keys incl. "platform"; no-platform → exactly 2 keys, no "platform") |
+| `send_batch_interview` args + conditional platform | `{interviews}` + conditional platform | `Map{interviews}` + conditional platform | MATCH (2 tests: with platform="reddit" present; without → no platform key) |
+| `send_close_env` args | `{}` | empty `Map` | MATCH (test asserts CommandType::CloseEnv received) |
+| `send_success` → response | `IPCResponse{status=COMPLETED, result=Some}` | `IPCResponse{status=Completed, result=Some(result), error=None}` | MATCH (test: result {score:99}, error None) |
+| `send_error` → response | `IPCResponse{status=FAILED, error=Some}` | `IPCResponse{status=Failed, error=Some, result=None}` | MATCH (test: error "something went wrong" / "agent error", result None) |
+| command_id round-trip into response | `send_success/error(command_id, …)` | `command_id = envelope.command.command_id` echoed into response | MATCH (§16.4; correlation now automatic via embedded oneshot, but command_id retained for protocol + the 发送/收到 log lines) |
+| FIFO oldest-first | mtime-sorted dir scan (oldest first) | `mpsc.try_recv()` preserves send order | MATCH (test: send "first" then "second" → poll yields "first" then "second") |
+| liveness `check_env_alive` | reads `env_status.json` `status=="alive"` | reads shared `Arc<AtomicBool>` set by start/stop | MATCH (test: false before start → true after start() → false after stop()) |
+| Client `Clone` / multi-sender | many Flask routes write one `ipc_commands/` dir | `#[derive(Clone)]` on Sender-backed client | MATCH (test: `client.clone()` + `tokio::join!` two concurrent sends, both Ok) |
+| `poll_commands` empty | returns `None` (no files) | `rx.try_recv().ok()` → `None` | MATCH (test) |
+| send/receive log lines | `logger.info("发送IPC命令…")` / `logger.info("收到IPC响应…")` | `info!("发送IPC命令…")` / `info!("收到IPC响应…")` | MATCH (preserved verbatim) |
+
+### `[≠]` adjudications — CHALLENGED, all SURVIVE (genuinely inexpressible on the LOCKED in-process substrate; none are feature-skips)
+
+The entire file-transport mechanism exists ONLY to cross the OASIS-subprocess↔Flask OS-process boundary. DECISION-15 LOCKED teri's substrate as in-process (OASIS subprocess → in-process SimEngine), eliminating that boundary. The mpsc+oneshot delivers the SAME observable protocol (command type+args → matching IPCResponse, or timeout). Precedent: U-007/U-016 Zep-network→petgraph adjudicated identically. Per-artifact:
+
+- **ipc_commands/ + ipc_responses/ dirs + os.makedirs** — FS channel between 2 processes; one process → no boundary. Same delivery via mpsc. **INEXPRESSIBLE.**
+- **env_status.json file + `_update_env_status` timestamp (S-488)** — cross-process liveness signal. CHALLENGED HARDEST: traced ALL consumers. The timestamp field IS read by `get_env_status_detail` — but that lives in `simulation_runner.py` = **U-022 (separate, unported unit, all `- [ ]`)**, and it reads the cross-process file the *subprocess* owns. The rich payload (twitter_available/reddit_available/timestamp) is written by the simulation SCRIPTS (`run_parallel_simulation.py:249-253`, `run_twitter/reddit_simulation.py` = U-028/U-029/U-030), NOT by `SimulationIPCServer._update_env_status` (which writes only `{status,timestamp}` as a fallback). Within U-020's scope, NOTHING consumes the timestamp; the file is purely the cross-process delivery of a boolean now shared in-memory. When U-022 is ported it already delegates liveness to `SimulationIPCClient.check_env_alive()` (runner L1388). **INEXPRESSIBLE within U-020; not a disguised skip.**
+- **os.remove cleanup (command/response files)** — reclaim files post-delivery; mpsc consumes the envelope, oneshot self-consumes. Nothing to clean. **INEXPRESSIBLE.**
+- **mtime-ordered directory scan** — imposes oldest-first over an unordered FS dir; mpsc is ALREADY FIFO, so oldest-first is PRESERVED (the observable), only the mechanism is moot. **INEXPRESSIBLE (observable preserved).**
+- **poll_interval (0.5s)** — FS re-scan cadence; a channel wakes the awaiter immediately. The OBSERVABLE (timeout as real elapsed await) is preserved. **INEXPRESSIBLE (observable preserved).**
+- **JSONDecodeError-retry-on-partial-file** — defends a half-written-file read race; in-process values move whole, never partially observable. **INEXPRESSIBLE (file-race artifact).**
+- **S-488 `_update_env_status` method-folding** — folded into start()/stop() AtomicBool stores. Observable liveness (alive on start, stopped on stop, readable by check_env_alive) IS preserved (test-confirmed). Only the file write + timestamp (file artifacts, no in-process U-020 consumer) are dropped. **VALID fold — no observable lost.**
+
+### Symbols (16/16) — S-477..S-492
+
+- S-477 `SimulationIPCClient` (type, Clone) → `[x]`
+- S-478 `__init__`→`channel(buffer)` factory → `[x]` (dirs/makedirs `[≠]`, inexpressible)
+- S-479 `send_command` → `[x]` (uuid v4, real timeout await + faithful 等待命令响应超时 message, log lines; poll_interval/file-IO `[≠]`)
+- S-480 `send_interview` → `[x]` (conditional platform key verified)
+- S-481 `send_batch_interview` → `[x]` (conditional platform key verified)
+- S-482 `send_close_env` → `[x]` (empty args, CloseEnv type verified)
+- S-483 `check_env_alive` → `[x]` (AtomicBool; env_status.json read `[≠]`)
+- S-484 `SimulationIPCServer` (type) → `[x]`
+- S-485 `__init__`→`channel()` → `[x]` (dirs `[≠]`; running starts false)
+- S-486 `start` → `[x]` (running.store(true); `_update_env_status("alive")` `[≠]`)
+- S-487 `stop` → `[x]` (running.store(false))
+- S-488 `_update_env_status` → `[≠]` (folded into start/stop AtomicBool; file write + timestamp inexpressible cross-process artifact, no in-process U-020 consumer — CHALLENGE survived)
+- S-489 `poll_commands` → `[x]` (try_recv FIFO oldest-first verified; mtime scan + JSONDecodeError-retry `[≠]`)
+- S-490 `send_response` → `[x]` (oneshot fire; os.remove `[≠]`)
+- S-491 `send_success` → `[x]` (Completed/result/command_id-echo verified)
+- S-492 `send_error` → `[x]` (Failed/error verified)
+
+15 `[x]` + 1 `[≠]` (S-488, challenge-survived) = **16/16 covered.**
+
+### VERDICT: **PASS** — sub-cycle (b) done.
+S-477..S-487, S-489..S-492 = `[x]`; S-488 = `[≠]` (genuinely inexpressible, CHALLENGE survived). Sub-cycle (a) S-453..S-476 already `[x]` (2026-06-17 PASS above). **All U-020 symbols S-453..S-492 are now `[x]`/`[≠]` ⇒ U-020 COMPLETE — unit ledger may flip `- [x]` and commit.** No protocol behavior lost (timeout defaults, conditional platform, FIFO, liveness, command_id all preserved + differentially tested). Symbol-map updated for S-477..S-492 only.

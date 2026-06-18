@@ -593,22 +593,22 @@
 - [x] S-474 · `unit:U-020` · `field` · `IPCResponse.timestamp` · `simulation_ipc.py:73` → `IPCResponse::timestamp: String` (default=python_isoformat_local())
 - [x] S-475 · `unit:U-020` · `method` · `IPCResponse.to_dict` · `simulation_ipc.py:75` → `IPCResponse::to_dict(&self) -> Value` (5-key ordered; status=.value; result/error=null not omitted)
 - [x] S-476 · `unit:U-020` · `method` · `IPCResponse.from_dict` · `simulation_ipc.py:85` → `IPCResponse::from_dict(data: &Value) -> Result<Self>` (command_id/status required; result/error/timestamp tolerant)
-- [ ] S-477 · `unit:U-020` · `type` · `SimulationIPCClient` · file-based IPC client · `simulation_ipc.py:95`
-- [ ] S-478 · `unit:U-020` · `method` · `SimulationIPCClient.__init__` · `simulation_ipc.py:102`
-- [ ] S-479 · `unit:U-020` · `method` · `SimulationIPCClient.send_command` · writes cmd JSON, polls response dir, 0.5s interval, timeout raises TimeoutError · `simulation_ipc.py:117`
-- [ ] S-480 · `unit:U-020` · `method` · `SimulationIPCClient.send_interview` · timeout=60s · `simulation_ipc.py:189`
-- [ ] S-481 · `unit:U-020` · `method` · `SimulationIPCClient.send_batch_interview` · timeout=120s · `simulation_ipc.py:224`
-- [ ] S-482 · `unit:U-020` · `method` · `SimulationIPCClient.send_close_env` · timeout=30s · `simulation_ipc.py:254`
-- [ ] S-483 · `unit:U-020` · `method` · `SimulationIPCClient.check_env_alive` · reads env_status.json · `simulation_ipc.py:270`
-- [ ] S-484 · `unit:U-020` · `type` · `SimulationIPCServer` · file-based IPC server · `simulation_ipc.py:288`
-- [ ] S-485 · `unit:U-020` · `method` · `SimulationIPCServer.__init__` · `simulation_ipc.py:295`
-- [ ] S-486 · `unit:U-020` · `method` · `SimulationIPCServer.start` · `simulation_ipc.py:313`
-- [ ] S-487 · `unit:U-020` · `method` · `SimulationIPCServer.stop` · `simulation_ipc.py:318`
-- [ ] S-488 · `unit:U-020` · `method` · `SimulationIPCServer._update_env_status` · writes env_status.json · `simulation_ipc.py:323`
-- [ ] S-489 · `unit:U-020` · `method` · `SimulationIPCServer.poll_commands` · scans ipc_commands/ dir · `simulation_ipc.py:332`
-- [ ] S-490 · `unit:U-020` · `method` · `SimulationIPCServer.send_response` · writes response JSON · `simulation_ipc.py:362`
-- [ ] S-491 · `unit:U-020` · `method` · `SimulationIPCServer.send_success` · `simulation_ipc.py:380`
-- [ ] S-492 · `unit:U-020` · `method` · `SimulationIPCServer.send_error` · `simulation_ipc.py:388`
+- [x] S-477 · `unit:U-020` · `type` · `SimulationIPCClient` · file-based IPC client → `pub struct SimulationIPCClient { tx: mpsc::Sender<IpcEnvelope>, alive: Arc<AtomicBool> }` (Clone) · `src/services/simulation_ipc.rs` · `simulation_ipc.py:95`
+- [x] S-478 · `unit:U-020` · `method` · `SimulationIPCClient.__init__` → `pub fn channel(buffer: usize) -> (SimulationIPCClient, SimulationIPCServer)` factory; dirs/makedirs `[≠]` (no FS boundary in-process; replaced by shared mpsc+AtomicBool) · `src/services/simulation_ipc.rs` · `simulation_ipc.py:102`
+- [x] S-479 · `unit:U-020` · `method` · `SimulationIPCClient.send_command` → `async fn send_command(&self, command_type, args, timeout: Duration) -> Result<IPCResponse>`; uuid v4 command_id; oneshot; tx.send(env).await; tokio::time::timeout(timeout, reply_rx); elapsed → TeriError::Sim("等待命令响应超时 (N秒)"); log lines preserved; poll_interval `[≠]` (channel wakes immediately); file-write/poll-loop/os.remove `[≠]` · `src/services/simulation_ipc.rs` · `simulation_ipc.py:117`
+- [x] S-480 · `unit:U-020` · `method` · `SimulationIPCClient.send_interview` → `async fn send_interview(&self, agent_id: i64, prompt: &str, platform: Option<&str>, timeout: Duration) -> Result<IPCResponse>`; args={agent_id,prompt,[platform]}; platform key inserted only when Some; delegates to send_command(Interview, ...) · `src/services/simulation_ipc.rs` · `simulation_ipc.py:189`
+- [x] S-481 · `unit:U-020` · `method` · `SimulationIPCClient.send_batch_interview` → `async fn send_batch_interview(&self, interviews: Vec<Value>, platform: Option<&str>, timeout: Duration) -> Result<IPCResponse>`; args={interviews,[platform]}; delegates to send_command(BatchInterview, ...) · `src/services/simulation_ipc.rs` · `simulation_ipc.py:224`
+- [x] S-482 · `unit:U-020` · `method` · `SimulationIPCClient.send_close_env` → `async fn send_close_env(&self, timeout: Duration) -> Result<IPCResponse>`; args={}; delegates to send_command(CloseEnv, ...) · `src/services/simulation_ipc.rs` · `simulation_ipc.py:254`
+- [x] S-483 · `unit:U-020` · `method` · `SimulationIPCClient.check_env_alive` → `fn check_env_alive(&self) -> bool`; reads shared Arc<AtomicBool>; env_status.json file read `[≠]` (in-process bool; no FS round-trip) · `src/services/simulation_ipc.rs` · `simulation_ipc.py:270`
+- [x] S-484 · `unit:U-020` · `type` · `SimulationIPCServer` · file-based IPC server → `pub struct SimulationIPCServer { rx: mpsc::Receiver<IpcEnvelope>, running: Arc<AtomicBool> }` · `src/services/simulation_ipc.rs` · `simulation_ipc.py:288`
+- [x] S-485 · `unit:U-020` · `method` · `SimulationIPCServer.__init__` → via `channel()` factory; dirs `[≠]`; running starts false · `src/services/simulation_ipc.rs` · `simulation_ipc.py:295`
+- [x] S-486 · `unit:U-020` · `method` · `SimulationIPCServer.start` → `fn start(&self)`; running.store(true, SeqCst); _update_env_status("alive") `[≠]` (AtomicBool store) · `src/services/simulation_ipc.rs` · `simulation_ipc.py:313`
+- [x] S-487 · `unit:U-020` · `method` · `SimulationIPCServer.stop` → `fn stop(&self)`; running.store(false, SeqCst) · `src/services/simulation_ipc.rs` · `simulation_ipc.py:318`
+- [≠] S-488 · `unit:U-020` · `method` · `SimulationIPCServer._update_env_status` · `[≠]` fully absorbed into start/stop AtomicBool stores; env_status.json file write + timestamp are cross-process artifacts; nothing in-process consumes the timestamp · `src/services/simulation_ipc.rs` · `simulation_ipc.py:323`
+- [x] S-489 · `unit:U-020` · `method` · `SimulationIPCServer.poll_commands` → `fn poll_commands(&mut self) -> Option<IpcEnvelope>`; rx.try_recv().ok(); FIFO preserves mtime oldest-first ordering; returns IpcEnvelope (command+reply sink) not bare IPCCommand; mtime dir scan + JSONDecodeError-retry `[≠]` · `src/services/simulation_ipc.rs` · `simulation_ipc.py:332`
+- [x] S-490 · `unit:U-020` · `method` · `SimulationIPCServer.send_response` → `fn send_response(envelope: IpcEnvelope, response: IPCResponse)`; fires envelope.reply oneshot; os.remove cleanup `[≠]` (oneshot consumes itself) · `src/services/simulation_ipc.rs` · `simulation_ipc.py:362`
+- [x] S-491 · `unit:U-020` · `method` · `SimulationIPCServer.send_success` → `fn send_success(envelope: IpcEnvelope, result: Map<String,Value>)`; builds IPCResponse{command_id=envelope.command.command_id, status=Completed, result=Some(result), error=None}; command_id preserved for protocol/log fidelity · `src/services/simulation_ipc.rs` · `simulation_ipc.py:380`
+- [x] S-492 · `unit:U-020` · `method` · `SimulationIPCServer.send_error` → `fn send_error(envelope: IpcEnvelope, error: String)`; builds IPCResponse{status=Failed, error=Some(error), result=None} · `src/services/simulation_ipc.rs` · `simulation_ipc.py:388`
 
 ---
 
