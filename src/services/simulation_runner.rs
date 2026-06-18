@@ -61,6 +61,7 @@ use serde_json::{Map, Value};
 
 use crate::error::Result;
 use crate::models::project::python_isoformat_local;
+use crate::services::simulation_ipc::IPCResponse;
 
 // ---------------------------------------------------------------------------
 // RunnerStatus  (S-541..S-549)
@@ -3963,6 +3964,86 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
         result.sort_by(|a, b| b.total_actions.cmp(&a.total_actions));
 
         Ok(result)
+    }
+
+    // ---------------------------------------------------------------------------
+    // Sub-cycle (e) - Interview wiring via IPC
+    // S-628, S-630, S-631, S-633
+    // ---------------------------------------------------------------------------
+
+    /// Check whether the simulation environment for `simulation_id` is alive.
+    ///
+    /// Delegates to [`SimulationIPCClient::check_env_alive`] (S-628).
+    pub async fn check_env_alive(&self, simulation_id: &str) -> Result<bool> {
+        let runs = self.runs.lock().await;
+        let handle = runs
+            .get(simulation_id)
+            .ok_or_else(|| TeriError::Sim(format!("Simulation not found: {}", simulation_id)))?;
+        Ok(handle.ipc_client().check_env_alive())
+    }
+
+    /// Interview a single agent via IPC.
+    ///
+    /// Port of `interview_agent(agent_id, prompt, platform=None, timeout=60.0)`
+    /// (`simulation_runner.py:1428-1490`).
+    ///
+    /// Default timeout: 60 s (matches Python default). Platform is optional.
+    ///
+    /// S-630
+    pub async fn interview_agent(
+        &self,
+        simulation_id: &str,
+        agent_id: i64,
+        prompt: &str,
+        platform: Option<&str>,
+        timeout: Duration,
+    ) -> Result<IPCResponse> {
+        let runs = self.runs.lock().await;
+        let handle = runs
+            .get(simulation_id)
+            .ok_or_else(|| TeriError::Sim(format!("Simulation not found: {}", simulation_id)))?;
+        handle.ipc_client().send_interview(agent_id, prompt, platform, timeout).await
+    }
+
+    /// Interview multiple agents via IPC.
+    ///
+    /// Port of `interview_agents_batch(interviews, platform=None, timeout=120.0)`
+    /// (`simulation_runner.py:1492-1548`).
+    ///
+    /// Default timeout: 120 s (matches Python default). Platform is optional.
+    ///
+    /// S-631
+    pub async fn interview_agents_batch(
+        &self,
+        simulation_id: &str,
+        interviews: Vec<Value>,
+        platform: Option<&str>,
+        timeout: Duration,
+    ) -> Result<IPCResponse> {
+        let runs = self.runs.lock().await;
+        let handle = runs
+            .get(simulation_id)
+            .ok_or_else(|| TeriError::Sim(format!("Simulation not found: {}", simulation_id)))?;
+        handle.ipc_client().send_batch_interview(interviews, platform, timeout).await
+    }
+
+    /// Close the simulation environment via IPC.
+    ///
+    /// Port of `close_simulation_env(timeout=30.0)` (`simulation_runner.py:1611-1658`).
+    ///
+    /// Default timeout: 30 s (matches Python default).
+    ///
+    /// S-633
+    pub async fn close_simulation_env(
+        &self,
+        simulation_id: &str,
+        timeout: Duration,
+    ) -> Result<IPCResponse> {
+        let runs = self.runs.lock().await;
+        let handle = runs
+            .get(simulation_id)
+            .ok_or_else(|| TeriError::Sim(format!("Simulation not found: {}", simulation_id)))?;
+        handle.ipc_client().send_close_env(timeout).await
     }
 }
 
