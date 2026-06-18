@@ -1870,3 +1870,80 @@ Single defect: S-597 `progress_percent` uses round-half-away-from-zero; Python u
 **Symbols cleared to `- [x]` (60):** S-541..S-598 (RunnerStatus + variants S-542..549, AgentAction + fields/method S-550..560, RoundSummary + fields/method S-561..570, SimulationRunState + fields/methods S-571..598), S-610, S-611. **`[≠]` confirmed:** S-540, S-595 (value-only). S-599 (`SimulationRunner` orchestrator) correctly remains `- [ ]` — sub-cycle (b).
 
 **Sub-cycle (a) coverage: 60/60 cleared + 2 `[≠]` confirmed → unit sub-cycle (a) PASS.**
+
+---
+
+## 2026-06-17 — U-022 sub-cycle (b) SimulationRunner LIFECYCLE — **FAIL** (parity-verifier, opus, fail-closed)
+
+**Scope:** S-599,600,602,603,608,612,616,617,624,625,627 (`- [~]` ported sub-cycle b) + `[≠]` rows S-601/604/606/607 + `[→U-049]` S-626. Source: `/home/drdave/Desktop/meta/MiroFish/backend/app/services/simulation_runner.py`. Worktree: `.worktrees/mirofish-port/teri`.
+
+**Gates (ran here):** `cargo test` → **980 passed, 6 ignored, 0 failed**. `cargo clippy --all-targets -- -D warnings` → exit 0. No build/lint regression. Diff is +179/-6 sim/mod.rs, +1018 simulation_runner.rs, +120 simulation_manager.rs, +34 symbol-map.
+
+**High-risk claims 1 & 2 — VERIFIED PASS (no regression to U-015/U-018/U-048):**
+- **Claim 1 (SimEngine prepare-phase restructure, sim/mod.rs 582-604):** the ONLY logic deletion is the 6-line `stream::iter(pool.agents.iter()).map(...).buffered(n).collect().await` chain, replaced by collecting `Box::pin(agent.prepare_action(&world, llm))` into a `Vec<Pin<Box<dyn Future+Send>>>` then `stream::iter(prepared).buffered(n).collect().await`. Behavior-identical: `prepare_action` is `&self` (no eager side effect; async-fn body is lazy, so building the Vec executes no agent logic), `.buffered(n)` unchanged → SAME ordered results + SAME concurrency degree; same `Vec<Result<Action>>` shape + same `?` propagation in phase 2 zip. Heap-pin is a `Send`-bound requirement for `tokio::spawn`, not a semantic change. 44 sim tests + graph/build integration green & unchanged.
+- **Claim 2 (cooperative shutdown hook):** purely additive. `shutdown: Option<Arc<AtomicBool>>` defaults `None`; per-tick check is gated `if let Some(ref flag) && flag.load(Acquire)` — unreachable for all pre-existing callers. Static check: only NEW `start_simulation:1135` calls `with_shutdown`; no existing caller/test sets it. Graceful break falls through to the SAME post-loop completion path (history cloned, partial `total_ticks`, `completion_tx.send(Some(..))`, `Ok`) → does NOT tear U-048's subscribe_completion contract. New tests assert both (full loop when None/false; graceful empty-completion when pre-set).
+- **Claim 3 (RunInputs seam):** FAITHFUL. Python start_simulation builds nothing — the engine/pool/graph are constructed inside the spawned `run_*.py` child; the Rust seam moves that construction to the caller (U-024/API) and start_simulation owns only spawn+register+stop. No observable in Python start_simulation is dropped: reject-if-running, config-load/missing-Err, total_rounds compute+truncate, STARTING-persist, graph-updater (require graph_id / fail→log+disable-not-abort), platform flags, RUNNING-persist, register — all present & ordered identically. `mark_state_json_stopped` is a faithful port of L1248-1259 (missing→no-op false; partial edit status+updated_at preserving all keys; 2-space indent; +cache-invalidation, a correct teri addition). All PASS.
+
+**>>> TWO REAL DIVERGENCES / DOWNGRADES → FAIL <<<**
+
+**FAIL-1 — `stop_simulation` grace window NARROWED 10s → 5s (S-616/S-617).**
+- Source: `_terminate_process(cls, process, sim_id, timeout: int = 10)` (py L721). `stop_simulation` calls it WITHOUT a timeout arg (py L793) → **10s** grace before SIGKILL (`process.wait(timeout=10)`, L769). Only `cleanup_all_simulations` passes `timeout=5` (py L1224).
+- Rust: BOTH `stop_simulation` (rs:1219) and `cleanup_all` (rs:1292) call the same `terminate_handle`, which uses a single `const TERMINATE_GRACE = Duration::from_secs(5)` (rs:850, used at rs:1406). So `stop_simulation`'s grace window is 5s, not 10s.
+- Observable downgrade: a sim that yields gracefully between 5s and 10s is force-`abort()`ed under teri but allowed to finish under MiroFish. The symbol-map S-616 claim "The 5s grace-then-force WINDOW (`TERMINATE_GRACE`) is preserved exactly" is **factually wrong** (and its Python-description "SIGKILL after 5s" mislabels the 10s stop path). This is expressible, contractual, observable timing → NOT a legitimate `[≠]`; it is a quantitative narrowing.
+- **Fix:** `terminate_handle` must take a grace duration (or two constants). `stop_simulation` → 10s; `cleanup_all` → 5s. Mirror py L793 (default 10) vs py L1224 (5). Add a test asserting the stop-path force-abort fires at ~10s, not 5s.
+
+**FAIL-2 — `cleanup_all` CLOBBERS already-finished runs (S-625).**
+- Source: in `cleanup_all_simulations`, ALL state recording — run_state.json STOPPED+error (py L1234-1241) AND the state.json secondary write (py L1244-1259) — is **inside `if process.poll() is None:`** (py L1219). A process that has already exited (poll() != None, e.g. a sim that COMPLETED normally) is skipped entirely: Python writes NOTHING for it.
+- Rust: rs:1285-1320 writes `run_state.json` → `Stopped` + `error="服务器关闭，模拟被终止"` AND calls `mark_state_json_stopped` (flips state.json status→`stopped`) for EVERY drained handle, including `handle.is_finished()` ones (the `is_finished()` branch at rs:1286 only skips `terminate_handle`, NOT the state writes). The code comment claiming Python "always records the shutdown for tracked runs" is incorrect — Python gates it on still-running.
+- Observable downgrade: a simulation that finished (status completed/stopped) before server shutdown has its final `run_state.json` overwritten to `runner_status=Stopped, error="服务器关闭，模拟被终止"` and its `state.json` status flipped to `stopped` — corrupting the historical record of completed runs. MiroFish preserves it untouched.
+- **Fix:** guard the STOPPED-state + `mark_state_json_stopped` writes behind `!handle.is_finished()` (py `poll() is None`). Only running runs get the shutdown record. Add a test: a finished run in the map is drained but its run_state.json / state.json are NOT modified by cleanup_all.
+
+**Notes (not blockers):**
+- Prompt conflated S-624 (`_cleanup_done` flag, in scope, ported) with S-615 (`_check_all_platforms_completed`, dual-platform). S-615 is correctly left `- [ ]` (sub-cycle c, action-log dependent) — its absence here is NOT a FAIL.
+- `[≠]` rows S-601/604/606/607 (SCRIPTS_DIR / _action_queues / stdout+stderr file handles) are genuinely inexpressible-substrate (no child process / no pipes in-process; no observable output) — confirmed legitimate. S-626 `[→U-049]` deferral (signal handlers are Flask-WSGI-specific; cleanup_all shipped as the callable U-049 invokes) — legitimate, not a drop.
+- S-609 `get_run_state` is implemented (mem-cache-then-file) but its symbol-map row is `- [ ]` (not claimed for b). Internal use only here; left for its own clearing. Not a blocker.
+
+**Verdict: FAIL — 0 of the 11 claimed sub-cycle (b) symbols flipped to `- [x]`.** S-616, S-617, S-625 carry real downgrades; the rest (S-599/600/602/603/608/612/624/627) are individually sound but the unit cannot PASS while sibling lifecycle symbols diverge (rollup rule). All `- [~]` rows remain `- [~]`. Route back to porter with FAIL-1 + FAIL-2 (both small, localized fixes in `terminate_handle` / `cleanup_all`). The SimEngine restructure + shutdown hook + RunInputs seam are CLEARED for re-verification once the two terminate/cleanup divergences are fixed.
+
+---
+
+## 2026-06-17 — U-022 sub-cycle (b) RE-VERIFICATION (FAIL-1 + FAIL-2 fixes) — opus, fail-closed — **PASS**
+
+Re-verify ONLY the two fixes that FAILed the prior block. The three structural claims (SimEngine restructure / shutdown hook / RunInputs seam) + `mark_state_json_stopped` were already cleared; confirmed undisturbed (the two fixes are surgical and localized to `simulation_runner.rs`; `mark_state_json_stopped`'s body at `simulation_manager.rs:1441-1468` and `SimEngine::with_shutdown`/`run` are byte-unchanged by the fix).
+
+### FAIL-1 fix — grace-window split — **PASS (parity confirmed)**
+- Source: `_terminate_process(process, sim_id, timeout: int = 10)` (py:721). `stop_simulation` calls it with NO timeout arg (py:793) → default **10s** (`process.wait(timeout=10)`, py:769). `cleanup_all_simulations` calls `_terminate_process(process, sim_id, timeout=5)` (py:1224) → **5s**.
+- Rust: `const STOP_GRACE = Duration::from_secs(10)` (rs:856), `const CLEANUP_GRACE = Duration::from_secs(5)` (rs:864). `terminate_handle(handle, sim_id, grace: Duration)` (rs:1436) is now parameterized; `stop_simulation` passes `STOP_GRACE` (rs:1234), `cleanup_all` passes `CLEANUP_GRACE` (rs:1326). The single collapsed `TERMINATE_GRACE=5s` that narrowed stop's 10s window is gone.
+- Differential: the 5–10s band where stop tolerates a graceful exit but cleanup force-aborts is now correctly distinct. Both windows match their per-caller Python `timeout`.
+
+### FAIL-2 fix — `cleanup_all` finished-run gate — **PASS (parity confirmed)**
+- Source: in `cleanup_all_simulations` the ENTIRE record-keeping body — terminate (py:1220-1231) + `run_state.json` STOPPED+error write (py:1234-1241) + secondary `state.json` write (py:1244-1259) — is gated behind `if process.poll() is None:` (py:1219). A finished run (poll() is not None) is skipped: NOTHING is written for it. `_processes.clear()` (py:1282) still drains ALL entries regardless.
+- Rust: `cleanup_all` (rs:1316-1321) now `if handle.is_finished() { continue; }` — the in-process analog of `poll() is not None`. A finished handle is skipped (no terminate, no `run_state.json` write, no `mark_state_json_stopped`) and its persisted state (COMPLETED, error=None) is left INTACT; it is still drained (`runs.drain()` at rs:1291, the `_processes.clear()` equivalent, removed it before the loop and it drops at end of iteration). A still-running handle: `terminate_handle(.., CLEANUP_GRACE)` + STOPPED/clear-flags/`completed_at`/error `服务器关闭，模拟被终止` → `run_state.json`, secondary `state.json` write via `SimulationManager::mark_state_json_stopped` (U-023), per-run catch-log-continue. Faithful.
+
+### Regression tests (read — they PROVE the fix, not just compile)
+- `terminate_grace_windows_match_python_defaults` (rs:2513): asserts `STOP_GRACE==10s`, `CLEANUP_GRACE==5s`, `STOP_GRACE != CLEANUP_GRACE`, `STOP_GRACE > CLEANUP_GRACE`. Directly proves FAIL-1.
+- `cleanup_all_preserves_finished_run_state` (rs:2603): starts a 1-round run, waits until finished, writes COMPLETED `run_state.json` + `state.json="completed"`, runs `cleanup_all`, then asserts run_state stays **Completed**, **error stays None**, **completed_at untouched** (`2026-06-17T12:00:00`), **state.json stays "completed"** (secondary write did NOT fire), AND the run is **drained** (`get_running_simulations().is_empty()`). Exactly the FAIL-2 assertion set required.
+- `cleanup_all_stops_running_but_skips_finished` (rs:2673): mixed run — proves the gate DISCRIMINATES (finished preserved COMPLETED/no-error/"completed"; running → Stopped + `服务器关闭` error + state.json "stopped"); both drained. Proves it is not all-or-nothing.
+- `stop_completes_within_grace_window` (rs:2475): cooperative graceful stop returns well under `STOP_GRACE` (between-tick shutdown, not force-abort).
+- `cleanup_all_is_idempotent` (rs:2540) + `cleanup_all_terminates_and_records` (rs:2550): empty-map silent return + flag flip; running-run terminate+record path.
+
+### Edge cases
+- Empty map + idempotency: `cleanup_done.compare_exchange(false,true,AcqRel/Acquire)` (rs:1279) succeeds once; second call returns on the flag. Empty drain + no updaters → silent return (rs:1294). Covered by `cleanup_all_is_idempotent`.
+- Grace-boundary race: `tokio::time::timeout(grace, &mut task)` reaps the task on either branch (Ok=graceful, Err=abort+await-cancelled) — same race semantics as Python `process.wait(timeout)`; grace window is the only observable. No state corruption.
+
+### Gates
+- `cargo test`: **983 passed, 6 ignored** (5 suites) — no regression. Targeted `services::simulation_runner`: 60 passed; the 6 named lifecycle/regression tests: all pass.
+- `cargo clippy --all-targets -- -D warnings`: **no issues found**.
+
+### `[≠]` challenge (re-confirmed survives)
+- S-601 `SCRIPTS_DIR` (locate `run_*.py`) — no scripts run in-process (`SimEngine::run`); no observable output. Inexpressible-substrate. ✓
+- S-604 `_action_queues` (thread→thread `Queue`) — no second thread to hand off to in-process tokio. No observable. ✓
+- S-606/607 `_stdout_files`/`_stderr_files` (drain child pipes) — no child process / pipes in-process. No observable. ✓
+- S-626 `register_cleanup` — `[→U-049]`, NOT a drop: SIGTERM/SIGINT/SIGHUP/atexit installation is Flask-WSGI-specific; U-049 wires teri's `ctrl_c` graceful-shutdown to CALL the shipped `cleanup_all`. ✓
+
+### Verdict
+**PASS** — both FAIL-1 and FAIL-2 fixes are behaviorally faithful to the Python source and proven by genuine differential regression tests; 983 tests green; clippy clean; structural cleared code undisturbed.
+- Flipped `- [~]`→`- [x]`: **S-599, S-600, S-602, S-603, S-608, S-612, S-616, S-617, S-624, S-625, S-627** (11 lifecycle symbols).
+- Confirmed `[≠]`: S-601, S-604, S-606, S-607. Confirmed `[→U-049]`: S-626.
+- Left `- [ ]` for sub-cycles c-f: S-605 (`_monitor_threads`, monitor task), S-615 (`_check_all_platforms_completed`), + monitor/reader/interview symbols.
+- Sub-cycle (b) symbols verified: **11/11 cleared lifecycle (`- [x]`) + 4 `[≠]` + 1 `[→U-049]`** — the unit may proceed; (b) is PASS.

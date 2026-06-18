@@ -17,7 +17,24 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 1   # RESUMED 2026-06-17 (12th resume, reset 0); baseline re-verified 917 green. Next: U-022 SimulationRunner via architect decomposition.
+cycles_this_session: 2   # RESUMED 2026-06-17 (12th resume, reset 0); baseline re-verified 917 green. Next: U-022 SimulationRunner via architect decomposition.
+# CYCLE2 (12th resume) 2026-06-17: U-022 sub-cycle (b) LIFECYCLE (S-599/600/602/603/608/612/616/617/624/625/627, 11 [x]
+#   + 4 [≠] + S-626 [→U-049]) — opus FAIL→fix→PASS (DECISION-17, porter@opus). src/services/simulation_runner.rs:
+#   SimulationRunner<L> (owned Mutex<HashMap<String,RunHandle>>), RunHandle{state,task:JoinHandle,shutdown:Arc<AtomicBool>,
+#   graph_enabled,monitor:Option}, RunInputs<L>{engine,pool,graph,llm} SEAM (Python child-interp builds engine/pool/graph
+#   from config path; teri has no subprocess so caller assembles them — verifier confirmed faithful, drops no observable),
+#   start_simulation (tokio::spawn SimEngine + register + return running), stop_simulation/terminate_handle (cooperative
+#   shutdown.store(true) then task.abort() after timeout(grace)), cleanup_all (idempotent AtomicBool), get_running_simulations.
+#   ADDITIVE SimEngine edits (src/sim/mod.rs, verifier-cleared as byte-identical for the 11 existing None callers): (1) new
+#   shutdown:Option<Arc<AtomicBool>> field + with_shutdown() + per-tick break (graceful, still emits completion → U-048
+#   contract intact); (2) prepare-phase HRTB fix — collect prepare_action futures into Vec<Pin<Box<dyn Future+Send>>> then
+#   stream::iter(..).buffered(n) = same order/concurrency, only a Send-bound fix for tokio::spawn. ADDITIVE U-023
+#   SimulationManager::mark_state_json_stopped (S-625 secondary state.json write, py L1248-1259 faithful read-modify-write).
+#   GATE CAUGHT 2 real downgrades: FAIL-1 grace window collapsed 10s→5s for BOTH paths vs Python stop=10s(py:793 default
+#   timeout=10)/cleanup=5s(py:1224) — fixed STOP_GRACE=10s + CLEANUP_GRACE=5s parameterized; FAIL-2 cleanup_all clobbered
+#   already-FINISHED runs' state vs Python's `if process.poll() is None` gate (py:1219) — fixed `if handle.is_finished()
+#   {continue}` (skip writes, still drain). Both proven by regression tests. teri 983 green, clippy --all-targets clean.
+#   U-022 unit STAYS [ ] (sub-cycles c monitor/tail/graph-fire, d readers, e interview, f history+env+register_cleanup remain).
 # CYCLE1 (12th resume) 2026-06-17: U-022 sub-cycle (a) run-state types (S-540..S-598 + S-610/611) — opus FAIL→fix→PASS
 #   (DECISION-17, architect). NEW src/services/simulation_runner.rs. RunnerStatus (8 variants, lowercase .value),
 #   AgentAction (9-field + to_dict 9-key), RoundSummary (8-field + to_dict 9-key, computed actions_count + nested

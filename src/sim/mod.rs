@@ -414,6 +414,24 @@ pub struct SimEngine {
     /// making it observable to any receiver created after `run()` completes.
     completion_tx: watch::Sender<Option<SimCompletion>>,
     _completion_anchor: watch::Receiver<Option<SimCompletion>>,
+    /// Optional cooperative-shutdown flag, checked at the top of every tick in `run()`.
+    ///
+    /// **Additive, opt-in.** Defaults to `None`; when `None`, `run()` behaves exactly as
+    /// before (runs the full `max_ticks` loop). When set (via [`SimEngine::with_shutdown`])
+    /// and flipped to `true` by an external owner, `run()` breaks out of the tick loop at the
+    /// next tick boundary — *gracefully*: the snapshots produced so far are kept, the
+    /// completion signal is still emitted with the partial `total_ticks`, and `run()` returns
+    /// `Ok(SimulationResult)` with the partial history.
+    ///
+    /// This is the in-process analog of MiroFish's `os.killpg(pgid, SIGTERM)` cooperative
+    /// terminate (`simulation_runner.py:_terminate_process` L759-774): the running simulation
+    /// is asked to stop between rounds rather than killed mid-round. The hard-kill analog
+    /// (SIGKILL) is the caller's `JoinHandle::abort()` after the 5s grace window
+    /// (`SimulationRunner::stop_simulation`).
+    ///
+    /// Existing callers that never call `with_shutdown` observe identical behavior — this
+    /// field is `None` for them and the per-tick check is a no-op.
+    shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl SimEngine {
@@ -433,7 +451,25 @@ impl SimEngine {
             snapshot_hooks: Vec::new(),
             completion_tx,
             _completion_anchor: completion_anchor,
+            shutdown: None,
         }
+    }
+
+    /// Install a cooperative-shutdown flag, checked at the top of every tick in `run()`.
+    ///
+    /// **Additive, opt-in.** When the shared `AtomicBool` is flipped to `true`, the next
+    /// `run()` tick boundary breaks the loop gracefully (partial history kept, completion
+    /// signal emitted with the partial tick count, `Ok` returned). Callers that never call
+    /// this method observe identical behavior to before this method existed.
+    ///
+    /// Used by `SimulationRunner::stop_simulation` (U-022 sub-cycle b) to map MiroFish's
+    /// `os.killpg(pgid, SIGTERM)` graceful-terminate onto an in-process cooperative stop,
+    /// with `JoinHandle::abort()` after a 5s grace window as the SIGKILL analog.
+    ///
+    /// The flag is read with `Ordering::Acquire` to pair with the owner's `store(true,
+    /// Ordering::Release)`.
+    pub fn with_shutdown(&mut self, flag: Arc<std::sync::atomic::AtomicBool>) {
+        self.shutdown = Some(flag);
     }
 
     /// Register a snapshot hook called once per tick during `run()`.
@@ -517,17 +553,55 @@ impl SimEngine {
         }
 
         for _ in 0..self.config.max_ticks {
+            // Cooperative-shutdown check (additive, opt-in). When the owner flips the flag,
+            // break gracefully BEFORE advancing/executing this tick: history up to the prior
+            // tick is preserved, the completion signal below still fires with the partial
+            // count, and `run()` returns Ok. When `shutdown` is None (every pre-existing
+            // caller), this is a no-op and the loop runs the full `max_ticks`.
+            if let Some(ref flag) = self.shutdown
+                && flag.load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
+
             world.advance_tick();
 
             // Phase 1: prepare actions concurrently (immutable reads + LLM calls).
             // stream::buffered drives at most `parallelism` futures simultaneously,
             // giving real throughput gains when agent steps are LLM-bound.
-            let actions: Vec<crate::error::Result<crate::sim::Action>> =
-                stream::iter(pool.agents.iter())
-                    .map(|agent| agent.prepare_action(&world, llm))
-                    .buffered(self.config.parallelism)
-                    .collect()
-                    .await;
+            //
+            // The per-agent futures are collected into a `Vec<Pin<Box<dyn Future + Send>>>`
+            // BEFORE streaming, rather than mapped lazily on the agent iterator. This is
+            // behavior-identical (the same futures still run concurrently through
+            // `.buffered()`), but building the Vec with a plain `for` loop avoids the
+            // `stream::iter(...).map(closure)` higher-ranked-lifetime inference failure
+            // ("implementation of `FnOnce` is not general enough") that otherwise occurs when
+            // `run()`'s future must be `Send` — i.e. when it is handed to `tokio::spawn`
+            // (U-022's `SimulationRunner::start_simulation`). Direct `.await` callers are
+            // unaffected.
+            let actions: Vec<crate::error::Result<crate::sim::Action>> = {
+                // Borrow scope: the prepared futures borrow `world`/`llm`; they are all driven
+                // to completion by `collect().await` here, releasing those borrows before
+                // phase 2's `&mut world`. The boxed-future lifetime `'p` ties to this scope.
+                let prepared: Vec<
+                    std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<
+                                    Output = crate::error::Result<crate::sim::Action>,
+                                > + Send
+                                + '_,
+                        >,
+                    >,
+                > = pool
+                    .agents
+                    .iter()
+                    .map(|agent| {
+                        Box::pin(agent.prepare_action(&world, llm))
+                            as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send + '_>>
+                    })
+                    .collect();
+                stream::iter(prepared).buffered(self.config.parallelism).collect().await
+            };
 
             // Phase 2: commit results sequentially (mutable writes + world state).
             for (agent, action_result) in pool.agents.iter_mut().zip(actions) {
@@ -1464,5 +1538,104 @@ mod tests {
         let json = serde_json::to_string(&sc).expect("serialize");
         let back: SimCompletion = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(sc, back);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cooperative-shutdown hook (additive, U-022 sub-cycle b)
+    // -----------------------------------------------------------------------
+
+    struct IdleLlm;
+    #[async_trait::async_trait]
+    impl crate::llm::LlmClient for IdleLlm {
+        async fn complete(&self, _: &str) -> crate::error::Result<String> {
+            Ok("Think(idle)".to_string())
+        }
+        async fn complete_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _: &str,
+        ) -> crate::error::Result<T> {
+            Err(crate::error::TeriError::Llm("not used".into()))
+        }
+        async fn stream(
+            &self,
+            _: &str,
+        ) -> crate::error::Result<
+            std::pin::Pin<Box<dyn futures::Stream<Item = crate::error::Result<String>> + Send>>,
+        > {
+            Err(crate::error::TeriError::Llm("not used".into()))
+        }
+        async fn chat(
+            &self,
+            _: &[crate::llm::ChatMessage],
+            _: &crate::llm::ChatOptions,
+        ) -> crate::error::Result<String> {
+            Err(crate::error::TeriError::Llm("not used".into()))
+        }
+        async fn chat_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _: &[crate::llm::ChatMessage],
+            _: &crate::llm::ChatOptions,
+        ) -> crate::error::Result<T> {
+            Err(crate::error::TeriError::Llm("not used".into()))
+        }
+    }
+
+    fn one_agent_pool(name: &str) -> crate::agent::AgentPool {
+        use crate::agent::{Agent, AgentPool, Persona};
+        let mut pool = AgentPool::new();
+        pool.add_agent(Agent::new(Persona {
+            name: name.into(),
+            background: "test".into(),
+            traits: vec![],
+            role: "none".into(),
+            social: None,
+        }));
+        pool
+    }
+
+    #[tokio::test]
+    async fn test_no_shutdown_flag_runs_full_loop() {
+        // Additive-safety: an engine with NO shutdown flag (every pre-existing caller)
+        // runs the full max_ticks loop, identical to before with_shutdown existed.
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        const N: u32 = 6;
+        let mut pool = one_agent_pool("nosd");
+        let engine = SimEngine::new(SimConfig::new(N, 1));
+        // Deliberately do NOT call with_shutdown.
+        let graph = crate::graph::KnowledgeGraph::new();
+        let result = engine.run(&mut pool, &graph, &IdleLlm).await.expect("run failed");
+        assert_eq!(result.history.len() as u32, N, "no-shutdown engine must run full loop");
+
+        // And a flag set to false is also a full run.
+        let mut pool2 = one_agent_pool("nosd2");
+        let mut engine2 = SimEngine::new(SimConfig::new(N, 1));
+        engine2.with_shutdown(Arc::new(AtomicBool::new(false)));
+        let result2 = engine2.run(&mut pool2, &graph, &IdleLlm).await.expect("run failed");
+        assert_eq!(result2.history.len() as u32, N, "shutdown=false must run full loop");
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_before_run_yields_empty_graceful_completion() {
+        // Flag already true before run(): the loop breaks at the FIRST tick boundary,
+        // producing zero snapshots, but still emits a (partial) completion signal and
+        // returns Ok — the graceful-stop contract.
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        const N: u32 = 50;
+        let mut pool = one_agent_pool("sd-pre");
+        let mut engine = SimEngine::new(SimConfig::new(N, 1));
+        let flag = Arc::new(AtomicBool::new(true));
+        engine.with_shutdown(Arc::clone(&flag));
+        let completion_rx = engine.subscribe_completion();
+
+        let graph = crate::graph::KnowledgeGraph::new();
+        let result = engine.run(&mut pool, &graph, &IdleLlm).await.expect("graceful stop is Ok");
+
+        assert_eq!(result.history.len(), 0, "pre-set shutdown breaks before first tick");
+        let sc = completion_rx.borrow().clone().expect("completion still fires on graceful stop");
+        assert_eq!(sc.total_ticks, 0, "partial total_ticks reflects the truncated run");
     }
 }

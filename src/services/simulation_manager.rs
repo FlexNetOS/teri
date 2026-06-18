@@ -1416,6 +1416,57 @@ impl SimulationManager {
         self.load_simulation_state(simulation_id)
     }
 
+    /// Mark `{sim_dir}/state.json`'s `status` as `"stopped"` (+ refresh `updated_at`),
+    /// preserving every other key already in the file.
+    ///
+    /// This is the U-023-owned realization of the **secondary `state.json` write** in
+    /// MiroFish `cleanup_all_simulations` (`simulation_runner.py:1244-1259`): when the
+    /// server shuts down, each running simulation's `state.json` is partially edited
+    /// (`state_data['status'] = 'stopped'`, `state_data['updated_at'] = now`) and written
+    /// back — a *raw read-modify-write* that keeps all other keys intact. The runner
+    /// (U-022) calls this rather than editing JSON directly (DECISION-17 §17.0 Area 4:
+    /// "write via the `SimulationManager`, not a raw json edit").
+    ///
+    /// Faithful behavior (matching Python L1248-1259):
+    /// - If `state.json` does not exist → no-op, `Ok(false)` (Python logs a warning and
+    ///   skips; teri returns `false` to signal "no file touched").
+    /// - If it exists → parse as a JSON object, set `status`/`updated_at`, re-serialize
+    ///   with 2-space indent (`ensure_ascii=False, indent=2`), write back. `Ok(true)`.
+    /// - Parse/IO errors propagate as `Err` (Python wraps this in a try/except that logs
+    ///   and continues per-simulation; the caller — `cleanup_all` — applies that
+    ///   catch-log-continue policy so one bad file does not abort the whole cleanup).
+    ///
+    /// The in-memory cache is invalidated for this `simulation_id` so a subsequent
+    /// `get_simulation` reflects the on-disk change rather than a stale cached state.
+    pub fn mark_state_json_stopped(&self, simulation_id: &str) -> Result<bool> {
+        let state_file = self.sim_data_dir.join(simulation_id).join("state.json");
+        if !state_file.exists() {
+            // Python L1256-1257: logs "state.json 不存在" and skips. No file to touch.
+            return Ok(false);
+        }
+
+        let raw = std::fs::read_to_string(&state_file)?;
+        let mut data: Value = serde_json::from_str(&raw)?;
+        let obj = data.as_object_mut().ok_or_else(|| {
+            TeriError::Sim(format!("state.json for {simulation_id} is not a JSON object"))
+        })?;
+
+        // Partial edit (Python L1251-1252) — preserves all other keys.
+        obj.insert("status".to_string(), Value::String("stopped".to_string()));
+        obj.insert("updated_at".to_string(), Value::String(python_isoformat_local()));
+
+        // Re-serialize: 2-space indent, no ASCII escaping (Python `indent=2, ensure_ascii=False`).
+        let json = serde_json::to_string_pretty(&data)?;
+        std::fs::write(&state_file, json.as_bytes())?;
+
+        // Invalidate the cache entry so the next load reflects the on-disk status.
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.remove(simulation_id);
+        }
+
+        Ok(true)
+    }
+
     // -----------------------------------------------------------------------
     // list_simulations (S-677)
     // -----------------------------------------------------------------------
@@ -2019,6 +2070,75 @@ mod manager_tests {
 
         let unique: std::collections::HashSet<&str> = ids.iter().map(|s| s.as_str()).collect();
         assert_eq!(unique.len(), ids.len(), "all simulation IDs must be unique");
+    }
+
+    // -----------------------------------------------------------------------
+    // mark_state_json_stopped (U-022 S-625 secondary state.json write)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mark_state_json_stopped_missing_file_is_noop() {
+        let dir = temp_sim_dir("mark_stopped_missing");
+        let mgr = SimulationManager::new(&dir);
+        // No state.json created → returns Ok(false), touches nothing.
+        let touched = mgr.mark_state_json_stopped("nonexistent-sim").unwrap();
+        assert!(!touched, "missing state.json must be a no-op returning false");
+    }
+
+    #[test]
+    fn mark_state_json_stopped_partial_edit_preserves_other_keys() {
+        let dir = temp_sim_dir("mark_stopped_partial");
+        let mgr = SimulationManager::new(&dir);
+        let state = mgr.create_simulation("proj-x", "graph-y", true, true).unwrap();
+        let sim_id = &state.simulation_id;
+
+        let state_file = dir.join(sim_id).join("state.json");
+        // Capture the original keys + a couple of values to prove they survive.
+        let before: Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
+        let before_obj = before.as_object().unwrap();
+        let orig_project = before_obj.get("project_id").cloned().unwrap();
+        let orig_keys: std::collections::HashSet<String> = before_obj.keys().cloned().collect();
+
+        let touched = mgr.mark_state_json_stopped(sim_id).unwrap();
+        assert!(touched, "existing state.json must be edited, returning true");
+
+        let after: Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
+        let after_obj = after.as_object().unwrap();
+
+        // status flipped to "stopped"
+        assert_eq!(after_obj.get("status"), Some(&Value::String("stopped".into())));
+        // updated_at present and non-empty
+        assert!(
+            after_obj
+                .get("updated_at")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        );
+        // All other keys preserved (no key dropped by the partial edit).
+        let after_keys: std::collections::HashSet<String> = after_obj.keys().cloned().collect();
+        assert_eq!(orig_keys, after_keys, "partial edit must not add/drop keys");
+        // A non-touched value (project_id) is unchanged.
+        assert_eq!(after_obj.get("project_id"), Some(&orig_project));
+    }
+
+    #[test]
+    fn mark_state_json_stopped_invalidates_cache() {
+        let dir = temp_sim_dir("mark_stopped_cache");
+        let mgr = SimulationManager::new(&dir);
+        let state = mgr.create_simulation("proj-c", "graph-c", true, true).unwrap();
+        let sim_id = state.simulation_id.clone();
+
+        // Warm the cache (get_simulation loads + caches via load path).
+        let loaded = mgr.get_simulation(&sim_id).unwrap().unwrap();
+        assert_eq!(loaded.status, SimulationStatus::Created);
+
+        mgr.mark_state_json_stopped(&sim_id).unwrap();
+
+        // After the secondary write, get_simulation must reflect "stopped" (cache invalidated).
+        let reloaded = mgr.get_simulation(&sim_id).unwrap().unwrap();
+        assert_eq!(reloaded.status, SimulationStatus::Stopped);
     }
 }
 

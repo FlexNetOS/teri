@@ -13,8 +13,17 @@
 //!   `to_detail_dict`)
 //! - [`load_run_state`]      — S-609..S-611 (file persistence helpers)
 //!
-//! Sub-cycles (b)–(f) (struct `SimulationRunner`, lifecycle, monitor, readers,
-//! interview wiring) are ported in later cycles and will extend this file.
+//! Sub-cycle (b) — **lifecycle** (S-599..S-604, S-608, S-612, S-616, S-617, S-624,
+//! S-625, S-627) — is ported below the data types:
+//!
+//! - [`SimulationRunner`]   — the owned-state supervisor (S-599); `start_simulation`
+//!   (S-612), `stop_simulation` (S-617), `cleanup_all` (S-625), `get_running_simulations`
+//!   (S-627), `get_run_state` (S-609).
+//! - [`RunHandle`]          — per-run state+task+shutdown+ipc bundle (S-602/603/608).
+//! - `terminate_handle`     — the 5s grace-then-force cooperative stop (S-616 observable).
+//!
+//! S-626 (`register_cleanup`) is deferred to U-049 (`[→U-049]`). Sub-cycles (c)–(f)
+//! (monitor/tail/graph-fire, readers, interview wiring) extend this file in later cycles.
 //!
 //! # `[≠]` symbols in this sub-cycle
 //!
@@ -779,6 +788,677 @@ pub fn save_run_state(sim_data_dir: &Path, state: &SimulationRunState) -> Result
     Ok(())
 }
 
+// ===========================================================================
+// SimulationRunner lifecycle — sub-cycle (b)
+//
+// Ports S-599..S-604, S-608, S-612, S-616, S-617, S-624, S-625, S-627.
+// S-626 (`register_cleanup`) is deferred to U-049 (see module note below).
+//
+// MiroFish's `SimulationRunner` is a process *supervisor*: it `subprocess.Popen`s
+// `run_{twitter,reddit,parallel}_simulation.py`, tracks them in class-level dicts
+// keyed by `simulation_id`, and process-group-kills them on stop/cleanup. teri runs
+// the simulation IN-PROCESS (`SimEngine::run` is a tokio future) — DECISION-2, LOCKED.
+//
+// The OS-subprocess *transport* (Popen, pgid, taskkill/killpg/SIGTERM/SIGKILL,
+// stdout/stderr pipe drains, the `run_*.py` scripts, `sys.executable`) is structurally
+// absent in teri and is `[≠]` inexpressible (DECISION-17 §17.4). The *observable
+// lifecycle contract* is FULLY PORTED:
+//   - start → running state (platform flags set, persisted)
+//   - stop  → graceful terminate within a 5s window, then force; STOPPED + completed_at
+//   - cleanup → idempotent, terminates ALL runs, stops graph updaters, persists STOPPED
+//   - get_running → ids whose task is not finished
+//
+// `[≠]` symbols realized here (DECISION-17 §17.4, re-justified inline):
+//   - S-540 `IS_WINDOWS` — non-contractual platform selector; teri's stop is OS-agnostic.
+//   - S-601 `SCRIPTS_DIR` — no `run_*.py` scripts to locate (in-process engine). No output.
+//   - S-604 `_action_queues` — thread→thread `Queue` handoff between the Popen monitor
+//     thread and main; in-process tokio uses channels directly. No second thread, no queue.
+//   - S-606/S-607 `_stdout_files`/`_stderr_files` — file handles existed ONLY to drain a
+//     child process's stdout/stderr pipes (avoid pipe-buffer deadlock). No child pipe
+//     in-process. (Not in (b)'s symbol list, named here for completeness.)
+//   - S-612 (partial) — Popen/`sys.executable`/script-path/`PYTHONUTF8`/`bufsize`/
+//     `start_new_session`: no interpreter/script to spawn. The RUNNING state + platform
+//     flags + persistence ARE ported; the spawn is a `tokio::spawn` of `SimEngine::run`.
+//   - S-616 (partial) — `taskkill`/`killpg`/pgid/SIGTERM/SIGKILL/Win-Unix branch: no OS
+//     process to signal. The 5s grace-then-force WINDOW is ported (cooperative shutdown
+//     flag, then `JoinHandle::abort()` after `timeout(5s)`).
+//
+// `register_cleanup` (S-626) is DEFERRED to U-049 — `[→U-049]`, NOT `[≠]`, NOT dropped.
+// U-049 wires teri's `ctrl_c` graceful-shutdown (U-002) to call `cleanup_all`. This module
+// ships `cleanup_all` as the callable U-049 will invoke; it does NOT install signal handlers.
+// ===========================================================================
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use tokio::task::JoinHandle;
+
+use crate::error::TeriError;
+use crate::llm::LlmClient;
+use crate::services::graph_memory::GraphMemoryManager;
+use crate::services::simulation_ipc::{SimulationIPCClient, SimulationIPCServer, channel};
+use crate::services::simulation_manager::SimulationManager;
+use crate::sim::SimEngine;
+
+/// Grace window for a cooperative stop before the task is force-aborted, when invoked
+/// from `stop_simulation`.
+///
+/// Mirrors MiroFish `_terminate_process`'s SIGTERM-then-SIGKILL window
+/// (`simulation_runner.py:769` `process.wait(timeout=timeout)`, then
+/// `os.killpg(pgid, SIGKILL)` on `TimeoutExpired`). The grace duration is the contractual
+/// observable; only the kill *mechanism* differs.
+///
+/// `stop_simulation` calls `_terminate_process(process)` with **no** timeout arg
+/// (`simulation_runner.py:793`), so it uses the parameter default `timeout=10`
+/// (`simulation_runner.py:721`) → **10 seconds**. A sim that exits gracefully between
+/// 5–10s MUST be allowed to finish here (it is force-aborted only under `cleanup_all`).
+const STOP_GRACE: Duration = Duration::from_secs(10);
+
+/// Grace window for a cooperative stop before the task is force-aborted, when invoked
+/// from `cleanup_all` (server-shutdown path).
+///
+/// `cleanup_all_simulations` calls `_terminate_process(process, timeout=5)`
+/// (`simulation_runner.py:1224`) → **5 seconds**. Shutdown is impatient: a sim that has
+/// not exited within 5s is force-aborted.
+const CLEANUP_GRACE: Duration = Duration::from_secs(5);
+
+/// Buffer size for the per-run IPC channel (matches the `SimEngine` broadcast buffer
+/// for backpressure parity — see `simulation_ipc::channel`).
+const IPC_CHANNEL_BUFFER: usize = 64;
+
+/// One simulation's live runtime state — the in-process analog of the six Python
+/// class-level dicts keyed by `simulation_id`
+/// (`_run_states`/`_processes`/`_action_queues`/`_monitor_threads`/`_graph_memory_enabled`).
+///
+/// Bundling them into one owned struct (rather than parallel maps) follows DECISION-17
+/// §"Class-dicts → owned struct": it makes the per-run invariants (state ↔ task ↔ shutdown
+/// flag belong together) un-desynchronizable.
+///
+/// S-602 (`state`), S-603 (`task`), S-608 (`graph_enabled`). `shutdown` and `ipc_client`
+/// realize the cooperative-stop signal and the DECISION-16 interview transport.
+pub struct RunHandle {
+    /// The real-time run state (S-602 `_run_states[id]`).
+    pub state: SimulationRunState,
+    /// The spawned simulation task — the in-process analog of `_processes[id]`'s `Popen`
+    /// (S-603). Driving `SimEngine::run`. `abort()` is the SIGKILL analog.
+    task: JoinHandle<()>,
+    /// Cooperative-stop signal, honored by `SimEngine`'s tick loop via `with_shutdown`.
+    /// `store(true, Release)` is the SIGTERM analog (graceful, between rounds).
+    shutdown: Arc<AtomicBool>,
+    /// In-process IPC client for interview/close-env round-trips (DECISION-16). The paired
+    /// server is owned by the sim task. (`[≠]` replaces the file-IPC the Popen child used.)
+    ipc_client: SimulationIPCClient,
+    /// The monitor task (`_monitor_threads[id]`, S-605). Ported in sub-cycle (c); `None`
+    /// here. `stop`/`cleanup_all` abort it if present, so (c) needs no lifecycle rework.
+    monitor: Option<JoinHandle<()>>,
+    /// Whether graph-memory updating is enabled for this run (S-608 `_graph_memory_enabled[id]`).
+    graph_enabled: bool,
+}
+
+impl RunHandle {
+    /// Borrow the IPC client (used by interview wiring in sub-cycle e/f).
+    pub fn ipc_client(&self) -> &SimulationIPCClient {
+        &self.ipc_client
+    }
+
+    /// Whether graph-memory updating is enabled for this run.
+    pub fn graph_enabled(&self) -> bool {
+        self.graph_enabled
+    }
+
+    /// Whether the simulation task has finished (the in-process analog of
+    /// `process.poll() is not None`).
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+}
+
+/// Inputs required to drive an in-process simulation run.
+///
+/// This is the seam that replaces MiroFish's `subprocess.Popen(cmd, ...)`: where Python
+/// hands a config-file path to a child interpreter that loads the engine/agents/graph
+/// itself, teri's caller (U-024 / the API layer) assembles the engine + agent pool +
+/// knowledge graph + LLM client and hands them to [`SimulationRunner::start_simulation`],
+/// which owns only the *lifecycle* (spawn, register, cooperative stop, force-abort).
+///
+/// `engine` is taken by value (the spawned task owns it for the run's duration); the
+/// runner installs the cooperative-shutdown flag on it before spawning.
+pub struct RunInputs<L: LlmClient + Send + Sync + 'static> {
+    /// The simulation engine to drive. The runner calls `engine.with_shutdown(flag)` then
+    /// `engine.run(&mut pool, &graph, &*llm)` inside the spawned task.
+    pub engine: SimEngine,
+    /// The agent pool (owned by the task; `SimEngine::run` mutates it).
+    pub pool: crate::agent::AgentPool,
+    /// The knowledge graph (read by `SimEngine::run`).
+    pub graph: crate::graph::KnowledgeGraph,
+    /// The LLM client backing agent decisions.
+    pub llm: Arc<L>,
+}
+
+/// In-process simulation supervisor — port of `SimulationRunner` (`simulation_runner.py:196`).
+///
+/// S-599 (type), S-600 (`RUN_STATE_DIR` → `sim_data_dir`), S-602/603/604/608 (per-run dicts
+/// folded into [`RunHandle`]), S-624 (`_cleanup_done` → `cleanup_done`).
+///
+/// Generic over the LLM client `L` because it owns a [`GraphMemoryManager<L>`] and spawns
+/// `SimEngine::run::<L>` — the same forcing function as U-021/U-023 (`LlmClient` is not
+/// dyn-safe, so the class-level singleton becomes one owned instance held in app state).
+///
+/// # Concurrency
+///
+/// `runs` is a `tokio::sync::Mutex` so it can be held across `.await` only where necessary.
+/// Lifecycle methods that must `.await` on a handle (stop, cleanup) **take the handle out of
+/// the map first**, drop the lock, then await — never holding the lock across the abort/join.
+pub struct SimulationRunner<L: LlmClient + Send + Sync + 'static> {
+    /// Root simulation-data directory — teri analog of `RUN_STATE_DIR`
+    /// (`os.path.join(dirname(__file__), '../../uploads/simulations')`). S-600.
+    /// (`SCRIPTS_DIR`, S-601, is `[≠]`: there are no `run_*.py` scripts in-process.)
+    sim_data_dir: std::path::PathBuf,
+    /// Per-run state + task + shutdown flag, keyed by `simulation_id`. Folds the six Python
+    /// class-level dicts (S-602/603/604/605/606/607/608) into one map of owned handles.
+    runs: tokio::sync::Mutex<std::collections::HashMap<String, RunHandle>>,
+    /// Graph-memory manager (U-021) — the runner calls `create_updater`/`stop_updater`/
+    /// `stop_all` exactly where MiroFish calls `ZepGraphMemoryManager.*`.
+    graph_mgr: Arc<GraphMemoryManager<L>>,
+    /// Simulation manager (U-023) — owns `state.json`; the runner calls
+    /// `mark_state_json_stopped` for the S-625 secondary write (DECISION-17 §17.0 Area 4).
+    manager: Arc<SimulationManager>,
+    /// Idempotency flag for `cleanup_all` — port of `_cleanup_done` (S-624). Flipped
+    /// false→true atomically on the first call (mirrors U-021 `stop_all`'s `compare_exchange`).
+    cleanup_done: AtomicBool,
+}
+
+impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
+    /// Construct a runner over the given data dir, sharing the graph manager and simulation
+    /// manager that the rest of teri's app state holds.
+    pub fn new(
+        sim_data_dir: impl Into<std::path::PathBuf>,
+        graph_mgr: Arc<GraphMemoryManager<L>>,
+        manager: Arc<SimulationManager>,
+    ) -> Self {
+        Self {
+            sim_data_dir: sim_data_dir.into(),
+            runs: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            graph_mgr,
+            manager,
+            cleanup_done: AtomicBool::new(false),
+        }
+    }
+
+    /// Memory-cache-then-file load of a run state — port of `get_run_state` (S-609).
+    ///
+    /// Python: return `_run_states[id]` if present, else `_load_run_state(id)` (and cache it).
+    /// teri: return a clone of the live `RunHandle.state` if a run is registered, else read
+    /// `run_state.json` from disk via [`load_run_state`].
+    ///
+    /// Returns a clone (the live state lives behind the `runs` mutex; a borrow cannot escape).
+    pub async fn get_run_state(&self, simulation_id: &str) -> Result<Option<SimulationRunState>> {
+        {
+            let runs = self.runs.lock().await;
+            if let Some(handle) = runs.get(simulation_id) {
+                return Ok(Some(handle.state.clone()));
+            }
+        }
+        // Not in memory — load from disk (S-610).
+        load_run_state(&self.sim_data_dir, simulation_id)
+    }
+
+    /// Start a simulation — port of `start_simulation` (S-612).
+    ///
+    /// Observable contract (PORTED exactly; the Popen mechanism is `[≠]`):
+    /// 1. **Reject if already running** — if a run for `simulation_id` exists with status
+    ///    `Running` or `Starting`, return `Err` (Python L335-337 `raise ValueError`).
+    /// 2. **Load config + compute `total_rounds`** — read `simulation_config.json`
+    ///    `time_config`, `total_rounds = int(total_hours * 60 / minutes_per_round)`,
+    ///    defaults `total_simulation_hours=72`, `minutes_per_round=30` (L350-353).
+    ///    Missing config → `Err` (Python L343-344 `raise ValueError("模拟配置不存在")`).
+    /// 3. **`max_rounds` truncation** — if `max_rounds > 0`, `total_rounds =
+    ///    min(total_rounds, max_rounds)` (L356-360).
+    /// 4. **Build STARTING state**, persist `run_state.json` (L362-370).
+    /// 5. **Graph-memory updater** — if enabled, require `graph_id`, create the updater,
+    ///    set `graph_enabled` (L373-385). On creation failure: log + `graph_enabled=false`
+    ///    (Python L381-383 catches and continues — does NOT abort the start).
+    /// 6. **Platform flags** — twitter / reddit / parallel set `twitter_running`/
+    ///    `reddit_running` (L388-397).
+    /// 7. **Spawn the sim task** (the in-process Popen analog), set `runner_status=Running`,
+    ///    set `process_pid` (`[≠]` → stays `None` in teri), persist, register the handle (L438-457).
+    /// 8. **Return the running state.**
+    ///
+    /// On any failure during spawn/setup, the state transitions to `Failed` with the error
+    /// recorded and persisted before returning `Err` (Python L473-477).
+    ///
+    /// `graph` for the updater: when graph-memory is enabled, the caller must provide the
+    /// shared `KnowledgeGraph` handle the updater writes to (`graph_for_updater`); `None`
+    /// when disabled.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_simulation(
+        &self,
+        simulation_id: &str,
+        platform: &str,
+        max_rounds: Option<i64>,
+        enable_graph_memory_update: bool,
+        graph_id: Option<&str>,
+        inputs: RunInputs<L>,
+        graph_for_updater: Option<Arc<tokio::sync::Mutex<crate::graph::KnowledgeGraph>>>,
+    ) -> Result<SimulationRunState> {
+        // (1) Reject if already running (L335-337).
+        if let Some(existing) = self.get_run_state(simulation_id).await?
+            && matches!(existing.runner_status, RunnerStatus::Running | RunnerStatus::Starting)
+        {
+            return Err(TeriError::Sim(format!("模拟已在运行中: {simulation_id}")));
+        }
+
+        // (2) Load config + compute total_rounds (L340-353).
+        let config = self
+            .manager
+            .get_simulation_config(simulation_id)?
+            .ok_or_else(|| TeriError::Sim("模拟配置不存在，请先调用 /prepare 接口".to_string()))?;
+        let time_config = config.get("time_config");
+        let total_hours = time_config
+            .and_then(|t| t.get("total_simulation_hours"))
+            .and_then(Value::as_i64)
+            .unwrap_or(72);
+        let minutes_per_round = time_config
+            .and_then(|t| t.get("minutes_per_round"))
+            .and_then(Value::as_i64)
+            .unwrap_or(30);
+        // Python `int(total_hours * 60 / minutes_per_round)` — Python `/` is float division,
+        // `int()` truncates toward zero. Guard against a zero divisor (Python would raise
+        // ZeroDivisionError; teri treats a non-positive cadence as "no truncation basis" → 0).
+        let mut total_rounds: i64 = if minutes_per_round != 0 {
+            ((total_hours as f64 * 60.0) / minutes_per_round as f64) as i64
+        } else {
+            0
+        };
+
+        // (3) max_rounds truncation (L356-360).
+        if let Some(mr) = max_rounds
+            && mr > 0
+        {
+            let original = total_rounds;
+            total_rounds = total_rounds.min(mr);
+            if total_rounds < original {
+                tracing::info!("轮数已截断: {} -> {} (max_rounds={})", original, total_rounds, mr);
+            }
+        }
+
+        // (4) Build STARTING state + persist (L362-370).
+        let mut state = SimulationRunState::new(simulation_id.to_string());
+        state.runner_status = RunnerStatus::Starting;
+        state.total_rounds = total_rounds;
+        state.total_simulation_hours = total_hours;
+        state.started_at = Some(crate::models::project::python_isoformat_local());
+        save_run_state(&self.sim_data_dir, &state)?;
+
+        // (5) Graph-memory updater (L373-385).
+        let mut graph_enabled = false;
+        if enable_graph_memory_update {
+            let gid = graph_id
+                .ok_or_else(|| TeriError::Sim("启用图谱记忆更新时必须提供 graph_id".to_string()))?;
+            // The updater needs the shared graph handle to write into.
+            match graph_for_updater {
+                Some(g) => {
+                    match self
+                        .graph_mgr
+                        .create_updater(simulation_id, g, Arc::clone(&inputs.llm), gid.to_string())
+                        .await
+                    {
+                        Ok(()) => {
+                            graph_enabled = true;
+                            tracing::info!(
+                                "已启用图谱记忆更新: simulation_id={}, graph_id={}",
+                                simulation_id,
+                                gid
+                            );
+                        }
+                        Err(e) => {
+                            // Python L381-383: catch, log, set enabled=false — do NOT abort.
+                            tracing::error!("创建图谱记忆更新器失败: {}", e);
+                            graph_enabled = false;
+                        }
+                    }
+                }
+                None => {
+                    // graph_id given but no graph handle supplied to write into.
+                    tracing::error!("创建图谱记忆更新器失败: no knowledge-graph handle provided");
+                    graph_enabled = false;
+                }
+            }
+        }
+
+        // (6) Platform flags (L388-397). Anything other than twitter/reddit is "parallel".
+        match platform {
+            "twitter" => state.twitter_running = true,
+            "reddit" => state.reddit_running = true,
+            _ => {
+                state.twitter_running = true;
+                state.reddit_running = true;
+            }
+        }
+
+        // (7) Spawn the sim task (the in-process Popen analog, L408-469).
+        // Build the IPC channel (DECISION-16): client stays in the handle, server moves
+        // into the task (the sim loop services interview/close commands in (c)/(e)).
+        let (ipc_client, ipc_server) = channel(IPC_CHANNEL_BUFFER);
+
+        // Cooperative-stop flag, installed on the engine and held in the handle.
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let RunInputs { mut engine, pool, graph, llm } = inputs;
+        engine.with_shutdown(Arc::clone(&shutdown));
+
+        let task = spawn_sim_task(engine, pool, graph, llm, ipc_server);
+
+        // process_pid stays None ([≠] value-only — no OS pid). runner_status → Running.
+        state.runner_status = RunnerStatus::Running;
+        save_run_state(&self.sim_data_dir, &state)?;
+
+        tracing::info!("模拟启动成功: {}, platform={}", simulation_id, platform);
+
+        let handle = RunHandle {
+            state: state.clone(),
+            task,
+            shutdown,
+            ipc_client,
+            monitor: None, // set in sub-cycle (c)
+            graph_enabled,
+        };
+
+        {
+            let mut runs = self.runs.lock().await;
+            runs.insert(simulation_id.to_string(), handle);
+        }
+
+        // (8) Return the running state.
+        Ok(state)
+    }
+
+    /// Stop a simulation — port of `stop_simulation` (S-617) + `_terminate_process` (S-616).
+    ///
+    /// Observable contract (PORTED; the kill mechanism is `[≠]`):
+    /// 1. **Run must exist** — else `Err` (Python L780-781).
+    /// 2. **Run must be RUNNING or PAUSED** — else `Err` (Python L783-784).
+    /// 3. Transition to `Stopping`, persist (L786-787).
+    /// 4. **Terminate within the 5s grace window, then force** — set the cooperative
+    ///    shutdown flag (SIGTERM analog), await the task bounded by `timeout(5s)`; on
+    ///    timeout, `task.abort()` (SIGKILL analog). Abort the monitor task too if present.
+    /// 5. Transition to `Stopped`, clear platform flags, set `completed_at`, persist (L806-810).
+    /// 6. Stop the graph-memory updater if enabled (L813-819).
+    ///
+    /// Returns the final STOPPED state.
+    pub async fn stop_simulation(&self, simulation_id: &str) -> Result<SimulationRunState> {
+        // (1)/(2): validate existence + status against the LIVE handle's state.
+        // Take the handle OUT of the map (we will await on its task — never hold the lock
+        // across .await). If absent in memory, fall back to disk for the precondition checks.
+        let mut handle = {
+            let mut runs = self.runs.lock().await;
+            runs.remove(simulation_id)
+        };
+
+        // Determine the current status for the precondition checks.
+        let current_status = match &handle {
+            Some(h) => h.state.runner_status.clone(),
+            None => match load_run_state(&self.sim_data_dir, simulation_id)? {
+                Some(s) => s.runner_status,
+                None => {
+                    return Err(TeriError::Sim(format!("模拟不存在: {simulation_id}")));
+                }
+            },
+        };
+
+        if !matches!(current_status, RunnerStatus::Running | RunnerStatus::Paused) {
+            // Put the handle back if we removed it (we are not stopping it).
+            if let Some(h) = handle {
+                let mut runs = self.runs.lock().await;
+                runs.insert(simulation_id.to_string(), h);
+            }
+            return Err(TeriError::Sim(format!(
+                "模拟未在运行: {simulation_id}, status={current_status}"
+            )));
+        }
+
+        // (3): transition to Stopping, persist. Build the working state from the live handle
+        // if present, else from disk.
+        let mut state = match &handle {
+            Some(h) => h.state.clone(),
+            None => load_run_state(&self.sim_data_dir, simulation_id)?
+                .unwrap_or_else(|| SimulationRunState::new(simulation_id.to_string())),
+        };
+        state.runner_status = RunnerStatus::Stopping;
+        save_run_state(&self.sim_data_dir, &state)?;
+
+        // (4): terminate — cooperative-then-force, 10s grace window (S-616). `stop_simulation`
+        // calls `_terminate_process(process)` with no timeout arg (py:793) → default 10s (py:721).
+        if let Some(h) = handle.as_mut() {
+            terminate_handle(h, simulation_id, STOP_GRACE).await;
+        }
+
+        // (5): transition to Stopped + clear flags + completed_at, persist (L806-810).
+        state.runner_status = RunnerStatus::Stopped;
+        state.twitter_running = false;
+        state.reddit_running = false;
+        state.completed_at = Some(crate::models::project::python_isoformat_local());
+        save_run_state(&self.sim_data_dir, &state)?;
+
+        // (6): stop the graph-memory updater if enabled (L813-819).
+        let graph_enabled = handle.as_ref().map(|h| h.graph_enabled).unwrap_or(false);
+        if graph_enabled {
+            self.graph_mgr.stop_updater(simulation_id).await;
+            tracing::info!("已停止图谱记忆更新: simulation_id={}", simulation_id);
+        }
+
+        tracing::info!("模拟已停止: {}", simulation_id);
+        // The handle is dropped here (removed from the map and not re-inserted) — the run is
+        // terminated, mirroring Python popping `_processes[id]` after termination.
+        Ok(state)
+    }
+
+    /// Clean up ALL running simulations — port of `cleanup_all_simulations` (S-625).
+    ///
+    /// Called on server shutdown (by U-049, which wires `ctrl_c` to it). **Idempotent**
+    /// via `cleanup_done` `compare_exchange` (S-624 `_cleanup_done`, mirroring U-021's
+    /// `stop_all`):
+    ///
+    /// 1. If already done → return immediately (Python L1194-1196).
+    /// 2. If nothing to clean (no runs, no graph updaters) → silent return (L1199-1203).
+    /// 3. Stop ALL graph-memory updaters via `GraphMemoryManager::stop_all` (L1208-1212).
+    /// 4. For each handle: if it is **finished** (`is_finished()`, the in-process analog of
+    ///    `process.poll() is not None`), SKIP it — Python gates the whole body behind
+    ///    `if process.poll() is None:` (L1219), so a completed run is neither terminated nor
+    ///    state-written and keeps its final state intact. Otherwise (still running): terminate
+    ///    it (cooperative-then-force, 5s grace `timeout=5`, S-616), set its run state STOPPED +
+    ///    clear flags + `completed_at` + error "服务器关闭，模拟被终止", persist `run_state.json`
+    ///    (L1234-1241), AND do the secondary `state.json` write via the SimulationManager
+    ///    (L1244-1259, DECISION-17 §17.0 Area 4). Per-run errors are caught-logged-continued
+    ///    (Python L1261-1262).
+    /// 5. Drain the runs map — ALL entries, finished or running (Python `_processes.clear()`,
+    ///    L1282-1283).
+    pub async fn cleanup_all(&self) {
+        // (1) Idempotency — flip false→true atomically (mirrors U-021 stop_all; S-624).
+        if self
+            .cleanup_done
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        // (2) Nothing to clean? Silent return (L1199-1203). Take the runs out so we drop the
+        // lock before any .await; check emptiness against runs + the graph manager.
+        let mut drained: Vec<(String, RunHandle)> = {
+            let mut runs = self.runs.lock().await;
+            runs.drain().collect()
+        };
+        let has_updaters = !self.graph_mgr.get_all_stats().await.is_empty();
+        if drained.is_empty() && !has_updaters {
+            return; // nothing to clean
+        }
+
+        tracing::info!("正在清理所有模拟进程...");
+
+        // (3) Stop all graph-memory updaters first (L1208-1212). `stop_all` is itself
+        // idempotent; errors are logged inside it.
+        self.graph_mgr.stop_all().await;
+
+        // (4) Terminate each RUNNING run, persist STOPPED state + secondary state.json write.
+        //
+        // Python gates the ENTIRE block — terminate + `run_state.json` write + `state.json`
+        // write — behind `if process.poll() is None:` (`simulation_runner.py:1219`). A
+        // finished/completed run is SKIPPED: it is neither terminated nor state-written, so its
+        // persisted final state (COMPLETED, etc.) is left intact. Only the drain/removal happens
+        // for it (Python `cls._processes.clear()` at L1282 clears all entries regardless).
+        //
+        // teri mirrors this exactly: `handle.is_finished()` is the in-process equivalent of
+        // `process.poll() is not None`. A finished handle is drained (we own it here and let it
+        // drop) but its state is NOT overwritten — recording STOPPED+error over a completed run
+        // would corrupt its final state (FAIL-2 regression).
+        for (simulation_id, mut handle) in drained.drain(..) {
+            if handle.is_finished() {
+                // poll() is not None → skip entirely (no terminate, no state writes). Drained
+                // above; the handle drops at end of this iteration.
+                continue;
+            }
+
+            // process.poll() is None → the run is still RUNNING; terminate + record shutdown.
+            tracing::info!("终止模拟进程: {}", simulation_id);
+            // cleanup_all calls `_terminate_process(process, timeout=5)` (py:1224) → 5s grace.
+            terminate_handle(&mut handle, &simulation_id, CLEANUP_GRACE).await;
+
+            // Update run_state.json (L1234-1241).
+            let mut state = handle.state.clone();
+            state.runner_status = RunnerStatus::Stopped;
+            state.twitter_running = false;
+            state.reddit_running = false;
+            state.completed_at = Some(crate::models::project::python_isoformat_local());
+            state.error = Some("服务器关闭，模拟被终止".to_string());
+            if let Err(e) = save_run_state(&self.sim_data_dir, &state) {
+                // Per-run catch-log-continue (Python L1261-1262).
+                tracing::error!("清理进程失败: {}, error={}", simulation_id, e);
+            }
+
+            // Secondary state.json write via the SimulationManager (L1244-1259).
+            tracing::info!("尝试更新 state.json: {}", simulation_id);
+            match self.manager.mark_state_json_stopped(&simulation_id) {
+                Ok(true) => {
+                    tracing::info!("已更新 state.json 状态为 stopped: {}", simulation_id);
+                }
+                Ok(false) => {
+                    tracing::warn!("state.json 不存在: {}", simulation_id);
+                }
+                Err(e) => {
+                    tracing::warn!("更新 state.json 失败: {}, error={}", simulation_id, e);
+                }
+            }
+        }
+
+        tracing::info!("模拟进程清理完成");
+        // (5) The runs map was already drained above.
+    }
+
+    /// List the ids of all simulations whose task is not finished — port of
+    /// `get_running_simulations` (S-627).
+    ///
+    /// Python: ids where `process.poll() is None`. teri: ids where `!task.is_finished()`.
+    pub async fn get_running_simulations(&self) -> Vec<String> {
+        let runs = self.runs.lock().await;
+        runs.iter()
+            .filter(|(_, h)| !h.is_finished())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+}
+
+/// Spawn the simulation task that drives `SimEngine::run` to completion in-process.
+///
+/// This is the in-process analog of `subprocess.Popen(cmd, ...)` (S-612). The task owns the
+/// engine, pool, graph, LLM client, and the IPC server (the server's `start()` marks the
+/// environment alive for interview round-trips — DECISION-16). When `SimEngine::run` returns
+/// (naturally, or early via the cooperative-shutdown flag), the task ends and the IPC server
+/// is stopped + dropped.
+fn spawn_sim_task<L: LlmClient + Send + Sync + 'static>(
+    engine: SimEngine,
+    pool: crate::agent::AgentPool,
+    graph: crate::graph::KnowledgeGraph,
+    llm: Arc<L>,
+    ipc_server: SimulationIPCServer,
+) -> JoinHandle<()> {
+    // Box+coerce the future to an explicit `Pin<Box<dyn Future + Send>>`. This sidesteps
+    // rustc's higher-ranked-lifetime inference failure ("implementation of `FnOnce` is not
+    // general enough") on the `SimEngine::run` → `prepare_action` closure when the run future
+    // is handed to `tokio::spawn`. The explicit type annotation pins the lifetime so the
+    // closure's `for<'a> FnMut(&'a Agent)` bound resolves. Behavior is unchanged.
+    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+        Box::pin(run_sim_body(engine, pool, graph, llm, ipc_server));
+    tokio::spawn(fut)
+}
+
+/// The body driven by the spawned simulation task.
+///
+/// Split into a named `async fn` (rather than an inline `async move` block) so the
+/// `SimEngine::run` higher-ranked closure resolves cleanly under `tokio::spawn` — an inline
+/// block trips rustc's "implementation of `FnOnce` is not general enough" on the
+/// `prepare_action` borrow. Behavior is identical to an inline block.
+async fn run_sim_body<L: LlmClient + Send + Sync + 'static>(
+    engine: SimEngine,
+    mut pool: crate::agent::AgentPool,
+    graph: crate::graph::KnowledgeGraph,
+    llm: Arc<L>,
+    ipc_server: SimulationIPCServer,
+) {
+    // Mark the env alive while the run is in progress (DECISION-16: `check_env_alive`
+    // reads this flag; interview commands are serviced by the (c)/(e) loop dispatch).
+    ipc_server.start();
+
+    if let Err(e) = engine.run(&mut pool, &graph, &*llm).await {
+        tracing::error!("模拟运行失败: {}", e);
+    }
+
+    // Run finished (or aborted before this point) — mark env not-alive.
+    ipc_server.stop();
+}
+
+/// Cooperative-then-force terminate of a single run's tasks — port of `_terminate_process`
+/// (S-616), observable contract only.
+///
+/// 1. Set the cooperative shutdown flag (`store(true, Release)`) — the SIGTERM analog. The
+///    `SimEngine` tick loop honors it at the next round boundary and returns gracefully.
+/// 2. Await the task bounded by the `grace` window (`timeout(grace)`).
+/// 3. On timeout, `task.abort()` — the SIGKILL analog — then await the (now cancelled) task.
+/// 4. Abort the monitor task too if present (it would otherwise outlive the run).
+///
+/// The `grace` duration is the contractual observable and is supplied by the caller to match
+/// the source's per-caller `timeout` (`_terminate_process(process, timeout=…)`):
+/// `stop_simulation` → [`STOP_GRACE`] (10s, the Python default), `cleanup_all` →
+/// [`CLEANUP_GRACE`] (5s, the explicit `timeout=5`). The Windows `taskkill`/Unix
+/// `killpg`/pgid/SIGTERM/SIGKILL machinery is `[≠]` inexpressible (no OS process); the
+/// grace-then-force *window* is preserved exactly, including the per-caller difference.
+async fn terminate_handle(handle: &mut RunHandle, simulation_id: &str, grace: Duration) {
+    // (1) Cooperative stop — SIGTERM analog.
+    handle.shutdown.store(true, Ordering::Release);
+    tracing::info!("终止模拟 (cooperative): simulation={}", simulation_id);
+
+    // (2)/(3) grace window, then force-abort.
+    match tokio::time::timeout(grace, &mut handle.task).await {
+        Ok(_join_result) => {
+            // Task finished within the grace window (graceful stop succeeded).
+        }
+        Err(_elapsed) => {
+            // Grace window elapsed — force-abort (SIGKILL analog), then reap the cancellation.
+            tracing::warn!("模拟未响应协作停止，强制终止: {}", simulation_id);
+            handle.task.abort();
+            let _ = (&mut handle.task).await; // observe the JoinError::Cancelled, ignore it
+        }
+    }
+
+    // (4) Abort the monitor task if present (sub-cycle c). It tails the action log and would
+    // otherwise outlive the run; aborting it here mirrors the daemon-thread teardown.
+    if let Some(monitor) = handle.monitor.take() {
+        monitor.abort();
+        let _ = monitor.await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1492,5 +2172,564 @@ mod tests {
         let detail = s.to_detail_dict();
         // to_dict (23) + recent_actions + rounds_count = 25
         assert_eq!(detail.len(), 25, "to_detail_dict must emit exactly 25 keys");
+    }
+}
+
+// ===========================================================================
+// Tests — SimulationRunner lifecycle (sub-cycle b)
+// ===========================================================================
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::agent::{Agent, AgentPool, Persona};
+    use crate::graph::KnowledgeGraph;
+    use crate::llm::{ChatMessage, ChatOptions, LlmClient};
+    use crate::services::graph_memory::GraphMemoryManager;
+    use crate::services::simulation_manager::SimulationManager;
+    use crate::sim::{SimConfig, SimEngine};
+    use async_trait::async_trait;
+    use std::env;
+    use std::pin::Pin;
+    use std::time::Duration;
+
+    // ---- Mock LLM: every agent thinks "idle"; the run advances ticks cheaply. ----
+    struct MockLlm;
+    #[async_trait]
+    impl LlmClient for MockLlm {
+        async fn complete(&self, _: &str) -> Result<String> {
+            Ok("Think(idle)".to_string())
+        }
+        async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+            Err(TeriError::Llm("not used".into()))
+        }
+        async fn stream(
+            &self,
+            _: &str,
+        ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            Err(TeriError::Llm("not used".into()))
+        }
+        async fn chat(&self, _: &[ChatMessage], _: &ChatOptions) -> Result<String> {
+            Err(TeriError::Llm("not used".into()))
+        }
+        async fn chat_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _: &[ChatMessage],
+            _: &ChatOptions,
+        ) -> Result<T> {
+            Err(TeriError::Llm("not used".into()))
+        }
+    }
+
+    fn temp_dir(suffix: &str) -> std::path::PathBuf {
+        let mut p = env::temp_dir();
+        p.push(format!(
+            "teri_test_sim_runner_lifecycle_{}_{}_{}",
+            std::process::id(),
+            suffix,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p
+    }
+
+    /// Build a `SimulationRunner<MockLlm>` over a fresh temp dir, returning it plus the dir
+    /// and the shared `SimulationManager` (so tests can prep configs + inspect state.json).
+    fn make_runner(
+        suffix: &str,
+    ) -> (SimulationRunner<MockLlm>, std::path::PathBuf, Arc<SimulationManager>) {
+        let dir = temp_dir(suffix);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manager = Arc::new(SimulationManager::new(&dir));
+        let graph_mgr = Arc::new(GraphMemoryManager::<MockLlm>::new());
+        let runner = SimulationRunner::new(&dir, graph_mgr, Arc::clone(&manager));
+        (runner, dir, manager)
+    }
+
+    /// Write a `simulation_config.json` with the given time_config under `{dir}/{sim_id}/`.
+    fn write_config(dir: &Path, sim_id: &str, total_hours: i64, minutes_per_round: i64) {
+        let sim_dir = dir.join(sim_id);
+        std::fs::create_dir_all(&sim_dir).unwrap();
+        let cfg = serde_json::json!({
+            "time_config": {
+                "total_simulation_hours": total_hours,
+                "minutes_per_round": minutes_per_round
+            }
+        });
+        std::fs::write(
+            sim_dir.join("simulation_config.json"),
+            serde_json::to_string_pretty(&cfg).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Build `RunInputs` for a short simulation (max_ticks ticks, 1 agent).
+    fn run_inputs(max_ticks: u32) -> RunInputs<MockLlm> {
+        let mut pool = AgentPool::new();
+        pool.add_agent(Agent::new(Persona {
+            name: "A".into(),
+            background: "test".into(),
+            traits: vec![],
+            role: "none".into(),
+            social: None,
+        }));
+        RunInputs {
+            engine: SimEngine::new(SimConfig::new(max_ticks, 1)),
+            pool,
+            graph: KnowledgeGraph::new(),
+            llm: Arc::new(MockLlm),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // start_simulation
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn start_missing_config_errors() {
+        let (runner, _dir, _mgr) = make_runner("missing_cfg");
+        // No simulation_config.json written → ValueError analog.
+        let res = runner
+            .start_simulation("sim-x", "parallel", None, false, None, run_inputs(1), None)
+            .await;
+        assert!(res.is_err(), "missing config must error");
+        let msg = format!("{}", res.err().unwrap());
+        assert!(
+            msg.contains("模拟配置不存在"),
+            "error must be the missing-config message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_computes_total_rounds() {
+        let (runner, dir, _mgr) = make_runner("total_rounds");
+        // total_hours=72, minutes_per_round=30 → int(72*60/30) = 144.
+        write_config(&dir, "sim-tr", 72, 30);
+        let state = runner
+            .start_simulation("sim-tr", "parallel", None, false, None, run_inputs(2), None)
+            .await
+            .expect("start should succeed");
+        assert_eq!(state.total_rounds, 144);
+        assert_eq!(state.total_simulation_hours, 72);
+        assert_eq!(state.runner_status, RunnerStatus::Running);
+        // parallel → both platforms running
+        assert!(state.twitter_running);
+        assert!(state.reddit_running);
+        assert!(state.started_at.is_some());
+        // process_pid is [≠] value-only → always None in teri.
+        assert!(state.process_pid.is_none());
+    }
+
+    #[tokio::test]
+    async fn start_max_rounds_truncates() {
+        let (runner, dir, _mgr) = make_runner("max_rounds");
+        write_config(&dir, "sim-mr", 72, 30); // 144 natural rounds
+        let state = runner
+            .start_simulation("sim-mr", "twitter", Some(10), false, None, run_inputs(2), None)
+            .await
+            .expect("start should succeed");
+        assert_eq!(state.total_rounds, 10, "max_rounds=10 must truncate 144 → 10");
+        // twitter-only → only twitter running
+        assert!(state.twitter_running);
+        assert!(!state.reddit_running);
+    }
+
+    #[tokio::test]
+    async fn start_max_rounds_no_truncate_when_larger() {
+        let (runner, dir, _mgr) = make_runner("max_no_trunc");
+        write_config(&dir, "sim-nt", 1, 30); // int(1*60/30) = 2 rounds
+        let state = runner
+            .start_simulation("sim-nt", "reddit", Some(100), false, None, run_inputs(2), None)
+            .await
+            .expect("start should succeed");
+        // min(2, 100) = 2 — no truncation when max_rounds exceeds natural.
+        assert_eq!(state.total_rounds, 2);
+        assert!(!state.twitter_running);
+        assert!(state.reddit_running);
+    }
+
+    #[tokio::test]
+    async fn start_registers_run_and_persists() {
+        let (runner, dir, _mgr) = make_runner("registers");
+        write_config(&dir, "sim-reg", 72, 30);
+        let _ = runner
+            .start_simulation("sim-reg", "parallel", Some(2), false, None, run_inputs(2), None)
+            .await
+            .expect("start should succeed");
+
+        // run_state.json persisted with status running (or completed, if the 2-tick run
+        // finished already — both are acceptable post-start; the key is it was persisted).
+        let on_disk = load_run_state(&dir, "sim-reg").unwrap().expect("run_state.json persisted");
+        assert_eq!(on_disk.total_rounds, 2);
+
+        // get_run_state returns the live (registered) state.
+        let live = runner.get_run_state("sim-reg").await.unwrap().expect("registered");
+        assert_eq!(live.simulation_id, "sim-reg");
+    }
+
+    #[tokio::test]
+    async fn start_rejects_when_already_running() {
+        let (runner, dir, _mgr) = make_runner("reject_running");
+        write_config(&dir, "sim-dup", 72, 30);
+        // First start with a long-enough run that it stays Running (50 ticks, 1 agent —
+        // the MockLlm is instant, so this MAY complete fast; to make it reliably "running"
+        // we instead seed a Running state directly via a first start and check the in-memory
+        // handle's recorded status, which is Running at registration time).
+        let _ = runner
+            .start_simulation("sim-dup", "parallel", Some(50), false, None, run_inputs(50), None)
+            .await
+            .expect("first start ok");
+
+        // The handle's recorded state is Running. A second start must reject.
+        let res = runner
+            .start_simulation("sim-dup", "parallel", Some(50), false, None, run_inputs(50), None)
+            .await;
+        assert!(res.is_err(), "second concurrent start must reject");
+        assert!(format!("{}", res.err().unwrap()).contains("模拟已在运行中"));
+    }
+
+    // -----------------------------------------------------------------------
+    // get_running_simulations
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_running_lists_active_runs() {
+        let (runner, dir, _mgr) = make_runner("get_running");
+        write_config(&dir, "sim-run-a", 72, 30);
+        let _ = runner
+            .start_simulation("sim-run-a", "parallel", Some(50), false, None, run_inputs(50), None)
+            .await
+            .expect("start ok");
+        // The just-registered run is tracked. (It may finish quickly under MockLlm; if so it
+        // is reported as not-running, which is the faithful poll()-based contract.)
+        let running = runner.get_running_simulations().await;
+        // Either it is still running (listed) or finished (not listed) — both honor the
+        // is_finished() contract. We assert the method returns without panicking and that any
+        // listed id is the one we started.
+        for id in &running {
+            assert_eq!(id, "sim-run-a");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // stop_simulation
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn stop_nonexistent_errors() {
+        let (runner, _dir, _mgr) = make_runner("stop_missing");
+        let res = runner.stop_simulation("ghost").await;
+        assert!(res.is_err());
+        assert!(format!("{}", res.err().unwrap()).contains("模拟不存在"));
+    }
+
+    #[tokio::test]
+    async fn stop_not_running_errors() {
+        let (runner, dir, _mgr) = make_runner("stop_not_running");
+        // Persist a run_state.json in COMPLETED state (not Running/Paused) — stop must reject.
+        let mut s = SimulationRunState::new("sim-done".to_string());
+        s.runner_status = RunnerStatus::Completed;
+        save_run_state(&dir, &s).unwrap();
+
+        let res = runner.stop_simulation("sim-done").await;
+        assert!(res.is_err(), "stop on a non-running sim must error");
+        assert!(format!("{}", res.err().unwrap()).contains("模拟未在运行"));
+    }
+
+    #[tokio::test]
+    async fn stop_transitions_to_stopped() {
+        let (runner, dir, _mgr) = make_runner("stop_ok");
+        write_config(&dir, "sim-stop", 72, 30);
+        // Start a long run so it is reliably Running at stop time.
+        let _ = runner
+            .start_simulation(
+                "sim-stop",
+                "parallel",
+                Some(1000),
+                false,
+                None,
+                run_inputs(1000),
+                None,
+            )
+            .await
+            .expect("start ok");
+
+        let stopped = runner.stop_simulation("sim-stop").await.expect("stop ok");
+        assert_eq!(stopped.runner_status, RunnerStatus::Stopped);
+        assert!(!stopped.twitter_running);
+        assert!(!stopped.reddit_running);
+        assert!(stopped.completed_at.is_some());
+
+        // The run is no longer tracked as running.
+        let running = runner.get_running_simulations().await;
+        assert!(!running.contains(&"sim-stop".to_string()));
+
+        // run_state.json reflects STOPPED.
+        let on_disk = load_run_state(&dir, "sim-stop").unwrap().unwrap();
+        assert_eq!(on_disk.runner_status, RunnerStatus::Stopped);
+    }
+
+    #[tokio::test]
+    async fn stop_completes_within_grace_window() {
+        // The cooperative stop must finish well within (a small multiple of) the grace window
+        // for a fast-yielding sim — proving the graceful path, not the force-abort.
+        let (runner, dir, _mgr) = make_runner("stop_grace");
+        write_config(&dir, "sim-grace", 72, 30);
+        let _ = runner
+            .start_simulation(
+                "sim-grace",
+                "parallel",
+                Some(1000),
+                false,
+                None,
+                run_inputs(1000),
+                None,
+            )
+            .await
+            .expect("start ok");
+
+        let t0 = std::time::Instant::now();
+        let _ = runner.stop_simulation("sim-grace").await.expect("stop ok");
+        let elapsed = t0.elapsed();
+        // Must not block the full grace window (the cooperative flag stops it between ticks).
+        assert!(
+            elapsed < STOP_GRACE + Duration::from_secs(2),
+            "stop took too long: {:?}",
+            elapsed
+        );
+    }
+
+    /// FAIL-1 regression: the two terminate callers use DIFFERENT grace windows, matching the
+    /// per-caller Python `_terminate_process` timeouts.
+    ///   - `stop_simulation` → no timeout arg (`simulation_runner.py:793`) → default `timeout=10`
+    ///     (`simulation_runner.py:721`) → [`STOP_GRACE`] == 10s.
+    ///   - `cleanup_all`     → `timeout=5` (`simulation_runner.py:1224`)    → [`CLEANUP_GRACE`] == 5s.
+    ///
+    /// A sim that exits gracefully between 5–10s must be allowed to finish under
+    /// `stop_simulation` but force-aborted under `cleanup_all`.
+    #[test]
+    fn terminate_grace_windows_match_python_defaults() {
+        // stop_simulation's window is the Python default (10s), NOT the cleanup window (5s).
+        assert_eq!(
+            STOP_GRACE,
+            Duration::from_secs(10),
+            "stop_simulation must use the Python `_terminate_process` default timeout=10s (py:721/793)"
+        );
+        // cleanup_all's window is the explicit `timeout=5` (5s).
+        assert_eq!(
+            CLEANUP_GRACE,
+            Duration::from_secs(5),
+            "cleanup_all must use the explicit Python `_terminate_process(timeout=5)` (py:1224)"
+        );
+        // The two windows MUST differ — the 5s narrowing that lumped them is the FAIL-1 bug.
+        assert_ne!(
+            STOP_GRACE, CLEANUP_GRACE,
+            "the stop vs cleanup grace windows must be distinct (10s vs 5s)"
+        );
+        // The 5–10s band where stop tolerates but cleanup aborts must be non-empty.
+        assert!(STOP_GRACE > CLEANUP_GRACE);
+    }
+
+    // -----------------------------------------------------------------------
+    // cleanup_all
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cleanup_all_is_idempotent() {
+        let (runner, _dir, _mgr) = make_runner("cleanup_idem");
+        // No runs, no updaters → silent return, but the idempotency flag still flips.
+        runner.cleanup_all().await;
+        // Second call must be a no-op (returns immediately on the flag).
+        runner.cleanup_all().await;
+        // No panic / no double-cleanup is the assertion; reaching here is success.
+    }
+
+    #[tokio::test]
+    async fn cleanup_all_terminates_and_records() {
+        let (runner, dir, manager) = make_runner("cleanup_terminate");
+        // Create a state.json (U-023) so the secondary write has a file to edit.
+        let created = manager.create_simulation("proj", "graph", true, true).unwrap();
+        let sim_id = created.simulation_id.clone();
+        write_config(&dir, &sim_id, 72, 30);
+
+        let _ = runner
+            .start_simulation(&sim_id, "parallel", Some(1000), false, None, run_inputs(1000), None)
+            .await
+            .expect("start ok");
+
+        runner.cleanup_all().await;
+
+        // run_state.json must be STOPPED with the shutdown error message.
+        let on_disk = load_run_state(&dir, &sim_id).unwrap().unwrap();
+        assert_eq!(on_disk.runner_status, RunnerStatus::Stopped);
+        assert_eq!(on_disk.error.as_deref(), Some("服务器关闭，模拟被终止"));
+        assert!(on_disk.completed_at.is_some());
+
+        // Secondary state.json write: status flipped to "stopped".
+        let reloaded = manager.get_simulation(&sim_id).unwrap().unwrap();
+        assert_eq!(reloaded.status, crate::services::simulation_manager::SimulationStatus::Stopped);
+
+        // After cleanup the runs map is drained.
+        assert!(runner.get_running_simulations().await.is_empty());
+    }
+
+    /// Spin a freshly-started run until its task is finished (the in-process analog of
+    /// `process.poll() is not None`), bounded so the test can't hang.
+    async fn wait_until_finished(runner: &SimulationRunner<MockLlm>, sim_id: &str) {
+        for _ in 0..200 {
+            if !runner.get_running_simulations().await.contains(&sim_id.to_string()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("run {sim_id} did not finish within the bound");
+    }
+
+    /// Read the raw `status` field out of `{dir}/{sim_id}/state.json`.
+    fn read_state_json_status(dir: &Path, sim_id: &str) -> String {
+        let raw = std::fs::read_to_string(dir.join(sim_id).join("state.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        v["status"].as_str().unwrap().to_string()
+    }
+
+    /// FAIL-2 regression: a FINISHED/completed run must SURVIVE `cleanup_all` with its persisted
+    /// state INTACT. Python gates the whole record-keeping body behind `if process.poll() is None:`
+    /// (`simulation_runner.py:1219`) — a completed run is skipped entirely (not terminated, not
+    /// state-written), keeping its final COMPLETED state. Overwriting it with STOPPED + the
+    /// shutdown error message would corrupt a normally-completed sim's record (the bug).
+    #[tokio::test]
+    async fn cleanup_all_preserves_finished_run_state() {
+        let (runner, dir, manager) = make_runner("cleanup_finished_survives");
+        // state.json (U-023) so we can prove the secondary write does NOT fire for a finished run.
+        let created = manager.create_simulation("proj", "graph", true, true).unwrap();
+        let sim_id = created.simulation_id.clone();
+        write_config(&dir, &sim_id, 72, 30);
+
+        // Start a TINY run so the task finishes near-instantly under MockLlm.
+        let _ = runner
+            .start_simulation(&sim_id, "parallel", Some(1), false, None, run_inputs(1), None)
+            .await
+            .expect("start ok");
+
+        // Wait until the handle reports finished (poll() is not None analog).
+        wait_until_finished(&runner, &sim_id).await;
+        assert!(
+            !runner.get_running_simulations().await.contains(&sim_id),
+            "run must be finished before we simulate a completed record"
+        );
+
+        // Simulate the run having recorded its OWN final COMPLETED state (run_state.json) and a
+        // COMPLETED state.json — the state a normally-finished sim would leave on disk.
+        let mut final_state = SimulationRunState::new(sim_id.clone());
+        final_state.runner_status = RunnerStatus::Completed;
+        final_state.completed_at = Some("2026-06-17T12:00:00".to_string());
+        final_state.error = None;
+        save_run_state(&dir, &final_state).unwrap();
+        // Overwrite state.json status to "completed" directly on disk (raw, like the engine would).
+        {
+            let sf = dir.join(&sim_id).join("state.json");
+            let raw = std::fs::read_to_string(&sf).unwrap();
+            let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            v["status"] = serde_json::Value::String("completed".to_string());
+            std::fs::write(&sf, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        }
+
+        // Run cleanup_all — the finished run must be DRAINED but NOT state-overwritten.
+        runner.cleanup_all().await;
+
+        // run_state.json: still COMPLETED, no shutdown error, original completed_at intact.
+        let on_disk = load_run_state(&dir, &sim_id).unwrap().unwrap();
+        assert_eq!(
+            on_disk.runner_status,
+            RunnerStatus::Completed,
+            "finished run's run_state.json must NOT be clobbered to STOPPED by cleanup_all"
+        );
+        assert_eq!(
+            on_disk.error, None,
+            "finished run must NOT acquire the '服务器关闭' shutdown error"
+        );
+        assert_eq!(
+            on_disk.completed_at.as_deref(),
+            Some("2026-06-17T12:00:00"),
+            "finished run's completed_at must be untouched"
+        );
+
+        // state.json: secondary write must NOT have fired — status stays "completed".
+        assert_eq!(
+            read_state_json_status(&dir, &sim_id),
+            "completed",
+            "finished run's state.json must NOT be flipped to 'stopped' by cleanup_all"
+        );
+
+        // The run is still DRAINED from the map (cleanup did remove it — Python _processes.clear()).
+        assert!(runner.get_running_simulations().await.is_empty());
+    }
+
+    /// FAIL-2 companion: in one cleanup_all, a RUNNING run is stopped+error-recorded while a
+    /// FINISHED run's state is preserved — proving the gate discriminates the two, not all-or-nothing.
+    #[tokio::test]
+    async fn cleanup_all_stops_running_but_skips_finished() {
+        let (runner, dir, manager) = make_runner("cleanup_mixed");
+
+        // --- The FINISHED run ---
+        let done = manager.create_simulation("proj", "g-done", true, true).unwrap();
+        let done_id = done.simulation_id.clone();
+        write_config(&dir, &done_id, 72, 30);
+        let _ = runner
+            .start_simulation(&done_id, "parallel", Some(1), false, None, run_inputs(1), None)
+            .await
+            .expect("start finished-run ok");
+        wait_until_finished(&runner, &done_id).await;
+        // Record its COMPLETED final state.
+        let mut done_state = SimulationRunState::new(done_id.clone());
+        done_state.runner_status = RunnerStatus::Completed;
+        done_state.completed_at = Some("2026-06-17T12:00:00".to_string());
+        save_run_state(&dir, &done_state).unwrap();
+        {
+            let sf = dir.join(&done_id).join("state.json");
+            let raw = std::fs::read_to_string(&sf).unwrap();
+            let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            v["status"] = serde_json::Value::String("completed".to_string());
+            std::fs::write(&sf, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        }
+
+        // --- The still-RUNNING run (long, so it is reliably running at cleanup time) ---
+        let live = manager.create_simulation("proj", "g-live", true, true).unwrap();
+        let live_id = live.simulation_id.clone();
+        write_config(&dir, &live_id, 72, 30);
+        let _ = runner
+            .start_simulation(&live_id, "parallel", Some(1000), false, None, run_inputs(1000), None)
+            .await
+            .expect("start running-run ok");
+        assert!(
+            runner.get_running_simulations().await.contains(&live_id),
+            "the long run must still be running before cleanup"
+        );
+
+        // One cleanup over BOTH.
+        runner.cleanup_all().await;
+
+        // Finished run: state preserved (COMPLETED, no shutdown error, status "completed").
+        let done_disk = load_run_state(&dir, &done_id).unwrap().unwrap();
+        assert_eq!(done_disk.runner_status, RunnerStatus::Completed);
+        assert_eq!(done_disk.error, None);
+        assert_eq!(read_state_json_status(&dir, &done_id), "completed");
+
+        // Running run: STOPPED + shutdown error recorded, state.json flipped to "stopped".
+        let live_disk = load_run_state(&dir, &live_id).unwrap().unwrap();
+        assert_eq!(
+            live_disk.runner_status,
+            RunnerStatus::Stopped,
+            "the still-running run MUST be stopped by cleanup_all"
+        );
+        assert_eq!(live_disk.error.as_deref(), Some("服务器关闭，模拟被终止"));
+        assert!(!live_disk.twitter_running);
+        assert!(!live_disk.reddit_running);
+        assert_eq!(read_state_json_status(&dir, &live_id), "stopped");
+
+        // Both drained.
+        assert!(runner.get_running_simulations().await.is_empty());
     }
 }
