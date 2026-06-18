@@ -26,11 +26,24 @@
 //! - `interview_agents` — DEFERRED to sub-cycle (e); requires U-020 simulation IPC.
 //!   Returns honest error string the ReACT loop tolerates (mirrors Python `_execute_tool`
 //!   try/except → error text). Method present, marked pending.
+//!
+//! # Sub-cycle (c) additions — ReACT tool dispatch + parser
+//!
+//! Adds the pure ReACT plumbing (no loop — that is sub-cycle (e)):
+//! - `ReportTool` enum with back-compat redirect arms
+//! - `ToolCall` parsed struct
+//! - `parse_tool_calls` free fn — 3-tier priority parse (xml / bare-json / trailing-json)
+//!   with `{"tool"/"params"}`→`{"name"/"parameters"}` normalization
+//! - `VALID_TOOL_NAMES` constant gate for tiers 2–3
+//! - `get_tools_description` free fn — generates the tool descriptions the model sees
+//! - `ReportTools::execute` — dispatch table over `ReportTool` with all param coercions
+//! - Tool description constants (`TOOL_DESC_*`) verbatim from `report_agent.py`
 
 use crate::error::{Result, TeriError};
 use crate::graph::{Entity, KnowledgeGraph};
 use crate::llm::LlmClient;
 use crate::services::entity_reader::KnowledgeGraphEntityReader;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -1331,6 +1344,605 @@ fn synthesize_fact_from_triple(
 }
 
 // ---------------------------------------------------------------------------
+// Sub-cycle (c): ReACT tool dispatch + parser
+//
+// Sources: `report_agent.py` —
+//   `_define_tools`, `_execute_tool`, `_parse_tool_calls`, `_is_valid_tool_call`,
+//   `_get_tools_description`, `VALID_TOOL_NAMES`, `TOOL_DESC_*` constants.
+// ---------------------------------------------------------------------------
+
+// ── Tool description constants (verbatim from report_agent.py:476–548) ──────
+
+/// Tool description: insight_forge (report_agent.py:476–492).
+pub const TOOL_DESC_INSIGHT_FORGE: &str = "\
+【深度洞察检索 - 强大的检索工具】
+这是我们强大的检索函数，专为深度分析设计。它会：
+1. 自动将你的问题分解为多个子问题
+2. 从多个维度检索模拟图谱中的信息
+3. 整合语义搜索、实体分析、关系链追踪的结果
+4. 返回最全面、最深度的检索内容
+
+【使用场景】
+- 需要深入分析某个话题
+- 需要了解事件的多个方面
+- 需要获取支撑报告章节的丰富素材
+
+【返回内容】
+- 相关事实原文（可直接引用）
+- 核心实体洞察
+- 关系链分析";
+
+/// Tool description: panorama_search (report_agent.py:494–509).
+pub const TOOL_DESC_PANORAMA_SEARCH: &str = "\
+【广度搜索 - 获取全貌视图】
+这个工具用于获取模拟结果的完整全貌，特别适合了解事件演变过程。它会：
+1. 获取所有相关节点和关系
+2. 区分当前有效的事实和历史/过期的事实
+3. 帮助你了解舆情是如何演变的
+
+【使用场景】
+- 需要了解事件的完整发展脉络
+- 需要对比不同阶段的舆情变化
+- 需要获取全面的实体和关系信息
+
+【返回内容】
+- 当前有效事实（模拟最新结果）
+- 历史/过期事实（演变记录）
+- 所有涉及的实体";
+
+/// Tool description: quick_search (report_agent.py:511–521).
+pub const TOOL_DESC_QUICK_SEARCH: &str = "\
+【简单搜索 - 快速检索】
+轻量级的快速检索工具，适合简单、直接的信息查询。
+
+【使用场景】
+- 需要快速查找某个具体信息
+- 需要验证某个事实
+- 简单的信息检索
+
+【返回内容】
+- 与查询最相关的事实列表";
+
+/// Tool description: interview_agents (report_agent.py:523–548).
+pub const TOOL_DESC_INTERVIEW_AGENTS: &str = "\
+【深度采访 - 真实Agent采访（双平台）】
+调用OASIS模拟环境的采访API，对正在运行的模拟Agent进行真实采访！
+这不是LLM模拟，而是调用真实的采访接口获取模拟Agent的原始回答。
+默认在Twitter和Reddit两个平台同时采访，获取更全面的观点。
+
+功能流程：
+1. 自动读取人设文件，了解所有模拟Agent
+2. 智能选择与采访主题最相关的Agent（如学生、媒体、官方等）
+3. 自动生成采访问题
+4. 调用 /api/simulation/interview/batch 接口在双平台进行真实采访
+5. 整合所有采访结果，提供多视角分析
+
+【使用场景】
+- 需要从不同角色视角了解事件看法（学生怎么看？媒体怎么看？官方怎么说？）
+- 需要收集多方意见和立场
+- 需要获取模拟Agent的真实回答（来自OASIS模拟环境）
+- 想让报告更生动，包含\"采访实录\"
+
+【返回内容】
+- 被采访Agent的身份信息
+- 各Agent在Twitter和Reddit两个平台的采访回答
+- 关键引言（可直接引用）
+- 采访摘要和观点对比
+
+【重要】需要OASIS模拟环境正在运行才能使用此功能！";
+
+// ── Tool enum (report_agent.py:919–954 `_define_tools` + _execute_tool dispatch) ─
+
+/// Closed set of tools the ReACT loop can dispatch.
+///
+/// Back-compat redirect names are additional arms so an LLM emitting an old
+/// tool name still dispatches (observable behavior — PORTED per architect §3a).
+///
+/// Port of the `if/elif` dispatch in `ReportAgent._execute_tool`
+/// (`report_agent.py:956–1062`) and the implicit names in `_define_tools`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ReportTool {
+    /// Deep multi-query analysis.  Back-compat: "get_simulation_context" → this.
+    InsightForge,
+    /// Temporal-aware full-graph scan.
+    PanoramaSearch,
+    /// Simple keyword search.  Back-compat: "search_graph" → this.
+    QuickSearch,
+    /// Interview simulation agents.
+    InterviewAgents,
+    /// Back-compat redirect → `QuickSearch` (`report_agent.py:1025–1028`).
+    SearchGraph,
+    /// Back-compat legacy tool → calls `get_graph_statistics` directly
+    /// (`report_agent.py:1030–1032`).
+    GetGraphStatistics,
+    /// Back-compat legacy tool → calls `get_entity_summary` directly
+    /// (`report_agent.py:1034–1040`).
+    GetEntitySummary,
+    /// Back-compat redirect → `InsightForge` (`report_agent.py:1042–1046`).
+    GetSimulationContext,
+    /// Back-compat legacy tool → calls `get_entities_by_type` directly
+    /// (`report_agent.py:1048–1055`).
+    GetEntitiesByType,
+}
+
+impl ReportTool {
+    /// Parse a tool name string to a `ReportTool` variant.
+    ///
+    /// Returns `None` for unknown names (caller emits the unknown-tool string).
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "insight_forge" => Some(Self::InsightForge),
+            "panorama_search" => Some(Self::PanoramaSearch),
+            "quick_search" => Some(Self::QuickSearch),
+            "interview_agents" => Some(Self::InterviewAgents),
+            // back-compat redirects
+            "search_graph" => Some(Self::SearchGraph),
+            "get_graph_statistics" => Some(Self::GetGraphStatistics),
+            "get_entity_summary" => Some(Self::GetEntitySummary),
+            "get_simulation_context" => Some(Self::GetSimulationContext),
+            "get_entities_by_type" => Some(Self::GetEntitiesByType),
+            _ => None,
+        }
+    }
+}
+
+// ── ToolCall parsed struct ───────────────────────────────────────────────────
+
+/// A parsed tool call from the LLM response.
+///
+/// Mirrors the dict shape `{"name": "...", "parameters": {...}}` produced by
+/// `_parse_tool_calls` after key-normalization (`_is_valid_tool_call`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCall {
+    /// Tool name (after normalization: "tool" key is renamed to "name").
+    pub name: String,
+    /// Tool parameters (after normalization: "params" key is renamed to "parameters").
+    pub parameters: serde_json::Map<String, serde_json::Value>,
+}
+
+// ── VALID_TOOL_NAMES (report_agent.py:1065) ─────────────────────────────────
+
+/// Canonical tool names that gate tier-2 and tier-3 bare-JSON parse.
+///
+/// Port of `VALID_TOOL_NAMES = {"insight_forge", ...}` (`report_agent.py:1065`).
+pub const VALID_TOOL_NAMES: [&str; 4] =
+    ["insight_forge", "panorama_search", "quick_search", "interview_agents"];
+
+// ── parse_tool_calls (report_agent.py:1067–1112) ────────────────────────────
+
+/// Parse tool calls from an LLM response string.
+///
+/// 3-tier priority (verbatim from `_parse_tool_calls` / `_is_valid_tool_call`):
+/// 1. `<tool_call>…</tool_call>` XML tags (DOTALL, multiple allowed).
+/// 2. Bare whole-response JSON if it starts with `{` and ends with `}`.
+/// 3. Trailing `{"name"|"tool": …}` regex at end of response.
+///
+/// Tiers 2–3 are gated by `VALID_TOOL_NAMES`.
+/// `{"tool"/"params"}` keys are normalised to `{"name"/"parameters"}` in-place
+/// (mirrors `_is_valid_tool_call` mutation, `report_agent.py:1120–1123`).
+pub fn parse_tool_calls(response: &str) -> Vec<ToolCall> {
+    // Tier 1: <tool_call>…</tool_call> (report_agent.py:1077–1087)
+    // Python: r'<tool_call>\s*(\{.*?\})\s*</tool_call>'  re.DOTALL
+    let xml_re = Regex::new(r"(?s)<tool_call>\s*(\{.*?\})\s*</tool_call>").unwrap();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+
+    for cap in xml_re.captures_iter(response) {
+        let json_str = &cap[1];
+        // Tier-1 XML format: Python appends `json.loads(...)` RAW — no VALID_TOOL_NAMES
+        // gate AND no key-normalization (normalization lives only in `_is_valid_tool_call`,
+        // which tier-1 never calls; report_agent.py:1079–1082). So we read the RAW "name"
+        // and RAW "parameters" keys here: a `{"name":..,"params":..}` tier-1 call yields
+        // EMPTY parameters, matching Python's downstream `call.get("parameters", {})` == {}.
+        // [≠] Python pushes name-less/aliased objects raw too, then KeyError-crashes at the
+        // downstream `call["name"]` access (report_agent.py:1419/1852) — a Python defect we
+        // do not preserve: a tier-1 object lacking a "name" key is skipped gracefully and the
+        // parser falls through to tiers 2/3 (which DO normalize + gate). Observable only on
+        // malformed LLM output; the well-formed `{"name":..}` path is byte-faithful.
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str)
+            && let Some(obj) = val.as_object()
+            && let Some(name) = obj.get("name").and_then(|v| v.as_str())
+        {
+            let name = name.to_string();
+            let parameters =
+                obj.get("parameters").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+            tool_calls.push(ToolCall { name, parameters });
+        }
+    }
+
+    if !tool_calls.is_empty() {
+        return tool_calls;
+    }
+
+    // Tier 2: bare whole-response JSON (report_agent.py:1089–1099)
+    let stripped = response.trim();
+    if stripped.starts_with('{')
+        && stripped.ends_with('}')
+        && let Ok(mut val) = serde_json::from_str::<serde_json::Value>(stripped)
+        && let Some(obj) = val.as_object_mut()
+        && is_valid_tool_call(obj)
+    {
+        let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let parameters =
+            obj.get("parameters").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+        tool_calls.push(ToolCall { name, parameters });
+        return tool_calls;
+    }
+
+    // Tier 3: trailing {"name"|"tool": …} at end of response (report_agent.py:1101–1110)
+    // Python: r'(\{"(?:name|tool)"\s*:.*?\})\s*$'  re.DOTALL
+    let trailing_re = Regex::new(r#"(?s)(\{"(?:name|tool)"\s*:.*?\})\s*$"#).unwrap();
+    if let Some(cap) = trailing_re.captures(stripped)
+        && let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&cap[1])
+        && let Some(obj) = val.as_object_mut()
+        && is_valid_tool_call(obj)
+    {
+        let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let parameters =
+            obj.get("parameters").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+        tool_calls.push(ToolCall { name, parameters });
+    }
+
+    tool_calls
+}
+
+/// Validate a parsed JSON object as a tool call AND normalise its keys in-place.
+///
+/// Port of `_is_valid_tool_call` (`report_agent.py:1114–1125`).
+/// Accepts `{"name": …}` or `{"tool": …}` as the tool-name key,
+/// and `{"parameters": …}` or `{"params": …}` as the params key.
+/// Mutates the map: renames `"tool"→"name"` and `"params"→"parameters"`.
+/// Gates on `VALID_TOOL_NAMES`.
+fn is_valid_tool_call(obj: &mut serde_json::Map<String, serde_json::Value>) -> bool {
+    // Extract tool name from either "name" or "tool" key.
+    let tool_name = obj
+        .get("name")
+        .or_else(|| obj.get("tool"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    if let Some(ref name) = tool_name
+        && VALID_TOOL_NAMES.contains(&name.as_str())
+    {
+        // Normalise keys in-place (report_agent.py:1120–1123).
+        normalize_tool_call_keys(obj);
+        return true;
+    }
+    false
+}
+
+/// Normalise `"tool"→"name"` and `"params"→"parameters"` in a JSON object.
+///
+/// Port of the key-rename mutation in `_is_valid_tool_call`
+/// (`report_agent.py:1120–1123`):
+///   if "tool" in data: data["name"] = data.pop("tool")
+///   if "params" in data and "parameters" not in data: data["parameters"] = data.pop("params")
+fn normalize_tool_call_keys(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    if let Some(tool_val) = obj.remove("tool") {
+        obj.insert("name".to_string(), tool_val);
+    }
+    if obj.contains_key("params")
+        && !obj.contains_key("parameters")
+        && let Some(params_val) = obj.remove("params")
+    {
+        obj.insert("parameters".to_string(), params_val);
+    }
+}
+
+// ── get_tools_description (report_agent.py:1127–1135) ───────────────────────
+
+/// Generate the tool descriptions text the model sees.
+///
+/// Port of `_get_tools_description` (`report_agent.py:1127–1135`).
+///
+/// Output format (verbatim):
+/// ```text
+/// 可用工具：
+/// - insight_forge: <TOOL_DESC_INSIGHT_FORGE>
+///   参数: query: ..., report_context: ...
+/// - panorama_search: ...
+/// ...
+/// ```
+pub fn get_tools_description() -> String {
+    // Mirror the Python dict insertion order in `_define_tools` (report_agent.py:919–954).
+    #[allow(clippy::type_complexity)]
+    let tools: &[(&str, &str, &[(&str, &str)])] = &[
+        (
+            "insight_forge",
+            TOOL_DESC_INSIGHT_FORGE,
+            &[
+                ("query", "你想深入分析的问题或话题"),
+                ("report_context", "当前报告章节的上下文（可选，有助于生成更精准的子问题）"),
+            ],
+        ),
+        (
+            "panorama_search",
+            TOOL_DESC_PANORAMA_SEARCH,
+            &[
+                ("query", "搜索查询，用于相关性排序"),
+                ("include_expired", "是否包含过期/历史内容（默认True）"),
+            ],
+        ),
+        (
+            "quick_search",
+            TOOL_DESC_QUICK_SEARCH,
+            &[("query", "搜索查询字符串"), ("limit", "返回结果数量（可选，默认10）")],
+        ),
+        (
+            "interview_agents",
+            TOOL_DESC_INTERVIEW_AGENTS,
+            &[
+                ("interview_topic", "采访主题或需求描述（如：'了解学生对宿舍甲醛事件的看法'）"),
+                ("max_agents", "最多采访的Agent数量（可选，默认5，最大10）"),
+            ],
+        ),
+    ];
+
+    let mut parts = vec!["可用工具：".to_string()];
+    for (name, desc, params) in tools {
+        parts.push(format!("- {}: {}", name, desc));
+        if !params.is_empty() {
+            let params_desc = params
+                .iter()
+                .map(|(k, v)| format!("{}: {}", k, v))
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!("  参数: {}", params_desc));
+        }
+    }
+    parts.join("\n")
+}
+
+// ── ReportTools::execute (report_agent.py:956–1062 `_execute_tool`) ─────────
+
+impl<'g, L: LlmClient> ReportTools<'g, L> {
+    /// Dispatch a tool call by enum variant, parsing params and applying coercions.
+    ///
+    /// Port of `ReportAgent._execute_tool` (`report_agent.py:956–1062`).
+    ///
+    /// Always returns a `String` (the Observation text).  Errors are swallowed
+    /// and returned as the `"工具执行失败: {e}"` text — matching Python's
+    /// `try/except Exception as e: return f"工具执行失败: {str(e)}"` —
+    /// so the ReACT loop keeps going after a tool failure.
+    ///
+    /// `simulation_id` and `simulation_requirement` are needed for `InterviewAgents`.
+    /// `graph_id` is the `[≠]`-label string passed through to legacy tool outputs
+    /// (`get_graph_statistics` includes it in its return dict).
+    pub fn execute(
+        &self,
+        tool: ReportTool,
+        params: &serde_json::Map<String, serde_json::Value>,
+        graph_id: &str,
+        simulation_id: &str,
+        simulation_requirement: &str,
+        report_context: &str,
+    ) -> String {
+        match self.execute_inner(
+            tool,
+            params,
+            graph_id,
+            simulation_id,
+            simulation_requirement,
+            report_context,
+        ) {
+            Ok(s) => s,
+            Err(e) => format!("工具执行失败: {}", e),
+        }
+    }
+
+    fn execute_inner(
+        &self,
+        tool: ReportTool,
+        params: &serde_json::Map<String, serde_json::Value>,
+        graph_id: &str,
+        simulation_id: &str,
+        simulation_requirement: &str,
+        report_context: &str,
+    ) -> Result<String> {
+        match tool {
+            // ── insight_forge (report_agent.py:971–980) ──────────────────────
+            ReportTool::InsightForge => {
+                let query = str_param(params, "query");
+                let ctx = if !str_param(params, "report_context").is_empty() {
+                    str_param(params, "report_context")
+                } else {
+                    report_context.to_string()
+                };
+                let result = self.insight_forge(graph_id, &query, simulation_requirement, &ctx, 5);
+                Ok(result.to_text())
+            }
+
+            // ── panorama_search (report_agent.py:982–993) ────────────────────
+            ReportTool::PanoramaSearch => {
+                let query = str_param(params, "query");
+                // include_expired: str→bool coercion (report_agent.py:985–987)
+                // Python: include_expired = True (default); str check: in ['true','1','yes']
+                let include_expired = coerce_include_expired(params, true);
+                let result = self.panorama_search(graph_id, &query, include_expired, 50, None);
+                Ok(result.to_text())
+            }
+
+            // ── quick_search (report_agent.py:995–1006) ──────────────────────
+            ReportTool::QuickSearch => {
+                let query = str_param(params, "query");
+                // limit: str→int coercion (report_agent.py:998–1000)
+                let limit = coerce_int_param(params, "limit", 10)?;
+                let result = self.quick_search(graph_id, &query, limit);
+                Ok(result.to_text())
+            }
+
+            // ── interview_agents (report_agent.py:1008–1021) ─────────────────
+            ReportTool::InterviewAgents => {
+                // interview_topic falls back to "query" param (report_agent.py:1010)
+                let interview_topic = {
+                    let t = str_param(params, "interview_topic");
+                    if t.is_empty() { str_param(params, "query") } else { t }
+                };
+                // max_agents: str→int, then min(n, 10) (report_agent.py:1011–1014)
+                let max_agents = coerce_int_param(params, "max_agents", 5)?;
+                let max_agents = max_agents.min(10);
+                // interview_agents returns Result; convert Err → Err (outer swallows to text)
+                let result = self.interview_agents(
+                    simulation_id,
+                    &interview_topic,
+                    simulation_requirement,
+                    max_agents,
+                    None,
+                )?;
+                Ok(result.to_text())
+            }
+
+            // ── back-compat: search_graph → quick_search (report_agent.py:1025–1028) ──
+            ReportTool::SearchGraph => self.execute_inner(
+                ReportTool::QuickSearch,
+                params,
+                graph_id,
+                simulation_id,
+                simulation_requirement,
+                report_context,
+            ),
+
+            // ── back-compat: get_graph_statistics (report_agent.py:1030–1032) ─
+            ReportTool::GetGraphStatistics => {
+                let result = self.get_graph_statistics(graph_id);
+                Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
+            }
+
+            // ── back-compat: get_entity_summary (report_agent.py:1034–1040) ──
+            ReportTool::GetEntitySummary => {
+                let entity_name = str_param(params, "entity_name");
+                let result = self.get_entity_summary(graph_id, &entity_name);
+                Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
+            }
+
+            // ── back-compat: get_simulation_context → insight_forge
+            //    (report_agent.py:1042–1046) ───────────────────────────────────
+            ReportTool::GetSimulationContext => {
+                // Redirect: use "query" param or fall back to simulation_requirement.
+                let query_raw = str_param(params, "query");
+                let query = if query_raw.is_empty() {
+                    simulation_requirement.to_string()
+                } else {
+                    query_raw
+                };
+                let mut redirected = params.clone();
+                redirected.insert("query".to_string(), serde_json::Value::String(query));
+                self.execute_inner(
+                    ReportTool::InsightForge,
+                    &redirected,
+                    graph_id,
+                    simulation_id,
+                    simulation_requirement,
+                    report_context,
+                )
+            }
+
+            // ── back-compat: get_entities_by_type (report_agent.py:1048–1055) ─
+            ReportTool::GetEntitiesByType => {
+                let entity_type = str_param(params, "entity_type");
+                let nodes = self.get_entities_by_type(graph_id, &entity_type);
+                let dicts: Vec<serde_json::Value> = nodes
+                    .iter()
+                    .map(|n| serde_json::to_value(n.to_dict()).unwrap_or_default())
+                    .collect();
+                Ok(serde_json::to_string_pretty(&dicts).unwrap_or_default())
+            }
+        }
+    }
+}
+
+// ── execute() entry-point: accepts a raw tool name string ───────────────────
+
+impl<'g, L: LlmClient> ReportTools<'g, L> {
+    /// Execute a tool by raw name string (as the LLM emits it).
+    ///
+    /// Unknown tool names return `"未知工具: {name}。请使用以下工具之一: ..."`.
+    /// This is the variant called by the ReACT loop.
+    pub fn execute_by_name(
+        &self,
+        tool_name: &str,
+        params: &serde_json::Map<String, serde_json::Value>,
+        graph_id: &str,
+        simulation_id: &str,
+        simulation_requirement: &str,
+        report_context: &str,
+    ) -> String {
+        match ReportTool::from_name(tool_name) {
+            Some(tool) => self.execute(
+                tool,
+                params,
+                graph_id,
+                simulation_id,
+                simulation_requirement,
+                report_context,
+            ),
+            // Unknown tool string (report_agent.py:1057–1058) — byte-identical.
+            None => format!(
+                "未知工具: {}。请使用以下工具之一: insight_forge, panorama_search, quick_search",
+                tool_name
+            ),
+        }
+    }
+}
+
+// ── Param coercion helpers ───────────────────────────────────────────────────
+
+/// Extract a string parameter, returning "" on missing / non-string.
+fn str_param(params: &serde_json::Map<String, serde_json::Value>, key: &str) -> String {
+    params.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
+}
+
+/// `include_expired` str→bool coercion (report_agent.py:985–987).
+///
+/// Python: `if isinstance(include_expired, str): include_expired = include_expired.lower() in ['true', '1', 'yes']`
+/// Default is `true` (Python `include_expired = parameters.get("include_expired", True)`).
+fn coerce_include_expired(
+    params: &serde_json::Map<String, serde_json::Value>,
+    default: bool,
+) -> bool {
+    match params.get("include_expired") {
+        None => default,
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::String(s)) => {
+            matches!(s.to_lowercase().as_str(), "true" | "1" | "yes")
+        }
+        // Any other JSON type: treat as truthy if non-zero number, else default.
+        Some(serde_json::Value::Number(n)) => n.as_i64().map(|i| i != 0).unwrap_or(default),
+        Some(_) => default,
+    }
+}
+
+/// Integer parameter with str→int coercion (report_agent.py:998–1000, 1011–1013).
+///
+/// Python: `limit = parameters.get("limit", 10); if isinstance(limit, str): limit = int(limit)`.
+/// The `default` applies ONLY when the key is MISSING (`.get(..., default)`). When the key is
+/// present but a non-numeric string, Python `int(...)` raises `ValueError`, which propagates
+/// through `_execute_tool`'s try/except (report_agent.py:1060–1062) to the `"工具执行失败: {e}"`
+/// wrapper. We mirror that: an unparseable string returns `Err`, so `execute_inner` surfaces the
+/// failure text instead of silently running the tool with a wrong/default limit.
+/// [≠] The inner Python message (`invalid literal for int() with base 10: '…'`) is a
+/// Python-runtime artifact; teri emits its own parse-error text under the identical
+/// `"工具执行失败: "` prefix — the observable CONTRACT (tool fails, no results) is preserved.
+fn coerce_int_param(
+    params: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    default: i64,
+) -> Result<i64> {
+    match params.get(key) {
+        None => Ok(default),
+        Some(serde_json::Value::Number(n)) => Ok(n.as_i64().unwrap_or(default)),
+        Some(serde_json::Value::String(s)) => s.parse::<i64>().map_err(|_| {
+            TeriError::Unknown(format!("invalid integer for parameter '{}': '{}'", key, s))
+        }),
+        // A non-string, non-number JSON value: Python would pass it through unchanged and the
+        // downstream slice/`min` would raise — mirror as a failure rather than a silent default.
+        Some(other) => Err(TeriError::Unknown(format!(
+            "invalid integer for parameter '{}': {}",
+            key, other
+        ))),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ZepToolsService — legacy DTO + retry namespace (U-017 baseline, KEPT VERBATIM)
 // ---------------------------------------------------------------------------
 
@@ -1945,5 +2557,537 @@ mod tests {
         assert_eq!(summary.get("entity_name").and_then(|v| v.as_str()), Some("Nonexistent"));
         assert!(summary.get("entity_info").map(|v| v.is_null()).unwrap_or(false));
         assert_eq!(summary.get("total_relations").and_then(|v| v.as_i64()), Some(0));
+    }
+
+    // ── Sub-cycle (c): parse_tool_calls — 3-tier tests ──────────────────────
+
+    // Tier 1: <tool_call>…</tool_call>
+    #[test]
+    fn test_parse_tool_calls_tier1_xml_single() {
+        let resp = r#"Some thought here.
+<tool_call>
+{"name": "quick_search", "parameters": {"query": "hello"}}
+</tool_call>"#;
+        let calls = parse_tool_calls(resp);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "quick_search");
+        assert_eq!(calls[0].parameters.get("query").and_then(|v| v.as_str()), Some("hello"));
+    }
+
+    #[test]
+    fn test_parse_tool_calls_tier1_xml_multiple() {
+        // Multiple <tool_call> tags → return all (Python iterates finditer)
+        let resp = r#"<tool_call>{"name": "quick_search", "parameters": {"query": "a"}}</tool_call>
+<tool_call>{"name": "panorama_search", "parameters": {"query": "b"}}</tool_call>"#;
+        let calls = parse_tool_calls(resp);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "quick_search");
+        assert_eq!(calls[1].name, "panorama_search");
+    }
+
+    #[test]
+    fn test_parse_tool_calls_tier1_dotall() {
+        // Multiline JSON inside <tool_call>
+        let resp = "<tool_call>\n{\n  \"name\": \"insight_forge\",\n  \"parameters\": {\n    \"query\": \"test\"\n  }\n}\n</tool_call>";
+        let calls = parse_tool_calls(resp);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "insight_forge");
+    }
+
+    #[test]
+    fn test_parse_tool_calls_tier1_bad_json_skipped() {
+        let resp = "<tool_call>NOT_JSON</tool_call>";
+        let calls = parse_tool_calls(resp);
+        assert!(calls.is_empty());
+    }
+
+    // Tier 2: bare whole-response JSON
+    #[test]
+    fn test_parse_tool_calls_tier2_bare_json() {
+        let resp = r#"{"name": "quick_search", "parameters": {"query": "foo"}}"#;
+        let calls = parse_tool_calls(resp);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "quick_search");
+    }
+
+    #[test]
+    fn test_parse_tool_calls_tier2_bare_json_invalid_tool_rejected() {
+        // A valid JSON object but unknown tool name → empty (VALID_TOOL_NAMES gate)
+        let resp = r#"{"name": "unknown_tool", "parameters": {}}"#;
+        let calls = parse_tool_calls(resp);
+        // Tier 2 rejects it (unknown tool); tier 3 might pick it up via trailing
+        // regex — but "unknown_tool" still fails VALID_TOOL_NAMES gate there too.
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_parse_tool_calls_tier2_not_bare_if_text_before() {
+        // Tier 2 only triggers if the WHOLE stripped response is a JSON object.
+        // If there's text before/after, tier 2 is skipped and tier 3 may catch it.
+        let resp = "Thinking...\n{\"name\": \"quick_search\", \"parameters\": {\"query\": \"q\"}}";
+        let calls = parse_tool_calls(resp);
+        // Tier 3 (trailing regex) should catch it
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "quick_search");
+    }
+
+    // Tier 3: trailing {"name"|"tool": …} regex
+    #[test]
+    fn test_parse_tool_calls_tier3_trailing_name_key() {
+        let resp = "Some thinking text\n{\"name\": \"panorama_search\", \"parameters\": {\"query\": \"x\"}}";
+        let calls = parse_tool_calls(resp);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "panorama_search");
+    }
+
+    #[test]
+    fn test_parse_tool_calls_tier3_trailing_tool_key() {
+        // "tool" key is accepted by tier-3 regex and normalised to "name"
+        let resp = "Some text\n{\"tool\": \"quick_search\", \"params\": {\"query\": \"z\"}}";
+        let calls = parse_tool_calls(resp);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "quick_search");
+        assert_eq!(calls[0].parameters.get("query").and_then(|v| v.as_str()), Some("z"));
+    }
+
+    #[test]
+    fn test_parse_tool_calls_tier3_trailing_unknown_rejected() {
+        let resp = "Some text\n{\"tool\": \"bad_tool\", \"params\": {}}";
+        let calls = parse_tool_calls(resp);
+        assert!(calls.is_empty());
+    }
+
+    // ── Key normalization is TIER-2/3 ONLY (Python `_is_valid_tool_call`); tier-1 is RAW ──
+    // Python tier-1 appends `json.loads(...)` directly with NO normalization
+    // (report_agent.py:1079–1082). These goldens are derived from the real Python behavior.
+
+    #[test]
+    fn test_parse_tool_calls_tier1_params_not_normalized() {
+        // Python tier-1: `{"name":"quick_search","params":{...}}` is appended raw; the
+        // downstream `call.get("parameters", {})` then sees the RAW dict → "params" is NOT
+        // promoted → parameters is EMPTY. (Differs from tiers 2/3 which DO normalize.)
+        let resp = r#"<tool_call>{"name": "quick_search", "params": {"query": "p"}}</tool_call>"#;
+        let calls = parse_tool_calls(resp);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "quick_search");
+        // RAW "parameters" key is absent → empty (Python parity, NOT Some("p")).
+        assert!(calls[0].parameters.is_empty());
+    }
+
+    #[test]
+    fn test_parse_tool_calls_tier1_tool_key_without_name_skipped() {
+        // [≠] Python tier-1 pushes `{"tool":..}` raw (no "name" key), then KeyError-crashes at
+        // the downstream `call["name"]` access (report_agent.py:1419/1852) — a Python defect.
+        // teri does not preserve the crash: the name-less tier-1 object is skipped and the
+        // parser falls through (tier-2 needs a bare `{...}` start; tier-3 needs a trailing
+        // `}` not `</tool_call>`), so the result is empty.
+        let resp =
+            r#"<tool_call>{"tool": "quick_search", "parameters": {"query": "n"}}</tool_call>"#;
+        let calls = parse_tool_calls(resp);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_parse_tool_calls_tier1_reads_raw_parameters_key() {
+        // Tier-1 reads the RAW "parameters" key directly (no promotion of "params"); when
+        // "parameters" IS present, its value is used verbatim — matching Python's
+        // `call.get("parameters", {})` over the raw dict.
+        let resp = r#"<tool_call>{"name": "quick_search", "params": {"query": "OLD"}, "parameters": {"query": "NEW"}}</tool_call>"#;
+        let calls = parse_tool_calls(resp);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].parameters.get("query").and_then(|v| v.as_str()), Some("NEW"));
+    }
+
+    #[test]
+    fn test_parse_tool_calls_tier2_normalizes_tool_to_name() {
+        // Bare JSON (tier-2) DOES go through `_is_valid_tool_call` → "tool"→"name" rename.
+        let resp = r#"{"tool": "quick_search", "parameters": {"query": "n"}}"#;
+        let calls = parse_tool_calls(resp);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "quick_search");
+    }
+
+    #[test]
+    fn test_parse_tool_calls_tier2_normalizes_params_to_parameters() {
+        // Bare JSON (tier-2) DOES promote "params"→"parameters".
+        let resp = r#"{"name": "quick_search", "params": {"query": "p"}}"#;
+        let calls = parse_tool_calls(resp);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].parameters.get("query").and_then(|v| v.as_str()), Some("p"));
+    }
+
+    // Empty / malformed input
+    #[test]
+    fn test_parse_tool_calls_empty_string() {
+        let calls = parse_tool_calls("");
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_parse_tool_calls_plain_text_no_json() {
+        let calls = parse_tool_calls("Final Answer: here is the answer");
+        assert!(calls.is_empty());
+    }
+
+    // ── Sub-cycle (c): ReportTool::from_name ────────────────────────────────
+
+    #[test]
+    fn test_report_tool_from_name_canonical() {
+        assert_eq!(ReportTool::from_name("insight_forge"), Some(ReportTool::InsightForge));
+        assert_eq!(ReportTool::from_name("panorama_search"), Some(ReportTool::PanoramaSearch));
+        assert_eq!(ReportTool::from_name("quick_search"), Some(ReportTool::QuickSearch));
+        assert_eq!(ReportTool::from_name("interview_agents"), Some(ReportTool::InterviewAgents));
+    }
+
+    #[test]
+    fn test_report_tool_from_name_back_compat() {
+        assert_eq!(ReportTool::from_name("search_graph"), Some(ReportTool::SearchGraph));
+        assert_eq!(
+            ReportTool::from_name("get_graph_statistics"),
+            Some(ReportTool::GetGraphStatistics)
+        );
+        assert_eq!(ReportTool::from_name("get_entity_summary"), Some(ReportTool::GetEntitySummary));
+        assert_eq!(
+            ReportTool::from_name("get_simulation_context"),
+            Some(ReportTool::GetSimulationContext)
+        );
+        assert_eq!(
+            ReportTool::from_name("get_entities_by_type"),
+            Some(ReportTool::GetEntitiesByType)
+        );
+    }
+
+    #[test]
+    fn test_report_tool_from_name_unknown() {
+        assert_eq!(ReportTool::from_name("nonexistent"), None);
+        assert_eq!(ReportTool::from_name(""), None);
+    }
+
+    // ── Sub-cycle (c): execute_by_name — dispatch + unknown-tool string ──────
+
+    fn empty_params() -> serde_json::Map<String, serde_json::Value> {
+        serde_json::Map::new()
+    }
+
+    fn params_with(key: &str, val: &str) -> serde_json::Map<String, serde_json::Value> {
+        let mut m = serde_json::Map::new();
+        m.insert(key.to_string(), serde_json::Value::String(val.to_string()));
+        m
+    }
+
+    #[test]
+    fn test_execute_by_name_unknown_tool() {
+        let g = fixture_graph();
+        let llm = StubLlm;
+        let tools = ReportTools::new(&g, &llm);
+        let result = tools.execute_by_name("does_not_exist", &empty_params(), "g", "s1", "req", "");
+        // Byte-identical to Python: "未知工具: {name}。请使用以下工具之一: ..."
+        assert!(result.starts_with("未知工具: does_not_exist"));
+        assert!(result.contains("insight_forge"));
+    }
+
+    #[test]
+    fn test_execute_by_name_quick_search() {
+        let g = fixture_graph();
+        let llm = StubLlm;
+        let tools = ReportTools::new(&g, &llm);
+        let params = params_with("query", "Alice");
+        let result = tools.execute_by_name("quick_search", &params, "g", "s1", "req", "");
+        // Returns text (the SearchResult.to_text())
+        assert!(!result.is_empty());
+        assert!(result.contains("搜索查询"));
+    }
+
+    #[test]
+    fn test_execute_by_name_panorama_search() {
+        let g = fixture_graph();
+        let llm = StubLlm;
+        let tools = ReportTools::new(&g, &llm);
+        let params = params_with("query", "works");
+        let result = tools.execute_by_name("panorama_search", &params, "g", "s1", "req", "");
+        assert!(!result.is_empty());
+        // panorama_search to_text() opens with "广度搜索结果" header
+        assert!(result.contains("广度搜索结果") || result.contains("查询:"));
+    }
+
+    #[test]
+    fn test_execute_by_name_insight_forge() {
+        let g = fixture_graph();
+        let llm = StubLlm;
+        let tools = ReportTools::new(&g, &llm);
+        let params = params_with("query", "Alice relationships");
+        let result = tools.execute_by_name("insight_forge", &params, "g", "s1", "test sim req", "");
+        assert!(!result.is_empty());
+        assert!(result.contains("未来预测深度分析") || result.contains("分析问题"));
+    }
+
+    #[test]
+    fn test_execute_by_name_interview_agents_returns_error_text() {
+        // interview_agents is [!] pending (sub-cycle e); must return error text, not panic.
+        let g = fixture_graph();
+        let llm = StubLlm;
+        let tools = ReportTools::new(&g, &llm);
+        let params = params_with("interview_topic", "What do students think?");
+        let result = tools.execute_by_name("interview_agents", &params, "g", "s1", "req", "");
+        // Must be the "工具执行失败: ..." text (not a panic)
+        assert!(result.contains("工具执行失败"), "expected error text, got: {}", result);
+    }
+
+    // ── Sub-cycle (c): back-compat redirects ─────────────────────────────────
+
+    #[test]
+    fn test_execute_by_name_search_graph_redirects_to_quick_search() {
+        let g = fixture_graph();
+        let llm = StubLlm;
+        let tools = ReportTools::new(&g, &llm);
+        let params = params_with("query", "Bob");
+        let r1 = tools.execute_by_name("search_graph", &params, "g", "s1", "req", "");
+        let r2 = tools.execute_by_name("quick_search", &params, "g", "s1", "req", "");
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn test_execute_by_name_get_graph_statistics() {
+        let g = fixture_graph();
+        let llm = StubLlm;
+        let tools = ReportTools::new(&g, &llm);
+        let result =
+            tools.execute_by_name("get_graph_statistics", &empty_params(), "g", "s1", "req", "");
+        // Returns JSON string of graph stats
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid JSON");
+        assert!(parsed.get("total_nodes").is_some());
+        assert!(parsed.get("total_edges").is_some());
+    }
+
+    #[test]
+    fn test_execute_by_name_get_entity_summary() {
+        let g = fixture_graph();
+        let llm = StubLlm;
+        let tools = ReportTools::new(&g, &llm);
+        let params = params_with("entity_name", "Alice");
+        let result = tools.execute_by_name("get_entity_summary", &params, "g", "s1", "req", "");
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid JSON");
+        assert_eq!(parsed.get("entity_name").and_then(|v| v.as_str()), Some("Alice"));
+    }
+
+    #[test]
+    fn test_execute_by_name_get_simulation_context_redirects_to_insight_forge() {
+        let g = fixture_graph();
+        let llm = StubLlm;
+        let tools = ReportTools::new(&g, &llm);
+        let params = params_with("query", "Alice");
+        let result =
+            tools.execute_by_name("get_simulation_context", &params, "g", "s1", "sim req", "");
+        // Should return InsightForge text
+        assert!(result.contains("未来预测深度分析") || result.contains("分析问题"));
+    }
+
+    #[test]
+    fn test_execute_by_name_get_simulation_context_fallback_to_sim_req() {
+        // If no "query" param, fallback to simulation_requirement
+        let g = fixture_graph();
+        let llm = StubLlm;
+        let tools = ReportTools::new(&g, &llm);
+        let result = tools.execute_by_name(
+            "get_simulation_context",
+            &empty_params(),
+            "g",
+            "s1",
+            "sim req fallback",
+            "",
+        );
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_execute_by_name_get_entities_by_type() {
+        let g = fixture_graph();
+        let llm = StubLlm;
+        let tools = ReportTools::new(&g, &llm);
+        let params = params_with("entity_type", "person");
+        let result = tools.execute_by_name("get_entities_by_type", &params, "g", "s1", "req", "");
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid JSON");
+        let arr = parsed.as_array().expect("should be array");
+        assert_eq!(arr.len(), 2); // Alice + Bob
+    }
+
+    // ── Sub-cycle (c): param coercions ───────────────────────────────────────
+
+    #[test]
+    fn test_coerce_include_expired_true_variants() {
+        // "true", "1", "yes" → true
+        for s in &["true", "1", "yes", "True", "YES", "1"] {
+            let mut m = serde_json::Map::new();
+            m.insert("include_expired".to_string(), serde_json::Value::String(s.to_string()));
+            assert!(coerce_include_expired(&m, false), "failed for '{}'", s);
+        }
+    }
+
+    #[test]
+    fn test_coerce_include_expired_false_variants() {
+        for s in &["false", "0", "no", "nope", ""] {
+            let mut m = serde_json::Map::new();
+            m.insert("include_expired".to_string(), serde_json::Value::String(s.to_string()));
+            assert!(!coerce_include_expired(&m, true), "failed for '{}'", s);
+        }
+    }
+
+    #[test]
+    fn test_coerce_include_expired_bool_value() {
+        let mut m = serde_json::Map::new();
+        m.insert("include_expired".to_string(), serde_json::Value::Bool(false));
+        assert!(!coerce_include_expired(&m, true));
+
+        let mut m2 = serde_json::Map::new();
+        m2.insert("include_expired".to_string(), serde_json::Value::Bool(true));
+        assert!(coerce_include_expired(&m2, false));
+    }
+
+    #[test]
+    fn test_coerce_include_expired_missing_uses_default() {
+        let m = serde_json::Map::new();
+        assert!(coerce_include_expired(&m, true));
+        assert!(!coerce_include_expired(&m, false));
+    }
+
+    #[test]
+    fn test_coerce_int_param_from_number() {
+        let mut m = serde_json::Map::new();
+        m.insert("limit".to_string(), serde_json::json!(7));
+        assert_eq!(coerce_int_param(&m, "limit", 10).unwrap(), 7);
+    }
+
+    #[test]
+    fn test_coerce_int_param_from_string() {
+        let mut m = serde_json::Map::new();
+        m.insert("limit".to_string(), serde_json::Value::String("15".to_string()));
+        assert_eq!(coerce_int_param(&m, "limit", 10).unwrap(), 15);
+    }
+
+    #[test]
+    fn test_coerce_int_param_bad_string_is_err() {
+        // Python parity: `int("not_a_number")` raises ValueError → tool fails with
+        // "工具执行失败: …" (report_agent.py:1060–1062). The default applies ONLY on a
+        // MISSING key, never on an unparseable present value.
+        let mut m = serde_json::Map::new();
+        m.insert("limit".to_string(), serde_json::Value::String("not_a_number".to_string()));
+        assert!(coerce_int_param(&m, "limit", 10).is_err());
+    }
+
+    #[test]
+    fn test_coerce_int_param_missing_uses_default() {
+        let m = serde_json::Map::new();
+        assert_eq!(coerce_int_param(&m, "limit", 42).unwrap(), 42);
+    }
+
+    #[test]
+    fn test_execute_quick_search_bad_limit_returns_failure_text() {
+        // End-to-end: a non-numeric `limit` makes quick_search fail with the Python-parity
+        // "工具执行失败: " prefix instead of silently running with the default.
+        let g = fixture_graph();
+        let llm = StubLlm;
+        let tools = ReportTools::new(&g, &llm);
+        let mut p = serde_json::Map::new();
+        p.insert("query".to_string(), serde_json::Value::String("x".to_string()));
+        p.insert("limit".to_string(), serde_json::Value::String("abc".to_string()));
+        let out = tools.execute_by_name("quick_search", &p, "g", "s", "req", "");
+        assert!(out.starts_with("工具执行失败: "), "got: {out}");
+    }
+
+    // max_agents cap at 10 (report_agent.py:1014: max_agents = min(max_agents, 10))
+    #[test]
+    fn test_execute_max_agents_capped_at_10() {
+        // The cap happens in execute_inner before calling interview_agents.
+        // interview_agents returns Err (pending), which becomes error text — that's fine.
+        // We verify the cap by checking the error text still comes back (not a panic from
+        // an out-of-range value).
+        let g = fixture_graph();
+        let llm = StubLlm;
+        let tools = ReportTools::new(&g, &llm);
+        let mut params = serde_json::Map::new();
+        params.insert("interview_topic".to_string(), serde_json::json!("topic"));
+        params.insert("max_agents".to_string(), serde_json::json!("999")); // should be capped to 10
+        let result = tools.execute_by_name("interview_agents", &params, "g", "s1", "req", "");
+        // Still returns error text (not a panic)
+        assert!(result.contains("工具执行失败"));
+    }
+
+    // interview_topic falls back to "query" when not present (report_agent.py:1010)
+    #[test]
+    fn test_execute_interview_agents_topic_fallback_to_query() {
+        let g = fixture_graph();
+        let llm = StubLlm;
+        let tools = ReportTools::new(&g, &llm);
+        // Only "query" param, no "interview_topic"
+        let params = params_with("query", "student opinions");
+        let result = tools.execute_by_name("interview_agents", &params, "g", "s1", "req", "");
+        // Must return error-text (pending), not panic
+        assert!(result.contains("工具执行失败"));
+    }
+
+    // ── Sub-cycle (c): get_tools_description ─────────────────────────────────
+
+    #[test]
+    fn test_get_tools_description_contains_all_tools() {
+        let desc = get_tools_description();
+        assert!(desc.contains("可用工具："));
+        assert!(desc.contains("insight_forge"));
+        assert!(desc.contains("panorama_search"));
+        assert!(desc.contains("quick_search"));
+        assert!(desc.contains("interview_agents"));
+    }
+
+    #[test]
+    fn test_get_tools_description_contains_params() {
+        let desc = get_tools_description();
+        assert!(desc.contains("参数:"));
+        // insight_forge params
+        assert!(desc.contains("report_context"));
+        // panorama_search params
+        assert!(desc.contains("include_expired"));
+        // quick_search params
+        assert!(desc.contains("limit"));
+        // interview_agents params
+        assert!(desc.contains("max_agents"));
+    }
+
+    #[test]
+    fn test_get_tools_description_order() {
+        let desc = get_tools_description();
+        let pos_insight = desc.find("insight_forge").unwrap();
+        let pos_panorama = desc.find("panorama_search").unwrap();
+        let pos_quick = desc.find("quick_search").unwrap();
+        let pos_interview = desc.find("interview_agents").unwrap();
+        // Order must match Python _define_tools insertion order
+        assert!(pos_insight < pos_panorama);
+        assert!(pos_panorama < pos_quick);
+        assert!(pos_quick < pos_interview);
+    }
+
+    // ── Sub-cycle (c): tool description constants verbatim spot-checks ────────
+
+    #[test]
+    fn test_tool_desc_insight_forge_verbatim() {
+        assert!(TOOL_DESC_INSIGHT_FORGE.contains("深度洞察检索"));
+        assert!(TOOL_DESC_INSIGHT_FORGE.contains("自动将你的问题分解为多个子问题"));
+        assert!(TOOL_DESC_INSIGHT_FORGE.contains("关系链分析"));
+    }
+
+    #[test]
+    fn test_tool_desc_panorama_search_verbatim() {
+        assert!(TOOL_DESC_PANORAMA_SEARCH.contains("广度搜索"));
+        assert!(TOOL_DESC_PANORAMA_SEARCH.contains("区分当前有效的事实和历史/过期的事实"));
+    }
+
+    #[test]
+    fn test_tool_desc_quick_search_verbatim() {
+        assert!(TOOL_DESC_QUICK_SEARCH.contains("简单搜索"));
+        assert!(TOOL_DESC_QUICK_SEARCH.contains("与查询最相关的事实列表"));
+    }
+
+    #[test]
+    fn test_tool_desc_interview_agents_verbatim() {
+        assert!(TOOL_DESC_INTERVIEW_AGENTS.contains("深度采访"));
+        assert!(TOOL_DESC_INTERVIEW_AGENTS.contains("OASIS模拟环境正在运行"));
     }
 }

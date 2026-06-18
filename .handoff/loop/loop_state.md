@@ -17,7 +17,7 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 2   # NEW SESSION 2026-06-18; CYCLE 8=U-024(a), CYCLE 9=U-024(b) ReportTools wiring
+cycles_this_session: 3   # BUDGET REACHED; CYCLE 8=U-024(a), 9=U-024(b), 10=U-024(c) — hand off after
 # CYCLE3 (12th resume) 2026-06-17: U-022 sub-cycle (c) MONITOR + offset-tail + graph-fire (S-605/613/614/615 + S-1056/U-047,
 #   5 [x]) — opus PASS (DECISION-17 Area 2, porter@opus). src/services/simulation_runner.rs: monitor_simulation (2s
 #   MONITOR_POLL_INTERVAL poll loop, per-platform file-exists guard, save_run_state per poll, loop-exit on U-048
@@ -417,3 +417,23 @@ next_iterate: U-022 [x] complete → U-017 port-fresh full implementation
 # (develop 7c354a5 = config/main only, no U-024 overlap). NEXT: U-024 (c) tool-dispatch — ReportTool enum +
 # parse_tool_calls (3-tier) + execute (param coercions incl include_expired str→bool, back-compat redirects) +
 # _get_tools_description. (c) needs (b)'s ReportTools::execute target. Then (d) plan_outline.
+
+
+# CYCLE 10 (2026-06-18, 10th resume): U-024 sub-cycle (c) tool-dispatch — porter@porter, parity@opus FAIL→fix→PASS.
+# src/services/zep_tools.rs: ReportTool enum (4 canonical + 5 back-compat redirect arms), ToolCall, VALID_TOOL_NAMES,
+# parse_tool_calls (3-tier: <tool_call> xml / bare-json / trailing-regex), is_valid_tool_call+normalize (tier2/3 only),
+# get_tools_description + 4 TOOL_DESC_* verbatim, ReportTools::execute/execute_by_name (9 arms, param coercions).
+# GATE CAUGHT 2 REAL DOWNGRADES (no-downgrade gate working): (1) tier-1 was normalizing params→parameters but Python
+# tier-1 appends RAW (normalization is _is_valid_tool_call = tier2/3 ONLY) → a {"name":..,"params":..} tier-1 call
+# must yield EMPTY parameters (Python downstream .get("parameters",{})={}) — FIXED: tier-1 reads raw keys, re-authored
+# 5 goldens from Python. (2) coerce_int_param silently defaulted on bad string but Python int("abc") raises→"工具执行失败"
+# — FIXED: returns Result, ? at limit/max_agents sites, Err→failure-text. ROUND-2 verify PASS. 2 legit [≠]: name-less
+# tier-1 object skip (Python pushes-raw-then-KeyError-CRASHES = defect, not preserved); int inner-msg (Python ValueError
+# string inexpressible, same "工具执行失败: " prefix/contract). 1069 tests green, clippy clean. Atomic gate: X-parity
+# PASS + Y-green + Y-not-regressed.
+# SESSION BUDGET REACHED (3 cycles: a/b/c). HANDOFF. NEXT = U-024 sub-cycle (d) plan_outline: get_simulation_context
+# → PLAN_SYSTEM_PROMPT + PLAN_USER_PROMPT_TEMPLATE → chat_json(temp 0.3) → ReportOutline; PORT the on-error 3-section
+# fallback outline. Deps (a)+(b)+(c) all DONE. Then (e) ReACT-loop (the branch ladder), (f) ReportManager, (g) loggers/
+# Sink, (h) generate_report, (i) chat. (b2 insight_forge needs OQ-3; interview_agents arm needs U-020 IPC at (e)/(h)).
+# HARNESS NOTE: architect-in-loop upgrade (PR #44 harness_hub) now governs — every extend-Y/structural unit routes
+# through rust-port-architect for a recorded findings/<unit>-architecture.md before porting (proven across a/b/c).
