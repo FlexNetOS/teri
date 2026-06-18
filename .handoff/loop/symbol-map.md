@@ -901,35 +901,35 @@
 - [x] S-762 · `unit:U-024` · `method` · `ReportAgent._generate_section_react` · up to 5 ReACT iterations per section; min 3 tool calls enforced · `report_agent.py:1221`
 - [ ] S-763 · `unit:U-024` · `method` · `ReportAgent.generate_report` · planning + sections + assembly · `report_agent.py:1532`
 - [ ] S-764 · `unit:U-024` · `method` · `ReportAgent.chat` · tool-assisted chat against report, max 2 tool calls · `report_agent.py:1766`
-- [ ] S-765 · `unit:U-024` · `type` · `ReportManager` · FS-based report persistence · `report_agent.py:1884`
-- [ ] S-766 · `unit:U-024` · `field` · `ReportManager.REPORTS_DIR` · `report_agent.py:1903`
-- [ ] S-767 · `unit:U-024` · `method` · `ReportManager._ensure_reports_dir` · `report_agent.py:1906`
-- [ ] S-768 · `unit:U-024` · `method` · `ReportManager._get_report_folder` · `report_agent.py:1911`
-- [ ] S-769 · `unit:U-024` · `method` · `ReportManager._ensure_report_folder` · `report_agent.py:1916`
-- [ ] S-770 · `unit:U-024` · `method` · `ReportManager._get_report_path` · `report_agent.py:1923`
-- [ ] S-771 · `unit:U-024` · `method` · `ReportManager._get_report_markdown_path` · `report_agent.py:1928`
-- [ ] S-772 · `unit:U-024` · `method` · `ReportManager._get_outline_path` · `report_agent.py:1933`
-- [ ] S-773 · `unit:U-024` · `method` · `ReportManager._get_progress_path` · `report_agent.py:1938`
-- [ ] S-774 · `unit:U-024` · `method` · `ReportManager._get_section_path` · `report_agent.py:1943`
-- [ ] S-775 · `unit:U-024` · `method` · `ReportManager._get_agent_log_path` · `report_agent.py:1948`
-- [ ] S-776 · `unit:U-024` · `method` · `ReportManager._get_console_log_path` · `report_agent.py:1953`
-- [ ] S-777 · `unit:U-024` · `method` · `ReportManager.get_console_log` · incremental, from_line param · `report_agent.py:1958`
-- [ ] S-778 · `unit:U-024` · `method` · `ReportManager.get_console_log_stream` · `report_agent.py:2005`
-- [ ] S-779 · `unit:U-024` · `method` · `ReportManager.get_agent_log` · incremental, from_line param · `report_agent.py:2019`
-- [ ] S-780 · `unit:U-024` · `method` · `ReportManager.get_agent_log_stream` · `report_agent.py:2067`
-- [ ] S-781 · `unit:U-024` · `method` · `ReportManager.save_outline` · `report_agent.py:2081`
-- [ ] S-782 · `unit:U-024` · `method` · `ReportManager.save_section` · `report_agent.py:2095`
-- [ ] S-783 · `unit:U-024` · `method` · `ReportManager._clean_section_content` · `report_agent.py:2132`
-- [ ] S-784 · `unit:U-024` · `method` · `ReportManager.update_progress` · `report_agent.py:2200`
-- [ ] S-785 · `unit:U-024` · `method` · `ReportManager.get_progress` · `report_agent.py:2229`
-- [ ] S-786 · `unit:U-024` · `method` · `ReportManager.get_generated_sections` · `report_agent.py:2240`
-- [ ] S-787 · `unit:U-024` · `method` · `ReportManager.assemble_full_report` · `report_agent.py:2271`
-- [ ] S-788 · `unit:U-024` · `method` · `ReportManager._post_process_report` · `report_agent.py:2301`
-- [ ] S-789 · `unit:U-024` · `method` · `ReportManager.save_report` · `report_agent.py:2427`
-- [ ] S-790 · `unit:U-024` · `method` · `ReportManager.get_report` · `report_agent.py:2447`
-- [ ] S-791 · `unit:U-024` · `method` · `ReportManager.get_report_by_simulation` · `report_agent.py:2500`
-- [ ] S-792 · `unit:U-024` · `method` · `ReportManager.list_reports` · `report_agent.py:2521`
-- [ ] S-793 · `unit:U-024` · `method` · `ReportManager.delete_report` · `report_agent.py:2548`
+- [x] S-765 · `unit:U-024` · `type` · `ReportManager` · FS-based report persistence · `report_agent.py:1884` → `src/report/manager.rs::ReportManager`
+- [x] S-766 · `unit:U-024` · `field` · `ReportManager.REPORTS_DIR` · `report_agent.py:1903` → `ReportManager::reports_dir: PathBuf` (caller-constructed per DECISION-11; Python class-level → instance field)
+- [x] S-767 · `unit:U-024` · `method` · `ReportManager._ensure_reports_dir` · `report_agent.py:1906` → `ReportManager::ensure_reports_dir(&self)`
+- [x] S-768 · `unit:U-024` · `method` · `ReportManager._get_report_folder` · `report_agent.py:1911` → `ReportManager::get_report_folder(&self, report_id)`
+- [x] S-769 · `unit:U-024` · `method` · `ReportManager._ensure_report_folder` · `report_agent.py:1916` → `ReportManager::ensure_report_folder(&self, report_id)`
+- [x] S-770 · `unit:U-024` · `method` · `ReportManager._get_report_path` · `report_agent.py:1923` → `ReportManager::get_report_path(&self, report_id)`
+- [x] S-771 · `unit:U-024` · `method` · `ReportManager._get_report_markdown_path` · `report_agent.py:1928` → `ReportManager::get_report_markdown_path(&self, report_id)`
+- [x] S-772 · `unit:U-024` · `method` · `ReportManager._get_outline_path` · `report_agent.py:1933` → `ReportManager::get_outline_path(&self, report_id)`
+- [x] S-773 · `unit:U-024` · `method` · `ReportManager._get_progress_path` · `report_agent.py:1938` → `ReportManager::get_progress_path(&self, report_id)`
+- [x] S-774 · `unit:U-024` · `method` · `ReportManager._get_section_path` · `report_agent.py:1943` → `ReportManager::get_section_path(&self, report_id, section_index)`; `section_{NN:02}.md` format preserved
+- [x] S-775 · `unit:U-024` · `method` · `ReportManager._get_agent_log_path` · `report_agent.py:1948` → `ReportManager::get_agent_log_path(&self, report_id)`
+- [x] S-776 · `unit:U-024` · `method` · `ReportManager._get_console_log_path` · `report_agent.py:1953` → `ReportManager::get_console_log_path(&self, report_id)`
+- [x] S-777 · `unit:U-024` · `method` · `ReportManager.get_console_log` · incremental, from_line param · `report_agent.py:1958` → `ReportManager::get_console_log(&self, report_id, from_line)` → `Map{logs,total_lines,from_line,has_more}`
+- [x] S-778 · `unit:U-024` · `method` · `ReportManager.get_console_log_stream` · `report_agent.py:2005` → `ReportManager::get_console_log_stream(&self, report_id) -> Vec<String>`
+- [x] S-779 · `unit:U-024` · `method` · `ReportManager.get_agent_log` · incremental, from_line param · `report_agent.py:2019` → `ReportManager::get_agent_log(&self, report_id, from_line)` → `Map{logs,total_lines,from_line,has_more}`; invalid JSON lines silently skipped
+- [x] S-780 · `unit:U-024` · `method` · `ReportManager.get_agent_log_stream` · `report_agent.py:2067` → `ReportManager::get_agent_log_stream(&self, report_id) -> Vec<Value>`
+- [x] S-781 · `unit:U-024` · `method` · `ReportManager.save_outline` · `report_agent.py:2081` → `ReportManager::save_outline(&self, report_id, outline)`; `serde_json::to_string_pretty` (indent=2, non-ASCII unescaped)
+- [x] S-782 · `unit:U-024` · `method` · `ReportManager.save_section` · `report_agent.py:2095` → `ReportManager::save_section(&self, report_id, section_index, section)` → `PathBuf`; calls `clean_section_content`
+- [x] S-783 · `unit:U-024` · `method` · `ReportManager._clean_section_content` · `report_agent.py:2132` → `ReportManager::clean_section_content(&self, content, section_title)` — heading regex, dup-title-in-5-lines drop, all-headings→bold, leading blank/separator strip
+- [x] S-784 · `unit:U-024` · `method` · `ReportManager.update_progress` · `report_agent.py:2200` → `ReportManager::update_progress(&self, report_id, status, progress, message, current_section, completed_sections)`; writes `progress.json`
+- [x] S-785 · `unit:U-024` · `method` · `ReportManager.get_progress` · `report_agent.py:2229` → `ReportManager::get_progress(&self, report_id) -> Option<Map>`; returns `None` if file missing
+- [x] S-786 · `unit:U-024` · `method` · `ReportManager.get_generated_sections` · `report_agent.py:2240` → `ReportManager::get_generated_sections(&self, report_id) -> Vec<Map>`; sorted by filename; returns `[]` if folder missing
+- [x] S-787 · `unit:U-024` · `method` · `ReportManager.assemble_full_report` · `report_agent.py:2271` → `ReportManager::assemble_full_report(&self, report_id, outline) -> io::Result<String>`; writes `full_report.md`
+- [x] S-788 · `unit:U-024` · `method` · `ReportManager._post_process_report` · `report_agent.py:2301` → `ReportManager::post_process_report(&self, content, outline)` — dup-heading (last-5 window), level1/2/3 handling, separator-after-heading skip, blank-collapse-to-2
+- [x] S-789 · `unit:U-024` · `method` · `ReportManager.save_report` · `report_agent.py:2427` → `ReportManager::save_report(&self, report)` — writes meta.json + outline.json + full_report.md
+- [x] S-790 · `unit:U-024` · `method` · `ReportManager.get_report` · `report_agent.py:2447` → `ReportManager::get_report(&self, report_id) -> Option<Report>`; old-format `{id}.json` fallback; markdown_content falls back to full_report.md
+- [x] S-791 · `unit:U-024` · `method` · `ReportManager.get_report_by_simulation` · `report_agent.py:2500` → `ReportManager::get_report_by_simulation(&self, simulation_id) -> Option<Report>`; scans both folder and `.json` formats
+- [x] S-792 · `unit:U-024` · `method` · `ReportManager.list_reports` · `report_agent.py:2521` → `ReportManager::list_reports(&self, simulation_id, limit) -> Vec<Report>`; sorted by created_at desc; old+new format
+- [x] S-793 · `unit:U-024` · `method` · `ReportManager.delete_report` · `report_agent.py:2548` → `ReportManager::delete_report(&self, report_id) -> bool`; removes folder (new format) or flat files (old format)
 
 ---
 

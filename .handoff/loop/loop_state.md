@@ -17,7 +17,7 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 2   # NEW SESSION 2026-06-18; CYCLE 11=U-024(d), CYCLE 12=U-024(e) ReACT loop
+cycles_this_session: 3   # BUDGET REACHED; CYCLE 11=U-024(d), 12=U-024(e), 13=U-024(f) ReportManager
 # CYCLE3 (12th resume) 2026-06-17: U-022 sub-cycle (c) MONITOR + offset-tail + graph-fire (S-605/613/614/615 + S-1056/U-047,
 #   5 [x]) — opus PASS (DECISION-17 Area 2, porter@opus). src/services/simulation_runner.rs: monitor_simulation (2s
 #   MONITOR_POLL_INTERVAL poll loop, per-platform file-exists guard, save_run_state per poll, loop-exit on U-048
@@ -479,3 +479,25 @@ next_iterate: U-022 [x] complete → U-017 port-fresh full implementation
 # get_console_log (+_stream), back-compat old-format {id}.json/{id}.md paths. Config.UPLOAD_FOLDER→teri env config. Deps
 # (a) only — graph-independent, parallelizable. Then (g) loggers/ReportSink (wires the // (g): markers from e), (h)
 # generate_report (orchestration), (i) chat. (b2 insight_forge OQ-3 still pending; interview_agents needs U-020 at h).
+
+
+# CYCLE 13 (2026-06-18, 13th resume): U-024 sub-cycle (f) ReportManager — porter@porter, parity@opus PASS (7 surfaces,
+# verifier ran BOTH sides byte-identical). NEW src/report/manager.rs (pub mod manager): ReportManager{reports_dir:PathBuf}
+# = upload_folder/reports (DECISION-11 caller-constructs, teri config.upload_folder). 29 methods ALL ported: path helpers
+# (meta.json/full_report.md/outline.json/progress.json/section_{NN:02d}.md/agent_log.jsonl/console_log.txt), get_console_log/
+# get_agent_log (from_line pagination {logs,total_lines,from_line,has_more}, invalid-json-skip), *_stream, save_outline,
+# save_section(+clean_section_content), update_progress/get_progress, get_generated_sections, assemble_full_report,
+# post_process_report, save_report, get_report (+old-format {id}.json + full_report.md fallback), get_report_by_simulation,
+# list_reports (created_at desc, old+new), delete_report (folder+flat). REGEX content-shaping (clean_section_content:
+# heading→**bold**, dup-title-first-5-lines drop, leading-separator strip; post_process_report: level1/2/3, dup-window
+# last-5 lines, ---after-heading skip, blank-collapse≤2) byte-identical. JSON to_string_pretty = json.dump(ensure_ascii=
+# False,indent=2) byte-identical (preserve_order). FIXED updated_at: chrono Local rfc3339(+offset) → python_isoformat_local()
+# (naive isoformat, matches Python datetime.now().isoformat(), shared U-023 helper). 43 new tests, 1142 green, clippy clean.
+# Atomic gate: X-parity PASS + Y-green + Y-not-regressed. Y-drift clean.
+# SESSION BUDGET REACHED (3 cycles: d/e/f). HANDOFF. U-024 progress: a✓ b✓ c✓ d✓ e✓ f✓ | REMAINING: (g) loggers/ReportSink
+# [wires the 7 // (g): markers in generate_section_react: ReportLogger jsonl agent_log + ReportConsoleLogger tracing layer +
+# ReportSink trait unifying SSE+jsonl; report_agent.py ReportLogger/ReportConsoleLogger classes], (h) generate_report
+# [orchestration: plan_outline→per-section generate_section_react→assemble; status machine; save-section-immediately
+# streaming; report_id uuid; deps b,c,d,e,f,g], (i) chat [conversational 2-iter ReACT, get_report_by_simulation, 15000-char
+# ctx cap, response cleaning]. Also pending: (b2) insight_forge semantic [OQ-3 query_vec_similarity]; interview_agents tool
+# [U-020 IPC, wired at h]. After U-024: U-025/26/27 HTTP API routes (report route exposes the ReACT per-section stream).

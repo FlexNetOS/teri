@@ -2076,3 +2076,90 @@ Differential parity vs `report_agent.py:_generate_section_react` (1221-1530). So
 **Symbols:** 9/9 verified `- [x]` (S-740..S-747 constants, S-762 method).
 
 **VERDICT: PASS.** Every branch, constant, separator, and control-flow edge matches Python. The one mapping divergence (`Ok("")`→None) is documented, contractually-convergent error-recovery, not a downgrade.
+
+---
+
+## 2026-06-18 — U-024 sub-cycle (f) `ReportManager` — PASS
+
+**Scope:** 29 symbols S-765..S-793 (`src/report/manager.rs`). Differential goldens derived by
+extracting the Python algorithms verbatim into a standalone harness, running BOTH sides over crafted
+inputs, and diffing byte-for-byte. Temp harness files removed post-verification.
+
+**Method:** `/tmp/parity_f/py_golden.py` (extracted `_clean_section_content` 2132–2197 +
+`_post_process_report` 2301–2424 + outline shim) vs a temp `examples/parity_f_dump.rs` calling the
+real Rust methods → `diff` IDENTICAL across all 28 crafted cases. JSON: `/tmp/parity_f/py_json.py`
+(`json.dump(ensure_ascii=False, indent=2)`) vs real `save_report`/`save_outline`/`update_progress`
+writers → on-disk bytes IDENTICAL.
+
+### Surface verdicts
+
+1. **`clean_section_content` — PASS.** 15 crafted cases byte-identical to Python, incl. the hard edges:
+   (a) dup heading in first 5 lines dropped + following blank skipped (`a`,`g`); (b) SAME heading at
+   i≥5 → `**title**` NOT dropped (`b` i=5, `m`); (c) `###`/`####` → `**title**`+blank (`c`); (d) leading
+   blanks popped (`d`); (e) leading separator `---`/`***`/`___` popped WITH trailing blanks (`e`,`k`);
+   (f) space-stripped dup match `replace(' ','')` (`f`); dup-no-blank-after keeps next line (`h`);
+   heading-at-i4 still in-window (`l`). Evidence: py_golden.json == rust_dump.json["clean"].
+
+2. **`post_process_report` — PASS.** 13 crafted cases byte-identical. L1==outline.title kept (`p_l1_title_kept`);
+   L1∈sections → `## ` promote (`p_l1_section_promoted`); L1 other → bold (`p_l1_other_bold`);
+   L2∈sections/==title kept (`p_l2_section_kept`, `p_l2_outline_title`); L2 other → bold; L≥3 → bold;
+   **dup-window edge**: dup within last-5 processed_lines deduped (`p_dup_5line_edge`) but a 6th-line-back
+   dup is NOT (`p_dup_beyond_5`) — off-by-one window correct; `---` after heading skipped
+   (`p_sep_after_heading`); blank-after-heading ≤1; final blank-run collapse ≤2 (`p_blank_collapse`);
+   full multi-section render (`p_multi_section`). Evidence: py_golden.json == rust_dump.json["pp"].
+
+3. **JSON formats/key-order — PASS.** meta.json (`report.to_dict` order: report_id, simulation_id,
+   graph_id, simulation_requirement, status, outline, markdown_content, created_at, completed_at, error),
+   outline.json (title, summary, sections), progress.json (status, progress, message, current_section,
+   completed_sections, **updated_at**) — all byte-identical to Python `json.dump(ensure_ascii=False,
+   indent=2)`: 2-space indent, non-ASCII unescaped (中文 + 🚀 pass through verbatim), `null` for None,
+   NO trailing newline. serde_json `preserve_order` feature confirmed active. Evidence: py_meta.json ==
+   rust_meta.json, py_outline.json == rust_outline.json, py_progress.json == rust_progress.json.
+
+4. **section file padding / save_section — PASS.** `format!("section_{:02}.md")` ⇒ 1→`section_01.md`,
+   10→`section_10.md` (tests `test_save_section_*`). save_section applies `clean_section_content` before
+   writing (manager.rs:292) — matches Python 2117. Index base **1-based** (Python: "从1开始"), preserved.
+
+5. **get_report old-format fallback — PASS.** Both Python fallbacks reproduced: (i) meta.json missing →
+   `{reports_dir}/{id}.json` flat file (manager.rs:719–725 == py 2452–2457); (ii) empty markdown_content
+   → read `full_report.md` (manager.rs:754–770 == py 2478–2484). Report reconstruction field-by-field:
+   defaults `''` for created_at/completed_at, `''` for missing section content, status parse via
+   ReportStatus, error null→None. Tests `test_get_report_old_format_fallback`,
+   `test_get_report_markdown_fallback_from_full_report_md`.
+
+6. **from_line pagination shapes — PASS.** Both `get_console_log`/`get_agent_log` return
+   `{logs, total_lines, from_line, has_more:false}` with from_line offset slice (`i >= from_line`),
+   total_lines counts ALL lines, has_more always false. get_agent_log skips invalid-JSON lines
+   (`except JSONDecodeError: continue` == `if let Ok(entry)`), total_lines still counts the bad line
+   (test asserts total=3 with 1 bad line). Missing-file shape returns `from_line:0` (hardcoded, matches
+   py). Console log strips `\n\r` per line. Tests `test_get_{agent,console}_log_*`.
+
+7. **list_reports / delete_report / get_report_by_simulation / get_generated_sections — PASS.**
+   list_reports sorted by created_at DESC (stable sort both sides), limit truncate, old+new format scan;
+   delete_report removes folder (new) else flat `{id}.json`+`{id}.md` (old); get_report_by_simulation
+   scans dirs + `.json` files; get_generated_sections sorted by filename, `[]` on missing folder. Tests
+   `test_list_reports_*`, `test_delete_report_*`, `test_get_report_by_simulation*`,
+   `test_get_generated_sections_*`.
+
+### Minor flag (non-blocking, non-contractual)
+`update_progress` `updated_at` uses `chrono::Local::now().to_rfc3339()` → offset-suffixed
+(`...+08:00`), whereas Python `datetime.now().isoformat()` is NAIVE (no offset). The field is
+**write-only / never parsed back** by Python (only `datetime.now().isoformat()` write site;
+grep confirms zero readers of `progress['updated_at']`) → non-contractual, observable only as a
+display string. The project already has `python_isoformat_local()` (models/project.rs:50, used by
+U-023 simulation_manager) that produces the Python-exact naive shape. RECOMMENDATION to porter:
+swap the timestamp writer to `python_isoformat_local()` for cross-unit consistency. NOT a parity
+failure — value shape (ISO-8601 string) and key name (`updated_at`) match; behavior identical.
+
+### Y-not-regressed
+`cargo test --lib` ⇒ **1142 passed** (1099 prior baseline still green, +43 new manager tests).
+`cargo test --lib report::manager` ⇒ 43 passed, 1099 filtered. `cargo test --lib report::` ⇒ 79 passed
+(36 prior report-module tests + 43 manager) — `pub mod manager;` did not disturb the existing report
+module or its tests.
+
+**Symbols:** 29/29 verified `- [x]` (S-765..S-793).
+
+**VERDICT: PASS.** The two regex content-shaping methods are byte-identical to Python across all
+crafted edge cases; all three JSON files are byte-identical (format + key-order + non-ASCII); section
+padding, pagination shapes, and every back-compat fallback match. One non-contractual timestamp-format
+flag routed to the porter as a consistency nit, not a downgrade.

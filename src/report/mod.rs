@@ -1,3 +1,5 @@
+pub mod manager;
+
 use crate::error::{Result, TeriError};
 use crate::i18n::{get_language_instruction, t};
 use crate::llm::{ChatMessage, ChatOptions, LlmClient};
