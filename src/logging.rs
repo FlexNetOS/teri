@@ -34,6 +34,7 @@
 //! bytes, and inspect the rotated files.
 
 use crate::error::Result;
+use crate::report::console_logger::{ReportConsoleLayer, init_sink};
 use file_rotate::{ContentLimit, FileRotate, compression::Compression, suffix::AppendCount};
 use std::path::{Path, PathBuf};
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -103,6 +104,15 @@ pub fn init_logging(level: &str) -> Result<()> {
         .or_else(|_| EnvFilter::try_new(level))
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
+    // Initialise the process-global report-console sink handle BEFORE installing
+    // the subscriber.  The layer checks this handle on each event; it is a no-op
+    // until `ReportConsoleLogger::new` installs an active sink.
+    init_sink();
+
+    // The per-report console layer — installed in BOTH arms below.
+    // Dormant (no-op) while REPORT_CONSOLE_SINK holds None.
+    let report_console_layer = ReportConsoleLayer;
+
     match std::env::var(LOG_DIR_ENV) {
         Ok(dir) if !dir.is_empty() => {
             // File + console — both layers composed via Registry
@@ -120,11 +130,22 @@ pub fn init_logging(level: &str) -> Result<()> {
             let console_layer =
                 fmt::layer().with_target(true).with_level(true).with_filter(console_filter);
 
-            tracing_subscriber::registry().with(console_layer).with(file_layer).init();
+            tracing_subscriber::registry()
+                .with(console_layer)
+                .with(file_layer)
+                .with(report_console_layer)
+                .init();
         }
         _ => {
-            // Console-only — identical to the original implementation
-            fmt().with_env_filter(console_filter).with_target(true).with_level(true).init();
+            // Console-only — converted to registry() form to accommodate the third layer.
+            // Behaviour of the existing console output is unchanged (same filter, target, level).
+            let console_layer =
+                fmt::layer().with_target(true).with_level(true).with_filter(console_filter);
+
+            tracing_subscriber::registry()
+                .with(console_layer)
+                .with(report_console_layer)
+                .init();
         }
     }
 

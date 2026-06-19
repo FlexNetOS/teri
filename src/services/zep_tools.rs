@@ -41,6 +41,7 @@
 
 use crate::error::{Result, TeriError};
 use crate::graph::{Entity, KnowledgeGraph};
+use crate::i18n::{t, t_args};
 use crate::llm::LlmClient;
 use crate::services::entity_reader::KnowledgeGraphEntityReader;
 use regex::Regex;
@@ -1491,6 +1492,21 @@ impl ReportTool {
             _ => None,
         }
     }
+
+    /// The canonical tool name string for this variant (used in log messages).
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::InsightForge => "insight_forge",
+            Self::PanoramaSearch => "panorama_search",
+            Self::QuickSearch => "quick_search",
+            Self::InterviewAgents => "interview_agents",
+            Self::SearchGraph => "search_graph",
+            Self::GetGraphStatistics => "get_graph_statistics",
+            Self::GetEntitySummary => "get_entity_summary",
+            Self::GetSimulationContext => "get_simulation_context",
+            Self::GetEntitiesByType => "get_entities_by_type",
+        }
+    }
 }
 
 // ── ToolCall parsed struct ───────────────────────────────────────────────────
@@ -1723,6 +1739,18 @@ impl<'g, L: LlmClient> ReportTools<'g, L> {
         simulation_requirement: &str,
         report_context: &str,
     ) -> String {
+        let tool_name = tool.name();
+        // (g2): executingTool — report_agent.py:968 logger.info(...)
+        // Params are formatted as debug repr (Python: params=parameters dict repr).
+        let params_repr = serde_json::to_string(params).unwrap_or_else(|_| "{}".to_string());
+        tracing::info!(
+            target: "teri::report",
+            "{}",
+            t_args(
+                "report.executingTool",
+                &[("toolName", &tool_name), ("params", &params_repr)]
+            )
+        );
         match self.execute_inner(
             tool,
             params,
@@ -1732,7 +1760,19 @@ impl<'g, L: LlmClient> ReportTools<'g, L> {
             report_context,
         ) {
             Ok(s) => s,
-            Err(e) => format!("工具执行失败: {}", e),
+            Err(e) => {
+                let err_str = e.to_string();
+                // (g2): toolExecFailed — report_agent.py:1061 logger.error(...)
+                tracing::error!(
+                    target: "teri::report",
+                    "{}",
+                    t_args(
+                        "report.toolExecFailed",
+                        &[("toolName", &tool_name), ("error", &err_str)]
+                    )
+                );
+                format!("工具执行失败: {}", e)
+            }
         }
     }
 
@@ -1799,14 +1839,22 @@ impl<'g, L: LlmClient> ReportTools<'g, L> {
             }
 
             // ── back-compat: search_graph → quick_search (report_agent.py:1025–1028) ──
-            ReportTool::SearchGraph => self.execute_inner(
-                ReportTool::QuickSearch,
-                params,
-                graph_id,
-                simulation_id,
-                simulation_requirement,
-                report_context,
-            ),
+            ReportTool::SearchGraph => {
+                // (g2): redirectToQuickSearch — report_agent.py:1027 logger.info(...)
+                tracing::info!(
+                    target: "teri::report",
+                    "{}",
+                    t("report.redirectToQuickSearch")
+                );
+                self.execute_inner(
+                    ReportTool::QuickSearch,
+                    params,
+                    graph_id,
+                    simulation_id,
+                    simulation_requirement,
+                    report_context,
+                )
+            }
 
             // ── back-compat: get_graph_statistics (report_agent.py:1030–1032) ─
             ReportTool::GetGraphStatistics => {
@@ -1824,6 +1872,12 @@ impl<'g, L: LlmClient> ReportTools<'g, L> {
             // ── back-compat: get_simulation_context → insight_forge
             //    (report_agent.py:1042–1046) ───────────────────────────────────
             ReportTool::GetSimulationContext => {
+                // (g2): redirectToInsightForge — report_agent.py:1044 logger.info(...)
+                tracing::info!(
+                    target: "teri::report",
+                    "{}",
+                    t("report.redirectToInsightForge")
+                );
                 // Redirect: use "query" param or fall back to simulation_requirement.
                 let query_raw = str_param(params, "query");
                 let query = if query_raw.is_empty() {

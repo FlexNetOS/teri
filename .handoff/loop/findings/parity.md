@@ -2263,3 +2263,36 @@ timestamp, elapsed rounding, and the 7 wirings all match Python — but 4 `*_len
 observable byte-vs-char downgrade against a convention this port already established. Route back to the
 rust-port-porter for the 4-site `.chars().count()` fix + non-ASCII length-assertion in the 4 tests;
 re-verify. Symbols S-681..S-698 remain `- [~]`.
+
+---
+
+## 2026-06-18 — U-024 sub-cycle (g2) `ReportConsoleLogger` — PASS
+
+**Verdict:** PASS (6/6 symbols S-699..S-704 → `- [x]`). Differential vs `MiroFish/backend/app/services/report_agent.py:307-388`.
+
+**Method:** Ran `cargo test --lib console_logger` (10/10 pass). To rule out the flagged "conditional-skip papers over a non-capturing layer" risk, I temporarily injected a hard assertion `assert!(SUBSCRIBER_INSTALLED)` into the capture tests — it PASSED both in isolation and in the full lib suite, proving the real capture path (layer install → emit → assert file content) genuinely executes in every runnable config (no other test installs a global tracing subscriber, so console_logger wins the set-once race). Also dumped a real captured `console_log.txt` end-to-end.
+
+**Real captured output (decisive evidence):**
+```
+[19:03:05] INFO: ReACT generating section: Market Overview
+[19:03:05] WARNING: Section X iteration 2: LLM returned None
+[19:03:05] ERROR: Tool execution failed: quick_search, error: boom
+```
+(a `tracing::debug!` line and a `teri::server` line in the same run produced NO output → INFO floor + target filter both proven live.)
+
+| # | Surface | Verdict | Evidence |
+|---|---------|---------|----------|
+| 1 | Layer GENUINELY captures | PASS | Probe proved `SUBSCRIBER_INSTALLED=true`; format dump shows real file lines; conditional-skip is a legit set-once fallback, never the only path |
+| 2 | Format `[%H:%M:%S] LEVEL: msg\n` | PASS | Dump matches exactly; local time via `chrono::Local::now()`; message-only (no target/span decoration) |
+| 3 | WARN→WARNING (#1 trap) | PASS | Dump shows `WARNING:` not `WARN:`; `python_level_name` maps WARN→"WARNING"; `test_warn_maps_to_warning_not_warn` asserts no `WARN:` |
+| 4 | INFO+ floor (DEBUG excluded) | PASS | `tracing::debug!` produced no line; py:1322 kept as DEBUG, not promoted; `test_debug_events_excluded` |
+| 5 | Target filter (report + zep prefix only) | PASS | `teri::server`/`teri::sim` excluded; `teri::report` exact + `teri::services::zep_tools` prefix captured; `test_non_report_target_excluded` + `test_zep_tools_target_captured` |
+| 6 | Emission sites + LEVELS match Python | PASS | All 17 sites diffed (mod.rs ×13 + zep_tools.rs ×4); levels exact: info/warn/error per py:917/968/1027/1044/1061(ERR)/1152/1205/1209(ERR)/1249/1313(WARN)/1332(WARN)/1352(WARN)/1393/1421/1490/1503(WARN). Note: py tool-exec logs (968/1061/1027/1044) use the `mirofish.report_agent` logger (py:33), so Rust placing them in zep_tools.rs on `target:"teri::report"` is CORRECT. `iteration+1` arg matches. All fire UNCONDITIONALLY (not gated on report_logger) |
+| 7 | Lifecycle (new/close/Drop) | PASS | `new` mkdir+append open+sink install; `close` flush+toggle-off (post-close not captured); `Drop`→close idempotent. Mirrors py `__init__`/`_setup_file_handler`/`close`/`__del__` |
+| 8 | init change additive/non-breaking | PASS | `logging.rs` adds `report_console_layer` to BOTH arms; console-only arm converted to `registry().with(...).init()`; no-op when sink None (default); existing console/file output filter/target/level unchanged |
+
+**Forward-dep [!]:** `teri::services::zep_tools` capture target is wired; no production module emits on it yet (only the test fixture at console_logger.rs:610). This is the architect's wiring-ready seam, NOT a downgrade — capture scope is faithfully reproduced; the producer is a separate unit (legit-tracked).
+
+**[≠] challenge:** none claimed; none warranted — `console_log.txt` is contractual (read back by `get_console_log`/stream, surfaced to frontend), so a `[≠]` would be a disguised feature-skip. The full feature was ported.
+
+**Regression:** full `cargo test --lib` = 1176 passed / 0 failed (1166 prior + 10 g2). Y not regressed.

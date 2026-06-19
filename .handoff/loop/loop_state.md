@@ -17,7 +17,7 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 1   # NEW SESSION 2026-06-18; CYCLE 14 = U-024 sub-cycle (g1) ReportLogger
+cycles_this_session: 2   # NEW SESSION 2026-06-18; CYCLE 14=U-024(g1), CYCLE 15=U-024(g2) ReportConsoleLogger
 # CYCLE3 (12th resume) 2026-06-17: U-022 sub-cycle (c) MONITOR + offset-tail + graph-fire (S-605/613/614/615 + S-1056/U-047,
 #   5 [x]) — opus PASS (DECISION-17 Area 2, porter@opus). src/services/simulation_runner.rs: monitor_simulation (2s
 #   MONITOR_POLL_INTERVAL poll loop, per-platform file-exists guard, save_run_state per poll, loop-exit on U-048
@@ -524,3 +524,27 @@ next_iterate: U-022 [x] complete → U-017 port-fresh full implementation
 # generate_report [orchestration plan→sections→assemble + status machine + save-section streaming + report_id uuid +
 # ReportSink SSE/jsonl unify + log_start/planning_*/report_complete/error wiring + console_logger create/close; deps
 # b,c,d,e,f,g1,g2], (i) chat. (b2 insight_forge OQ-3; interview_agents U-020 at h).
+
+
+# CYCLE 15 (2026-06-18, 15th resume): U-024 sub-cycle (g2) ReportConsoleLogger — architect-decided + porter@porter,
+# parity@opus PASS (8 surfaces, verifier PROVED real capture). ARCHITECT (findings/u024-g2-console-logger.md): map
+# Python's "FileHandler attached to named loggers" → per-report tracing_subscriber Layer gated on a process-global
+# OnceLock<Arc<Mutex<Option<sink>>>>; ReportConsoleLogger toggles sink on(new)/off(Drop). NEW src/report/console_logger.rs
+# (ReportConsoleSink + ReportConsoleLayer + ReportConsoleLogger). ADDITIVE src/logging.rs init_logging (install layer
+# both arms, no-op when sink None — non-breaking). Format [%H:%M:%S]<local> LEVEL: message (message-only, no
+# target/span). CRITICAL: tracing WARN→Python "WARNING" (gate #1 trap — correct). INFO+ floor (DEBUG py:1322 excluded).
+# Targets teri::report (exact) + teri::services::zep_tools (prefix). 17 loop emissions wired UNCONDITIONALLY in
+# generate_section_react/plan_outline/zep_tools (reactGenerateSection INFO, sectionIterNone/Conflict/ConflictDowngrade/
+# MaxIter WARN, sectionGenDone/NoPrefix/multiToolOnlyFirst/startPlanningOutline/outlinePlanDone INFO, outlinePlanFailed
+# ERROR, + zep executingTool INFO/toolExecFailed ERROR/redirects INFO/agentInitDone INFO — all on target teri::report
+# per Python's report_agent logger). Verifier refuted the SUBSCRIBER_INSTALLED test-skip concern (injected assert,
+# dumped real console_log.txt). fwd-dep [!]: zep_tools producers emit when that path runs (wiring-ready seam). 10 new
+# tests, 1176 green, clippy clean. Atomic gate: X-parity PASS + Y-green + Y-not-regressed. Y-drift clean.
+# U-024 progress: a✓ b✓ c✓ d✓ e✓ f✓ g1✓ g2✓ | (g) COMPLETE. REMAINING: (h) generate_report [the top-level orchestration
+# — report_agent.py:1532-1765: report_id uuid, status machine pending→planning→generating→completed/failed, create
+# ReportLogger+ReportConsoleLogger (log_start/log_planning_start/context/complete + console_logger.new), plan_outline,
+# per-section generate_section_react + save_section-immediately streaming + log_section_full_complete, assemble_full_report,
+# log_report_complete/log_error, total-time, console_logger.close(). UNIFY with teri generate_stream via ReportSink
+# (SSE+jsonl) — likely needs an ARCHITECT decision for the ReportSink streaming shape (structural). deps b,c,d,e,f,g
+# ALL DONE. interview_agents tool still honest-err until U-020 wired here.], (i) chat [conversational 2-iter ReACT,
+# get_report_by_simulation, 15000-char ctx cap, response cleaning]. (b2 insight_forge OQ-3 still pending.)

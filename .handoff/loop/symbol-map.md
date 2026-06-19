@@ -835,12 +835,12 @@
 - [~] S-696 · `unit:U-024` · `method` · `ReportLogger.log_section_full_complete` · `report_agent.py:258` → `ReportLogger::log_section_full_complete(section_title, section_index, full_content)`
 - [~] S-697 · `unit:U-024` · `method` · `ReportLogger.log_report_complete` · `report_agent.py:281` → `ReportLogger::log_report_complete(total_sections, total_time_seconds)`
 - [~] S-698 · `unit:U-024` · `method` · `ReportLogger.log_error` · `report_agent.py:293` → `ReportLogger::log_error(error_message, stage, section_title: Option<&str>)`
-- [ ] S-699 · `unit:U-024` · `type` · `ReportConsoleLogger` · attaches file handler to named loggers · `report_agent.py:307`
-- [ ] S-700 · `unit:U-024` · `method` · `ReportConsoleLogger.__init__` · `report_agent.py:315`
-- [ ] S-701 · `unit:U-024` · `method` · `ReportConsoleLogger._ensure_log_file` · `report_agent.py:330`
-- [ ] S-702 · `unit:U-024` · `method` · `ReportConsoleLogger._setup_file_handler` · dynamically attaches handler · `report_agent.py:335`
-- [ ] S-703 · `unit:U-024` · `method` · `ReportConsoleLogger.close` · detaches handler — must be called explicitly · `report_agent.py:366`
-- [ ] S-704 · `unit:U-024` · `method` · `ReportConsoleLogger.__del__` · `report_agent.py:384`
+- [x] S-699 · `unit:U-024` · `type` · `ReportConsoleLogger` · attaches file handler to named loggers · `report_agent.py:307` → `ReportConsoleLayer` per-event target/level filter (`teri::report` exact + `teri::services::zep_tools` prefix, INFO+); parity-verified g2 (format dump shows correct capture)
+- [x] S-700 · `unit:U-024` · `method` · `ReportConsoleLogger.__init__` · `report_agent.py:315` → `ReportConsoleLogger::new` (mkdir+append open+sink install); verified
+- [x] S-701 · `unit:U-024` · `method` · `ReportConsoleLogger._ensure_log_file` · `report_agent.py:330` → mkdir inside `new`; verified by `test_mkdir_and_file_created`
+- [x] S-702 · `unit:U-024` · `method` · `ReportConsoleLogger._setup_file_handler` · dynamically attaches handler · `report_agent.py:335` → sets `REPORT_CONSOLE_SINK`; verified by lifecycle install/emit
+- [x] S-703 · `unit:U-024` · `method` · `ReportConsoleLogger.close` · detaches handler — must be called explicitly · `report_agent.py:366` → toggles sink off + flush; verified by post-close-not-captured + idempotence
+- [x] S-704 · `unit:U-024` · `method` · `ReportConsoleLogger.__del__` · `report_agent.py:384` → `impl Drop` calls close; verified by `test_drop_is_idempotent`
 - [~] S-705 · `unit:U-024` · `type` · `ReportStatus` · enum: PENDING/PLANNING/GENERATING/COMPLETED/FAILED · `report_agent.py:389` → `teri::report::ReportStatus` (`src/report/mod.rs`)
 - [~] S-706 · `unit:U-024` · `variant` · `ReportStatus.PENDING` · `report_agent.py:391` → `teri::report::ReportStatus::Pending`
 - [~] S-707 · `unit:U-024` · `variant` · `ReportStatus.PLANNING` · `report_agent.py:392` → `teri::report::ReportStatus::Planning`

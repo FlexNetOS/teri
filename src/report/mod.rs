@@ -1,3 +1,4 @@
+pub mod console_logger;
 pub mod logger;
 pub mod manager;
 
@@ -566,12 +567,19 @@ impl ReportAgent {
         simulation_id: impl Into<String>,
         simulation_requirement: impl Into<String>,
     ) -> Self {
-        Self {
-            graph_id: graph_id.into(),
-            simulation_id: simulation_id.into(),
-            simulation_requirement: simulation_requirement.into(),
-            report_logger: None,
-        }
+        let graph_id = graph_id.into();
+        let simulation_id = simulation_id.into();
+        let simulation_requirement = simulation_requirement.into();
+        // (g2): agentInitDone — report_agent.py:917 logger.info(...)
+        tracing::info!(
+            target: "teri::report",
+            "{}",
+            crate::i18n::t_args(
+                "report.agentInitDone",
+                &[("graphId", &graph_id), ("simulationId", &simulation_id)]
+            )
+        );
+        Self { graph_id, simulation_id, simulation_requirement, report_logger: None }
     }
 
     // -----------------------------------------------------------------------
@@ -608,6 +616,9 @@ impl ReportAgent {
         llm: &L,
         progress: Option<&ProgressCallback<'_>>,
     ) -> ReportOutline {
+        // (g2): startPlanningOutline — report_agent.py:1152 logger.info(...)
+        tracing::info!(target: "teri::report", "{}", t("report.startPlanningOutline"));
+
         // Step 1: progress(0)
         if let Some(cb) = progress {
             cb("planning", 0, &t("progress.analyzingRequirements"));
@@ -628,7 +639,13 @@ impl ReportAgent {
         let user_prompt = match Self::build_plan_user_prompt(&self.simulation_requirement, &context)
         {
             Ok(p) => p,
-            Err(_) => {
+            Err(e) => {
+                // (g2): outlinePlanFailed — report_agent.py:1209 logger.error(...)
+                tracing::error!(
+                    target: "teri::report",
+                    "{}",
+                    crate::i18n::t_args("report.outlinePlanFailed", &[("error", &e.to_string())])
+                );
                 return Self::fallback_outline();
             }
         };
@@ -639,7 +656,13 @@ impl ReportAgent {
 
         let response: serde_json::Value = match llm.chat_json(&messages, &opts).await {
             Ok(v) => v,
-            Err(_) => {
+            Err(e) => {
+                // (g2): outlinePlanFailed — report_agent.py:1209 logger.error(...)
+                tracing::error!(
+                    target: "teri::report",
+                    "{}",
+                    crate::i18n::t_args("report.outlinePlanFailed", &[("error", &e.to_string())])
+                );
                 return Self::fallback_outline();
             }
         };
@@ -677,6 +700,13 @@ impl ReportAgent {
         if let Some(cb) = progress {
             cb("planning", 100, &t("progress.outlinePlanComplete"));
         }
+
+        // (g2): outlinePlanDone — report_agent.py:1205 logger.info(...)
+        tracing::info!(
+            target: "teri::report",
+            "{}",
+            crate::i18n::t_args("report.outlinePlanDone", &[("count", &outline.sections.len())])
+        );
 
         outline
     }
@@ -821,6 +851,14 @@ impl ReportAgent {
         use crate::llm::{ChatMessage, ChatOptions};
         use crate::services::zep_tools::{get_tools_description, parse_tool_calls};
 
+        // (g2): reactGenerateSection — report_agent.py:1249 logger.info(...)
+        // Unconditional: fires regardless of whether report_logger is Some.
+        tracing::info!(
+            target: "teri::report",
+            "{}",
+            t_args("report.reactGenerateSection", &[("title", &section.title)])
+        );
+
         // (g1): log_section_start
         if let Some(l) = self.report_logger.as_ref() {
             l.log_section_start(&section.title, section_index);
@@ -910,6 +948,15 @@ impl ReportAgent {
 
             if response_opt.is_none() {
                 // None/empty handling (report_agent.py:1312-1320)
+                // (g2): sectionIterNone — report_agent.py:1313 logger.warning(...)
+                tracing::warn!(
+                    target: "teri::report",
+                    "{}",
+                    t_args(
+                        "report.sectionIterNone",
+                        &[("title", &section.title), ("iteration", &(iteration + 1))]
+                    )
+                );
                 if iteration < max_iterations - 1 {
                     messages.push(ChatMessage::assistant("（响应为空）"));
                     messages.push(ChatMessage::user("请继续生成内容。"));
@@ -930,6 +977,20 @@ impl ReportAgent {
             if has_tool_calls && has_final_answer {
                 conflict_retries += 1;
 
+                // (g2): sectionConflict — report_agent.py:1332 logger.warning(...)
+                tracing::warn!(
+                    target: "teri::report",
+                    "{}",
+                    t_args(
+                        "report.sectionConflict",
+                        &[
+                            ("title", &section.title),
+                            ("iteration", &(iteration + 1)),
+                            ("conflictCount", &conflict_retries),
+                        ]
+                    )
+                );
+
                 if conflict_retries <= 2 {
                     // First two conflicts: re-ask verbatim (report_agent.py:1338-1348)
                     messages.push(ChatMessage::assistant(&response));
@@ -944,6 +1005,18 @@ impl ReportAgent {
                 } else {
                     // Third conflict: truncate to first </tool_call>, force-execute
                     // (report_agent.py:1351-1361)
+                    // (g2): sectionConflictDowngrade — report_agent.py:1352 logger.warning(...)
+                    tracing::warn!(
+                        target: "teri::report",
+                        "{}",
+                        t_args(
+                            "report.sectionConflictDowngrade",
+                            &[
+                                ("title", &section.title),
+                                ("conflictCount", &conflict_retries),
+                            ]
+                        )
+                    );
                     let end_tag = "</tool_call>";
                     if let Some(first_tool_end) = response.find(end_tag) {
                         let truncated = &response[..first_tool_end + end_tag.len()];
@@ -994,6 +1067,15 @@ impl ReportAgent {
                 // Rust: rsplit gives the same last-occurrence semantics.
                 let final_answer =
                     response.rsplit("Final Answer:").next().unwrap_or("").trim().to_string();
+                // (g2): sectionGenDone — report_agent.py:1393 logger.info(...)
+                tracing::info!(
+                    target: "teri::report",
+                    "{}",
+                    t_args(
+                        "report.sectionGenDone",
+                        &[("title", &section.title), ("count", &tool_calls_count)]
+                    )
+                );
                 // (g1): log_section_content — situation-1 valid-final-answer return
                 if let Some(l) = self.report_logger.as_ref() {
                     l.log_section_content(
@@ -1031,8 +1113,16 @@ impl ReportAgent {
                     );
                 }
                 if tool_calls.len() > 1 {
-                    // (g2): log_multiToolOnlyFirst — CONSOLE log (Python logger.info), owned by
-                    // sub-cycle (g2) / ReportConsoleLogger. NOT a ReportLogger call. Do NOT wire here.
+                    // (g2): multiToolOnlyFirst — report_agent.py:1421 logger.info(...)
+                    // Unconditional: fires regardless of whether report_logger is Some.
+                    tracing::info!(
+                        target: "teri::report",
+                        "{}",
+                        t_args(
+                            "report.multiToolOnlyFirst",
+                            &[("total", &tool_calls.len()), ("toolName", &call.name)]
+                        )
+                    );
                 }
 
                 let result = tools.execute_by_name(
@@ -1121,6 +1211,15 @@ impl ReportAgent {
             // Situation 3 else: sufficient tools, no prefix → accept raw response (report_agent.py:1491)
             // Python: final_answer = response.strip()
             let final_answer = response.trim().to_string();
+            // (g2): sectionNoPrefix — report_agent.py:1490 logger.info(...)
+            tracing::info!(
+                target: "teri::report",
+                "{}",
+                t_args(
+                    "report.sectionNoPrefix",
+                    &[("title", &section.title), ("count", &tool_calls_count)]
+                )
+            );
             // (g1): log_section_content — situation-3 no-prefix return
             if let Some(l) = self.report_logger.as_ref() {
                 l.log_section_content(
@@ -1133,6 +1232,12 @@ impl ReportAgent {
             return final_answer;
         }
         // ── POST-LOOP: FORCE-FINAL (report_agent.py:1502-1530) ──────────────────
+        // (g2): sectionMaxIter — report_agent.py:1503 logger.warning(...)
+        tracing::warn!(
+            target: "teri::report",
+            "{}",
+            t_args("report.sectionMaxIter", &[("title", &section.title)])
+        );
         messages.push(ChatMessage::user(REACT_FORCE_FINAL_MSG));
 
         let force_response = llm.chat(&messages, &opts).await;
