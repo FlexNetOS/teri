@@ -2655,3 +2655,32 @@ Python ground truth captured via `os.path.splitext(f)[1].lower().lstrip('.')`. R
 - `[≠] U025-TRACEBACK` carried (3-key 500 contract preserved, value-only Rust-string divergence, non-contractual). `[!] U025-FILEPARSER` resolved, `[!] U025-CLONE` done.
 
 **VERDICT: PASS.** S-798 (`generate_ontology`, route 5) → `- [x]`. U-025 stays `- [ ]` (S-799–S-803 / sub-cycles d/e/f pending).
+
+---
+
+## 2026-06-18 — U-025 sub-cycle (e): task-query routes — PASS
+
+**Unit:** U-025 (`backend/app/api/graph.py` → `src/api/graph.rs`)
+**Symbols verified:** S-800 `GET /task/<task_id>` (get_task), S-801 `GET /tasks` (list_tasks) → both `- [x]`.
+**Differential:** HTTP-level via full `create_app` router (`/api/graph/*` nested under `/api`, confirmed server.rs:198,206). Source primitives (TaskManager::global/get_task/list_tasks, Task::to_dict) confirmed CALLED correctly; internals not re-verified (landed U-012).
+
+### get_task (py:534-550) — PASS
+- 200 seeded: `{"success":true,"data":<task.to_dict()>}` — key order success,data (preserve_order on). Test `get_task_200_data_matches_to_dict` asserts `json["data"] == task.to_dict()` exact (round-trip via singleton). to_dict 11-key shape identical to py:41-53 (task_id, task_type, status, created_at, updated_at, progress, message, progress_detail, result, error, metadata; status lowercase; isoformat).
+- 404 missing: `{"success":false,"error":"Task not found: <id>"}` — 2-key, NO traceback. Uses `ApiError::client(NOT_FOUND, t_args("api.taskNotFound",[("id",id)]))`. i18n value byte-identical to Python locale (`en.json:339`/`zh.json:339`: `"Task not found: {id}"`/`"任务不存在: {id}"`, {id} substituted). Test `get_task_404_missing` asserts status 404, success=false, error contains id, no traceback key.
+
+### list_tasks (py:553-564) — PASS
+- 200: `{"success":true,"data":[...],"count":N}` — key order success,data,count. Handler calls `TaskManager::global().list_tasks(None)` which returns `Vec<Value>` ALREADY to_dict'd (task.rs:382-391) — handler does NOT re-to_dict (no double-serialize). `count = tasks.len()`. Test `list_tasks_data_array_and_count_consistent` asserts count==data.len(), seeded task present, count>=1 (robust to shared global).
+- Python `TaskManager().list_tasks()` (no filter) ↔ teri `list_tasks(None)`: both unfiltered, both sorted newest-first by created_at (task.rs:389 `b.created_at.cmp(&a.created_at)` == py:172 `sorted(...reverse=True)`). No filtering/ordering divergence.
+
+### Cross-cutting
+- preserve_order: serde_json built with `preserve_order` feature (Cargo.toml:35) → json! macro emits keys in insertion order on both bodies. CONFIRMED.
+- 404 client error is 2-key (no traceback); server/500 would be 3-key — correct client-vs-server split (api/mod.rs:177-185 client; 215-225 server).
+- Singleton: handlers use `TaskManager::global()` (OnceLock process singleton, task.rs:206) matching Python `__new__` singleton — cross-request task visibility preserved. Tests robust to shared global (assert seeded-id present / count>=1, not exact totals).
+
+### No-downgrade of Y
+- Full suite: `cargo test -p teri` → **1275 passed, 6 ignored** (5 suites, 12.24s).
+- Task-route tests: get_task_200_data_matches_to_dict, get_task_404_missing, list_tasks_data_array_and_count_consistent, task_routes_non_regression_existing_routes_still_work → all ok.
+- clippy `-p teri --all-targets`: clean (no issues).
+- (a)/(b)/(c) routes + /health: non-regression test green.
+
+**VERDICT: PASS.** S-800, S-801 → `- [x]`. U-025 stays `- [ ]` pending sub-cycles (d) S-799/`/build` and (f) S-802/S-803 (`/data`, `/delete`).

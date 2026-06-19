@@ -17,7 +17,7 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 2   # NEW SESSION 2026-06-18 (18th resume); CYCLE 20=U-025(a+b) seam+project routes (PASS r1), 21=U-025(c) ontology route (FAIL→fix→PASS)
+cycles_this_session: 3   # BUDGET REACHED; NEW SESSION 2026-06-18 (18th resume); CYCLE 20=U-025(a+b) seam+project routes (PASS r1), 21=U-025(c) ontology (FAIL→fix→PASS), 22=U-025(e) task routes (PASS r1)
 # CYCLE3 (12th resume) 2026-06-17: U-022 sub-cycle (c) MONITOR + offset-tail + graph-fire (S-605/613/614/615 + S-1056/U-047,
 #   5 [x]) — opus PASS (DECISION-17 Area 2, porter@opus). src/services/simulation_runner.rs: monitor_simulation (2s
 #   MONITOR_POLL_INTERVAL poll loop, per-platform file-exists guard, save_run_state per poll, loop-exit on U-048
@@ -735,3 +735,27 @@ next_iterate: U-022 [x] complete → U-017 port-fresh full implementation
 # reshape {nodes,edges,node_count,edge_count}, U025-ZEP-TEMPORAL [≠]]. After U-025: U-026 simulation routes (92KB Flask —
 # LARGE, own architect decomposition), U-027 report routes (h4 ReportSink→SSE adapter lands here). U-024 tail open:
 # (b2) insight_forge OQ-3, (h4) deferred to U-027.
+
+
+# CYCLE 22 (NEW SESSION 2026-06-18, 18th resume): U-025 sub-cycle (e) task routes 7-8 — porter@porter, parity@opus
+# PASS (round-1). src/api/graph.rs: get_task GET /task/:task_id (TaskManager::global().get_task(&id)→Option<Task>;
+# None→ApiError::client(404, api.taskNotFound{id}); Some→{success,data:task.to_dict()}), list_tasks GET /tasks
+# (global().list_tasks(None)→Vec<Value> ALREADY to_dict'd — NO double-serialize; {success,data,count}, count==data.len()).
+# Handlers take no State (TaskManager::global is process OnceLock singleton = Python __new__ singleton, cross-request
+# visibility holds). Byte-faithful (preserve_order: get [success,data]/list [success,data,count]/404 [success,error]
+# 2-key no-traceback). newest-first sort matches Python sorted reverse. 4 new tests (robust to shared global singleton:
+# assert seeded-id-present/count>=1 not exact total). 1275 green, clippy --all-targets clean. Atomic gate: X-parity PASS
+# + Y-green + Y-not-regressed (a/b/c routes + /health intact). Y-drift clean (develop 7c354a5). S-800/801 [x].
+# SESSION BUDGET REACHED (3 cycles: a+b / c / e). HANDOFF. U-025 progress: (a)✓(b)✓(c)✓(e)✓ — routes 1,2,3,4,5,7,8
+# done (7/10). REMAINING in U-025: (d) build route 6 [POST /build graph.py:260-529 — THE big one, critical path:
+# ZEP_API_KEY guard→500 (U025-ZEPGUARD? [≠]), JSON parse, project lookup→404, status-machine guards (CREATED→400
+# ontologyNotGenerated / GRAPH_BUILDING&&!force→400+task_id / force-reset BUILDING|FAILED|COMPLETED), graph_name/chunk
+# resolution, extracted_text→400, ontology→400, create task + project GRAPH_BUILDING + graph_build_task_id + save,
+# delegate to build_graph_async (U-015; OpenAiAdapter Clone DONE), project.graph_id=task_id (U025-BUILD-PROJSTATE [!]:
+# terminal status via task poll since build_graph_async has no project_id), return {success,data:{project_id,task_id,
+# message}}], (f) data/delete routes 9-10 [gap routes LAST, dep on (d)'s graph_id=task_id: U025-GRAPHSTORE [!] map
+# graph_id→task_id→task.result["graph"] reshape {nodes,edges,node_count,edge_count}; U025-ZEP-TEMPORAL [≠] Zep bitemporal
+# fields inexpressible; do f AFTER d]. NEXT sub-cycle on resume = (d) build route (then f). After U-025: U-026 simulation
+# routes (api/simulation.py 92KB — LARGE, needs its OWN rust-port-architect decomposition like U-025 got), U-027 report
+# routes (where h4 ReportSink→SSE adapter from U-024 lands). U-024 tail still open: (b2) insight_forge OQ-3 vec-search,
+# (h4) deferred to U-027. create_app S-024 stays partial until all 3 blueprints (U-025/026/027) land.

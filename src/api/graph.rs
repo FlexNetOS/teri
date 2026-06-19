@@ -2,9 +2,10 @@
 //!
 //! Sub-cycles (a)+(b): shared seam + the 4 project-management routes.
 //! Sub-cycle (c): `/ontology/generate` multipart upload → LLM ontology generation.
-//! Sub-cycles (d)–(f) will add the remaining 5 routes to `graph_router`.
+//! Sub-cycle (e): `/task/:task_id` and `/tasks` task-query routes.
+//! Sub-cycles (d)+(f) will add the remaining 3 routes to `graph_router`.
 //!
-//! # Route → handler map (this file, routes 1–5 of 10)
+//! # Route → handler map (this file, routes 1–8 of 10)
 //!
 //! | # | Python route (graph.py)              | teri handler        | Status     |
 //! |---|--------------------------------------|---------------------|------------|
@@ -14,8 +15,8 @@
 //! | 4 | `POST /project/<id>/reset`     (:89) | `reset_project`     | ported (b) |
 //! | 5 | `POST /ontology/generate`     (:122) | `generate_ontology` | ported (c) |
 //! | 6 | `POST /build`                 (:260) | `build_graph`       | PENDING (d) |
-//! | 7 | `GET  /task/<id>`             (:534) | `get_task`          | PENDING (e) |
-//! | 8 | `GET  /tasks`                 (:553) | `list_tasks`        | PENDING (e) |
+//! | 7 | `GET  /task/<id>`             (:534) | `get_task`          | ported (e) |
+//! | 8 | `GET  /tasks`                 (:553) | `list_tasks`        | ported (e) |
 //! | 9 | `GET  /data/<graph_id>`       (:569) | `get_graph_data`    | PENDING (f) |
 //! | 10| `DELETE /delete/<graph_id>`   (:597) | `delete_graph`      | PENDING (f) |
 //!
@@ -85,10 +86,12 @@ pub fn graph_router(state: Arc<ApiState>) -> Router {
             "/ontology/generate",
             post(generate_ontology).layer(DefaultBodyLimit::max(upload_limit)),
         )
-        // Sub-cycles (d)–(f) will add:
+        // Sub-cycle (e): task-query routes (graph.py:534-564).
+        // TaskManager::global() is a process singleton; no State needed.
+        .route("/task/:task_id", get(get_task))
+        .route("/tasks", get(list_tasks))
+        // Sub-cycles (d)+(f) will add:
         // .route("/build", post(build_graph))
-        // .route("/task/:task_id", get(get_task))
-        // .route("/tasks", get(list_tasks))
         // .route("/data/:graph_id", get(get_graph_data))
         // .route("/delete/:graph_id", delete(delete_graph))
         .with_state(state)
@@ -554,6 +557,53 @@ async fn generate_ontology_inner<L: LlmClient>(
             "files":              project.files,
             "total_text_length":  project.total_text_length
         }
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Route 7 — GET /task/:task_id  (graph.py:534-550)
+//
+// Source:
+//   task = TaskManager().get_task(task_id)
+//   if not task:
+//       return jsonify({"success": False, "error": t('api.taskNotFound', id=task_id)}), 404
+//   return jsonify({"success": True, "data": task.to_dict()})
+//
+// Key order: success, data (200) / success, error (404).
+// TaskManager::global() is the process singleton — no State arg needed.
+// ---------------------------------------------------------------------------
+
+async fn get_task(Path(task_id): Path<String>) -> Result<Json<Value>, ApiError> {
+    match crate::task::TaskManager::global().get_task(&task_id) {
+        None => Err(ApiError::client(
+            StatusCode::NOT_FOUND,
+            crate::i18n::t_args("api.taskNotFound", &[("id", &task_id)]),
+        )),
+        Some(task) => Ok(Json(serde_json::json!({
+            "success": true,
+            "data": task.to_dict()
+        }))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Route 8 — GET /tasks  (graph.py:553-564)
+//
+// Source:
+//   tasks = TaskManager().list_tasks()
+//   return jsonify({"success": True, "data": [t.to_dict() for t in tasks], "count": len(tasks)})
+//
+// list_tasks(None) already returns Vec<serde_json::Value> (to_dict already applied).
+// Key order: success, data, count.
+// ---------------------------------------------------------------------------
+
+async fn list_tasks() -> Result<Json<Value>, ApiError> {
+    let tasks = crate::task::TaskManager::global().list_tasks(None);
+    let count = tasks.len();
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": tasks,
+        "count": count
     })))
 }
 
@@ -1678,5 +1728,170 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "GET /project/list must still be 200");
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers for task-route tests (sub-cycle e)
+    // -----------------------------------------------------------------------
+
+    /// Seed a task in the GLOBAL TaskManager and return its task_id.
+    ///
+    /// The global singleton is shared across the process; tests must be robust
+    /// to the registry containing tasks seeded by other tests.  All assertions
+    /// below use the known task_id rather than checking absolute counts.
+    fn seed_task(task_type: &str) -> String {
+        crate::task::TaskManager::global().create_task(task_type, None)
+    }
+
+    // -----------------------------------------------------------------------
+    // get_task — 200 (seeded task, data == task.to_dict()) (graph.py:534-550)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_task_200_data_matches_to_dict() {
+        let (app, _tmp) = test_app();
+        let task_id = seed_task("build_graph");
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/graph/task/{task_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK, "seeded task must return 200");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Envelope shape: {success: true, data: {...}}
+        assert_eq!(json["success"], true);
+        assert!(json["data"].is_object(), "data must be an object: {json}");
+
+        // data must contain task_id and task_type matching what we seeded
+        assert_eq!(json["data"]["task_id"], task_id, "data.task_id must match seeded id");
+        assert_eq!(
+            json["data"]["task_type"], "build_graph",
+            "data.task_type must match seeded type"
+        );
+        assert_eq!(json["data"]["status"], "pending", "newly created task must be pending");
+
+        // Verify it equals task.to_dict() exactly (round-trip through the singleton)
+        let task = crate::task::TaskManager::global().get_task(&task_id).unwrap();
+        let expected = task.to_dict();
+        assert_eq!(json["data"], expected, "data must equal task.to_dict()");
+    }
+
+    // -----------------------------------------------------------------------
+    // get_task — 404 (missing id → api.taskNotFound body) (graph.py:541-545)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_task_404_missing() {
+        let (app, _tmp) = test_app();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/graph/task/nonexistent-task-id-zzz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "missing task must return 404");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // 2-key client-error envelope: {success: false, error: "..."}
+        assert_eq!(json["success"], false);
+        let error = json["error"].as_str().expect("error must be a string: {json}");
+        assert!(
+            error.contains("nonexistent-task-id-zzz"),
+            "404 error must mention the task id: {error}"
+        );
+        // Must NOT have traceback (client error, not server error)
+        assert!(json.get("traceback").is_none(), "client error must not have traceback: {json}");
+    }
+
+    // -----------------------------------------------------------------------
+    // list_tasks — returns data array + count == data.len(); seeded task appears
+    // (graph.py:553-564)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn list_tasks_data_array_and_count_consistent() {
+        let (app, _tmp) = test_app();
+        // Seed at least one task so the list is non-empty
+        let task_id = seed_task("e2e_list_test");
+
+        let resp = app
+            .oneshot(Request::builder().uri("/api/graph/tasks").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK, "list_tasks must return 200");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Envelope: {success: true, data: [...], count: N}
+        assert_eq!(json["success"], true);
+        let data = json["data"].as_array().expect("data must be an array: {json}");
+        let count = json["count"].as_u64().expect("count must be a number: {json}") as usize;
+
+        // count must equal data.len() (graph.py:563 `"count": len(tasks)`)
+        assert_eq!(count, data.len(), "count must equal data array length");
+
+        // Our seeded task must appear in the list (global singleton may have others)
+        let found = data.iter().any(|item| item["task_id"] == task_id);
+        assert!(found, "seeded task_id {task_id} must appear in list: {json}");
+
+        // count >= 1 (we seeded at least one)
+        assert!(count >= 1, "list must contain at least the seeded task: {json}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Non-regression: (a)/(b)/(c) routes + /health still work after (e) landed
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn task_routes_non_regression_existing_routes_still_work() {
+        let (state, _tmp) = test_state();
+        let project_id = seed_project(&state, "TaskRouteRegressionCheck");
+        let app = crate::server::create_app(state);
+
+        // GET /project/:id (b)
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/graph/project/{project_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "GET /project/:id regression");
+
+        // GET /project/list (b)
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/graph/project/list").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "GET /project/list regression");
+
+        // /health (U-002)
+        let resp = app
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "/health regression after (e)");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
     }
 }
