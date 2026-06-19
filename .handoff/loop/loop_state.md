@@ -17,7 +17,7 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 3   # BUDGET REACHED; NEW SESSION 2026-06-18 (18th resume); CYCLE 20=U-025(a+b) seam+project routes (PASS r1), 21=U-025(c) ontology (FAIL→fix→PASS), 22=U-025(e) task routes (PASS r1)
+cycles_this_session: 1   # NEW SESSION 2026-06-18 (19th resume); CYCLE 23=U-025(d) build route (PASS r1, architect-refined additive completion hook)
 # CYCLE3 (12th resume) 2026-06-17: U-022 sub-cycle (c) MONITOR + offset-tail + graph-fire (S-605/613/614/615 + S-1056/U-047,
 #   5 [x]) — opus PASS (DECISION-17 Area 2, porter@opus). src/services/simulation_runner.rs: monitor_simulation (2s
 #   MONITOR_POLL_INTERVAL poll loop, per-platform file-exists guard, save_run_state per poll, loop-exit on U-048
@@ -759,3 +759,38 @@ next_iterate: U-022 [x] complete → U-017 port-fresh full implementation
 # routes (api/simulation.py 92KB — LARGE, needs its OWN rust-port-architect decomposition like U-025 got), U-027 report
 # routes (where h4 ReportSink→SSE adapter from U-024 lands). U-024 tail still open: (b2) insight_forge OQ-3 vec-search,
 # (h4) deferred to U-027. create_app S-024 stays partial until all 3 blueprints (U-025/026/027) land.
+
+
+# CYCLE 23 (NEW SESSION 2026-06-18, 19th resume): U-025 sub-cycle (d) POST /build route — THE big one.
+# architect-REFINED (findings/u025-architecture.md §4a-REFINED) + porter@porter + parity@opus PASS (round-1).
+# >>> KEY NO-DOWNGRADE WIN: architect's ORIGINAL §4a option (ii) ("graph_id=task_id at spawn, terminal status via task
+# poll") was caught as a REUSE-BY-NARROWING — Python build_task (graph.py:413-415,472-474,500-502) sets project.graph_id
+# + status=GraphCompleted/Failed + error from the bg thread, ALL served by GET /project/<id>; option (ii) DROPPED them.
+# REFINED to (A) ADDITIVE EXTEND. src/services/graph_builder.rs: NEW build_graph_async_with_completion(...,8th:
+# Option<ProjectCompletion{manager:ProjectManager,project_id}>); build_graph_async KEEPS 7-arg shape (delegates None →
+# U-015 byte-unchanged, ZERO blast radius, build_graph_worker_inner stays project-agnostic); hook in OUTER
+# build_graph_worker terminal branches: SUCCESS→apply_completion_success (reload project, status=GraphCompleted, graph_id
+# =Some(task_id), save) / FAILURE→apply_completion_failure (status=Failed, error=Some, save) — BEST-EFFORT (swallow save
+# errs, can't panic worker). src/models/project.rs: ProjectManager +#[derive(Clone)] (PathBuf, additive). src/api/graph.rs:
+# build_graph handler (§R.10 17 steps): ZEP guard config.zep_api_key empty→500 configError (KEPT — teri NOT keyless at
+# config, U025-ZEPGUARD resolved KEEP), JSON body (Option<Json> →{} tolerant), project_id→400 requireProjectId, lookup→404,
+# status machine (Created→400 ontologyNotGenerated / GraphBuilding&&!force→400 +task_id via client_with / force-reset
+# [GraphBuilding,Failed,GraphCompleted]→OntologyGenerated+clear), graph_name/chunk falsy-fallback (project.name||"MiroFish
+# Graph", project.chunk_size||DEFAULT_CHUNK_SIZE=500, ||DEFAULT_CHUNK_OVERLAP=50), get_extracted_text None/empty→400
+# textNotFound, project.ontology None→400 ontologyNotFound, build_graph_async_with_completion(build_llm, ..., BATCH=3,
+# Some(ProjectCompletion)) [creates task+spawns, SUBSUMES Python create_task], set status=GraphBuilding+graph_build_task_id
+# +save (AFTER task_id — reorder vs Python-saves-before-spawn, non-observable), 200 {success,data:{project_id,task_id,
+# message:graphBuildStarted}}. Completion hook PROVEN through-disk (tests reload project, assert status/graph_id/error on
+# success+failure paths). [≠] U025-TASKNAME (graph_build vs 构建图谱:{name}, non-contractual display label, name in metadata),
+# U025-GRAPHID-TIMING (graph_id at COMPLETED not spawn, non-observable — frontend reads it only post-complete for /data),
+# U025-TRACEBACK carried. 18 new tests, 1289 green, clippy --all-targets clean. Atomic gate: X-parity PASS + Y-green +
+# Y-not-regressed (U-015 + a/b/c/e routes + /health intact). Y-drift clean (develop 7c354a5). S-799 [x].
+# NEXT: U-025 (f) data/delete routes 9-10 — THE GAP ROUTES (LAST): get_graph_data GET /data/:graph_id [map graph_id→task_id
+# →TaskManager::global().get_task(graph_id).result["graph"] reshape into {nodes,edges,node_count,edge_count} contract;
+# U025-GRAPHSTORE [!] (no durable graph-by-id store — task-result map; durable GraphStore deferred to own unit, NOT
+# dropped); U025-ZEP-TEMPORAL [≠] (Zep bitemporal node/edge fields valid_at/invalid_at/expired_at/episodes/summary/labels
+# inexpressible, U-015 class)], delete_graph DELETE /delete/:graph_id [success envelope, no persistent store to delete].
+# Read graph.py:569-622. After (f): U-025 COMPLETE (all 10 routes) → mark unit [x]; S-024 create_app STAYS partial until
+# U-026+U-027 also land. Then U-026 simulation routes (api/simulation.py 92KB — LARGE, needs own rust-port-architect
+# decomposition), U-027 report routes (h4 ReportSink→SSE adapter from U-024 lands here). U-024 tail: (b2) insight_forge
+# OQ-3, (h4) deferred to U-027.

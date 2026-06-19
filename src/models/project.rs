@@ -329,6 +329,11 @@ impl Project {
 ///
 /// For testability, `ProjectManager::new(base)` accepts any `PathBuf`; the production
 /// path is `{config.upload_folder}/projects` — constructed by `ProjectManager::from_config`.
+///
+/// `Clone` is derived so that sub-cycle (d)'s `/build` handler can move a `ProjectManager`
+/// into the `ProjectCompletion` hook (which is sent into `tokio::spawn`).  `PathBuf` is
+/// `Clone + Send + Sync + 'static`, so this derive is additive and zero-behavior-change.
+#[derive(Clone)]
 pub struct ProjectManager {
     /// S-123: PROJECTS_DIR = `{upload_folder}/projects`
     projects_dir: PathBuf,

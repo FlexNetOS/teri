@@ -45,8 +45,40 @@ use std::collections::HashMap;
 use crate::error::TeriError;
 use crate::graph::{KnowledgeGraph, collect_entity_type_names};
 use crate::llm::LlmClient;
+use crate::models::project::{ProjectManager, ProjectStatus};
 use crate::seed::{SeedDocument, text_processor};
 use crate::task::{TaskManager, TaskStatus};
+
+// ---------------------------------------------------------------------------
+// ProjectCompletion — optional project-state hook for build_graph_async_with_completion
+//
+// Port of the three `ProjectManager.save_project(project)` mutations that Python's
+// `build_task` background thread performs (graph.py:413-415, 472-474, 500-502).
+// These are the project-state observables that option-(ii) would have silently dropped
+// (see §4a-REFINED, R.1 in u025-architecture.md); they are contractual because the
+// frontend reads them via `GET /api/graph/project/<id>`.
+//
+// Design invariants:
+//   • `ProjectManager` holds only a `PathBuf` → `Clone + Send + Sync + 'static` (R.6)
+//   • The hook is BEST-EFFORT: reload/save errors are swallowed (`let _ =` / `if let`)
+//     so a transient FS error cannot panic the spawned worker task (matching Python's
+//     `try/except` in `build_task` which logs but does not re-raise save errors).
+// ---------------------------------------------------------------------------
+
+/// Optional project-state completion hook for `build_graph_async_with_completion`.
+///
+/// When `Some(ProjectCompletion{..})` is passed, `build_graph_worker` updates the
+/// project's `status` and (on success) `graph_id` at the terminal transition,
+/// mirroring Python `build_task`'s background thread mutations (graph.py:472-474,500-502).
+///
+/// The `manager` holds only a `PathBuf` so it is `Clone + Send + Sync + 'static`
+/// and safe to move into `tokio::spawn`.
+pub struct ProjectCompletion {
+    /// A cloned `ProjectManager` (holds only a `PathBuf`; cheap to clone).
+    pub manager: ProjectManager,
+    /// The project whose state to update at build completion.
+    pub project_id: String,
+}
 
 /// Asynchronously builds a knowledge graph from `text` and returns a task_id immediately.
 ///
@@ -93,6 +125,47 @@ pub fn build_graph_async<L>(
 where
     L: LlmClient + Clone + Send + Sync + 'static,
 {
+    // Delegate to the with-completion form with None hook so U-015's verified 7-arg
+    // call shape is UNCHANGED.  Blast radius: zero (R.3 / R.7 in u025-architecture.md).
+    build_graph_async_with_completion(
+        llm,
+        text,
+        ontology,
+        graph_name,
+        chunk_size,
+        chunk_overlap,
+        _batch_size,
+        None,
+    )
+}
+
+/// Asynchronously builds a knowledge graph and optionally applies a project-state
+/// completion hook when the build task terminates.
+///
+/// This is the ADDITIVE entry point (sub-cycle d).  The existing `build_graph_async`
+/// delegates here with `completion: None`, keeping U-015's 7-arg verified surface stable.
+///
+/// # Additional argument
+/// - `completion` — when `Some`, the project referenced by `project_id` is updated at the
+///   terminal transition: success → `status=GraphCompleted, graph_id=Some(task_id)`;
+///   failure → `status=Failed, error=Some(err)`.  Mirrors graph.py:472-474 / 500-502.
+///   Updates are BEST-EFFORT (save errors are swallowed, never panic the worker).
+///
+/// Port of graph.py:364-513 (the outer `build_task` thread wrapper with project mutations).
+#[allow(clippy::too_many_arguments)]
+pub fn build_graph_async_with_completion<L>(
+    llm: L,
+    text: String,
+    ontology: Value,
+    graph_name: String,
+    chunk_size: usize,
+    chunk_overlap: usize,
+    _batch_size: usize, // [≠] Zep-batching artifact; accepted, ignored
+    completion: Option<ProjectCompletion>,
+) -> String
+where
+    L: LlmClient + Clone + Send + Sync + 'static,
+{
     // Create the task (S-189: mirrors Python `self.task_manager.create_task`).
     let mut metadata = HashMap::new();
     metadata.insert("graph_name".to_string(), json!(graph_name));
@@ -115,6 +188,7 @@ where
             graph_name,
             chunk_size,
             chunk_overlap,
+            completion,
         )
         .await;
     }));
@@ -127,6 +201,13 @@ where
 /// Drives the full pipeline: set_ontology → split → 2-pass extraction → rollup → complete/fail.
 /// All exceptions (any `Err`) are caught and routed to `fail_task` (matching the Python
 /// `try/except traceback` → `fail_task` pattern).
+///
+/// When `completion` is `Some`, this function also applies the project-state mutations
+/// that Python's `build_task` background thread performs at the terminal transitions
+/// (graph.py:472-474 on success; graph.py:500-502 on failure).  These are BEST-EFFORT:
+/// a failed `get_project` or `save_project` is silently ignored so it cannot panic
+/// the spawned task.
+#[allow(clippy::too_many_arguments)]
 async fn build_graph_worker<L>(
     task_id: String,
     llm: L,
@@ -135,6 +216,7 @@ async fn build_graph_worker<L>(
     graph_name: String,
     chunk_size: usize,
     chunk_overlap: usize,
+    completion: Option<ProjectCompletion>,
 ) where
     L: LlmClient + Clone + Send + Sync + 'static,
 {
@@ -149,10 +231,46 @@ async fn build_graph_worker<L>(
     )
     .await;
 
-    if let Err(e) = result {
-        // Mirror Python `except Exception as e: traceback.format_exc()` → `fail_task`.
-        TaskManager::global().fail_task(&task_id, e.to_string());
+    match result {
+        Ok(()) => {
+            // SUCCESS terminal — inner already called complete_task.
+            // Port of graph.py:472-474 + graph_id=task_id (R.4/R.5 in u025-architecture.md).
+            // graph_id is set ONCE at COMPLETED (not at spawn): null-until-complete is faithful
+            // because the frontend consumes graph_id only after COMPLETED to address /data/<id>.
+            apply_completion_success(&completion, &task_id);
+        }
+        Err(e) => {
+            // FAILURE terminal.  Mirror Python `except Exception as e: traceback.format_exc()`
+            // → `fail_task`, THEN port graph.py:500-502 (project.status=FAILED + error).
+            TaskManager::global().fail_task(&task_id, e.to_string());
+            apply_completion_failure(&completion, &e.to_string());
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Completion-hook helpers — extracted to avoid nested-if-let clippy lint.
+// These are best-effort (errors swallowed) per the architect's spec (R.4).
+// ---------------------------------------------------------------------------
+
+/// Apply the SUCCESS project-state mutations from the `ProjectCompletion` hook.
+/// Port of graph.py:472-474 + graph_id=task_id (R.4/R.5).
+fn apply_completion_success(completion: &Option<ProjectCompletion>, task_id: &str) {
+    let Some(c) = completion else { return };
+    let Ok(Some(mut p)) = c.manager.get_project(&c.project_id) else { return };
+    p.status = ProjectStatus::GraphCompleted;
+    p.graph_id = Some(task_id.to_string()); // teri graph handle = task_id (DECISION-9)
+    let _ = c.manager.save_project(&mut p); // best-effort
+}
+
+/// Apply the FAILURE project-state mutations from the `ProjectCompletion` hook.
+/// Port of graph.py:500-502.
+fn apply_completion_failure(completion: &Option<ProjectCompletion>, err: &str) {
+    let Some(c) = completion else { return };
+    let Ok(Some(mut p)) = c.manager.get_project(&c.project_id) else { return };
+    p.status = ProjectStatus::Failed;
+    p.error = Some(err.to_string());
+    let _ = c.manager.save_project(&mut p); // best-effort
 }
 
 /// Failable inner worker body.  Returns `Err` on any failure so the outer wrapper can route to

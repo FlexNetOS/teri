@@ -2684,3 +2684,105 @@ Python ground truth captured via `os.path.splitext(f)[1].lower().lstrip('.')`. R
 - (a)/(b)/(c) routes + /health: non-regression test green.
 
 **VERDICT: PASS.** S-800, S-801 → `- [x]`. U-025 stays `- [ ]` pending sub-cycles (d) S-799/`/build` and (f) S-802/S-803 (`/data`, `/delete`).
+
+---
+
+## 2026-06-18 — U-025 sub-cycle (d): `POST /build` (S-799) + completion-hook extension — PARITY VERDICT
+
+**Scope:** route 6 `POST /build` (`build_graph` handler, `src/api/graph.rs:608-834`) + the additive
+project-completion hook (`ProjectCompletion`, `apply_completion_success/failure`,
+`build_graph_async_with_completion`, `src/services/graph_builder.rs:76-274`) vs Python
+`backend/app/api/graph.py:260-529`.
+
+**Method:** differential read of every guard (status + JSON shape, file:line both sides), driven
+completion-hook tests that AWAIT the spawned task to terminal then RELOAD project from disk, additive-extend
+non-regression checks, full-suite + clippy gate.
+
+### Completion-hook preservation (THE no-downgrade point) — CONFIRMED
+The architect's own option-(ii) would have DROPPED three project-state observables (graph_id,
+status=COMPLETED/FAILED, error). The refined decision (A: additively extend with `Option<ProjectCompletion>`)
+is faithfully implemented and DRIVEN:
+- SUCCESS: `apply_completion_success` (graph_builder.rs:258-264) → reload project, `status=GraphCompleted`,
+  `graph_id=Some(task_id)`, save. Test `completion_hook_success_sets_graph_completed_and_graph_id`
+  (graph.rs:2503-2620) spawns via `build_graph_async_with_completion` + `ProjectCompletion`, polls task to
+  terminal, then **reloads from disk** (`pm.get_project`, graph.rs:2608) and asserts status=GraphCompleted +
+  graph_id==task_id + error=None. PASS (ran individually: 1 passed).
+- FAILURE: `apply_completion_failure` (graph_builder.rs:268-274) → reload, `status=Failed`,
+  `error=Some(err)`, save. Test `completion_hook_failure_sets_failed_status_and_error`
+  (graph.rs:2629-2735) forces an LLM error, awaits FAILED terminal, **reloads from disk** (graph.rs:2726),
+  asserts status=Failed + error contains the LLM message + graph_id=None. PASS.
+- Best-effort: both helpers swallow reload/save errors (`let Ok(Some(..)) = .. else { return }` +
+  `let _ = save_project`, graph_builder.rs:260/263/270/273) — a transient FS error cannot panic the worker
+  (mirrors Python build_task try/except). Mapped to graph.py:472-474 / 500-502. CONFIRMED — narrowing is NOT
+  back; the persisted terminal project state is observable via `Project::to_dict` (status/graph_id/error all
+  serialized, project.rs to_dict) → served by GET /project/<id>.
+
+### Additive-extend = U-015 NOT regressed — CONFIRMED
+- `build_graph_async` KEEPS its 7-arg signature (graph_builder.rs:116-124) and delegates to
+  `*_with_completion(.., None)` (graph_builder.rs:130-140).
+- `build_graph_worker_inner` is UNCHANGED / project-agnostic: 7 params, no completion/project_id
+  (graph_builder.rs:282-290). All completion mutations live in the `build_graph_worker` wrapper.
+- `ProjectManager` is `#[derive(Clone)]` over a single `PathBuf` (project.rs:336-338) → additive,
+  Send+Sync+'static, safe to move into tokio::spawn.
+- NO production caller of the 7-arg `build_graph_async` exists (only test callers); the sole production
+  caller of `*_with_completion` is the new `build_graph` handler (graph.rs:801) — nothing forced to change.
+- U-015 tests green byte-unchanged: `test_build_graph_async_returns_task_id_immediately`,
+  `test_build_graph_worker_inner_completes_with_result`, `build_graph_async_7arg_u015_non_regression`
+  (all 1 passed).
+
+### Guard sequence (verbatim, status + body) — ALL CONFIRMED
+1. ZEP missing → 500 `{success:false,error:configError}` 2-key (NOT 3-key traceback). gate=`config.zep_api_key`
+   empty (graph.rs:618-627 vs graph.py:286-295). Test `build_graph_500_zep_key_missing` asserts no traceback key. PASS.
+2. missing/empty project_id → 400 requireProjectId (graph.rs:638-644 vs 302-306). Tests _400_missing/_empty. PASS.
+3. project not found → 404 projectNotFound(id) (graph.rs:651-659 vs 309-314). Test _404. PASS.
+4. status==Created → 400 ontologyNotGenerated (graph.rs:670-675 vs 319-323). Test _400_ontology_not_generated. PASS.
+5. status==GraphBuilding && !force → 400 `{success:false,error:graphBuilding,task_id:<id|null>}` via
+   `ApiError::client_with` (graph.rs:681-696 vs 325-330); task_id key present (Null if absent). Test
+   _400_graph_building_without_force asserts task_id=="existing-task-id-123". PASS.
+6. force && status∈[GraphBuilding,Failed,GraphCompleted] → reset OntologyGenerated + clear
+   graph_id/graph_build_task_id/error (graph.rs:702-712 vs 333-337). Test _force_reset_path_proceeds. PASS.
+7. get_extracted_text None **or empty** → 400 textNotFound (graph.rs:764-779 handles Some("")
+   matching Python falsy `if not text`, vs 349-354). Test _400_text_not_found. PASS.
+8. ontology None → 400 ontologyNotFound (graph.rs:784-792 vs 357-362). Test _400_ontology_not_found. PASS.
+
+### Defaults / falsy-fallbacks — CONFIRMED
+- graph_name = data||(project.name if non-empty else "MiroFish Graph") — `.filter(|s| !s.is_empty())` +
+  empty-name branch (graph.rs:719-730 vs graph.py:340). literal "MiroFish Graph" kept.
+- chunk_size/overlap = data||(project value if >0 else config default 500/50) — `if ps <= 0` replicates
+  Python `or` falsy (0→default) (graph.rs:737-753 vs 341-342). config defaults 500/50 match (config.rs:256-257
+  == config.py:44-45). project.chunk_size/overlap updated in-memory, saved at step 15 (graph.rs:758-759 vs 345-346).
+
+### Response + reorder — CONFIRMED
+- 200 `{success:true,data:{project_id,task_id,message:graphBuildStarted(taskId)}}` key order (graph.rs:826-833
+  vs 515-522; i18n key graphBuildStarted en.json:336 exists). Test _200_happy_path asserts shape + UUID task_id.
+- project.status=GraphBuilding + graph_build_task_id=task_id persisted after 200; graph_id=None until COMPLETED
+  (graph.rs:818-820; test asserts saved.graph_id.is_none()). PASS.
+- Reorder (task_id-first then save vs Python save-before-spawn): NON-OBSERVABLE — both visible to polls only
+  after handler returns; worker touches project only at terminal (strictly after step-15 save). CONFIRMED.
+
+### `[≠]` adjudications
+- `[≠] U025-TASKNAME` (`构建图谱:{graph_name}` → `"graph_build"`): **LEGIT non-contractual.** Task name is a
+  display label; graph_name preserved in task metadata (graph_builder.rs:171). Changing the token would
+  reopen U-015's verified `task_type` shape. Not a distinct observable output. ACCEPTED.
+- `[≠] U025-GRAPHID-TIMING` (graph_id set at COMPLETED not mid-build): **LEGIT non-contractual.** Independently
+  refuted observability: frontend tracks build via `/task/<id>` (the /build response + graphBuildStarted msg
+  point there); graph_id is consumed ONLY post-COMPLETED to address `/data/<graph_id>` & `/delete/<graph_id>`
+  (graph.py:569-622, which need a *completed* graph to fetch). The two handles (Zep server id vs teri task id)
+  are not byte-comparable. Sub-divergence checked: on FAILED, Python may leave a stale mid-build Zep graph_id
+  while teri sets None — but a FAILED project's graph_id is not a consumed success-path observable (graph view
+  gates on status==GraphCompleted), so non-contractual; teri's FAILED⇒None is consistent (status⇔graph_id).
+  ACCEPTED.
+- `[≠] U025-TRACEBACK` (carried): 3-key `{success,error,traceback}` envelope preserved (ApiError::server);
+  only the value differs (Rust ctx vs Python stack). Non-contractual. ACCEPTED.
+- Empty/missing JSON body: handler uses `Option<Json<Value>>` defaulting to `{}` (graph.rs:610,633) —
+  replicates Python `request.get_json() or {}`; no 400/415 on empty body. CONFIRMED.
+
+### No-downgrade of Y
+- Full suite: **1289 passed, 6 ignored** (`cargo test -p teri`, 5 suites).
+- clippy `-p teri --all-targets`: clean (no issues).
+- (a)/(b)/(c)/(e) routes + /health: `build_route_non_regression_existing_routes_still_work` +
+  `task_routes_non_regression...` green.
+
+**VERDICT: PASS.** S-799 (`build_graph`, route 6) → `- [x]`; the `build_graph_async_with_completion`
+symbol verified as part of it. U-025 stays `- [ ]` pending sub-cycle (f) (S-802 `/data`, S-803 `/delete`).
+Test count: 1289 passed, 6 ignored.

@@ -940,7 +940,7 @@
 - [x] S-796 · `unit:U-025` · `route` · `DELETE /project/<project_id>` · handler `delete_project` · `graph.py:71` · **PARITY-VERIFIED 2026-06-18 (opus PASS).** Ok(true)→200 `{success,message:api.projectDeleted w/id}`; Ok(false)→404 `{success,error:api.projectDeleteFailed w/id}` (2-key). Note: teri `delete_project`→`Ok(false)` on absent (NOT Err) per S-133 — faithful to Python `return False`.
 - [x] S-797 · `unit:U-025` · `route` · `POST /project/<project_id>/reset` · handler `reset_project` · `graph.py:90` · **PARITY-VERIFIED 2026-06-18 (opus PASS).** Missing→404; else status machine `ontology.is_some()?OntologyGenerated:Created`, clears graph_id/graph_build_task_id/error, save, 200 `{success,message:api.projectReset,data:to_dict}` (key order success,message,data). Verified through HTTP: graph_id serializes null, status `"created"`/`"ontology_generated"`, data key order matches Python to_dict.
 - [x] S-798 · `unit:U-025` · `route` · `POST /ontology/generate` · multipart: files+simulation_requirement+project_name · `graph.py:123`
-- [ ] S-799 · `unit:U-025` · `route` · `POST /build` · json: project_id, graph_name → build_graph_async · `graph.py:261`
+- [x] S-799 · `unit:U-025` · `route` · `POST /build` · json: project_id, graph_name → build_graph_async · `graph.py:261`
 - [x] S-800 · `unit:U-025` · `route` · `GET /task/<task_id>` · TaskManager status · `graph.py:535`
 - [x] S-801 · `unit:U-025` · `route` · `GET /tasks` · list all tasks · `graph.py:554`
 - [ ] S-802 · `unit:U-025` · `route` · `GET /data/<graph_id>` · GraphBuilderService.get_graph_data · `graph.py:570`

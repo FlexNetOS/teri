@@ -2,8 +2,9 @@
 //!
 //! Sub-cycles (a)+(b): shared seam + the 4 project-management routes.
 //! Sub-cycle (c): `/ontology/generate` multipart upload → LLM ontology generation.
+//! Sub-cycle (d): `POST /build` — the big build route with project-state completion hook.
 //! Sub-cycle (e): `/task/:task_id` and `/tasks` task-query routes.
-//! Sub-cycles (d)+(f) will add the remaining 3 routes to `graph_router`.
+//! Sub-cycle (f) will add the remaining 2 routes to `graph_router`.
 //!
 //! # Route → handler map (this file, routes 1–8 of 10)
 //!
@@ -14,7 +15,7 @@
 //! | 3 | `DELETE /project/<id>`         (:70) | `delete_project`    | ported (b) |
 //! | 4 | `POST /project/<id>/reset`     (:89) | `reset_project`     | ported (b) |
 //! | 5 | `POST /ontology/generate`     (:122) | `generate_ontology` | ported (c) |
-//! | 6 | `POST /build`                 (:260) | `build_graph`       | PENDING (d) |
+//! | 6 | `POST /build`                 (:260) | `build_graph`       | ported (d) |
 //! | 7 | `GET  /task/<id>`             (:534) | `get_task`          | ported (e) |
 //! | 8 | `GET  /tasks`                 (:553) | `list_tasks`        | ported (e) |
 //! | 9 | `GET  /data/<graph_id>`       (:569) | `get_graph_data`    | PENDING (f) |
@@ -45,6 +46,7 @@ use crate::api::{ApiError, ApiState, build_llm};
 use crate::llm::LlmClient;
 use crate::models::project::{ProjectManager, ProjectStatus};
 use crate::seed::{self, SeedIngestor};
+use crate::services::graph_builder::{ProjectCompletion, build_graph_async_with_completion};
 use crate::services::ontology::OntologyGenerator;
 
 // ---------------------------------------------------------------------------
@@ -86,12 +88,13 @@ pub fn graph_router(state: Arc<ApiState>) -> Router {
             "/ontology/generate",
             post(generate_ontology).layer(DefaultBodyLimit::max(upload_limit)),
         )
+        // Sub-cycle (d): the big build route (graph.py:260-529).
+        .route("/build", post(build_graph))
         // Sub-cycle (e): task-query routes (graph.py:534-564).
         // TaskManager::global() is a process singleton; no State needed.
         .route("/task/:task_id", get(get_task))
         .route("/tasks", get(list_tasks))
-        // Sub-cycles (d)+(f) will add:
-        // .route("/build", post(build_graph))
+        // Sub-cycle (f) will add:
         // .route("/data/:graph_id", get(get_graph_data))
         // .route("/delete/:graph_id", delete(delete_graph))
         .with_state(state)
@@ -559,6 +562,278 @@ async fn generate_ontology_inner<L: LlmClient>(
         }
     })))
 }
+
+// ---------------------------------------------------------------------------
+// Route 6 — POST /build  (graph.py:260-529)
+//
+// The big build route — port of graph.py:283-372 (synchronous handler) + 515-522
+// (response) + project-completion hook (graph.py:472-474, 500-502 from build_task).
+//
+// Step ordering matches §R.10 of u025-architecture.md exactly:
+//  1.  ZEP guard               (graph.py:286-295)  → 500 configError
+//  2.  Parse JSON body         (graph.py:298)       → data or {}
+//  3.  project_id required     (graph.py:299-306)   → 400 requireProjectId
+//  4.  Project lookup          (graph.py:309-314)   → 404 projectNotFound
+//  5.  Read `force`            (graph.py:317)
+//  6.  Status: CREATED guard   (graph.py:319-323)   → 400 ontologyNotGenerated
+//  7.  Status: BUILDING && !force (graph.py:325-330)→ 400 graphBuilding + task_id
+//  8.  Force-reset             (graph.py:333-337)   → clear status/graph_id/task_id/error
+//  9.  Resolve graph_name      (graph.py:340)
+// 10.  Resolve chunk_size / overlap (graph.py:341-342)
+// 11.  Update project chunk config (graph.py:345-346) — saved at step 13
+// 12.  Fetch extracted text    (graph.py:349-354)   → 400 textNotFound
+// 13.  Fetch ontology          (graph.py:357-362)   → 400 ontologyNotFound
+// 14.  Spawn (SUBSUMES create_task) → build_graph_async_with_completion → task_id
+// 15.  Set project BUILDING + save (graph.py:370-372)
+// 16.  Return 200 {success,data:{project_id,task_id,message}}
+// 17.  Outer 500 envelope: any ?-propagated error → ApiError::server
+//
+// `[≠] U025-TASKNAME`: Python task name = `f"构建图谱: {graph_name}"`; teri uses the stable
+// `"graph_build"` token (U-015 verified surface).  graph_name is preserved in task metadata.
+// `[≠] U025-TRACEBACK`: server error 500 carries Rust string, not Python stack (§3b).
+// `[≠] U025-GRAPHID-TIMING`: graph_id set once at COMPLETED, not at spawn (R.5).
+// ZEP guard: KEPT/PORTED (R.8) — config.zep_api_key expressible; error path is contractual.
+//
+// NOTE on body parsing: Python uses `request.get_json() or {}` which tolerates absent/empty
+// body (returns {}) and also tolerates a body with Content-Type:application/json but empty
+// content.  We use `Option<Json<Value>>` defaulting to `{}` to replicate this semantics;
+// if the client omits the body entirely (no Content-Type), axum will match None → `{}`.
+// ---------------------------------------------------------------------------
+
+/// Route 6 handler — all `?`-propagated errors from `ProjectManager` or `save_project`
+/// are caught by the `map_err(ApiError::server)` wrappers INSIDE the handler body.
+/// The outer Python `try/except Exception as e` (graph.py:524-529) is mirrored by the
+/// `.map_err(ApiError::server)` on each fallible call site inside this handler
+/// (`[≠] U025-TRACEBACK`: traceback carries a Rust string, not a Python stack).
+async fn build_graph(
+    State(state): State<Arc<ApiState>>,
+    body: Option<axum::extract::Json<serde_json::Value>>,
+) -> Result<axum::response::Json<serde_json::Value>, ApiError> {
+    // -----------------------------------------------------------------------
+    // Step 1: ZEP guard (graph.py:286-295)
+    // Port-faithful: config.zep_api_key expressible; guard kept per R.8.
+    // Status is 500 but uses the 2-key client-error body shape (not the 3-key
+    // server traceback shape) — matches Python's `jsonify({"success":False,"error":...}), 500`.
+    // -----------------------------------------------------------------------
+    let mut errors: Vec<String> = Vec::new();
+    if state.config.zep_api_key.as_deref().unwrap_or("").is_empty() {
+        errors.push(crate::i18n::t("api.zepApiKeyMissing"));
+    }
+    if !errors.is_empty() {
+        return Err(ApiError::client(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            crate::i18n::t_args("api.configError", &[("details", &errors.join("; "))]),
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 2: Parse JSON body (graph.py:298)
+    // Python: `data = request.get_json() or {}` — tolerates absent/empty body → {}
+    // -----------------------------------------------------------------------
+    let data = body.map(|j| j.0).unwrap_or_else(|| serde_json::json!({}));
+
+    // -----------------------------------------------------------------------
+    // Step 3: project_id required (graph.py:299-306)
+    // -----------------------------------------------------------------------
+    let project_id = data.get("project_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if project_id.is_empty() {
+        return Err(ApiError::client(
+            axum::http::StatusCode::BAD_REQUEST,
+            crate::i18n::t("api.requireProjectId"),
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 4: Project lookup (graph.py:309-314)
+    // -----------------------------------------------------------------------
+    let pm = ProjectManager::from_config(&state.config);
+    let project_opt = pm.get_project(&project_id).map_err(ApiError::server)?;
+    let mut project = match project_opt {
+        None => {
+            return Err(ApiError::client(
+                axum::http::StatusCode::NOT_FOUND,
+                crate::i18n::t_args("api.projectNotFound", &[("id", &project_id)]),
+            ));
+        }
+        Some(p) => p,
+    };
+
+    // -----------------------------------------------------------------------
+    // Step 5: Read `force` (graph.py:317)
+    // Python: data.get('force', False) — any truthy JSON value is treated as true.
+    // -----------------------------------------------------------------------
+    let force = data.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // -----------------------------------------------------------------------
+    // Step 6: Status machine — CREATED guard (graph.py:319-323)
+    // -----------------------------------------------------------------------
+    if project.status == ProjectStatus::Created {
+        return Err(ApiError::client(
+            axum::http::StatusCode::BAD_REQUEST,
+            crate::i18n::t("api.ontologyNotGenerated"),
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 7: Status machine — BUILDING && !force (graph.py:325-330)
+    // The 400 body also carries `task_id` (graph.py:329): use ApiError::client_with.
+    // -----------------------------------------------------------------------
+    if project.status == ProjectStatus::GraphBuilding && !force {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "task_id".to_string(),
+            project
+                .graph_build_task_id
+                .as_deref()
+                .map(|s| serde_json::Value::String(s.to_string()))
+                .unwrap_or(serde_json::Value::Null),
+        );
+        return Err(ApiError::client_with(
+            axum::http::StatusCode::BAD_REQUEST,
+            crate::i18n::t("api.graphBuilding"),
+            extra,
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 8: Force-reset (graph.py:333-337)
+    // If force && status ∈ {GraphBuilding, Failed, GraphCompleted} → reset.
+    // -----------------------------------------------------------------------
+    if force
+        && matches!(
+            project.status,
+            ProjectStatus::GraphBuilding | ProjectStatus::Failed | ProjectStatus::GraphCompleted
+        )
+    {
+        project.status = ProjectStatus::OntologyGenerated;
+        project.graph_id = None;
+        project.graph_build_task_id = None;
+        project.error = None;
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 9: Resolve graph_name (graph.py:340)
+    // Python: data.get('graph_name', project.name or 'MiroFish Graph')
+    // Falsy-fallback: empty project.name → "MiroFish Graph"
+    // -----------------------------------------------------------------------
+    let graph_name = data
+        .get("graph_name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            if project.name.is_empty() {
+                "MiroFish Graph".to_string()
+            } else {
+                project.name.clone()
+            }
+        });
+
+    // -----------------------------------------------------------------------
+    // Step 10: Resolve chunk_size / chunk_overlap (graph.py:341-342)
+    // Python: data.get('chunk_size', project.chunk_size or Config.DEFAULT_CHUNK_SIZE)
+    // Zero/None project value → fall back to config default (Python `or` semantics).
+    // -----------------------------------------------------------------------
+    let chunk_size: usize = data
+        .get("chunk_size")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or_else(|| {
+            let ps = project.chunk_size;
+            if ps <= 0 { state.config.default_chunk_size } else { ps as usize }
+        });
+
+    let chunk_overlap: usize = data
+        .get("chunk_overlap")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or_else(|| {
+            let po = project.chunk_overlap;
+            if po <= 0 { state.config.default_chunk_overlap } else { po as usize }
+        });
+
+    // -----------------------------------------------------------------------
+    // Step 11: Update project chunk config (graph.py:345-346) — saved at step 15
+    // -----------------------------------------------------------------------
+    project.chunk_size = chunk_size as i64;
+    project.chunk_overlap = chunk_overlap as i64;
+
+    // -----------------------------------------------------------------------
+    // Step 12: Fetch extracted text (graph.py:349-354)
+    // -----------------------------------------------------------------------
+    let text_opt = pm.get_extracted_text(&project_id).map_err(ApiError::server)?;
+    let text = match text_opt {
+        None => {
+            return Err(ApiError::client(
+                axum::http::StatusCode::BAD_REQUEST,
+                crate::i18n::t("api.textNotFound"),
+            ));
+        }
+        Some(t) if t.is_empty() => {
+            return Err(ApiError::client(
+                axum::http::StatusCode::BAD_REQUEST,
+                crate::i18n::t("api.textNotFound"),
+            ));
+        }
+        Some(t) => t,
+    };
+
+    // -----------------------------------------------------------------------
+    // Step 13: Fetch ontology (graph.py:357-362)
+    // -----------------------------------------------------------------------
+    let ontology = match project.ontology.clone() {
+        None => {
+            return Err(ApiError::client(
+                axum::http::StatusCode::BAD_REQUEST,
+                crate::i18n::t("api.ontologyNotFound"),
+            ));
+        }
+        Some(o) => o,
+    };
+
+    // -----------------------------------------------------------------------
+    // Step 14: Spawn build (SUBSUMES Python's create_task + spawn thread)
+    // graph.py:364-366 + 511-513.
+    // batch_size=3 — matches Python's `add_text_batches(…, batch_size=3)` (graph.py:443).
+    // `[≠] U025-TASKNAME`: Python task name = f"构建图谱: {graph_name}"; teri uses stable
+    // "graph_build" token (U-015 verified surface); graph_name is in task metadata.
+    // -----------------------------------------------------------------------
+    let task_id = build_graph_async_with_completion(
+        build_llm(&state.config),
+        text,
+        ontology,
+        graph_name,
+        chunk_size,
+        chunk_overlap,
+        3, // batch_size (mirrors graph.py:443; [≠] Zep-batch artifact, accepted/ignored)
+        Some(ProjectCompletion { manager: pm.clone(), project_id: project_id.clone() }),
+    );
+
+    // -----------------------------------------------------------------------
+    // Step 15: Set project BUILDING + task_id + save (graph.py:370-372)
+    // NOTE: graph_id is NOT set here (R.5): set once at COMPLETED by the hook.
+    // Reorder vs Python (Python saves before spawn; teri gets task_id first then saves)
+    // is non-observable: both become visible to polls only after the handler returns.
+    // -----------------------------------------------------------------------
+    project.status = ProjectStatus::GraphBuilding;
+    project.graph_build_task_id = Some(task_id.clone());
+    pm.save_project(&mut project).map_err(ApiError::server)?;
+
+    // -----------------------------------------------------------------------
+    // Step 16: Return success envelope (graph.py:515-522)
+    // Key order: success, data{project_id, task_id, message}
+    // -----------------------------------------------------------------------
+    Ok(axum::response::Json(serde_json::json!({
+        "success": true,
+        "data": {
+            "project_id": project_id,
+            "task_id": task_id,
+            "message": crate::i18n::t_args("api.graphBuildStarted", &[("taskId", &task_id)])
+        }
+    })))
+}
+// (Step 17 — outer 500 envelope — is the `map_err(ApiError::server)` in `build_graph`
+//  which catches any unhandled `?`-propagated errors.)
 
 // ---------------------------------------------------------------------------
 // Route 7 — GET /task/:task_id  (graph.py:534-550)
@@ -1890,6 +2165,698 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "/health regression after (e)");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+    }
+
+    // =======================================================================
+    // Sub-cycle (d): POST /build tests
+    //
+    // Tests for every guard, the happy path, and the completion hook.
+    // The build route spawns a real tokio task; guards are all synchronous
+    // (they fire before the spawn).  The happy-path test asserts the 200
+    // response shape + project state immediately after the handler returns
+    // (status=GraphBuilding, graph_build_task_id set).  The completion-hook
+    // test drives build_graph_async_with_completion + ProjectCompletion
+    // directly (bypassing the HTTP layer) so it can await the task terminal.
+    // =======================================================================
+
+    use crate::models::project::ProjectStatus as PS;
+    use crate::services::graph_builder::{ProjectCompletion, build_graph_async_with_completion};
+    use crate::task::TaskManager;
+
+    /// Helper: post JSON body to POST /api/graph/build.
+    async fn post_build(
+        app: axum::Router,
+        body_json: serde_json::Value,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        let body_bytes = serde_json::to_vec(&body_json).unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/graph/build")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body_bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (status, json)
+    }
+
+    /// Helper: seed a project with extracted text + ontology so it is ready for /build.
+    fn seed_project_ready_for_build(state: &Arc<ApiState>) -> String {
+        let pm = ProjectManager::from_config(&state.config);
+        let mut p = pm.create_project("BuildTestProject").expect("create");
+        p.ontology = Some(serde_json::json!({
+            "entity_types": [{"name": "Person", "description": "A person"}],
+            "edge_types": []
+        }));
+        p.status = PS::OntologyGenerated;
+        pm.save_project(&mut p).expect("save");
+        pm.save_extracted_text(&p.project_id, "Alice works at Acme Corp.")
+            .expect("save text");
+        p.project_id
+    }
+
+    // -----------------------------------------------------------------------
+    // Guard tests
+    // -----------------------------------------------------------------------
+
+    /// Step 1: ZEP guard — missing zep_api_key → 500 configError (2-key body, NOT 3-key).
+    #[tokio::test]
+    async fn build_graph_500_zep_key_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = crate::Config::build_test();
+        config.upload_folder = tmp.path().to_string_lossy().to_string();
+        // Clear the zep_api_key so the guard fires
+        config.zep_api_key = None;
+        let state = Arc::new(crate::api::ApiState::new(config));
+        let app = crate::server::create_app(state);
+
+        let (status, json) = post_build(app, serde_json::json!({"project_id": "any"})).await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "ZEP guard must return 500: {json}");
+        assert_eq!(json["success"], false, "must be error envelope: {json}");
+        assert!(json["error"].as_str().is_some(), "must have error key: {json}");
+        // 2-key body (client-style at 500) — must NOT have traceback
+        assert!(
+            json.get("traceback").is_none(),
+            "ZEP config error must use 2-key body (no traceback): {json}"
+        );
+    }
+
+    /// Step 3: missing project_id → 400 requireProjectId.
+    #[tokio::test]
+    async fn build_graph_400_missing_project_id() {
+        let (app, _tmp) = test_app();
+        let (status, json) = post_build(app, serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "missing project_id must be 400: {json}");
+        assert_eq!(json["success"], false);
+        assert!(json["error"].as_str().is_some(), "must have error: {json}");
+    }
+
+    /// Step 3: empty-string project_id → 400 requireProjectId.
+    #[tokio::test]
+    async fn build_graph_400_empty_project_id() {
+        let (app, _tmp) = test_app();
+        let (status, json) = post_build(app, serde_json::json!({"project_id": ""})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "empty project_id must be 400: {json}");
+        assert_eq!(json["success"], false);
+    }
+
+    /// Step 4: project not found → 404 projectNotFound.
+    #[tokio::test]
+    async fn build_graph_404_project_not_found() {
+        let (app, _tmp) = test_app();
+        let (status, json) =
+            post_build(app, serde_json::json!({"project_id": "nonexistent-xyz"})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "missing project must be 404: {json}");
+        assert_eq!(json["success"], false);
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains("nonexistent-xyz"), "404 error must mention project id: {error}");
+    }
+
+    /// Step 6: project.status == Created → 400 ontologyNotGenerated.
+    #[tokio::test]
+    async fn build_graph_400_ontology_not_generated() {
+        let (state, _tmp) = test_state();
+        let project_id = seed_project(&state, "StatusCreatedProject");
+        // Status is Created after seed_project — no ontology
+
+        let app = crate::server::create_app(state);
+        let (status, json) = post_build(app, serde_json::json!({"project_id": project_id})).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "Created status must be 400 ontologyNotGenerated: {json}"
+        );
+        assert_eq!(json["success"], false);
+        let error = json["error"].as_str().unwrap();
+        // i18n key: api.ontologyNotGenerated
+        assert!(!error.is_empty(), "must have error message");
+    }
+
+    /// Step 7: project.status == GraphBuilding && !force → 400 graphBuilding with task_id.
+    #[tokio::test]
+    async fn build_graph_400_graph_building_without_force() {
+        let (state, _tmp) = test_state();
+        let pm = ProjectManager::from_config(&state.config);
+        let mut p = pm.create_project("BuildingProject").expect("create");
+        p.status = PS::GraphBuilding;
+        p.graph_build_task_id = Some("existing-task-id-123".to_string());
+        pm.save_project(&mut p).expect("save");
+
+        let app = crate::server::create_app(state);
+        let (status, json) = post_build(app, serde_json::json!({"project_id": p.project_id})).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "GraphBuilding without force must be 400: {json}"
+        );
+        assert_eq!(json["success"], false);
+        assert!(json["error"].as_str().is_some(), "must have error key: {json}");
+        // The body must carry task_id (graph.py:329)
+        assert_eq!(
+            json["task_id"].as_str().unwrap_or(""),
+            "existing-task-id-123",
+            "400 graphBuilding must carry task_id: {json}"
+        );
+    }
+
+    /// Step 8: force=true + status=GraphBuilding resets → proceeds past guard.
+    /// We can't complete a full build here (real LLM), but we can verify the project
+    /// was reset to OntologyGenerated BEFORE the build is launched.
+    ///
+    /// After force-reset the handler will try to proceed; it needs text+ontology to
+    /// avoid hitting textNotFound/ontologyNotFound.  We seed a build-ready project
+    /// to get all the way to the 200 response.
+    #[tokio::test]
+    async fn build_graph_force_reset_path_proceeds() {
+        let (state, _tmp) = test_state();
+        let pm = ProjectManager::from_config(&state.config);
+
+        // Create a project already in GraphBuilding state
+        let mut p = pm.create_project("ForceResetProject").expect("create");
+        p.status = PS::GraphBuilding;
+        p.graph_build_task_id = Some("stale-task-id".to_string());
+        p.graph_id = Some("stale-graph-id".to_string());
+        p.error = Some("previous error".to_string());
+        p.ontology = Some(serde_json::json!({
+            "entity_types": [],
+            "edge_types": []
+        }));
+        pm.save_project(&mut p).expect("save");
+        pm.save_extracted_text(&p.project_id, "Some extracted text for force reset test.")
+            .expect("save text");
+
+        let app = crate::server::create_app(state.clone());
+        let (status, json) =
+            post_build(app, serde_json::json!({"project_id": p.project_id, "force": true})).await;
+
+        // Should succeed — force-reset cleared the BUILDING state, then build started
+        assert_eq!(status, StatusCode::OK, "force-reset must succeed: {json}");
+        assert_eq!(json["success"], true, "must be success: {json}");
+
+        // project must now be GraphBuilding (set by step 15)
+        let saved = pm.get_project(&p.project_id).expect("get").expect("found");
+        assert_eq!(
+            saved.status,
+            PS::GraphBuilding,
+            "project must be GraphBuilding after /build: {saved:?}"
+        );
+        // graph_id must be None (force-reset cleared it; completion hook sets it later)
+        assert!(
+            saved.graph_id.is_none()
+                || saved.graph_id.as_deref().map(|s| s != "stale-graph-id").unwrap_or(false),
+            "stale graph_id must have been cleared by force-reset: {saved:?}"
+        );
+        // graph_build_task_id must be the new task_id from the response
+        let new_task_id = json["data"]["task_id"].as_str().expect("task_id in response");
+        assert_eq!(
+            saved.graph_build_task_id.as_deref().unwrap_or(""),
+            new_task_id,
+            "project.graph_build_task_id must be the new task_id"
+        );
+    }
+
+    /// Step 12: text not found (no extracted text) → 400 textNotFound.
+    #[tokio::test]
+    async fn build_graph_400_text_not_found() {
+        let (state, _tmp) = test_state();
+        let pm = ProjectManager::from_config(&state.config);
+        let mut p = pm.create_project("NoTextProject").expect("create");
+        p.status = PS::OntologyGenerated;
+        p.ontology = Some(serde_json::json!({"entity_types": [], "edge_types": []}));
+        pm.save_project(&mut p).expect("save");
+        // Deliberately do NOT save extracted text
+
+        let app = crate::server::create_app(state);
+        let (status, json) = post_build(app, serde_json::json!({"project_id": p.project_id})).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "no text must be 400 textNotFound: {json}");
+        assert_eq!(json["success"], false);
+        assert!(json["error"].as_str().is_some(), "must have error: {json}");
+    }
+
+    /// Step 13: ontology not set → 400 ontologyNotFound.
+    #[tokio::test]
+    async fn build_graph_400_ontology_not_found() {
+        let (state, _tmp) = test_state();
+        let pm = ProjectManager::from_config(&state.config);
+        let mut p = pm.create_project("NoOntologyProject").expect("create");
+        // Trick: set OntologyGenerated status but leave ontology = None
+        p.status = PS::OntologyGenerated;
+        p.ontology = None;
+        pm.save_project(&mut p).expect("save");
+        pm.save_extracted_text(&p.project_id, "Some text.").expect("save text");
+
+        let app = crate::server::create_app(state);
+        let (status, json) = post_build(app, serde_json::json!({"project_id": p.project_id})).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "missing ontology must be 400 ontologyNotFound: {json}"
+        );
+        assert_eq!(json["success"], false);
+    }
+
+    // -----------------------------------------------------------------------
+    // Happy path — POST /build 200 response shape + project state
+    // -----------------------------------------------------------------------
+
+    /// Happy path: valid project (ontology + text, status OntologyGenerated)
+    /// → 200 {success, data:{project_id, task_id, message}};
+    /// project.status becomes GraphBuilding + graph_build_task_id set immediately.
+    #[tokio::test]
+    async fn build_graph_200_happy_path() {
+        let (state, _tmp) = test_state();
+        let project_id = seed_project_ready_for_build(&state);
+
+        let app = crate::server::create_app(state.clone());
+        let (status, json) = post_build(app, serde_json::json!({"project_id": project_id})).await;
+
+        assert_eq!(status, StatusCode::OK, "happy path must be 200: {json}");
+        assert_eq!(json["success"], true, "must be success envelope: {json}");
+
+        // Response shape: {success, data:{project_id, task_id, message}}
+        let data = &json["data"];
+        assert!(data.is_object(), "data must be an object: {json}");
+        assert_eq!(
+            data["project_id"].as_str().unwrap(),
+            project_id,
+            "data.project_id must match: {json}"
+        );
+        let task_id = data["task_id"].as_str().expect("task_id must be present");
+        assert!(!task_id.is_empty(), "task_id must be non-empty");
+        let message = data["message"].as_str().expect("message must be present");
+        assert!(!message.is_empty(), "message must be non-empty (graphBuildStarted i18n)");
+
+        // task_id is a UUID — verify it is parseable (teri uses UUID task ids)
+        assert!(
+            uuid::Uuid::parse_str(task_id).is_ok(),
+            "task_id must be a valid UUID: {task_id}"
+        );
+
+        // Immediately after: project.status == GraphBuilding, graph_build_task_id == task_id
+        let pm = ProjectManager::from_config(&state.config);
+        let saved = pm.get_project(&project_id).expect("get ok").expect("found");
+        assert_eq!(
+            saved.status,
+            PS::GraphBuilding,
+            "project must be GraphBuilding synchronously: {saved:?}"
+        );
+        assert_eq!(
+            saved.graph_build_task_id.as_deref().unwrap_or(""),
+            task_id,
+            "project.graph_build_task_id must equal task_id from response"
+        );
+        // graph_id must be None — set by hook only at COMPLETED (R.5)
+        assert!(
+            saved.graph_id.is_none(),
+            "graph_id must be None immediately after /build (set at COMPLETED by hook): {saved:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Completion hook — success path: project.status → GraphCompleted + graph_id set
+    // -----------------------------------------------------------------------
+
+    /// Test the ProjectCompletion hook on the SUCCESS path by driving
+    /// `build_graph_async_with_completion` directly with a MockLlmClient so the
+    /// full pipeline runs (without network) and the hook fires at completion.
+    ///
+    /// Asserts:
+    ///   • project.status = GraphCompleted
+    ///   • project.graph_id = Some(task_id)  (DECISION-9: teri graph handle = task_id)
+    ///   • project.error = None
+    ///
+    /// Port-parity: mirrors graph.py:472-474 (project.status=GRAPH_COMPLETED; save)
+    /// and graph.py:413-415 (graph_id, set once at COMPLETED in teri not mid-build per R.5).
+    #[test]
+    fn completion_hook_success_sets_graph_completed_and_graph_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = crate::Config::build_test();
+        config.upload_folder = tmp.path().to_string_lossy().to_string();
+        let pm = ProjectManager::from_config(&config);
+
+        // Seed a project in OntologyGenerated state
+        let mut p = pm.create_project("HookSuccessProject").expect("create");
+        p.status = PS::OntologyGenerated;
+        pm.save_project(&mut p).expect("save");
+        let project_id = p.project_id.clone();
+
+        // Use a MockLlmClient so the pipeline runs without network
+        use crate::llm::{ChatMessage, ChatOptions, LlmClient};
+        use async_trait::async_trait;
+        use std::pin::Pin;
+
+        #[derive(Clone)]
+        struct HookMockLlm;
+        #[async_trait]
+        impl LlmClient for HookMockLlm {
+            async fn complete(&self, prompt: &str) -> crate::error::Result<String> {
+                if prompt.contains("Extract named entities") {
+                    Ok(r#"[{"name": "Alice", "kind": "Person"}]"#.to_string())
+                } else {
+                    Ok("[]".to_string())
+                }
+            }
+            async fn complete_json<T: serde::de::DeserializeOwned>(
+                &self,
+                prompt: &str,
+            ) -> crate::error::Result<T> {
+                let s = self.complete(prompt).await?;
+                serde_json::from_str(&s).map_err(|e| crate::error::TeriError::Llm(e.to_string()))
+            }
+            async fn stream(
+                &self,
+                _: &str,
+            ) -> crate::error::Result<
+                Pin<Box<dyn futures::Stream<Item = crate::error::Result<String>> + Send>>,
+            > {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+            async fn chat(
+                &self,
+                _: &[ChatMessage],
+                _: &ChatOptions,
+            ) -> crate::error::Result<String> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+            async fn chat_json<T: serde::de::DeserializeOwned>(
+                &self,
+                _: &[ChatMessage],
+                _: &ChatOptions,
+            ) -> crate::error::Result<T> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let task_id = rt.block_on(async {
+            build_graph_async_with_completion(
+                HookMockLlm,
+                "Alice works at Acme.".to_string(),
+                serde_json::json!({"entity_types": [], "edge_types": []}),
+                "HookTestGraph".to_string(),
+                500,
+                50,
+                3,
+                Some(ProjectCompletion { manager: pm.clone(), project_id: project_id.clone() }),
+            )
+        });
+
+        // Wait for the worker to finish (poll until not Pending/Processing or timeout)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        rt.block_on(async {
+            loop {
+                let task = TaskManager::global().get_task(&task_id);
+                match &task {
+                    Some(t)
+                        if matches!(
+                            t.status,
+                            crate::task::TaskStatus::Completed | crate::task::TaskStatus::Failed
+                        ) =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+                if std::time::Instant::now() > deadline {
+                    panic!("completion hook test timed out waiting for task terminal");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+
+        rt.shutdown_background();
+
+        // After completion, project must be GraphCompleted with graph_id = task_id
+        let saved = pm.get_project(&project_id).expect("get ok").expect("found");
+        assert_eq!(
+            saved.status,
+            PS::GraphCompleted,
+            "hook must set status=GraphCompleted: {saved:?}"
+        );
+        assert_eq!(
+            saved.graph_id.as_deref().unwrap_or(""),
+            task_id,
+            "hook must set graph_id = task_id (DECISION-9): {saved:?}"
+        );
+        assert!(saved.error.is_none(), "error must be None on success: {saved:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Completion hook — failure path: project.status → Failed + error set
+    // -----------------------------------------------------------------------
+
+    /// Test the ProjectCompletion hook on the FAILURE path using a FailLlm.
+    /// Asserts: project.status = Failed; project.error = Some(err_msg).
+    /// Port-parity: mirrors graph.py:500-502.
+    #[test]
+    fn completion_hook_failure_sets_failed_status_and_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = crate::Config::build_test();
+        config.upload_folder = tmp.path().to_string_lossy().to_string();
+        let pm = ProjectManager::from_config(&config);
+
+        let mut p = pm.create_project("HookFailProject").expect("create");
+        p.status = PS::OntologyGenerated;
+        pm.save_project(&mut p).expect("save");
+        let project_id = p.project_id.clone();
+
+        use crate::llm::{ChatMessage, ChatOptions, LlmClient};
+        use async_trait::async_trait;
+        use std::pin::Pin;
+
+        #[derive(Clone)]
+        struct FailLlm;
+        #[async_trait]
+        impl LlmClient for FailLlm {
+            async fn complete(&self, _: &str) -> crate::error::Result<String> {
+                Err(crate::error::TeriError::Llm("forced hook failure".into()))
+            }
+            async fn complete_json<T: serde::de::DeserializeOwned>(
+                &self,
+                _: &str,
+            ) -> crate::error::Result<T> {
+                Err(crate::error::TeriError::Llm("forced hook failure".into()))
+            }
+            async fn stream(
+                &self,
+                _: &str,
+            ) -> crate::error::Result<
+                Pin<Box<dyn futures::Stream<Item = crate::error::Result<String>> + Send>>,
+            > {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+            async fn chat(
+                &self,
+                _: &[ChatMessage],
+                _: &ChatOptions,
+            ) -> crate::error::Result<String> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+            async fn chat_json<T: serde::de::DeserializeOwned>(
+                &self,
+                _: &[ChatMessage],
+                _: &ChatOptions,
+            ) -> crate::error::Result<T> {
+                Err(crate::error::TeriError::Llm("not used".into()))
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let task_id = rt.block_on(async {
+            build_graph_async_with_completion(
+                FailLlm,
+                "some text".to_string(),
+                serde_json::json!({"entity_types": [], "edge_types": []}),
+                "FailHookGraph".to_string(),
+                500,
+                50,
+                3,
+                Some(ProjectCompletion { manager: pm.clone(), project_id: project_id.clone() }),
+            )
+        });
+
+        // Wait for FAILED terminal
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        rt.block_on(async {
+            loop {
+                let task = TaskManager::global().get_task(&task_id);
+                match &task {
+                    Some(t)
+                        if matches!(
+                            t.status,
+                            crate::task::TaskStatus::Completed | crate::task::TaskStatus::Failed
+                        ) =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+                if std::time::Instant::now() > deadline {
+                    panic!("completion hook failure test timed out");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+
+        rt.shutdown_background();
+
+        let saved = pm.get_project(&project_id).expect("get ok").expect("found");
+        assert_eq!(saved.status, PS::Failed, "hook must set status=Failed on LLM error: {saved:?}");
+        let err = saved.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("forced hook failure"),
+            "hook must set error string from LLM error: {err}"
+        );
+        // graph_id must stay None on failure
+        assert!(saved.graph_id.is_none(), "graph_id must be None on failure: {saved:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // U-015 non-regression: build_graph_async (7-arg) still works unchanged
+    // -----------------------------------------------------------------------
+
+    /// Prove that the 7-arg `build_graph_async` (U-015's verified surface) is byte-stable:
+    /// it compiles with the same call shape as before the additive change, and still
+    /// creates a task with task_type="graph_build".
+    #[test]
+    fn build_graph_async_7arg_u015_non_regression() {
+        use crate::llm::{ChatMessage, ChatOptions, LlmClient};
+        use crate::services::graph_builder::build_graph_async;
+        use async_trait::async_trait;
+        use std::pin::Pin;
+
+        #[derive(Clone)]
+        struct NopLlm;
+        #[async_trait]
+        impl LlmClient for NopLlm {
+            async fn complete(&self, _: &str) -> crate::error::Result<String> {
+                Ok("[{\"name\":\"X\",\"kind\":\"Person\"}]".to_string())
+            }
+            async fn complete_json<T: serde::de::DeserializeOwned>(
+                &self,
+                prompt: &str,
+            ) -> crate::error::Result<T> {
+                let s = self.complete(prompt).await?;
+                serde_json::from_str(&s).map_err(|e| crate::error::TeriError::Llm(e.to_string()))
+            }
+            async fn stream(
+                &self,
+                _: &str,
+            ) -> crate::error::Result<
+                Pin<Box<dyn futures::Stream<Item = crate::error::Result<String>> + Send>>,
+            > {
+                Err(crate::error::TeriError::Llm("nop".into()))
+            }
+            async fn chat(
+                &self,
+                _: &[ChatMessage],
+                _: &ChatOptions,
+            ) -> crate::error::Result<String> {
+                Err(crate::error::TeriError::Llm("nop".into()))
+            }
+            async fn chat_json<T: serde::de::DeserializeOwned>(
+                &self,
+                _: &[ChatMessage],
+                _: &ChatOptions,
+            ) -> crate::error::Result<T> {
+                Err(crate::error::TeriError::Llm("nop".into()))
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // EXACT 7-arg call shape from U-015's test (graph_builder.rs:398-406)
+        let task_id = rt.block_on(async {
+            build_graph_async(
+                NopLlm,
+                "text".to_string(),
+                serde_json::json!({"entity_types": [], "edge_types": []}),
+                "NonRegGraph".to_string(),
+                500,
+                50,
+                3,
+            )
+        });
+
+        assert!(!task_id.is_empty(), "build_graph_async (7-arg) must return non-empty task_id");
+        let task = TaskManager::global().get_task(&task_id).expect("task must exist");
+        assert_eq!(task.task_type, "graph_build", "U-015 task_type contract must be preserved");
+
+        rt.shutdown_background();
+    }
+
+    // -----------------------------------------------------------------------
+    // Non-regression: (a)/(b)/(c)/(e) + /health after (d) landed
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn build_route_non_regression_existing_routes_still_work() {
+        let (state, _tmp) = test_state();
+        let project_id = seed_project(&state, "BuildRouteRegression");
+        let app = crate::server::create_app(state);
+
+        // GET /project/:id (b)
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/graph/project/{project_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "GET /project/:id regression after (d)");
+
+        // GET /project/list (b)
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/graph/project/list").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "GET /project/list regression after (d)");
+
+        // GET /tasks (e)
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/graph/tasks").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "GET /tasks regression after (d)");
+
+        // /health (U-002)
+        let resp = app
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "/health regression after (d)");
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "ok");

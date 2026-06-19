@@ -206,6 +206,13 @@ do NOT re-implement it. BUT note the divergence the porter must handle and recor
   (BUILDING at request time, terminal state visible via task poll), and force-rebuild reset. Flagged for
   the parity gate to confirm no project-state observable is dropped.
 
+> **SUPERSEDED by §4a-REFINED below.** A closer read of the Python `build_task` background thread
+> (graph.py:378-509) shows option (ii) DROPS three real project-state observables
+> (`project.graph_id`, `project.status=GRAPH_COMPLETED/FAILED`, `project.error`) that the frontend reads
+> via `GET /api/graph/project/<id>`. Option (ii) was a reuse-by-narrowing the no-downgrade directive
+> forbids. The refined decision (§4a-REFINED) is **(A) additively extend** `build_graph_async` with an
+> optional project-completion hook. Read §4a-REFINED, not the option-(ii) call above.
+
 ### 4b. The graph_id-persistence gap — `get_graph_data` / `delete_graph` (`- [!] U025-GRAPHSTORE`)
 
 **Finding (do NOT hand-wave):** MiroFish's `/data/<graph_id>` and `/delete/<graph_id>`
@@ -332,3 +339,315 @@ None of these is a disguised feature-skip: every route's observable response is 
 genuinely Zep-server-inexpressible substrate (consistent with the standing U-015 Zep `[≠]` precedent) or
 non-contractual value-shape (traceback string). **When in doubt, the porter ports it and lets the gate
 challenge** — a wrong `[≠]` costs one re-port cycle, not a silent drop.
+
+---
+
+## §4a-REFINED — (d) project-completion: ADDITIVELY EXTEND, do not narrow
+
+**This section REPLACES §4a's option-(ii) call.** A closer read of the Python `build_task` background
+thread (graph.py:378-509) shows option (ii) silently drops real project-state observables. The refined
+decision is **(A) additively extend `build_graph_async`/`build_graph_worker` with an optional
+project-completion hook**. Every claim is grounded `file:line` in both repos.
+
+### R.1 — The finding option (ii) missed (why narrowing is a downgrade)
+
+Python `build_task` performs **three** `ProjectManager.save_project(project)` mutations from inside the
+background thread that teri's worker does NOT:
+
+| # | When | Mutation | graph.py:line |
+|---|---|---|---|
+| 1 | after `create_graph` (mid-build, ~10%) | `project.graph_id = graph_id; save` | 413-415 |
+| 2 | on success (terminal) | `project.status = GRAPH_COMPLETED; save` | 472-474 |
+| 3 | on failure (terminal) | `project.status = FAILED; project.error = str(e); save` | 500-502 |
+
+A frontend polling `GET /api/graph/project/<id>` during/after a build therefore observes the project
+transition `…→GRAPH_BUILDING→GRAPH_COMPLETED` (or `FAILED` + a populated `error`), and `project.graph_id`
+populated. The project's `to_dict()` serialises `status`, `graph_id`, and `error` (project.rs:170,172,180;
+`to_dict` already parity-verified in U-011). These are **contractual, observable** outputs of route (1)
+`GET /project/<id>` (graph.py:36), which renders them.
+
+**Option (ii) leaves the project stuck at `GRAPH_BUILDING` forever**, with `graph_id` either null or
+`=task_id` set at spawn, and never records the `FAILED`+`error` path. The COMPLETED/FAILED/error
+transitions are LOST. That is precisely the reuse-by-narrowing the no-downgrade directive forbids
+("complete the feature, never silently narrow"). It does **not** clear the `[≠]` bar (the transitions are
+genuinely expressible in teri — `Project.status`/`graph_id`/`error` fields all exist, project.rs:157/170/180
+— and they are observable via route 1). So this MUST be ported, not `[≠]`'d.
+
+### R.2 — Decision: (A) additively EXTEND (chosen). (B) rejected.
+
+**(A) chosen.** `build_graph_async`/`build_graph_worker` gain an OPTIONAL project-completion hook. When
+present, the worker applies the three mutations faithfully at the terminal transition. When absent (every
+existing caller), behavior is byte-identical to U-015's verified shape (zero blast radius). This preserves
+every project-state observable while keeping `build_graph_worker_inner` (the project-agnostic pipeline that
+tests drive directly) untouched.
+
+**(B) rejected.** Keeping option (ii) would require showing the dropped transitions are non-observable.
+They are not: route 1 (`GET /project/<id>`) serves `project.to_dict()` including `status`/`graph_id`/`error`,
+and the frontend renders the CREATED→…→COMPLETED/FAILED progression. A `[≠]` here would be a disguised
+feature-skip and the parity gate would FAIL it. (B) is therefore not a legal `[≠]`.
+
+### R.3 — The exact additive signature (zero blast radius)
+
+The existing test `test_build_graph_async_returns_task_id_immediately` (graph_builder.rs:398) calls
+`build_graph_async(mock_llm, text, ontology, name, 500, 50, 3)` — **7 positional args**. Rust has no default
+parameters, so an 8th positional param WOULD break that call. To keep blast radius truly zero, introduce a
+small owned struct and a NON-breaking second entry point:
+
+```rust
+/// Optional project-completion hook for `build_graph_async` (port of build_task's three
+/// `ProjectManager.save_project` mutations, graph.py:413-415,472-474,500-502).
+/// `manager` holds only a `PathBuf` → Clone+Send+Sync+'static, safe to move into tokio::spawn.
+pub struct ProjectCompletion {
+    pub manager: ProjectManager,   // ProjectManager (project.rs:332) — derive Clone (see R.6)
+    pub project_id: String,
+}
+
+// EXISTING entry point — unchanged 7-arg signature. Delegates with `None`.
+pub fn build_graph_async<L>(
+    llm: L, text: String, ontology: Value, graph_name: String,
+    chunk_size: usize, chunk_overlap: usize, _batch_size: usize,
+) -> String
+where L: LlmClient + Clone + Send + Sync + 'static
+{
+    build_graph_async_with_completion(
+        llm, text, ontology, graph_name, chunk_size, chunk_overlap, _batch_size, None,
+    )
+}
+
+// NEW additive entry point — carries the optional hook. The (d) /build handler calls THIS.
+#[allow(clippy::too_many_arguments)]
+pub fn build_graph_async_with_completion<L>(
+    llm: L, text: String, ontology: Value, graph_name: String,
+    chunk_size: usize, chunk_overlap: usize, _batch_size: usize,
+    completion: Option<ProjectCompletion>,
+) -> String
+where L: LlmClient + Clone + Send + Sync + 'static
+{ /* create task; spawn worker with `completion` threaded through */ }
+```
+
+**Rationale for the wrapper (not a new 8th param on the same fn):** keeping `build_graph_async` at 7 args
+means the existing test (graph_builder.rs:398) and every doc-referenced call shape compile unchanged — the
+blast radius is literally zero, no call-site edits. The (d) handler is the sole caller of the new
+`*_with_completion` form. (Equivalent acceptable variant: make the 8th param and update the one test call —
+but the wrapper keeps U-015's verified surface byte-stable, which is the safer no-downgrade choice. Porter
+picks; default = wrapper.)
+
+### R.4 — Worker hook placement (exact call sites)
+
+The hook fires in **`build_graph_worker`** (the outer wrapper, graph_builder.rs:130-156) — NOT in
+`build_graph_worker_inner` (164-308), which tests drive directly and must stay project-agnostic. The outer
+wrapper already owns both terminal branches:
+
+```rust
+async fn build_graph_worker<L>(
+    task_id: String, llm: L, text: String, ontology: Value,
+    graph_name: String, chunk_size: usize, chunk_overlap: usize,
+    completion: Option<ProjectCompletion>,   // NEW — threaded from build_graph_async_with_completion
+) where L: LlmClient + Clone + Send + Sync + 'static {
+    let result = build_graph_worker_inner(&task_id, llm, text, ontology,
+                                          graph_name, chunk_size, chunk_overlap).await;
+    match &result {
+        Ok(())  => { /* SUCCESS terminal — fires AFTER inner set the task result via complete_task */
+            if let Some(c) = &completion {
+                // port of graph.py:472-474 (+ graph_id=task_id, see R.5)
+                if let Ok(Some(mut p)) = c.manager.get_project(&c.project_id) {
+                    p.status   = ProjectStatus::GraphCompleted;
+                    p.graph_id = Some(task_id.clone());   // teri graph handle = task_id (R.5)
+                    let _ = c.manager.save_project(&mut p);
+                }
+            }
+        }
+        Err(e) => {                                  // FAILURE terminal
+            // existing: route to fail_task (unchanged)
+            TaskManager::global().fail_task(&task_id, e.to_string());
+            if let Some(c) = &completion {            // port of graph.py:500-502
+                if let Ok(Some(mut p)) = c.manager.get_project(&c.project_id) {
+                    p.status = ProjectStatus::Failed;
+                    p.error  = Some(e.to_string());
+                    let _ = c.manager.save_project(&mut p);
+                }
+            }
+        }
+    }
+}
+```
+
+Placement notes (port-faithful):
+- The success hook fires **after** `build_graph_worker_inner` returns `Ok` — i.e. after the inner already
+  called `complete_task` (graph_builder.rs:306). Python's order is the same: task COMPLETED (481-493) is set
+  inside the thread, then `project.status=GRAPH_COMPLETED` is the last project save (472-474, actually just
+  before the task complete in Python, but both are terminal and observed only after the thread ends — order
+  between the two terminal saves is not separately observable, so "task-complete then project-complete" is
+  faithful).
+- The failure hook fires alongside the existing `fail_task` (graph_builder.rs:154), mirroring Python's
+  `except` block which does both `project.status=FAILED;save` (500-502) and `task fail` (504-509).
+- The hook **swallows** a project-reload/save error (`if let Ok(Some(...))`, `let _ =`) — Python's
+  `save_project` inside the thread is best-effort (a thread exception there would only be logged); the task
+  status is the authoritative progress signal. A failed project save must not panic the spawned worker.
+- **Mutation #1 (mid-build `graph_id` set, graph.py:413-415) is NOT ported as a separate mid-build save** —
+  see R.5: teri has no mid-build graph handle, so `graph_id` is set once at the COMPLETED terminal. This is
+  observably equivalent (R.5 proves the during-build `graph_id` is not observed).
+
+### R.5 — graph_id timing: set at COMPLETED, not at spawn (adjudicated)
+
+Python sets `project.graph_id` **mid-build** at `create_graph` time (graph.py:413-414, ~10% progress) — the
+Zep server handle, available the moment the remote graph object is created. teri has **no mid-build graph
+handle**: the graph is built in-process and only exists once `build_graph_worker_inner` finishes
+(graph_builder.rs:262-307); there is no Zep `graph_id` (DECISION-9 / U-015 `[≠]`). The teri graph handle IS
+the `task_id` (DECISION-9 / §4b: `/data/<graph_id>` resolves `graph_id==task_id` → `task.result["graph"]`).
+
+**Decision: set `project.graph_id = Some(task_id)` at the COMPLETED transition (R.4 success hook), NOT at
+spawn.** Justification that this is observably equivalent to Python:
+
+- During the build, Python's `project.graph_id` is the Zep handle (a server graph id). teri's would be null.
+  **Is the during-build `graph_id` observable / does the frontend use it?** No: the frontend tracks build
+  progress via `GET /task/<id>` (the `/build` response hands back `task_id` and the localized
+  `graphBuildStarted` message pointing at `/task/<id>`, graph.py:515-521; i18n `graphBuildStarted` =
+  "...Query progress via /task/{taskId}", en.json:336). `graph_id` is consumed only **after** COMPLETED, to
+  address `/data/<graph_id>` and `/delete/<graph_id>`. The two handles are also semantically different
+  (Zep server id vs teri task id) and not byte-comparable anyway, so a differential gate cannot compare the
+  *value* mid-build — only "is it set when the consumer reads it." The consumer reads it after COMPLETED;
+  teri sets it at COMPLETED. **Null-until-complete is faithful.**
+- Setting `graph_id=task_id` at COMPLETED (not spawn) also keeps `graph_id` and `status` consistent: a
+  project is only ever `GraphCompleted` ⇔ `graph_id` populated, which matches Python's end state and avoids a
+  spurious "graph_id set but status still BUILDING/FAILED" intermediate teri would otherwise expose.
+- On the FAILED path, `graph_id` stays `None` (the force-reset already cleared it; we never set it) — matches
+  Python (a failed build never reaches line 414's save in a way the final state keeps, because 500-502
+  doesn't set graph_id and the create_graph save only happens if create_graph succeeded; teri's "set only at
+  COMPLETED" gives the same terminal observable: FAILED ⇒ graph_id None).
+
+So: graph_id set **once, at the COMPLETED terminal, = task_id**. The synchronous-path `graph_id` is NOT set
+at spawn (the route sets only `status=GraphBuilding` + `graph_build_task_id=task_id`, see R.7 step 13).
+
+### R.6 — `ProjectManager` is spawn-safe; derive `Clone`
+
+`ProjectManager` (project.rs:332) holds a single field `projects_dir: PathBuf` (project.rs:334). `PathBuf`
+is `Clone + Send + Sync + 'static`, so `ProjectManager` is `Send + Sync + 'static` and safe to move into
+`tokio::spawn` inside the `ProjectCompletion` struct. It does **not currently derive `Clone`** (no `#[derive]`
+on the struct, project.rs:331-335). **Action (sub-cycle d):** add `#[derive(Clone)]` to `ProjectManager` —
+additive, trivial (the sole field is `Clone`), zero behavior change. Even Clone is not strictly required here
+(the hook takes `&self`/owns a single instance moved into the spawn), but deriving it is cheap and matches
+the `Clone`-everywhere posture of the spawn-bound types. The route constructs
+`ProjectManager::from_config(&state.config)` (project.rs:350) and moves it into `ProjectCompletion`.
+
+### R.7 — Blast radius confirmation (build_graph_async callers)
+
+Searched all of `src/` + `tests/` for callers of `build_graph_async` / `build_graph_worker` /
+`build_graph_worker_inner`:
+
+| Caller | Location | Impact of the additive change |
+|---|---|---|
+| `test_build_graph_async_returns_task_id_immediately` | graph_builder.rs:398 (7-arg call) | **ZERO** — `build_graph_async` keeps its 7-arg signature; delegates with `None` (R.3). Test compiles + passes unchanged. |
+| `test_build_graph_worker_inner_completes_with_result` | graph_builder.rs:445 | **ZERO** — calls `build_graph_worker_inner` (project-agnostic), which is untouched by the hook (hook lives in the outer `build_graph_worker`). |
+| `test_*_routes_err_to_fail_task` | graph_builder.rs:526 | **ZERO** — same: drives `build_graph_worker_inner` directly. |
+| doc-comment references (mod.rs:245, graph/mod.rs:511, llm.rs:305, graph_builder.rs:7,53,380) | — | **ZERO** — comments, not calls. |
+| **NEW:** `/build` handler (sub-cycle d) | `src/api/graph.rs` (to be written) | the ONLY caller of the new `build_graph_async_with_completion`; passes `Some(ProjectCompletion{...})`. |
+
+There is **no existing production caller** of `build_graph_async` — the only production caller will be the
+(d) `/build` handler written in the same sub-cycle. U-015's verified surface (the 7-arg `build_graph_async`
++ `build_graph_worker_inner`) is therefore byte-stable; the hook is purely additive.
+
+### R.8 — ZEP-guard adjudication: KEEP (expressible + faithful, NOT keyless-inexpressible)
+
+teri **does** have a `zep_api_key: Option<String>` config field (config.rs:27, populated from
+`std::env::var("ZEP_API_KEY")`, config.rs:250). Moreover `Config::validate_collect()` already treats
+ZEP_API_KEY as **required** ("ZEP_API_KEY is not set", config.rs:350-352), a direct port of Python's
+`validate()`. So teri is **not** keyless w.r.t. ZEP at the config layer — the guard is fully expressible and
+the project's keyless-by-design posture (envctl model) applies to *injection*, not to dropping the contract.
+
+**Decision: KEEP the guard, port it literally.** The (d) handler's step 1 is:
+```rust
+let mut errors = Vec::new();
+if state.config.zep_api_key.as_deref().unwrap_or("").is_empty() {
+    errors.push(i18n::t("api.zepApiKeyMissing"));        // en.json:331 / zh.json:331 PRESENT
+}
+if !errors.is_empty() {
+    return Err(ApiError::client(StatusCode::INTERNAL_SERVER_ERROR,         // 500
+        i18n::t_args("api.configError", &[("details", &errors.join("; "))]))); // configError, :330
+}
+```
+This is byte-faithful to graph.py:286-295 (errors list → `t('api.configError', details=…)` → 500). It is
+**NOT** an inexpressible `[≠]` (the field + the i18n keys + the validate contract all exist). The earlier
+`- [≠] U025-ZEPGUARD?` flag is **RESOLVED to KEEP/PORTED** — drop the `?`-divergence; it is a normal ported
+guard. (The runtime reality that envctl usually injects the key only means the guard passes in practice; the
+*error path* when it is absent is still contractual and ported.)
+
+### R.9 — task-name `[≠]` adjudication
+
+Python names the task `f"构建图谱: {graph_name}"` (graph.py:366) — a localized, graph-name-interpolated label.
+teri's `build_graph_async` creates the task as `create_task("graph_build", metadata)` (graph_builder.rs:102),
+a stable machine token, with `graph_name` carried in the task **metadata** (graph_builder.rs:98). The task's
+`task_type`/name shape is **U-015's already-verified contract** (the `test_*` at graph_builder.rs:414 asserts
+`task.task_type == "graph_build"`). **Decision: accept `- [≠] U025-TASKNAME`** — the human-readable
+build-title-as-task-name is not reproduced; `graph_name` is preserved in metadata instead. This is a legal
+`[≠]`: the task name is non-contractual debug/display text (the frontend keys off `task_id` + `task_type` +
+progress/result, not the free-text name), and changing it would re-open U-015's verified surface. Do **not**
+pass the localized name through (that would churn U-015 for a non-observable). Gate challenges; default
+`[≠]` accepted (graph_name is preserved in metadata, so no data is lost — only the display label differs).
+
+### R.10 — Full ordered (d) handler step list (graph.py:283-372, 515-522)
+
+The synchronous `/build` handler, in order. Note **build_graph_async creates the task FIRST and returns
+task_id**, so Python's "create_task" (graph.py:365-366) is **SUBSUMED** by the call — the handler sets the
+project fields AFTER getting task_id (minor reorder vs Python, flagged below).
+
+1. **ZEP guard** (R.8): `zep_api_key` empty → push `zepApiKeyMissing` → 500 `configError`. (graph.py:286-295)
+2. **Parse JSON body** (axum `Json<Value>` or tolerant `Option`): `data = body or {}`. (graph.py:298)
+3. **`project_id` required**: missing/empty → 400 `requireProjectId`. (graph.py:299-306)
+4. **Project lookup**: `manager.get_project(&project_id)?` → `None` → 404 `projectNotFound(id)`. (graph.py:309-314)
+5. **Read `force`**: `data.force` default `false`. (graph.py:317)
+6. **Status machine — CREATED**: `status==Created` → 400 `ontologyNotGenerated`. (graph.py:319-323)
+7. **Status machine — BUILDING && !force**: → 400 `{success:false, error:graphBuilding, task_id:
+   project.graph_build_task_id}` (the extra `task_id` key — `ApiError::client_with`). (graph.py:325-330)
+8. **Force-reset**: if `force && status ∈ {GraphBuilding, Failed, GraphCompleted}` →
+   `status=OntologyGenerated; graph_id=None; graph_build_task_id=None; error=None`. (graph.py:333-337)
+9. **Resolve graph_name**: `data.graph_name` else `project.name` (non-empty) else `"MiroFish Graph"`.
+   (graph.py:340) — keep the literal default string `"MiroFish Graph"` (do NOT localize/rename).
+10. **Resolve chunk_size / chunk_overlap**: `data.chunk_size` else `project.chunk_size` (if non-zero) else
+    `config.default_chunk_size`; same for overlap with `config.default_chunk_overlap`. (graph.py:341-342)
+11. **Update project chunk config**: `project.chunk_size = chunk_size; project.chunk_overlap = chunk_overlap`
+    (in-memory; saved at step 13). (graph.py:345-346)
+12. **Fetch extracted text**: `manager.get_extracted_text(&project_id)?` → empty/None → 400 `textNotFound`.
+    (graph.py:349-354)
+13. **Fetch ontology**: `project.ontology` → None/empty → 400 `ontologyNotFound`. (graph.py:357-362)
+14. **Spawn (SUBSUMES create_task)**: call
+    `build_graph_async_with_completion(build_llm(&state.config), text, ontology, graph_name, chunk_size as
+    usize, chunk_overlap as usize, /*batch*/3, Some(ProjectCompletion{ manager:
+    ProjectManager::from_config(&state.config), project_id }))` → returns `task_id`. This **creates the task
+    internally** (graph_builder.rs:102) — there is NO separate `TaskManager::create_task` call in the
+    handler. (subsumes graph.py:364-366; pipeline = graph.py:378-509 via the worker+hook)
+15. **Set project BUILDING + save**: `project.status = GraphBuilding; project.graph_build_task_id =
+    Some(task_id.clone()); manager.save_project(&mut project)?`. (graph.py:370-372) — **graph_id is NOT set
+    here** (R.5: set at COMPLETED by the hook).
+16. **Response**: `200 {success:true, data:{project_id, task_id, message: t_args("api.graphBuildStarted",
+    [("taskId", task_id)])}}`. (graph.py:515-522; i18n key en.json:336)
+17. **Outer 500 envelope**: any unhandled `?`-propagated error → `ApiError::server(err)` →
+    `{success:false, error:err.to_string(), traceback:<teri ctx>}` (the §3b `U025-TRACEBACK` `[≠]`).
+    (graph.py:524-529)
+
+**Reorder flag (`- [≠]`-free, behavior-equivalent):** Python saves the project (BUILDING + task_id) BEFORE
+spawning the thread (graph.py:370-372 then 512-513); teri gets `task_id` from `build_graph_async_with_completion`
+FIRST (step 14) THEN saves BUILDING + task_id (step 15). The reorder is **not observable**: the task and the
+project-BUILDING save both become visible to subsequent polls only after the handler returns its response;
+no concurrent reader can observe the intra-handler ordering. The spawned worker only touches the project at
+its **terminal** transition (R.4), which is strictly after step 15's save. So no race, no observable
+divergence. (If extra-defensive: the worker's success/failure hook does `get_project` fresh, so even if it
+ran before step 15's save it would read the pre-BUILDING state and overwrite with the terminal state — still
+correct; but it cannot, since the terminal transition is post-pipeline = long after step 15.)
+
+### R.11 — Refined risk flags (supersede §7 rows for d)
+
+| Flag | Class (refined) | Resolution |
+|---|---|---|
+| `U025-BUILD-PROJSTATE` | **PORTED** (was `- [!]`) | (A) additive hook: success → `status=GraphCompleted, graph_id=Some(task_id)`; failure → `status=Failed, error=Some(e)`; both via `ProjectCompletion` hook in `build_graph_worker` (R.4). No project-state observable dropped. |
+| `U025-ZEPGUARD?` | **PORTED** (was `- [≠]?`) | KEEP guard, literal port — config field + i18n keys + validate contract all exist (R.8). Drop the `?`/divergence. |
+| `U025-GRAPHID-TIMING` | **PORTED** (decision) | `graph_id=task_id` set once at COMPLETED, not spawn; null-until-complete is faithful (R.5). |
+| `U025-TASKNAME` | `- [≠]` (accepted) | task name `构建图谱: {graph_name}` → stable `"graph_build"` token + graph_name in metadata; non-contractual display label, preserving U-015's verified `task_type` shape (R.9). graph_name not lost (in metadata). |
+| `U025-CLONE` (carried) | `- [!]`→PORTED | derive `Clone` on `OpenAiAdapter` (spawn by value) AND on `ProjectManager` (R.6) — both additive, fields all `Clone`. |
+| `U025-TRACEBACK` (carried) | `- [≠]` | unchanged from §3b — 3-key envelope preserved, value is teri context. |
+
+**Net:** the (d) sub-cycle ports ALL project-state observables (no narrowing); the only `[≠]` items are the
+task-name display label (R.9, non-contractual, graph_name preserved) and the carried traceback-value `[≠]`
+(§3b). No disguised feature-skip. The differential gate verifies: (1) project transitions CREATED→BUILDING→
+COMPLETED/FAILED+error via route 1 polling, (2) `graph_id` populated == task_id after COMPLETED, (3) the
+`/build` response envelope + `graphBuilding`+task_id 400 + force-reset, (4) ZEP-missing → 500 configError.
