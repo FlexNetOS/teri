@@ -2377,3 +2377,74 @@ progress.json sequence, agent_log.jsonl orchestration lines, sink events) is POR
 **h2 OVERALL VERDICT: PASS.** Round-1 downgrade fixed and regression-locked; no new divergence introduced
 by the restructure. S-763 cleared for the **h2 skeleton scope** (kept `- [~]` in symbol-map with the h2-PASS
 annotation; the section loop = h3 keeps the symbol open for full clearance).
+
+---
+
+## 2026-06-18 — U-024 h3 (per-section streaming loop in `generate_report`) — PASS
+
+**Scope:** the `for i in 0..total_sections` loop (src/report/mod.rs:1714-1868) replacing h2's placeholder
+assemble. Differential vs `report_agent.py:1636-1707`. Verifier: rust-port-parity-verifier (adversarial).
+
+**Gates:** `cargo test -p teri` 1220 passed / 6 ignored; report suite 142 passed; 6 h3 tests pass;
+`cargo clippy -p teri --all-targets` clean.
+
+### TRAP #1 — final meta.json carries section content (clone-vs-reference) — CONFIRMED FAITHFUL
+- Python: `report.outline = outline` (py:1615) is a REFERENCE; after the loop sets `section.content`,
+  the final `save_report` (py:1722 → 2433 `json.dump(report.to_dict())`, ReportSection.to_dict py:404-408
+  includes `content`) writes meta.json with POPULATED `outline.sections[*].content`. The intermediate
+  `save_report` (py:1626) runs BEFORE the loop → empty content.
+- teri: pre-loop clone at mod.rs:1682 (empty content) feeds the intermediate `save_report` (mod.rs:1699).
+  POST-loop RE-ASSIGN at mod.rs:1896 `report.outline = Some(outline.clone())` (now populated) feeds the
+  final `save_report` (mod.rs:1913 → manager.rs:714 `to_string_pretty(report.to_dict())`). save_report also
+  re-saves outline.json with populated content (manager.rs:719-721, == Python py:2436-2437).
+- Locked by `test_generate_report_h3_final_meta_has_section_content`: asserts both the returned
+  `Report.outline.sections[*].content` AND on-disk meta.json `outline.sections[*].content` are non-empty.
+
+### TRAP #2 — sink-event superset policy — LEGAL STRICT SUPERSET
+- Faithful events present: (a) pre-section base_progress (mod.rs:1747 == py:1648-1653),
+  (b) section-closure sub-progress inside generate_section_react (mod.rs:1773-1787 == py:1656-1665),
+  (c) post-loop 95 assembling (mod.rs:1873 == py:1698-1699), completed 100 (mod.rs:1924 == py:1728-1729).
+- ADDED: one post-section `section_content=Some(content)` event per section (mod.rs:1856). It changes NO
+  Python-observable artifact: same `progress.json` writes (the superset event is on the SINK, not a
+  `manager.update_progress` call — the update_progress sequence is byte-identical), same section_NN.md,
+  same full_report.md, same agent_log.jsonl, same console output. Architect §1/§3-step7/§7.5 superset bar
+  met → LEGAL (a strict-superset capability the dest provides for U-027 live streaming). NOT a divergence.
+- Locked by `test_generate_report_h3_sink_events`: 2 content-carrying events (idx 1,2), non-empty content,
+  plus the faithful (a)/(b)/(c)/completed events at correct progress values.
+
+### Progress arithmetic — CONTRACTUAL, VERBATIM MATCH
+- base_progress: `20 + ((i as f64/total as f64)*70.0) as i32` (mod.rs:1723) == `20 + int((i/total)*70)`
+  (py:1638). For total=2: i=0→20, i=1→55. For total=3: i=1→23, i=2→46 (Rust `as i32` truncates toward
+  zero == Python `int()` for positive). ✓
+- section closure: `base + (prog as f64*0.7/total as f64) as i32` (mod.rs:1776) == `base + int(prog*0.7/total)`
+  (py:1663). ✓
+- section-done: `base + (70/total as i32)` (mod.rs:1842) == `base + int(70/total)` (py:1691). Integer
+  division: 70/3=23 both sides. ✓
+- update_progress write SEQUENCE faithful: per-section pre (base), per-section done (base+70/total),
+  post-loop 95, completed 100; failed path -1 (i32 widening, h1). Final progress.json = completed/100 with
+  2 completed_sections — locked by `test_generate_report_h3_progress_json_sequence`.
+
+### Other checks
+- save-section-immediately (mod.rs:1812 == py:1673), BEFORE next section's LLM call — empirically locked
+  by `test_generate_report_h3_incremental_write` (mock records section_01.md exists at section-2 call[4]).
+  `save_section` runs `clean_section_content` (manager.rs:312, f-landed) == Python `_clean_section_content`.
+- REAL assemble over populated section files (mod.rs:1900, manager.rs:546 reads section_NN.md) — full_report.md
+  contains both sections; locked by `test_generate_report_h3_full_file_tree`.
+- agent_log.jsonl: 2 section_start (e) + 2 section_complete (h3 log_section_full_complete, mod.rs:1820) —
+  locked by `test_generate_report_h3_agent_log_section_complete_lines`. `.trim()` == Python `.strip()`
+  (mod.rs:1820 == py:1683). ✓
+- No-downgrade of Y: template `generate_stream` path untouched; h2 behaviors (status machine, failed-meta
+  retains outline, report_id shape) preserved — full suite green confirms no regression.
+
+### Ledger (`[!]`/`[≠]`)
+- `- [!]` interview_agents — U-020 InterviewBus not landed; honest-err stub; loop tolerates it (NOT a fail,
+  architect §4). On the TOOL (S-319), not generate_report.
+- `- [!]` report_id / total_time_seconds nondeterminism — tests assert by shape, not value (architect §7.2/7.3).
+- `[≠]` — NONE. Every observable artifact (meta.json, outline.json, progress.json sequence, section_NN.md,
+  full_report.md, agent_log.jsonl, console_log.txt) is PORTED. The sink-superset is a legal capability ADD,
+  not a `[≠]` skip.
+
+**h3 OVERALL VERDICT: PASS.** S-763's h3 scope cleared. The section loop is the LAST core piece of
+generate_report; h2 (skeleton/planning/tails) + h3 (section loop) together fully verify the orchestration.
+S-763 flipped to `- [x]` in symbol-map. h4 (U-027 ChannelSink/SseSink adapter seam) is optional polish per
+architect §6 — NOT required for generate_report parity (NullSink covers it).

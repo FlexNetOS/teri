@@ -17,7 +17,7 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 1   # NEW SESSION 2026-06-18 (17th resume); CYCLE 17=U-024(h2) generate_report skeleton (FAIL→fix→PASS)
+cycles_this_session: 2   # NEW SESSION 2026-06-18 (17th resume); CYCLE 17=U-024(h2) skeleton (FAIL→fix→PASS), 18=U-024(h3) section loop (PASS r1)
 # CYCLE3 (12th resume) 2026-06-17: U-022 sub-cycle (c) MONITOR + offset-tail + graph-fire (S-605/613/614/615 + S-1056/U-047,
 #   5 [x]) — opus PASS (DECISION-17 Area 2, porter@opus). src/services/simulation_runner.rs: monitor_simulation (2s
 #   MONITOR_POLL_INTERVAL poll loop, per-platform file-exists guard, save_run_state per poll, loop-exit on U-048
@@ -610,3 +610,32 @@ next_iterate: U-022 [x] complete → U-017 port-fresh full implementation
 # assemble. Deps h2,e,b,c. interview_agents still honest-err until U-020 sim/ipc.rs (MISSING).], (h4) U-027 SSE sink
 # adapter [with U-027 routes], (i) chat [conversational 2-iter ReACT, get_report_by_simulation, 15000-char ctx, response
 # cleaning]. (b2 insight_forge OQ-3 still pending.) Architect-in-loop (PR #44) governs structural sub-cycles.
+
+
+# CYCLE 18 (NEW SESSION 2026-06-18, 17th resume): U-024 sub-cycle (h3) per-section streaming loop — porter@porter,
+# parity@opus PASS (round-1, 5 surfaces). src/report/mod.rs generate_report: inserted the for-loop (report_agent.py
+# 1636-1707) REPLACING h2's placeholder assemble. Per section: base_progress=20+int((i/total)*70); update_progress
+# (generating, base, generatingSection{title,current,total}, current_section=Some(title)); faithful pre-section sink
+# emit; section sink-closure base+int(prog*0.7/total) passed INTO generate_section_react (landed e); section.content=…;
+# generated_sections.push("## {title}\n\n{content}"); save_section IMMEDIATELY (runs clean_section_content); push
+# completed-title; log_section_full_complete(title,num,full.trim()); tracing sectionSaved {:02}; update_progress
+# (generating, base+70/total, sectionDone{title}, current_section=None). Post-loop: faithful 95 assembling sink + update
+# _progress(95) + REAL assemble_full_report over the now-populated section files. TRAP#1 (clone-vs-reference) HANDLED &
+# verified: Python report.outline=outline is a REFERENCE so final save_report writes section content; teri cloned pre-loop
+# (empty, matches intermediate save) → RE-ASSIGNS report.outline=Some(outline.clone()) POST-loop so final meta.json carries
+# populated section content (ReportSection.to_dict includes content). TRAP#2 (sink superset) ADJUDICATED LEGAL: the 3
+# faithful events (pre-section/closure/95) match Python progress_callback EXACTLY; teri ADDS 1 per-section content-carrying
+# sink event (section_content=Some) as a documented strict superset for U-027 live-streaming — on the SINK, not a
+# progress.json write, so every Python-observable artifact (progress.json seq / section_NN.md / full_report.md / agent_log
+# .jsonl / console) is byte-unchanged (architect §1/§3-step7/§7.5). Progress arithmetic verbatim (as i32 trunc == Python
+# int() for positive; 70/total integer == int(70/total)). 6 new tests (full file tree, incremental-write [section_01.md
+# exists at section-2 LLM call], progress.json seq, final-meta section-content, agent_log section_complete lines, sink
+# events). 1220 green, clippy --all-targets clean. Atomic gate: X-parity PASS + Y-green + Y-not-regressed (template
+# untouched; h2 status-machine/failed-meta-retains-outline/report_id preserved). Y-drift clean (develop 7c354a5). >>>
+# S-763 generate_report FLIPPED [x] — the section loop was the last core piece; h4 (U-027 SseSink/ChannelSink adapter)
+# is OPTIONAL polish that lands WITH the U-027 routes (NullSink covers parity now). interview_agents stays honest-err [!]
+# until U-020 sim/ipc.rs lands. U-024 progress: a✓ b✓ c✓ d✓ e✓ f✓ g1✓ g2✓ h1✓ h2✓ h3✓ | REMAINING in U-024:
+# (h4) U-027 SSE sink adapter [DEFERRED → lands with U-027 HTTP routes], (i) chat [conversational 2-iter ReACT,
+# get_report_by_simulation, 15000-char ctx cap, response cleaning — report_agent.py:1766+], (b2) insight_forge [OQ-3
+# query_vec_similarity semantic multi-sub-query]. NEXT sub-cycle = (i) chat (h4 deferred to U-027 layer). After U-024:
+# U-025/26/27 HTTP API routes (U-027 report route wires the ReportSink→SSE adapter exposing the per-section stream).

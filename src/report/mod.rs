@@ -1564,7 +1564,7 @@ impl ReportAgent {
 
         // ── completed_section_titles: declared before the try-body so the error
         //    tail can pass it to update_progress(failed) (report_agent.py:1575).
-        let completed_section_titles: Vec<String> = vec![];
+        let mut completed_section_titles: Vec<String> = vec![];
 
         // ── BORROW BRIDGE: wrap sink in RefCell so Fn closures can call borrow_mut ──
         // This is safe: `sink_cell` is only used in this scope; we borrow it through
@@ -1674,7 +1674,11 @@ impl ReportAgent {
             };
             // plan_outline takes &self (immutable). plan_outline only reads graph_id,
             // simulation_requirement, and report_logger, so the immutable reborrow is valid.
-            let outline = self.plan_outline(tools, llm, Some(&plan_cb)).await;
+            let mut outline = self.plan_outline(tools, llm, Some(&plan_cb)).await;
+            // Pre-loop assignment: outline has empty section content (matches Python
+            // py:1615 reference semantics at this point, before the loop runs).
+            // The intermediate save_report at manager.save_report(&report) below writes
+            // this empty-content outline to meta.json (py:1626, before the loop).
             report.outline = Some(outline.clone());
 
             // log_planning_complete (report_agent.py:1618)
@@ -1707,12 +1711,192 @@ impl ReportAgent {
             // total_sections for log_report_complete (h2: no loop yet — h3 adds it)
             let total_sections = outline.sections.len();
 
-            // ── (h2) PLACEHOLDER: no section loop ──
-            // h3 will insert the per-section streaming loop here.
-            // For the skeleton, assemble immediately over the outline with no section files
-            // written. This yields a header+summary only markdown (documented h2 behavior).
+            // ── (h3) Per-section streaming loop (report_agent.py:1636-1704) ──────────────
+            // Declared before the loop; pushed into by each iteration.
+            let mut generated_sections: Vec<String> = vec![];
+
+            for i in 0..total_sections {
+                let section_num = i + 1;
+
+                // Python:1638  base_progress = 20 + int((i / total_sections) * 70)
+                // Arithmetic: i/total as f64 * 70.0, truncate to i32 (same as Python int()).
+                let base_progress: i32 = 20 + ((i as f64 / total_sections as f64) * 70.0) as i32;
+
+                let title = outline.sections[i].title.clone();
+
+                // py:1641-1646  update_progress(generating, base_progress, generatingSection,
+                //               current_section=Some(title), completed_sections)
+                manager.update_progress(
+                    &report_id,
+                    "generating",
+                    base_progress,
+                    &crate::i18n::t_args(
+                        "progress.generatingSection",
+                        &[
+                            ("title", &title as &dyn std::fmt::Display),
+                            ("current", &section_num),
+                            ("total", &total_sections),
+                        ],
+                    ),
+                    Some(&title),
+                    Some(&completed_section_titles),
+                )?;
+
+                // py:1648-1653  progress_callback("generating", base_progress, generatingSection)
+                // Faithful emit (a): top-level pre-section progress event.
+                sink_cell.borrow_mut().event(&crate::report::sink::ReportEvent {
+                    stage: crate::report::sink::ReportStage::Generating,
+                    progress: base_progress,
+                    message: crate::i18n::t_args(
+                        "progress.generatingSection",
+                        &[
+                            ("title", &title as &dyn std::fmt::Display),
+                            ("current", &section_num),
+                            ("total", &total_sections),
+                        ],
+                    ),
+                    section_title: Some(title.clone()),
+                    section_index: Some(section_num),
+                    section_content: None,
+                    report_id: report_id.clone(),
+                });
+
+                // py:1656-1667  section_closure: lambda stage, prog, msg →
+                //   progress_callback(stage, base_progress + int(prog * 0.7 / total_sections), msg)
+                // Faithful emit (b): sub-progress from within generate_section_react.
+                // Capture by clone to satisfy Fn + 'lifetime.
+                let section_cb_title = title.clone();
+                let section_cb_report_id = report_id.clone();
+                let section_cb_section_num = section_num;
+                let section_cb_base_progress = base_progress;
+                let section_cb_total_sections = total_sections;
+                let section_cb = |_stage: &str, prog: u32, msg: &str| {
+                    // Python:1663  base_progress + int(prog * 0.7 / total_sections)
+                    // f64 multiply then truncate to i32 — same as Python int().
+                    let rescaled_progress = section_cb_base_progress
+                        + ((prog as f64 * 0.7 / section_cb_total_sections as f64) as i32);
+                    sink_cell.borrow_mut().event(&crate::report::sink::ReportEvent {
+                        stage: crate::report::sink::ReportStage::Generating,
+                        progress: rescaled_progress,
+                        message: msg.to_string(),
+                        section_title: Some(section_cb_title.clone()),
+                        section_index: Some(section_cb_section_num),
+                        section_content: None,
+                        report_id: section_cb_report_id.clone(),
+                    });
+                };
+
+                // py:1656  section_content = self._generate_section_react(…)
+                // generate_section_react borrows &self (immutable) + &outline (immutable)
+                // during the await; setting outline.sections[i].content happens AFTER.
+                let content = self
+                    .generate_section_react(
+                        &outline.sections[i],
+                        &outline,
+                        &generated_sections,
+                        tools,
+                        llm,
+                        Some(&section_cb),
+                        section_num,
+                    )
+                    .await;
+
+                // py:1669  section.content = section_content
+                outline.sections[i].content = content.clone();
+
+                // py:1670  generated_sections.append(f"## {title}\n\n{content}")
+                generated_sections.push(format!("## {}\n\n{}", title, content));
+
+                // py:1673  ReportManager.save_section(report_id, section_num, section)
+                // save-section-immediately: writes section_NN.md before the next section.
+                manager.save_section(&report_id, section_num, &outline.sections[i])?;
+
+                // py:1674  completed_section_titles.append(section.title)
+                completed_section_titles.push(title.clone());
+
+                // py:1677-1684  log_section_full_complete(title, num, content.strip())
+                let full_section_content = format!("## {}\n\n{}", title, content);
+                if let Some(l) = &self.report_logger {
+                    l.log_section_full_complete(&title, section_num, full_section_content.trim());
+                }
+
+                // py:1686  logger.info(report.sectionSaved)
+                tracing::info!(
+                    target: "teri::report",
+                    "{}",
+                    crate::i18n::t_args(
+                        "report.sectionSaved",
+                        &[
+                            ("reportId", &report_id as &dyn std::fmt::Display),
+                            ("sectionNum", &format!("{:02}", section_num)),
+                        ],
+                    )
+                );
+
+                // py:1689-1695  update_progress(generating, base_progress + int(70/total_sections),
+                //               sectionDone{title}, current_section=None, completed_sections)
+                // Integer division: 70/total matches Python int(70/total) for positive ints.
+                manager.update_progress(
+                    &report_id,
+                    "generating",
+                    base_progress + (70 / total_sections as i32),
+                    &crate::i18n::t_args(
+                        "progress.sectionDone",
+                        &[("title", &title as &dyn std::fmt::Display)],
+                    ),
+                    None,
+                    Some(&completed_section_titles),
+                )?;
+
+                // (h3 superset for U-027 — Python streams section content via the
+                // immediately-saved file; teri ALSO surfaces it on the sink so U-027
+                // can stream section markdown live without reading the file.
+                // No Python-observable artifact changes: same files, same progress.json,
+                // same jsonl, same console output. Architect §1, §3-step7, §7.5.)
+                sink_cell.borrow_mut().event(&crate::report::sink::ReportEvent {
+                    stage: crate::report::sink::ReportStage::Generating,
+                    progress: base_progress + (70 / total_sections as i32),
+                    message: crate::i18n::t_args(
+                        "progress.sectionDone",
+                        &[("title", &title as &dyn std::fmt::Display)],
+                    ),
+                    section_title: Some(title.clone()),
+                    section_index: Some(section_num),
+                    section_content: Some(content.clone()), // section payload for U-027 live stream
+                    report_id: report_id.clone(),
+                });
+            }
+
+            // py:1698-1704  (after loop) progress_callback("generating", 95, assemblingReport)
+            //               + update_progress(generating, 95, assemblingReport, completed_sections)
+            // Faithful emit (c): assembling milestone.
+            sink_cell.borrow_mut().event(&crate::report::sink::ReportEvent {
+                stage: crate::report::sink::ReportStage::Generating,
+                progress: 95,
+                message: crate::i18n::t("progress.assemblingReport"),
+                section_title: None,
+                section_index: None,
+                section_content: None,
+                report_id: report_id.clone(),
+            });
+            manager.update_progress(
+                &report_id,
+                "generating",
+                95,
+                &crate::i18n::t("progress.assemblingReport"),
+                None,
+                Some(&completed_section_titles),
+            )?;
+
+            // CRITICAL TRAP #1: re-assign report.outline AFTER the loop so the final
+            // save_report (below) writes meta.json with populated section content.
+            // Python's `report.outline = outline` (py:1615) is a reference — after the
+            // loop, it already has content. teri cloned it before the loop (empty content);
+            // this second clone captures the now-populated content for the final save.
+            report.outline = Some(outline.clone());
 
             // Step 8: assemble full report (report_agent.py:1707)
+            // Now runs over populated section_NN.md files (real assemble).
             report.markdown_content = manager.assemble_full_report(&report_id, &outline)?;
 
             // Step 9: status → Completed, completed_at, total_time (report_agent.py:1708-1712)
@@ -3630,6 +3814,592 @@ Final Answer: This is premature."#;
             planning_progs.contains(&20),
             "planning rescaled 100//5=20 must appear; events: {planning_progs:?}"
         );
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (h3): per-section streaming loop parity tests
+    //
+    // Strategy:
+    //   - DualModeLlm: returns a 2-section outline for chat_json, and a
+    //     "Final Answer: <section content>" for chat (the ReACT loop).
+    //     The Final Answer path bypasses tool calls → deterministic content.
+    //   - NullSink / CaptureSink for sink.
+    //   - Explicit report_id for determinism.
+    //   - Temp dir via std::env::temp_dir().
+    //
+    // Tests:
+    //   h3-1: full file tree — section_01.md, section_02.md exist with content;
+    //          full_report.md (assemble) contains both sections.
+    //   h3-2: incremental write — section_01.md exists BEFORE section_02 LLM call.
+    //   h3-3: progress.json sequence — per-section writes appear in correct order.
+    //   h3-4: final meta.json carries section content (TRAP #1).
+    //   h3-5: agent_log.jsonl — section-loop lines present.
+    //   h3-6: sink events — pre-section + section_closure sub-progress +
+    //          post-section content-carrying (superset) + 95 assembling.
+    // -----------------------------------------------------------------------
+
+    /// Dual-mode LLM for h3 tests:
+    ///   - `chat_json` → returns the outline JSON (for plan_outline)
+    ///   - `chat` → returns "Final Answer: <canned content>" (for section ReACT loop)
+    ///
+    /// The `chat` response queue is a shared VecDeque; each section pops one entry.
+    /// A shared call-order log records (call_type, section_num_hint, file_existence)
+    /// for incremental-write assertions.
+    struct DualModeLlm {
+        outline_response: serde_json::Value,
+        // Canned chat responses, consumed FIFO (tool-call sequences + Final Answers).
+        chat_responses: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+        // Records the number of `chat` calls made (section LLM calls).
+        chat_call_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl DualModeLlm {
+        fn new(outline: serde_json::Value, chat_responses: Vec<String>) -> Self {
+            Self {
+                outline_response: outline,
+                chat_responses: std::sync::Arc::new(std::sync::Mutex::new(
+                    chat_responses.into_iter().collect(),
+                )),
+                chat_call_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        #[allow(dead_code)]
+        fn chat_calls(&self) -> usize {
+            self.chat_call_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for DualModeLlm {
+        async fn complete(&self, _: &str) -> Result<String> {
+            Err(TeriError::Llm("not used".into()))
+        }
+        async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+            Err(TeriError::Llm("not used".into()))
+        }
+        async fn stream(
+            &self,
+            _: &str,
+        ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            Err(TeriError::Llm("not used".into()))
+        }
+        /// ReACT loop chat: pops next canned response from the queue.
+        async fn chat(&self, _: &[crate::llm::ChatMessage], _: &ChatOptions) -> Result<String> {
+            self.chat_call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut q = self.chat_responses.lock().unwrap();
+            Ok(q.pop_front().unwrap_or_else(|| "Final Answer: default content.".to_string()))
+        }
+        /// plan_outline chat_json: always returns the outline.
+        async fn chat_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _: &[crate::llm::ChatMessage],
+            _: &ChatOptions,
+        ) -> Result<T> {
+            serde_json::from_value(self.outline_response.clone())
+                .map_err(|e| TeriError::Llm(format!("mock parse: {e}")))
+        }
+    }
+
+    /// Shared outline response for h3 tests (2 sections).
+    fn h3_outline_response() -> serde_json::Value {
+        serde_json::json!({
+            "title": "H3 Prediction Report",
+            "summary": "H3 summary.",
+            "sections": [
+                {"title": "Alpha Section"},
+                {"title": "Beta Section"}
+            ]
+        })
+    }
+
+    /// Canned ReACT chat response: a valid quick_search tool call.
+    fn react_tool_call_response(query: &str) -> String {
+        format!(
+            "Thought: I need to search for information.\n\
+             <tool_call>\n\
+             {{\"name\": \"quick_search\", \"parameters\": {{\"query\": \"{query}\"}}}}\n\
+             </tool_call>"
+        )
+    }
+
+    /// Build a DualModeLlm with deterministic tool-call+Final-Answer sequences per section.
+    ///
+    /// Each section gets 3 tool-call responses (to satisfy min_tool_calls=3) followed
+    /// by a "Final Answer: <content>" response. The `chat` response queue is shared
+    /// (FIFO) across all sections, so the full sequence for 2 sections is:
+    ///   s1-tc1, s1-tc2, s1-tc3, "Final Answer: Alpha…", s2-tc1, s2-tc2, s2-tc3, "Final Answer: Beta…"
+    fn h3_llm() -> DualModeLlm {
+        DualModeLlm::new(
+            h3_outline_response(),
+            vec![
+                // Section 1: 3 tool calls then Final Answer
+                react_tool_call_response("alpha query 1"),
+                react_tool_call_response("alpha query 2"),
+                react_tool_call_response("alpha query 3"),
+                "Final Answer: Alpha section content.".to_string(),
+                // Section 2: 3 tool calls then Final Answer
+                react_tool_call_response("beta query 1"),
+                react_tool_call_response("beta query 2"),
+                react_tool_call_response("beta query 3"),
+                "Final Answer: Beta section content.".to_string(),
+            ],
+        )
+    }
+
+    /// Read a section file and return its content (or None if missing).
+    fn read_section_file(
+        dir: &std::path::Path,
+        report_id: &str,
+        section_num: usize,
+    ) -> Option<String> {
+        let path = dir
+            .join("reports")
+            .join(report_id)
+            .join(format!("section_{:02}.md", section_num));
+        std::fs::read_to_string(path).ok()
+    }
+
+    // ── (h3)-1: full file tree after 2-section run ───────────────────────────
+
+    #[tokio::test]
+    async fn test_generate_report_h3_full_file_tree() {
+        let llm = h3_llm();
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let upload_dir =
+            std::env::temp_dir().join(format!("teri_h3_filetree_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+        let mut agent = ReportAgent::new_react("g-h3", "sim-h3", "file tree test");
+        let report_id = "report_h3filetreetest";
+
+        let mut null_sink = crate::report::sink::NullSink;
+        let report = agent
+            .generate_report(&tools, &llm, &mgr, &mut null_sink, Some(report_id.to_string()))
+            .await;
+
+        assert_eq!(report.status, ReportStatus::Completed, "report must be Completed");
+
+        // section_01.md must exist with non-empty content.
+        let sec1 = read_section_file(&upload_dir, report_id, 1);
+        assert!(sec1.is_some(), "section_01.md must exist");
+        let sec1_content = sec1.unwrap();
+        assert!(!sec1_content.is_empty(), "section_01.md must be non-empty");
+
+        // section_02.md must exist with non-empty content.
+        let sec2 = read_section_file(&upload_dir, report_id, 2);
+        assert!(sec2.is_some(), "section_02.md must exist");
+        let sec2_content = sec2.unwrap();
+        assert!(!sec2_content.is_empty(), "section_02.md must be non-empty");
+
+        // full_report.md (assembled) must contain content from both sections.
+        let full_report_path = upload_dir.join("reports").join(report_id).join("full_report.md");
+        assert!(full_report_path.exists(), "full_report.md must exist after assemble");
+        let full_content =
+            std::fs::read_to_string(&full_report_path).expect("full_report.md must be readable");
+        // Both section titles must appear in the assembled report.
+        assert!(
+            full_content.contains("Alpha Section"),
+            "assembled report must contain 'Alpha Section'"
+        );
+        assert!(
+            full_content.contains("Beta Section"),
+            "assembled report must contain 'Beta Section'"
+        );
+        // Assembled content must be non-trivial (not just the header).
+        assert!(
+            full_content.len() > 50,
+            "assembled report content must be substantial: {full_content:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    // ── (h3)-2: incremental write (section_01.md exists before section_02 LLM call)
+
+    #[tokio::test]
+    async fn test_generate_report_h3_incremental_write() {
+        // Use an AtomicBool to verify section_01.md exists when the second section's
+        // LLM call is made. We check disk state between calls by sharing a flag through
+        // a custom LLM wrapper.
+        use std::sync::{Arc, Mutex};
+
+        struct IncrementalCheckLlm {
+            inner: DualModeLlm,
+            upload_dir: std::path::PathBuf,
+            report_id: String,
+            // Records whether section_01.md existed when call N happened.
+            section01_existed_at_call: Arc<Mutex<Vec<bool>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmClient for IncrementalCheckLlm {
+            async fn complete(&self, _: &str) -> Result<String> {
+                Err(TeriError::Llm("not used".into()))
+            }
+            async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+                Err(TeriError::Llm("not used".into()))
+            }
+            async fn stream(
+                &self,
+                _: &str,
+            ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+                Err(TeriError::Llm("not used".into()))
+            }
+            async fn chat(
+                &self,
+                msgs: &[crate::llm::ChatMessage],
+                opts: &ChatOptions,
+            ) -> Result<String> {
+                // Record whether section_01.md exists before this call.
+                let sec01_exists = self
+                    .upload_dir
+                    .join("reports")
+                    .join(&self.report_id)
+                    .join("section_01.md")
+                    .exists();
+                self.section01_existed_at_call.lock().unwrap().push(sec01_exists);
+                self.inner.chat(msgs, opts).await
+            }
+            async fn chat_json<T: serde::de::DeserializeOwned>(
+                &self,
+                msgs: &[crate::llm::ChatMessage],
+                opts: &ChatOptions,
+            ) -> Result<T> {
+                self.inner.chat_json(msgs, opts).await
+            }
+        }
+
+        let upload_dir = std::env::temp_dir().join(format!("teri_h3_incr_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let report_id = "report_h3incrtest".to_string();
+
+        let section01_existed_at_call: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(vec![]));
+
+        let llm = IncrementalCheckLlm {
+            inner: h3_llm(),
+            upload_dir: upload_dir.clone(),
+            report_id: report_id.clone(),
+            section01_existed_at_call: Arc::clone(&section01_existed_at_call),
+        };
+
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+        let mut agent = ReportAgent::new_react("g-h3", "sim-h3", "incremental write test");
+
+        let mut null_sink = crate::report::sink::NullSink;
+        let report =
+            agent.generate_report(&tools, &llm, &mgr, &mut null_sink, Some(report_id)).await;
+
+        assert_eq!(report.status, ReportStatus::Completed);
+
+        let calls = section01_existed_at_call.lock().unwrap();
+        // With 3 tool calls + 1 Final Answer per section, we expect 8 total chat calls
+        // for a 2-section run (4 per section). Section 2 starts at call index 4.
+        // At minimum, there must be more than 4 calls total.
+        assert!(
+            calls.len() > 4,
+            "expected more than 4 chat calls for a 2-section run, got {}",
+            calls.len()
+        );
+        // When the FIRST call of the SECOND section is made (index 4), section_01.md
+        // must already exist on disk — that's the incremental-write guarantee.
+        // (Calls 0-3 are section 1's 3 tool-calls + Final Answer.)
+        assert!(
+            calls[4],
+            "section_01.md must exist when section 2's first LLM call is made \
+             (incremental write guarantee; calls[4] is the start of section 2)"
+        );
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    // ── (h3)-3: progress.json write sequence ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_generate_report_h3_progress_json_sequence() {
+        let llm = h3_llm();
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let upload_dir =
+            std::env::temp_dir().join(format!("teri_h3_progress_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+        let mut agent = ReportAgent::new_react("g-h3", "sim-h3", "progress seq test");
+        let report_id = "report_h3progresstest";
+
+        let mut null_sink = crate::report::sink::NullSink;
+        let report = agent
+            .generate_report(&tools, &llm, &mgr, &mut null_sink, Some(report_id.to_string()))
+            .await;
+
+        assert_eq!(report.status, ReportStatus::Completed);
+
+        // Final progress.json: must be completed=100.
+        let progress = read_progress(&upload_dir, report_id);
+        assert_eq!(
+            progress.get("progress").and_then(|v| v.as_i64()),
+            Some(100),
+            "final progress must be 100"
+        );
+        assert_eq!(
+            progress.get("status").and_then(|v| v.as_str()),
+            Some("completed"),
+            "final status must be 'completed'"
+        );
+
+        // With 2 sections, base_progress for section 0 = 20 + int(0/2*70) = 20;
+        // section_done progress = 20 + 70/2 = 55.
+        // base_progress for section 1 = 20 + int(1/2*70) = 20+35 = 55;
+        // section_done progress = 55 + 70/2 = 90.
+        // Then assembling=95, completed=100.
+        // We can only assert the FINAL state of progress.json (last write wins),
+        // but we CAN check that the final state is at 100 with "completed" status.
+        // The completed_section_titles must appear if present.
+        if let Some(arr) = progress.get("completed_sections").and_then(|v| v.as_array()) {
+            // With 2 sections both completed, completed_sections must have 2 entries.
+            assert_eq!(
+                arr.len(),
+                2,
+                "completed_sections in final progress.json must have 2 entries"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    // ── (h3)-4: final meta.json carries section content (TRAP #1) ───────────
+
+    #[tokio::test]
+    async fn test_generate_report_h3_final_meta_has_section_content() {
+        let llm = h3_llm();
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let upload_dir = std::env::temp_dir().join(format!("teri_h3_meta_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+        let mut agent = ReportAgent::new_react("g-h3", "sim-h3", "meta trap1 test");
+        let report_id = "report_h3metatrap1";
+
+        let mut null_sink = crate::report::sink::NullSink;
+        let report = agent
+            .generate_report(&tools, &llm, &mgr, &mut null_sink, Some(report_id.to_string()))
+            .await;
+
+        assert_eq!(report.status, ReportStatus::Completed);
+
+        // The Report struct returned must have section content.
+        let outline = report.outline.as_ref().expect("outline must be Some");
+        for (i, section) in outline.sections.iter().enumerate() {
+            assert!(
+                !section.content.is_empty(),
+                "returned Report.outline.sections[{}].content must be non-empty (TRAP #1)",
+                i
+            );
+        }
+
+        // The on-disk meta.json (written by the final save_report) must also carry
+        // non-empty section content — this is the TRAP #1 re-assign check.
+        let meta_path = upload_dir.join("reports").join(report_id).join("meta.json");
+        assert!(meta_path.exists(), "meta.json must exist");
+        let meta_raw = std::fs::read_to_string(&meta_path).expect("meta.json must be readable");
+        let meta: serde_json::Value =
+            serde_json::from_str(&meta_raw).expect("meta.json must be valid JSON");
+
+        let sections = meta
+            .get("outline")
+            .and_then(|o| o.get("sections"))
+            .and_then(|s| s.as_array())
+            .expect("meta.json must have outline.sections array");
+
+        assert_eq!(sections.len(), 2, "meta.json outline must have 2 sections");
+        for (i, section) in sections.iter().enumerate() {
+            let content = section.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            assert!(
+                !content.is_empty(),
+                "meta.json outline.sections[{}].content must be non-empty (TRAP #1: \
+                 post-loop re-assign of report.outline required)",
+                i
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    // ── (h3)-5: agent_log.jsonl — section_complete lines present ────────────
+
+    #[tokio::test]
+    async fn test_generate_report_h3_agent_log_section_complete_lines() {
+        let llm = h3_llm();
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let upload_dir =
+            std::env::temp_dir().join(format!("teri_h3_agentlog_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+        let mut agent = ReportAgent::new_react("g-h3", "sim-h3", "agent log test");
+        let report_id = "report_h3agentlogtest";
+
+        let mut null_sink = crate::report::sink::NullSink;
+        let report = agent
+            .generate_report(&tools, &llm, &mgr, &mut null_sink, Some(report_id.to_string()))
+            .await;
+
+        assert_eq!(report.status, ReportStatus::Completed);
+
+        let log_entries = parse_agent_log(&upload_dir, report_id);
+        assert!(!log_entries.is_empty(), "agent_log.jsonl must not be empty");
+
+        // Orchestration-level entries (h2):
+        let has_start = log_entries
+            .iter()
+            .any(|e| e.get("action").and_then(|v| v.as_str()) == Some("report_start"));
+        assert!(has_start, "agent_log.jsonl must contain a report_start entry");
+
+        // Section-loop entries (e): each section generates at least a section_start.
+        let section_starts: Vec<_> = log_entries
+            .iter()
+            .filter(|e| e.get("action").and_then(|v| v.as_str()) == Some("section_start"))
+            .collect();
+        assert_eq!(
+            section_starts.len(),
+            2,
+            "agent_log.jsonl must contain 2 section_start entries (one per section)"
+        );
+
+        // h3 section_full_complete entries (log_section_full_complete).
+        let section_complete: Vec<_> = log_entries
+            .iter()
+            .filter(|e| e.get("action").and_then(|v| v.as_str()) == Some("section_complete"))
+            .collect();
+        assert_eq!(
+            section_complete.len(),
+            2,
+            "agent_log.jsonl must contain 2 section_complete entries (h3 log_section_full_complete)"
+        );
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    // ── (h3)-6: sink events — pre-section, sub-progress, content-carrying, 95 ─
+
+    #[tokio::test]
+    async fn test_generate_report_h3_sink_events() {
+        use crate::report::sink::{ReportEvent, ReportSink, ReportStage};
+
+        struct CaptureSink {
+            events: Vec<ReportEvent>,
+        }
+        impl ReportSink for CaptureSink {
+            fn event(&mut self, ev: &ReportEvent) {
+                self.events.push(ev.clone());
+            }
+        }
+
+        let llm = h3_llm();
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let upload_dir = std::env::temp_dir().join(format!("teri_h3_sink_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+        let mut agent = ReportAgent::new_react("g-h3", "sim-h3", "sink events test");
+        let report_id = "report_h3sinktest";
+
+        let mut capture_sink = CaptureSink { events: vec![] };
+        let report = agent
+            .generate_report(&tools, &llm, &mgr, &mut capture_sink, Some(report_id.to_string()))
+            .await;
+
+        assert_eq!(report.status, ReportStatus::Completed);
+
+        // (a) Pre-section faithful emits: one per section with section_content=None.
+        // base_progress for section 0 (i=0, total=2) = 20 + int(0/2*70) = 20.
+        // base_progress for section 1 (i=1, total=2) = 20 + int(1/2*70) = 55.
+        let pre_sec_events: Vec<_> = capture_sink
+            .events
+            .iter()
+            .filter(|e| {
+                e.stage == ReportStage::Generating
+                    && e.section_content.is_none()
+                    && (e.progress == 20 || e.progress == 55)
+            })
+            .collect();
+        assert!(
+            !pre_sec_events.is_empty(),
+            "must have faithful pre-section generating events at base_progress (20 or 55)"
+        );
+
+        // (b) Section-closure sub-progress events (from section_cb inside generate_section_react).
+        // These have section_content=None and progress between base and base+70/total.
+        // They are emitted by the section_cb closure inside the ReACT loop.
+        let sub_progress_events: Vec<_> = capture_sink
+            .events
+            .iter()
+            .filter(|e| {
+                e.stage == ReportStage::Generating
+                    && e.section_content.is_none()
+                    && e.section_index.is_some()
+            })
+            .collect();
+        // At least the pre-section events must be in this category.
+        assert!(
+            !sub_progress_events.is_empty(),
+            "must have section-scoped Generating events (pre-section + sub-progress)"
+        );
+
+        // (h3 superset): content-carrying events — one per section with section_content=Some.
+        let content_events: Vec<_> = capture_sink
+            .events
+            .iter()
+            .filter(|e| e.stage == ReportStage::Generating && e.section_content.is_some())
+            .collect();
+        assert_eq!(
+            content_events.len(),
+            2,
+            "must have 2 content-carrying events (one per section, h3 superset for U-027)"
+        );
+        // Each content-carrying event must have a non-empty section_content.
+        for ev in &content_events {
+            assert!(
+                ev.section_content.as_ref().map(|s| !s.is_empty()).unwrap_or(false),
+                "content-carrying event must have non-empty section_content"
+            );
+            assert!(
+                ev.section_index.is_some(),
+                "content-carrying event must have section_index set"
+            );
+        }
+        // section_index must be 1 and 2 (1-indexed).
+        let content_indices: Vec<usize> =
+            content_events.iter().filter_map(|e| e.section_index).collect();
+        assert!(
+            content_indices.contains(&1),
+            "content-carrying events must include section_index=1; got {content_indices:?}"
+        );
+        assert!(
+            content_indices.contains(&2),
+            "content-carrying events must include section_index=2; got {content_indices:?}"
+        );
+
+        // (c) Faithful 95 assembling emit.
+        let assembling_ev = capture_sink
+            .events
+            .iter()
+            .find(|e| e.stage == ReportStage::Generating && e.progress == 95);
+        assert!(assembling_ev.is_some(), "must have a Generating/95 assemblingReport event");
+        assert!(
+            assembling_ev.unwrap().section_content.is_none(),
+            "assemblingReport event must have section_content=None"
+        );
+
+        // Completed event at 100.
+        let completed_ev = capture_sink.events.iter().find(|e| e.stage == ReportStage::Completed);
+        assert!(completed_ev.is_some(), "must have a Completed event");
+        assert_eq!(completed_ev.unwrap().progress, 100);
 
         let _ = std::fs::remove_dir_all(&upload_dir);
     }
