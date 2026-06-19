@@ -75,8 +75,10 @@ use serde_json::Value;
 use crate::api::{ApiError, ApiState};
 use crate::graph::KnowledgeGraph;
 use crate::models::project::python_isoformat_local;
+use crate::services::simulation_ipc::{CommandStatus, IPCResponse};
 use crate::services::simulation_manager::SimulationStatus;
 use crate::services::simulation_runner::{AgentStats, RunnerStatus, TimelineEntry};
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Router factory — sub-cycle (c) adds the 3 create/get/list routes.
@@ -154,6 +156,13 @@ pub fn simulation_router(state: Arc<ApiState>) -> Router {
         // Sub-cycle (j): social-DB read routes (posts/comments). Distinct static 2nd segments.
         .route("/:simulation_id/posts", get(get_simulation_posts))
         .route("/:simulation_id/comments", get(get_simulation_comments))
+        // Sub-cycle (k): interview routes. All POST, static paths (simulation_id in the body),
+        // no capture conflicts. `/interview/{batch,all,history}` are 2-segment statics distinct
+        // from the 1-segment `/interview`.
+        .route("/interview", post(interview_agent_route))
+        .route("/interview/batch", post(interview_batch_route))
+        .route("/interview/all", post(interview_all_route))
+        .route("/interview/history", post(interview_history_route))
         // Sub-cycle (e2): simulation-script download.  Static FIRST segment "script" — axum 0.7
         // ranks a static segment above the `/:simulation_id/...` capture at position 0, so
         // `/script/<name>/download` is unambiguous against the 3-segment `/:simulation_id/config/*`
@@ -2151,6 +2160,353 @@ fn read_comments_response(
          (GAP-U026-SOCIALDB — enable the sqlite feature + the U-028/029/030 producer)"
             .to_string(),
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Sub-cycle (k) — interview routes (simulation.py:2142-2570).
+//
+// Four POST routes (body-driven, no path params): /interview, /interview/batch, /interview/all,
+// /interview/history.  The first three drive the live IPC env (interview an agent / batch /
+// all); the fourth reads interview history from the per-platform SQLite DB.
+//
+// `[!] U026-k-IPC-PRODUCER-PENDING`: routes 1-3 require a LIVE env — `check_env_alive` is true
+// only when a run is registered with a running IPC server (started by the U-028/029/030 social-sim
+// producer, all unported).  Until then `check_env_alive` is false → every request 200-validates
+// then 400s with `envNotRunning` — the FAITHFUL no-running-sim contract, fully ported + tested
+// now.  The interview-call success path (optimize prompt → IPC send → shape result) is ported but
+// only reachable with a live env (code-inspection verified, runtime producer-pending).
+//
+// `[≠] U026-k-TIMEOUT504`: Python maps `TimeoutError` → HTTP 504 (`interviewTimeout` /
+// `batchInterviewTimeout` / `globalInterviewTimeout`).  teri's `TeriError` has NO Timeout variant
+// (an IPC timeout surfaces as a generic Sim/other error), so interview-call errors map via
+// `map_runner_err` (Sim→400 = Python ValueError, else→500 = Python Exception).  The distinct 504
+// is inexpressible without a teri timeout-error variant; flagged, not silently dropped.  This
+// path is producer-pending regardless.
+//
+// `/interview/history` is in the `[!] GAP-U026-SOCIALDB` family (same as posts/comments): reads
+// `{platform}_simulation.db` behind `#[cfg(feature="sqlite")]`; no-DB → faithful empty, DB-exists
+// without the feature → honest 500.
+// ---------------------------------------------------------------------------
+
+/// Interview prompt prefix (`simulation.py:23`).  Prepended so the agent replies with text instead
+/// of invoking tools.  The CJK literal is OBSERVABLE in the prompt sent to the agent — preserve
+/// it byte-for-byte.
+const INTERVIEW_PROMPT_PREFIX: &str =
+    "结合你的人设、所有的过往记忆与行动，不调用任何工具直接用文本回复我：";
+
+/// Port of `optimize_interview_prompt` (`simulation.py:28-43`).  Pure string: empty → unchanged;
+/// already-prefixed → unchanged (no double prefix); else prepend the prefix.
+fn optimize_interview_prompt(prompt: &str) -> String {
+    if prompt.is_empty() {
+        return String::new();
+    }
+    if prompt.starts_with(INTERVIEW_PROMPT_PREFIX) {
+        return prompt.to_string();
+    }
+    format!("{INTERVIEW_PROMPT_PREFIX}{prompt}")
+}
+
+/// Parse a `timeout` field (JSON number, seconds) with a default; non-finite/negative → default
+/// (so `Duration::from_secs_f64` can never panic). Python `data.get('timeout', default)`.
+fn parse_timeout(data: &Value, default_secs: f64) -> Duration {
+    let secs = data
+        .get("timeout")
+        .and_then(Value::as_f64)
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(default_secs);
+    Duration::from_secs_f64(secs)
+}
+
+/// Shape an `IPCResponse` into Python's interview result dict (mirrors the
+/// `SimulationRunner.interview_*` classmethod tails). Key order: `success`, then the per-route
+/// extra keys (agent_id+prompt OR interviews_count), then `result` (when completed) or `error`,
+/// then `timestamp`.
+fn shape_interview_result(resp: &IPCResponse, extra: Vec<(&'static str, Value)>) -> Value {
+    let completed = resp.status == CommandStatus::Completed;
+    let mut m = serde_json::Map::new();
+    m.insert("success".into(), Value::Bool(completed));
+    for (k, v) in extra {
+        m.insert(k.to_string(), v);
+    }
+    if completed {
+        m.insert("result".into(), resp.result.clone().map(Value::Object).unwrap_or(Value::Null));
+    } else {
+        m.insert("error".into(), resp.error.clone().map(Value::String).unwrap_or(Value::Null));
+    }
+    m.insert("timestamp".into(), Value::String(resp.timestamp.clone()));
+    Value::Object(m)
+}
+
+/// Validate an optional platform field: present + non-empty + not in {twitter,reddit} → Err(key).
+/// Mirrors Python `if platform and platform not in (...)`. Empty string is falsy → skipped.
+fn validate_interview_platform(platform: Option<&str>, err_key: &str) -> Result<(), ApiError> {
+    if let Some(p) = platform
+        && !p.is_empty()
+        && !matches!(p, "twitter" | "reddit")
+    {
+        return Err(ApiError::client(StatusCode::BAD_REQUEST, crate::i18n::t(err_key)));
+    }
+    Ok(())
+}
+
+/// Count agents eligible for a global interview = agent_configs entries carrying an `agent_id`
+/// (mirrors Python `interview_all_agents`' built-list length for the `interviews_count` field).
+fn count_interview_agents(state: &ApiState, simulation_id: &str) -> usize {
+    let config_path = social_db_path(state, simulation_id, "simulation_config.json");
+    let Ok(content) = std::fs::read_to_string(&config_path) else { return 0 };
+    let Ok(config) = serde_json::from_str::<Value>(&content) else { return 0 };
+    config
+        .get("agent_configs")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter(|a| a.get("agent_id").and_then(Value::as_i64).is_some())
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Port of MiroFish `interview_agent` route (simulation.py:2142-2270). POST /interview.
+async fn interview_agent_route(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, ApiError> {
+    let data = body.map(|Json(v)| v).unwrap_or_else(|| serde_json::json!({}));
+
+    let simulation_id = data
+        .get("simulation_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ApiError::client(StatusCode::BAD_REQUEST, crate::i18n::t("api.requireSimulationId"))
+        })?;
+    // Python `if agent_id is None` → 400 (agent_id 0 is valid).
+    let agent_id = data.get("agent_id").and_then(Value::as_i64).ok_or_else(|| {
+        ApiError::client(StatusCode::BAD_REQUEST, crate::i18n::t("api.requireAgentId"))
+    })?;
+    // Python `if not prompt` → empty/missing → 400.
+    let prompt = data
+        .get("prompt")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ApiError::client(StatusCode::BAD_REQUEST, crate::i18n::t("api.requirePrompt"))
+        })?;
+    let platform = data.get("platform").and_then(Value::as_str);
+    validate_interview_platform(platform, "api.invalidInterviewPlatform")?;
+    let timeout = parse_timeout(&data, 60.0);
+
+    // env-alive gate (Python check_env_alive false → 400 envNotRunning; teri Err(no-run) → false).
+    if !state.sim_runner.check_env_alive(simulation_id).await.unwrap_or(false) {
+        return Err(ApiError::client(StatusCode::BAD_REQUEST, crate::i18n::t("api.envNotRunning")));
+    }
+
+    // --- IPC-PRODUCER-PENDING success path ---
+    let optimized = optimize_interview_prompt(prompt);
+    let resp = state
+        .sim_runner
+        .interview_agent(simulation_id, agent_id, &optimized, platform, timeout)
+        .await
+        .map_err(map_runner_err)?;
+    let result = shape_interview_result(
+        &resp,
+        vec![("agent_id", serde_json::json!(agent_id)), ("prompt", Value::String(optimized))],
+    );
+    let success = result.get("success").and_then(Value::as_bool).unwrap_or(false);
+    Ok(Json(serde_json::json!({ "success": success, "data": result })))
+}
+
+/// Port of MiroFish `interview_agents_batch` route (simulation.py:2271-2408). POST /interview/batch.
+async fn interview_batch_route(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, ApiError> {
+    let data = body.map(|Json(v)| v).unwrap_or_else(|| serde_json::json!({}));
+
+    let simulation_id = data
+        .get("simulation_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ApiError::client(StatusCode::BAD_REQUEST, crate::i18n::t("api.requireSimulationId"))
+        })?;
+    // Python `if not interviews or not isinstance(interviews, list)` → 400.
+    let interviews = data
+        .get("interviews")
+        .and_then(Value::as_array)
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| {
+            ApiError::client(StatusCode::BAD_REQUEST, crate::i18n::t("api.requireInterviews"))
+        })?;
+    let platform = data.get("platform").and_then(Value::as_str);
+    validate_interview_platform(platform, "api.invalidInterviewPlatform")?;
+
+    // Per-item validation (Python loop, index is 1-based).
+    for (i, interview) in interviews.iter().enumerate() {
+        let idx = (i + 1).to_string();
+        if interview.get("agent_id").is_none() {
+            return Err(ApiError::client(
+                StatusCode::BAD_REQUEST,
+                crate::i18n::t_args("api.interviewListMissingAgentId", &[("index", &idx)]),
+            ));
+        }
+        if interview.get("prompt").is_none() {
+            return Err(ApiError::client(
+                StatusCode::BAD_REQUEST,
+                crate::i18n::t_args("api.interviewListMissingPrompt", &[("index", &idx)]),
+            ));
+        }
+        let item_platform = interview.get("platform").and_then(Value::as_str);
+        if let Some(p) = item_platform
+            && !p.is_empty()
+            && !matches!(p, "twitter" | "reddit")
+        {
+            return Err(ApiError::client(
+                StatusCode::BAD_REQUEST,
+                crate::i18n::t_args("api.interviewListInvalidPlatform", &[("index", &idx)]),
+            ));
+        }
+    }
+
+    let timeout = parse_timeout(&data, 120.0);
+
+    if !state.sim_runner.check_env_alive(simulation_id).await.unwrap_or(false) {
+        return Err(ApiError::client(StatusCode::BAD_REQUEST, crate::i18n::t("api.envNotRunning")));
+    }
+
+    // --- IPC-PRODUCER-PENDING success path ---
+    // Optimize each item's prompt (Python copies the item + replaces prompt).
+    let optimized: Vec<Value> = interviews
+        .iter()
+        .map(|item| {
+            let mut obj = item.as_object().cloned().unwrap_or_default();
+            let p = obj.get("prompt").and_then(Value::as_str).unwrap_or("");
+            obj.insert("prompt".into(), Value::String(optimize_interview_prompt(p)));
+            Value::Object(obj)
+        })
+        .collect();
+    let count = optimized.len();
+    let resp = state
+        .sim_runner
+        .interview_agents_batch(simulation_id, optimized, platform, timeout)
+        .await
+        .map_err(map_runner_err)?;
+    let result =
+        shape_interview_result(&resp, vec![("interviews_count", serde_json::json!(count))]);
+    let success = result.get("success").and_then(Value::as_bool).unwrap_or(false);
+    Ok(Json(serde_json::json!({ "success": success, "data": result })))
+}
+
+/// Port of MiroFish `interview_all_agents` route (simulation.py:2409-2511). POST /interview/all.
+async fn interview_all_route(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, ApiError> {
+    let data = body.map(|Json(v)| v).unwrap_or_else(|| serde_json::json!({}));
+
+    let simulation_id = data
+        .get("simulation_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ApiError::client(StatusCode::BAD_REQUEST, crate::i18n::t("api.requireSimulationId"))
+        })?;
+    let prompt = data
+        .get("prompt")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ApiError::client(StatusCode::BAD_REQUEST, crate::i18n::t("api.requirePrompt"))
+        })?;
+    let platform = data.get("platform").and_then(Value::as_str);
+    validate_interview_platform(platform, "api.invalidInterviewPlatform")?;
+    let timeout = parse_timeout(&data, 180.0);
+
+    if !state.sim_runner.check_env_alive(simulation_id).await.unwrap_or(false) {
+        return Err(ApiError::client(StatusCode::BAD_REQUEST, crate::i18n::t("api.envNotRunning")));
+    }
+
+    // --- IPC-PRODUCER-PENDING success path ---
+    let optimized = optimize_interview_prompt(prompt);
+    let resp = state
+        .sim_runner
+        .interview_all_agents(simulation_id, &optimized, platform, timeout)
+        .await
+        .map_err(map_runner_err)?;
+    // interviews_count = the built-list length the primitive used (agent_configs w/ agent_id).
+    let count = count_interview_agents(&state, simulation_id);
+    let result =
+        shape_interview_result(&resp, vec![("interviews_count", serde_json::json!(count))]);
+    let success = result.get("success").and_then(Value::as_bool).unwrap_or(false);
+    Ok(Json(serde_json::json!({ "success": success, "data": result })))
+}
+
+/// Port of MiroFish `get_interview_history` route (simulation.py:2512-2570). POST /interview/history.
+async fn interview_history_route(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, ApiError> {
+    let data = body.map(|Json(v)| v).unwrap_or_else(|| serde_json::json!({}));
+
+    let simulation_id = data
+        .get("simulation_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ApiError::client(StatusCode::BAD_REQUEST, crate::i18n::t("api.requireSimulationId"))
+        })?;
+    let platform = data.get("platform").and_then(Value::as_str);
+    let agent_id = data.get("agent_id").and_then(Value::as_i64);
+    let limit = data.get("limit").and_then(Value::as_u64).map(|n| n as usize).unwrap_or(100);
+
+    interview_history_response(&state, simulation_id, platform, agent_id, limit)
+}
+
+#[cfg(feature = "sqlite")]
+fn interview_history_response(
+    state: &ApiState,
+    simulation_id: &str,
+    platform: Option<&str>,
+    agent_id: Option<i64>,
+    limit: usize,
+) -> Result<Json<Value>, ApiError> {
+    let history = state
+        .sim_runner
+        .get_interview_history(simulation_id, platform, agent_id, limit)
+        .map_err(ApiError::server)?;
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": { "count": history.len(), "history": history }
+    })))
+}
+
+#[cfg(not(feature = "sqlite"))]
+fn interview_history_response(
+    state: &ApiState,
+    simulation_id: &str,
+    platform: Option<&str>,
+    _agent_id: Option<i64>,
+    _limit: usize,
+) -> Result<Json<Value>, ApiError> {
+    // Without the sqlite feature the interview DBs can't be read. If a relevant DB exists, surface
+    // an HONEST 500 (GAP-U026-SOCIALDB) — never a silent empty; else the faithful no-DB empty.
+    let platforms: Vec<&str> = match platform {
+        Some("twitter") | Some("reddit") => vec![platform.unwrap()],
+        _ => vec!["twitter", "reddit"],
+    };
+    for p in platforms {
+        if social_db_path(state, simulation_id, &format!("{p}_simulation.db")).exists() {
+            return Err(ApiError::server(
+                "interview-history DB exists but teri was built without the `sqlite` feature \
+                 (GAP-U026-SOCIALDB — enable the sqlite feature + the U-028/029/030 producer)"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": { "count": 0, "history": [] }
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -4631,6 +4987,291 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["data"]["count"], 2, "filtered to post_id 10");
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (k) — interview routes (/interview, /interview/{batch,all,history})
+    //   Validation + env-gate fully tested (env never alive now → 400 envNotRunning,
+    //   the faithful IPC-PRODUCER-PENDING contract). History no-DB empty + sqlite reads.
+    // -----------------------------------------------------------------------
+
+    fn post_json(uri: &str, body: serde_json::Value) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn body_json(resp: axum::http::Response<Body>) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// optimize_interview_prompt: empty→empty; non-prefixed→prefixed; already-prefixed→unchanged.
+    #[test]
+    fn optimize_interview_prompt_behaviors() {
+        assert_eq!(optimize_interview_prompt(""), "");
+        let p = optimize_interview_prompt("你好");
+        assert!(p.starts_with(INTERVIEW_PROMPT_PREFIX), "prefix prepended");
+        assert!(p.ends_with("你好"));
+        // No double prefix.
+        assert_eq!(optimize_interview_prompt(&p), p);
+    }
+
+    // --- /interview ---
+
+    #[tokio::test]
+    async fn interview_missing_simulation_id_400() {
+        let (app, _t) = test_app();
+        let resp = app
+            .oneshot(post_json("/api/simulation/interview", serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn interview_missing_agent_id_400() {
+        let (app, _t) = test_app();
+        let resp = app
+            .oneshot(post_json(
+                "/api/simulation/interview",
+                serde_json::json!({"simulation_id":"s"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// agent_id 0 is VALID (Python `if agent_id is None`); with a prompt missing it must fall
+    /// through to requirePrompt, NOT requireAgentId.
+    #[tokio::test]
+    async fn interview_agent_id_zero_is_valid_then_requires_prompt() {
+        let (app, _t) = test_app();
+        let resp = app
+            .oneshot(post_json(
+                "/api/simulation/interview",
+                serde_json::json!({"simulation_id":"s","agent_id":0}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        // The error is requirePrompt (agent_id 0 passed), not requireAgentId.
+        assert_eq!(json["error"], crate::i18n::t("api.requirePrompt"));
+    }
+
+    #[tokio::test]
+    async fn interview_bad_platform_400() {
+        let (app, _t) = test_app();
+        let resp = app
+            .oneshot(post_json(
+                "/api/simulation/interview",
+                serde_json::json!({"simulation_id":"s","agent_id":0,"prompt":"q","platform":"x"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"], crate::i18n::t("api.invalidInterviewPlatform"));
+    }
+
+    /// Valid request, but no running env → 400 envNotRunning (the faithful producer-pending path).
+    #[tokio::test]
+    async fn interview_valid_but_no_env_400_env_not_running() {
+        let (app, _t) = test_app();
+        let resp = app
+            .oneshot(post_json(
+                "/api/simulation/interview",
+                serde_json::json!({"simulation_id":"s","agent_id":0,"prompt":"q"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"], crate::i18n::t("api.envNotRunning"));
+    }
+
+    // --- /interview/batch ---
+
+    #[tokio::test]
+    async fn interview_batch_missing_interviews_400() {
+        let (app, _t) = test_app();
+        let resp = app
+            .oneshot(post_json(
+                "/api/simulation/interview/batch",
+                serde_json::json!({"simulation_id":"s"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"], crate::i18n::t("api.requireInterviews"));
+    }
+
+    #[tokio::test]
+    async fn interview_batch_item_missing_agent_id_400_with_index() {
+        let (app, _t) = test_app();
+        let resp = app
+            .oneshot(post_json(
+                "/api/simulation/interview/batch",
+                serde_json::json!({"simulation_id":"s","interviews":[{"prompt":"q"}]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        // 1-based index in the message (interviewListMissingAgentId index=1).
+        assert_eq!(
+            json["error"],
+            crate::i18n::t_args("api.interviewListMissingAgentId", &[("index", &"1")])
+        );
+    }
+
+    #[tokio::test]
+    async fn interview_batch_item_missing_prompt_400() {
+        let (app, _t) = test_app();
+        let resp = app
+            .oneshot(post_json(
+                "/api/simulation/interview/batch",
+                serde_json::json!({"simulation_id":"s","interviews":[{"agent_id":0}]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn interview_batch_valid_but_no_env_400() {
+        let (app, _t) = test_app();
+        let resp = app
+            .oneshot(post_json(
+                "/api/simulation/interview/batch",
+                serde_json::json!({"simulation_id":"s","interviews":[{"agent_id":0,"prompt":"q"}]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"], crate::i18n::t("api.envNotRunning"));
+    }
+
+    // --- /interview/all ---
+
+    #[tokio::test]
+    async fn interview_all_missing_prompt_400() {
+        let (app, _t) = test_app();
+        let resp = app
+            .oneshot(post_json(
+                "/api/simulation/interview/all",
+                serde_json::json!({"simulation_id":"s"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"], crate::i18n::t("api.requirePrompt"));
+    }
+
+    #[tokio::test]
+    async fn interview_all_valid_but_no_env_400() {
+        let (app, _t) = test_app();
+        let resp = app
+            .oneshot(post_json(
+                "/api/simulation/interview/all",
+                serde_json::json!({"simulation_id":"s","prompt":"q"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"], crate::i18n::t("api.envNotRunning"));
+    }
+
+    // --- /interview/history ---
+
+    #[tokio::test]
+    async fn interview_history_missing_simulation_id_400() {
+        let (app, _t) = test_app();
+        let resp = app
+            .oneshot(post_json("/api/simulation/interview/history", serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// No DB → 200 {count:0, history:[]} (faithful; the same in sqlite and non-sqlite builds).
+    #[tokio::test]
+    async fn interview_history_no_db_empty() {
+        let (app, _t) = test_app();
+        let resp = app
+            .oneshot(post_json(
+                "/api/simulation/interview/history",
+                serde_json::json!({"simulation_id":"s_no_db"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["count"], 0);
+        assert_eq!(json["data"]["history"], serde_json::json!([]));
+    }
+
+    /// No-sqlite build: an interview DB that EXISTS → honest 500 (GAP-U026-SOCIALDB), not silent empty.
+    #[cfg(not(feature = "sqlite"))]
+    #[tokio::test]
+    async fn interview_history_db_exists_without_sqlite_honest_500() {
+        let (state, _tmp) = test_state();
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join("s_db");
+        std::fs::create_dir_all(&sim_dir).unwrap();
+        std::fs::write(sim_dir.join("reddit_simulation.db"), b"x").unwrap();
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(post_json(
+                "/api/simulation/interview/history",
+                serde_json::json!({"simulation_id":"s_db"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json = body_json(resp).await;
+        assert!(json["error"].as_str().unwrap().contains("GAP-U026-SOCIALDB"));
+    }
+
+    /// sqlite build: real interview-history read from a `trace` table.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn interview_history_populated_from_sqlite() {
+        let (state, _tmp) = test_state();
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join("s_hist");
+        std::fs::create_dir_all(&sim_dir).unwrap();
+        {
+            let conn = rusqlite::Connection::open(sim_dir.join("reddit_simulation.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE trace (user_id INTEGER, action TEXT, info TEXT, created_at TEXT);
+                 INSERT INTO trace VALUES (0,'interview','{\"prompt\":\"q\",\"response\":\"r\"}','2025-12-01T10:00:00');
+                 INSERT INTO trace VALUES (1,'post','{}','2025-12-01T10:01:00');",
+            )
+            .unwrap();
+        }
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(post_json(
+                "/api/simulation/interview/history",
+                serde_json::json!({"simulation_id":"s_hist","platform":"reddit"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        // Only the action='interview' row is returned.
+        assert_eq!(json["data"]["count"], 1);
+        assert_eq!(json["data"]["history"][0]["agent_id"], 0);
     }
 
     // -----------------------------------------------------------------------
