@@ -59,6 +59,17 @@ impl ReportManager {
         Self { reports_dir: upload_folder.as_ref().join("reports") }
     }
 
+    /// Return the `upload_folder` root (the **parent** of `reports_dir`).
+    ///
+    /// `generate_report` (h2) needs `upload_folder` to construct `ReportLogger::new(id, folder)`
+    /// and `ReportConsoleLogger::new(id, folder)` — both take `upload_folder`, not `reports_dir`.
+    /// Exposing this accessor avoids threading a second path argument through `generate_report`.
+    ///
+    /// Returns `None` only if `reports_dir` has no parent (impossible in practice).
+    pub fn upload_folder(&self) -> Option<&Path> {
+        self.reports_dir.parent()
+    }
+
     // ── Path helpers ────────────────────────────────────────────────────────
 
     /// `{reports_dir}/{report_id}/`
@@ -110,7 +121,11 @@ impl ReportManager {
     }
 
     /// Ensure `reports_dir/{report_id}/` exists and return the path.
-    fn ensure_report_folder(&self, report_id: &str) -> io::Result<PathBuf> {
+    ///
+    /// Made `pub` so `generate_report` (h2) can call it explicitly to mirror
+    /// Python's `ReportManager._ensure_report_folder(report_id)` first-call before
+    /// any `update_progress`/`save_report` writes.  Zero blast radius — internal impl.
+    pub fn ensure_report_folder(&self, report_id: &str) -> io::Result<PathBuf> {
         let folder = self.get_report_folder(report_id);
         fs::create_dir_all(&folder)?;
         Ok(folder)
@@ -392,12 +407,16 @@ impl ReportManager {
     /// Port of `ReportManager.update_progress` (`report_agent.py:2199`).
     ///
     /// JSON: `json.dump(progress_data, f, ensure_ascii=False, indent=2)`.
+    ///
+    /// `progress` is `i32` (not `u32`) because Python's failed path writes `-1`
+    /// (`report_agent.py:1753`: `update_progress(report_id, "failed", -1, …)`).
+    /// Widened from `u32` in sub-cycle h1 (parity bug fix).
     #[allow(clippy::too_many_arguments)]
     pub fn update_progress(
         &self,
         report_id: &str,
         status: &str,
-        progress: u32,
+        progress: i32,
         message: &str,
         current_section: Option<&str>,
         completed_sections: Option<&[String]>,
@@ -406,7 +425,9 @@ impl ReportManager {
 
         let mut m = serde_json::Map::new();
         m.insert("status".into(), Value::String(status.to_string()));
-        m.insert("progress".into(), Value::Number(progress.into()));
+        // `i32` → `serde_json::Number` via `From<i32>` (not `From<u32>`).
+        // This allows -1 to serialize as the JSON integer -1, matching Python.
+        m.insert("progress".into(), Value::Number(serde_json::Number::from(progress)));
         m.insert("message".into(), Value::String(message.to_string()));
         m.insert(
             "current_section".into(),
@@ -1554,5 +1575,72 @@ mod tests {
         let r = make_report("nosim_rep");
         mgr.save_report(&r).unwrap();
         assert!(mgr.get_report_by_simulation("nonexistent_sim").is_none());
+    }
+
+    // ── h1 new tests: update_progress i32 widening ──────────────────────────
+
+    /// Parity bug fix (h1): Python's failed path writes `update_progress(..., "failed", -1, ...)`.
+    /// Teri previously narrowed to `u32`; this test proves -1 now round-trips correctly.
+    #[test]
+    fn test_update_progress_negative_one_failed_path() {
+        let (mgr, _dir) = temp_mgr();
+        mgr.update_progress("rep_fail", "failed", -1, "Generation failed", None, None)
+            .expect("update_progress failed path");
+
+        let progress = mgr.get_progress("rep_fail").expect("get_progress should return Some");
+        assert_eq!(progress.get("status").and_then(|v| v.as_str()), Some("failed"));
+        // The key assertion: progress.json must contain the integer -1, not some mangled u32.
+        assert_eq!(
+            progress.get("progress").and_then(|v| v.as_i64()),
+            Some(-1),
+            "progress.json 'progress' key must be -1 on the failed path"
+        );
+        assert_eq!(progress.get("message").and_then(|v| v.as_str()), Some("Generation failed"));
+        // current_section and completed_sections must be present (null / empty) as Python writes them.
+        assert!(progress.get("current_section").map(|v| v.is_null()).unwrap_or(false));
+        let completed = progress
+            .get("completed_sections")
+            .and_then(|v| v.as_array())
+            .expect("completed_sections array");
+        assert!(completed.is_empty());
+    }
+
+    /// Normal 0..100 progress values still serialize correctly after i32 widening.
+    #[test]
+    fn test_update_progress_normal_range_still_works() {
+        let (mgr, _dir) = temp_mgr();
+        for pct in [0_i32, 15, 50, 95, 100] {
+            mgr.update_progress("rep_pct", "generating", pct, "msg", None, None)
+                .expect("update_progress");
+            let p = mgr.get_progress("rep_pct").unwrap();
+            assert_eq!(
+                p.get("progress").and_then(|v| v.as_i64()),
+                Some(pct as i64),
+                "progress {pct} must round-trip"
+            );
+        }
+    }
+
+    // ── h1 new tests: upload_folder() accessor ───────────────────────────────
+
+    #[test]
+    fn test_upload_folder_returns_parent_of_reports_dir() {
+        let dir = std::env::temp_dir().join("teri_test_upload_folder");
+        let mgr = ReportManager::new(&dir);
+        // upload_folder() must return the original `dir`, not `dir/reports`.
+        let uf = mgr.upload_folder().expect("upload_folder should be Some");
+        assert_eq!(uf, dir.as_path());
+    }
+
+    // ── h1 new tests: ensure_report_folder now pub ───────────────────────────
+
+    #[test]
+    fn test_ensure_report_folder_is_pub_and_creates_dir() {
+        let (mgr, _dir) = temp_mgr();
+        let folder = mgr.ensure_report_folder("rep_pub").expect("ensure_report_folder");
+        assert!(folder.exists(), "folder must be created by ensure_report_folder");
+        assert!(folder.is_dir());
+        // Idempotent: calling again must not fail.
+        mgr.ensure_report_folder("rep_pub").expect("idempotent ensure_report_folder");
     }
 }

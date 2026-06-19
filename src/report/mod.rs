@@ -1,6 +1,7 @@
 pub mod console_logger;
 pub mod logger;
 pub mod manager;
+pub mod sink;
 
 use crate::error::{Result, TeriError};
 use crate::i18n::{get_language_instruction, t};
@@ -542,6 +543,16 @@ pub struct ReportAgent {
     /// `None` → all log_* calls are no-ops; the (e) tests continue to work unmodified.
     /// `Some(l)` → every wired log point writes to `…/reports/{id}/agent_log.jsonl`.
     pub report_logger: Option<logger::ReportLogger>,
+    /// Active console-capture guard for the current run (sub-cycle h1 field, h2 populates).
+    ///
+    /// Mirrors Python's `self.console_logger = ReportConsoleLogger(report_id)` set at the
+    /// start of `generate_report` and cleared (`.close()` + `None`) on both success and
+    /// except tails (`report_agent.py:1565, 1721, 1755`).
+    ///
+    /// `None` until `generate_report` (h2) constructs and installs it.
+    /// `Drop` on `ReportConsoleLogger` calls `close()` as a safety net; `generate_report`
+    /// also calls it explicitly for faithful Python ordering.
+    pub console_logger: Option<console_logger::ReportConsoleLogger>,
 }
 
 impl ReportAgent {
@@ -556,6 +567,7 @@ impl ReportAgent {
             simulation_id: String::new(),
             simulation_requirement: String::new(),
             report_logger: None,
+            console_logger: None,
         }
     }
 
@@ -579,7 +591,13 @@ impl ReportAgent {
                 &[("graphId", &graph_id), ("simulationId", &simulation_id)]
             )
         );
-        Self { graph_id, simulation_id, simulation_requirement, report_logger: None }
+        Self {
+            graph_id,
+            simulation_id,
+            simulation_requirement,
+            report_logger: None,
+            console_logger: None,
+        }
     }
 
     // -----------------------------------------------------------------------

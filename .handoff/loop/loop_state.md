@@ -17,7 +17,7 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 2   # NEW SESSION 2026-06-18; CYCLE 14=U-024(g1), CYCLE 15=U-024(g2) ReportConsoleLogger
+cycles_this_session: 3   # BUDGET REACHED; CYCLE 14=U-024(g1), 15=U-024(g2), 16=U-024(h1) ReportSink foundation
 # CYCLE3 (12th resume) 2026-06-17: U-022 sub-cycle (c) MONITOR + offset-tail + graph-fire (S-605/613/614/615 + S-1056/U-047,
 #   5 [x]) — opus PASS (DECISION-17 Area 2, porter@opus). src/services/simulation_runner.rs: monitor_simulation (2s
 #   MONITOR_POLL_INTERVAL poll loop, per-platform file-exists guard, save_run_state per poll, loop-exit on U-048
@@ -548,3 +548,32 @@ next_iterate: U-022 [x] complete → U-017 port-fresh full implementation
 # (SSE+jsonl) — likely needs an ARCHITECT decision for the ReportSink streaming shape (structural). deps b,c,d,e,f,g
 # ALL DONE. interview_agents tool still honest-err until U-020 wired here.], (i) chat [conversational 2-iter ReACT,
 # get_report_by_simulation, 15000-char ctx cap, response cleaning]. (b2 insight_forge OQ-3 still pending.)
+
+
+# CYCLE 16 (2026-06-18, 16th resume): U-024 sub-cycle (h1) ReportSink foundation — architect-decided + porter@porter,
+# parity@opus PASS (5 surfaces). ARCHITECT (findings/u024-h-generate-report.md): ReportSink = TRAIT (not channel/
+# async_stream) — orthogonal to teri's test-locked generate_stream template SSE (NO downgrade of Y); maps Python
+# progress_callback 1:1 (the (d)/(e) progress closures unchanged); jsonl/console sinks stay on their OWN typed seams
+# (ReportLogger field + g2 tracing layer) so g1 details key-order contract preserved; ReportSink is ONLY the progress/
+# SSE surface (U-027 route owns the mpsc/SSE impl). Decomposed (h) → h1/h2/h3/h4. h1 PORTED: new src/report/sink.rs
+# (ReportEvent{stage:ReportStage, progress:i32 [carries -1], message, section_title/index/content:Option, report_id},
+# ReportStage{pending/planning/generating/completed/failed lowercase}, trait ReportSink:Send{event}, NullSink no-op).
+# PARITY BUG FIXED (architect-found): ReportManager::update_progress narrowed progress→u32 but Python writes -1 on
+# failed path (report_agent.py:1753) → widened to i32, progress.json byte-identical to Python json.dumps (verifier
+# dumped both sides; key order status/progress/message/current_section/completed_sections/updated_at preserved via
+# preserve_order). +console_logger:Option<ReportConsoleLogger> field on ReportAgent (None in new/new_react, mirrors
+# Python self.console_logger). +ensure_report_folder pub +upload_folder() accessor (additive, for h2). 12 new tests,
+# 1188 green, clippy clean (commit runs cargo fmt — verifier noted 2 lines needing fmt). Atomic gate: X-parity PASS +
+# Y-green + Y-not-regressed. Y-drift clean.
+# SESSION BUDGET REACHED (3 cycles: g1/g2/h1). HANDOFF. U-024 progress: a✓ b✓ c✓ d✓ e✓ f✓ g1✓ g2✓ h1✓ | REMAINING:
+# (h2) generate_report skeleton [report_id = format!("report_{}", uuid4 simple [..12]); status machine Pending→Planning
+# →Generating→Completed/Failed; create ReportLogger+ReportConsoleLogger (set the &mut self fields) + log_start +
+# log_planning_start/context/complete around plan_outline + save_outline; finalize (log_report_complete, total-time,
+# Report.status/markdown_content/completed_at, save_report) + error tail (status=failed, progress=-1, log_error,
+# console_logger.close()); placeholder assemble. signature `generate_report<L>(&mut self, tools, llm, manager:&ReportManager,
+# sink:&mut dyn ReportSink, report_id:Option<String>) -> Report`. progress closure |stage,pct,msg| sink.event(...) passed
+# to plan_outline/generate_section_react.], (h3) per-section streaming loop [generate_section_react per section +
+# clean_section_content + save_section IMMEDIATELY + log_section_full_complete + update_progress + sink.event per section;
+# real assemble_full_report], (h4) U-027 SSE sink adapter [with U-027 routes]. Then (i) chat. (b2 insight_forge OQ-3;
+# interview_agents honest-err until U-020 sim/ipc.rs — confirmed MISSING — wired at h3.) After U-024: U-025/26/27 HTTP
+# API routes (U-027 report route exposes the ReACT per-section progress stream via a ReportSink→SSE adapter).
