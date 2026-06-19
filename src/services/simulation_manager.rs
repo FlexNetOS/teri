@@ -1733,6 +1733,237 @@ impl SimulationManager {
 }
 
 // =============================================================================
+// U-026 sub-cycle (d) — background prepare task (Send-safe spawn)
+//
+// Port of MiroFish `prepare_simulation` route's `run_prepare` background thread
+// (simulation.py:507-612). DECISION-U026-d-1 (findings/u026-d-architecture.md):
+// mirror `build_graph_async_with_completion` (graph_builder.rs:156) — a dedicated
+// worker that builds a `Send` progress closure INTERNALLY so the spawned future is
+// `Send`, WITHOUT changing `prepare_simulation`'s `Option<&mut dyn FnMut>` callback
+// bound (blast radius on that U-023-verified surface = 0). The `&mut dyn FnMut`
+// handed to `prepare_simulation` is a local borrow consumed entirely within the
+// single `prepare_simulation(...).await` call and never crosses the WORKER future's
+// await boundary, so the worker future holds no `!Send` value across an await.
+// =============================================================================
+
+/// Map a `PrepareProgress` event to the overall-% / detailed-message / progress_detail
+/// shape and push it to the task via `TaskManager::update_task`.
+///
+/// Port of the inner `progress_callback` (simulation.py:522-581). The stage→overall
+/// band table matches Python `stage_weights` (L524-529); `total_stages = 4` even though
+/// teri's pipeline only EMITS stages 1-3 (`[~] U026-d-STAGE4`: `copying_scripts` band is
+/// kept for index/total fidelity but never fires — emitted %s for stages 1-3 are
+/// byte-identical to Python).
+fn prepare_progress_update(task_id: &str, p: &PrepareProgress<'_>) {
+    // stage_weights (L524-529): (start, end, stage_index). Unknown → (0,100), index 1.
+    let (start, end, stage_index): (i64, i64, i64) = match p.stage {
+        "reading" => (0, 20, 1),
+        "generating_profiles" => (20, 70, 2),
+        "generating_config" => (70, 90, 3),
+        "copying_scripts" => (90, 100, 4),
+        _ => (0, 100, 1),
+    };
+    // overall = int(start + (end - start) * stage_progress / 100) — truncate toward zero
+    // (floor for non-negatives = Python int()).
+    let overall = start + (end - start) * p.progress / 100;
+
+    // stage_names (L535-540): i18n key; unknown stage → raw stage string.
+    let stage_name = match p.stage {
+        "reading" => crate::i18n::t("progress.readingGraphEntities"),
+        "generating_profiles" => crate::i18n::t("progress.generatingProfiles"),
+        "generating_config" => crate::i18n::t("progress.generatingSimConfig"),
+        "copying_scripts" => crate::i18n::t("progress.preparingScripts"),
+        other => other.to_string(),
+    };
+
+    let current_item = p.current.unwrap_or(0);
+    let total_items = p.total.unwrap_or(0);
+
+    // progress_detail dict (L556-565).
+    let mut progress_detail: HashMap<String, Value> = HashMap::new();
+    progress_detail.insert("current_stage".to_string(), Value::String(p.stage.to_string()));
+    progress_detail.insert("current_stage_name".to_string(), Value::String(stage_name.clone()));
+    progress_detail.insert("stage_index".to_string(), Value::Number(stage_index.into()));
+    progress_detail.insert("total_stages".to_string(), Value::Number(4.into()));
+    progress_detail.insert("stage_progress".to_string(), Value::Number(p.progress.into()));
+    progress_detail.insert("current_item".to_string(), Value::Number(current_item.into()));
+    progress_detail.insert("total_items".to_string(), Value::Number(total_items.into()));
+    progress_detail.insert("item_description".to_string(), Value::String(p.message.clone()));
+
+    // detailed_message (L568-574).
+    let detailed_message = if total_items > 0 {
+        format!("[{stage_index}/4] {stage_name}: {current_item}/{total_items} - {}", p.message)
+    } else {
+        format!("[{stage_index}/4] {stage_name}: {}", p.message)
+    };
+
+    // L576-581: progress + message + progress_detail; status untouched (stays PROCESSING).
+    crate::task::TaskManager::global().update_task(
+        task_id,
+        None,
+        Some(overall),
+        Some(detailed_message),
+        None,
+        None,
+        Some(progress_detail),
+    );
+}
+
+/// Spawn the background prepare task and return its `task_id` immediately.
+///
+/// Port of the `create_task` + spawned `run_prepare` thread (simulation.py:491-612).
+/// The `task_id` is created by the ROUTE (so it can also set `status=PREPARING` + save
+/// and embed the id in the immediate response, matching Python's L490-502 ordering)
+/// and passed in.
+///
+/// ## DECISION-U026-d-1-REVISED — dedicated OS thread, NOT `tokio::spawn`
+///
+/// `prepare_simulation`'s OWN future is `!Send`: it (and the nested `generate_config`,
+/// simulation_config.rs:2001) hold a `&mut dyn FnMut(...)` progress callback live across
+/// internal `.await`s. Awaiting it inside a `tokio::spawn` worker would therefore make the
+/// worker future `!Send` too — so the architect's option (b) (build a Send closure in a
+/// `tokio::spawn` worker) does NOT achieve Send-safety here without also `+ Send`-bounding
+/// `prepare_simulation` AND `generate_config` AND rewriting the raw-pointer trick at
+/// simulation_manager.rs:1321 (option (a)'s full cost on a U-023-verified surface).
+///
+/// Instead we run the `!Send` future on a **dedicated OS thread** with a current-thread
+/// tokio runtime. A current-thread runtime drives `!Send` futures (everything stays on one
+/// thread), so NO signature changes to any verified surface (blast radius = 0). This is also
+/// the MORE faithful port of Python's `threading.Thread(target=run_prepare, daemon=True)`
+/// (L611-612) — a real background thread, not a tokio task. Locale is captured before the
+/// thread starts and re-applied inside via `with_locale` (L504-505).
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_prepare_simulation(
+    task_id: String,
+    manager: std::sync::Arc<SimulationManager>,
+    simulation_id: String,
+    simulation_requirement: String,
+    document_text: String,
+    defined_entity_types: Option<Vec<String>>,
+    use_llm_for_profiles: bool,
+    parallel_profile_count: usize,
+    llm: crate::llm::OpenAiAdapter,
+    graph: crate::graph::KnowledgeGraph,
+    config_generator: crate::services::simulation_config::SimulationConfigGenerator<
+        crate::llm::OpenAiAdapter,
+    >,
+) -> String {
+    // Capture locale before spawning (L504-505: thread-local capture).
+    let locale = crate::i18n::get_locale();
+    let task_id_worker = task_id.clone();
+    std::thread::spawn(move || {
+        // Current-thread runtime: drives the !Send prepare future on this one thread.
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(e) => {
+                // Can't build a runtime → fail the task so /prepare/status observes it.
+                tracing::error!("prepare worker runtime build failed: {e}");
+                crate::task::TaskManager::global().fail_task(&task_id_worker, e.to_string());
+                return;
+            }
+        };
+        rt.block_on(crate::i18n::with_locale(locale, async move {
+            prepare_worker(
+                task_id_worker,
+                manager,
+                simulation_id,
+                simulation_requirement,
+                document_text,
+                defined_entity_types,
+                use_llm_for_profiles,
+                parallel_profile_count,
+                llm,
+                graph,
+                config_generator,
+            )
+            .await;
+        }));
+    });
+    task_id
+}
+
+/// Inner worker — port of `run_prepare` (simulation.py:508-608).
+///
+/// Drives `prepare_simulation` with a progress closure, then routes the terminal
+/// transition to `complete_task` (success) or `fail_task` + FAILED-save (error).
+///
+/// `pub(crate)` so tests can drive it directly on a current-thread runtime (bypassing the
+/// OS-thread spawn + TaskManager polling), mirroring `build_graph_worker_inner`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn prepare_worker(
+    task_id: String,
+    manager: std::sync::Arc<SimulationManager>,
+    simulation_id: String,
+    simulation_requirement: String,
+    document_text: String,
+    defined_entity_types: Option<Vec<String>>,
+    use_llm_for_profiles: bool,
+    parallel_profile_count: usize,
+    llm: crate::llm::OpenAiAdapter,
+    graph: crate::graph::KnowledgeGraph,
+    config_generator: crate::services::simulation_config::SimulationConfigGenerator<
+        crate::llm::OpenAiAdapter,
+    >,
+) {
+    use crate::task::{TaskManager, TaskStatus};
+    let tm = TaskManager::global();
+
+    // L511-516: PROCESSING / progress=0 / "startPreparingEnv".
+    tm.update_task(
+        &task_id,
+        Some(TaskStatus::Processing),
+        Some(0),
+        Some(crate::i18n::t("progress.startPreparingEnv")),
+        None,
+        None,
+        None,
+    );
+
+    // The Send progress closure (the crux): captures only the owned String task_id.
+    let task_id_cb = task_id.clone();
+    let mut cb = move |p: PrepareProgress<'_>| {
+        prepare_progress_update(&task_id_cb, &p);
+    };
+
+    let persona_generator = crate::agent::PersonaGenerator::new();
+
+    let result = manager
+        .prepare_simulation(
+            &simulation_id,
+            &simulation_requirement,
+            &document_text,
+            defined_entity_types.as_deref(),
+            use_llm_for_profiles,
+            parallel_profile_count,
+            &llm,
+            &graph,
+            &persona_generator,
+            &config_generator,
+            Some(&mut cb),
+        )
+        .await;
+
+    match result {
+        Ok(result_state) => {
+            // L593-597: complete_task(result=result_state.to_simple_dict()).
+            tm.complete_task(&task_id, result_state.to_simple_dict());
+        }
+        Err(e) => {
+            // L599-608: fail_task + reload state → FAILED + error + save (best-effort).
+            // (prepare_simulation also sets FAILED internally; the double-write is
+            //  idempotent on disk and matches Python's two-layer FAILED-set.)
+            tracing::error!("准备模拟失败: {e}");
+            tm.fail_task(&task_id, e.to_string());
+            if let Ok(Some(mut st)) = manager.get_simulation(&simulation_id) {
+                st.status = SimulationStatus::Failed;
+                st.error = Some(e.to_string());
+                let _ = manager.save_simulation_state(&mut st);
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Tests — SimulationManager (sub-cycle c)
 // =============================================================================
 
@@ -2834,5 +3065,92 @@ mod prepare_tests {
         assert!(sim_dir.join("reddit_profiles.json").exists());
         assert!(sim_dir.join("twitter_profiles.csv").exists());
         assert!(sim_dir.join("simulation_config.json").exists());
+    }
+}
+
+// =============================================================================
+// Tests — U-026 sub-cycle (d) prepare progress mapping (S-836 helper)
+// =============================================================================
+
+#[cfg(test)]
+mod prepare_progress_tests {
+    use super::*;
+
+    /// `prepare_progress_update` maps stage-local progress to the overall band and writes
+    /// the task progress/message/progress_detail. Mirrors Python's stage_weights math.
+    #[test]
+    fn prepare_progress_overall_band_and_detail() {
+        let tm = crate::task::TaskManager::global();
+        let task_id = tm.create_task("simulation_prepare", None);
+
+        // generating_profiles band (20,70) at stage_progress=50 → 20 + 50*50/100 = 45.
+        let p = PrepareProgress {
+            stage: "generating_profiles",
+            progress: 50,
+            message: "做人设 3/10".to_string(),
+            current: Some(3),
+            total: Some(10),
+        };
+        prepare_progress_update(&task_id, &p);
+
+        let task = tm.get_task(&task_id).expect("task exists");
+        let d = task.to_dict();
+        assert_eq!(d["progress"], 45, "overall = 20 + (70-20)*50/100 = 45");
+        // detailed_message: "[2/4] {name}: 3/10 - 做人设 3/10"
+        let msg = d["message"].as_str().unwrap();
+        assert!(msg.starts_with("[2/4]"), "stage_index 2 of 4: {msg}");
+        assert!(msg.contains("3/10"), "current/total present when total>0: {msg}");
+        // progress_detail keys
+        let pd = &d["progress_detail"];
+        assert_eq!(pd["current_stage"], "generating_profiles");
+        assert_eq!(pd["stage_index"], 2);
+        assert_eq!(pd["total_stages"], 4);
+        assert_eq!(pd["stage_progress"], 50);
+        assert_eq!(pd["current_item"], 3);
+        assert_eq!(pd["total_items"], 10);
+    }
+
+    /// reading band (0,20) truncates; total_items==0 omits the "current/total" segment.
+    #[test]
+    fn prepare_progress_reading_band_truncates_and_no_count_segment() {
+        let tm = crate::task::TaskManager::global();
+        let task_id = tm.create_task("simulation_prepare", None);
+
+        // reading band (0,20) at progress=55 → int(0 + 20*55/100) = int(11.0) = 11.
+        let p = PrepareProgress {
+            stage: "reading",
+            progress: 55,
+            message: "读取图谱".to_string(),
+            current: None,
+            total: None,
+        };
+        prepare_progress_update(&task_id, &p);
+
+        let task = tm.get_task(&task_id).expect("task exists");
+        let d = task.to_dict();
+        assert_eq!(d["progress"], 11, "overall = 20*55/100 truncated = 11");
+        let msg = d["message"].as_str().unwrap();
+        assert!(msg.starts_with("[1/4]"), "reading is stage 1: {msg}");
+        assert!(!msg.contains(" - "), "no count segment when total_items==0: {msg}");
+    }
+
+    /// Unknown stage → band (0,100), stage_index 1, raw stage name.
+    #[test]
+    fn prepare_progress_unknown_stage_full_band() {
+        let tm = crate::task::TaskManager::global();
+        let task_id = tm.create_task("simulation_prepare", None);
+        let p = PrepareProgress {
+            stage: "mystery",
+            progress: 30,
+            message: "x".to_string(),
+            current: None,
+            total: None,
+        };
+        prepare_progress_update(&task_id, &p);
+        let task = tm.get_task(&task_id).expect("task exists");
+        let d = task.to_dict();
+        assert_eq!(d["progress"], 30, "unknown band (0,100): 0 + 100*30/100 = 30");
+        assert_eq!(d["progress_detail"]["stage_index"], 1);
+        assert_eq!(d["progress_detail"]["current_stage_name"], "mystery", "raw stage name");
     }
 }

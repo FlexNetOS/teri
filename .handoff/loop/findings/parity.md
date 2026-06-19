@@ -3466,3 +3466,66 @@ Differential by reading BOTH sides (MiroFish runs need torch/creds → Python be
 - S-835: `[x]` (PASS round-1). 9/9 symbols exercised at source.
 
 Unit rollup: 1/1 symbol covered. **U-026 sub-cycle (m) is PASS** — clears to commit. With (m) landed, only (d) prepare(+status) remains for U-026 sub-cycles a-m.
+
+---
+
+## 2026-06-19 — U-026 sub-cycle (d): POST /prepare + POST /prepare/status + background prepare worker — VERDICT: PASS
+
+Source: MiroFish `simulation.py` `prepare_simulation` L359-639 (incl. `run_prepare` L508-612,
+`progress_callback` L522-581) and `get_prepare_status` L642-752.
+Port: teri `src/api/simulation.rs` (`prepare_simulation_route` L786, `prepare_status_route` L953,
+routes L127-128) + `src/services/simulation_manager.rs` (`spawn_prepare_simulation` L1840,
+`prepare_worker` L1897, `prepare_progress_update` L1757).
+
+Differential evidence (`cargo test -p teri --lib prepare`): 27 passed, 0 failed.
+- 11 route tests (every /prepare + /prepare/status branch: 400 require-id, 404 sim-not-found,
+  already-prepared short-circuit (no task_id), 400 project-missing-requirement, happy 200 preparing+task_id,
+  status 400 neither, not_started, ready-by-sim, task-found to_dict, task-gone 404, B1-precedes-task_id).
+- 3 progress-mapping unit tests (band math 45 / truncate 11 / unknown-stage(0,100); detailed_message
+  with & without count segment; progress_detail 8 keys, total_stages=4, stage_index 1-based).
+- All 10 api.* + 5 progress.* i18n keys confirmed present in BOTH en.json and zh.json AND match the
+  MiroFish source `locales/{en,zh}.json` (1:1).
+
+CONTRACT CRITICAL POINTS adjudicated:
+- entity_types preview-vs-worker: NOT conflated. Response uses `preview_entity_types`
+  (=preview.entity_types, simulation.rs:901/933 ↔ Python L484/623); worker receives body `entity_types`
+  (simulation.rs:861/915 ↔ Python L587). Two distinct inputs preserved.
+- overall-% i64 math `start + (end-start)*progress/100` == Python `int(start + (end-start)*progress/100)`
+  for the non-negative domain (start integer ⇒ int(start+x)=start+floor(x); proven by tests 45 & 11).
+- B1-precedes-task_id: B1 short-circuit runs first (returns ready/no-task_id); B3a double
+  check_simulation_prepared call preserved. Faithful.
+- to_simple_dict (9 keys) on complete; zero-entities → Ok(state, status=failed) → complete_task with
+  result.status="failed" (faithful to Python L1261-1266 + L593-597, NOT fail_task).
+
+DECISION-U026-d-1-REVISED (std::thread + current-thread runtime) — ADJUDICATED FAITHFUL, no downgrade:
+- The architect's option (b) premise was REFUTED correctly by the porter: `prepare_simulation`'s future
+  is genuinely !Send — the `*mut Option<&mut dyn FnMut(...)>` raw pointer (simulation_manager.rs:1321)
+  and the `&mut dyn FnMut` are held LIVE across the `.await` at L1350 (generate_profiles_from_entities).
+  A tokio::spawn worker awaiting that future inherits !Send. The design-doc claim "the &mut dyn never
+  crosses an await" was wrong; the std::thread + Builder::new_current_thread().block_on(with_locale(...))
+  is the correct realization (current-thread RT drives !Send futures on one thread).
+- Observable parity vs threading.Thread(daemon=True): (1) task_id returned immediately (spawn returns
+  synchronously); (2) background progress lands via global OnceLock TaskManager (Send+Sync mutex);
+  (3) terminal complete/fail; (4) locale captured pre-spawn + re-applied via with_locale; (5) runtime-build
+  failure → fail_task (observable, strict-superset safety); (6) panic-isolated detached thread (≈ daemon).
+  At least as faithful as option (b), arguably more (real OS thread = Python's thread).
+- Blast radius = 0 on the U-023 surface: `prepare_simulation` signature (L1180-1192) and the raw-pointer
+  trick (L1321) are UNCHANGED — git -L confirms the region was touched only by U-023 (a94658a) + a
+  whitespace fmt commit (1afbe0c), by no sub-cycle (d) commit. Option (a) correctly rejected.
+
+Risk flags adjudicated:
+- `[~] U026-d-STAGE4` (copying_scripts band dead in teri): CONFIRMED not a downgrade. teri's pipeline
+  emits only stages 1-3; the (90,100) band + total_stages=4 are kept for index/total fidelity; emitted
+  overall %s for stages 1-3 are byte-identical to Python. Status [~] justified.
+- `[!] U026-d-GRAPHREQ` (prepare requires &KnowledgeGraph; graph-resolve failure → empty graph → 0
+  entities → Ok(FAILED) → complete_task with status=failed, observable via /prepare/status, NOT a route
+  500): CONFIRMED faithful degradation, not a downgrade — matches Python's empty-Zep → failed-prepare.
+  Inexpressible-otherwise (teri has no live Zep client); status [!] justified.
+- `[≠] U026-ZEPKEY`, `[≠] U025-TRACEBACK`: inherited pre-approved precedents, not newly introduced.
+
+Build precondition: `cargo build -p teri --lib` clean.
+
+VERDICT: PASS — all contract behaviors match; std::thread spawn is a faithful, no-downgrade realization;
+U-023 surface untouched (blast radius 0). Symbols verified: prepare_simulation_route,
+prepare_status_route, spawn_prepare_simulation, prepare_worker, prepare_progress_update,
+to_simple_dict(reuse) — all exercised.

@@ -122,6 +122,10 @@ pub fn simulation_router(state: Arc<ApiState>) -> Router {
         // registered BEFORE `/:simulation_id` (capture) — axum 0.7 ranks static above capture,
         // same `[!] U026-ROUTE-ORDER` rule as `/list`.
         .route("/history", get(get_simulation_history))
+        // Sub-cycle (d): async prepare lifecycle. Both POST static paths (no capture conflict);
+        // /prepare/status is a 2-segment static distinct from /prepare by full-path match.
+        .route("/prepare", post(prepare_simulation_route))
+        .route("/prepare/status", post(prepare_status_route))
         .route("/:simulation_id", get(get_simulation))
         // Sub-cycle (e): profiles/config read routes.
         //
@@ -743,6 +747,301 @@ async fn get_simulation_history(
         "data": enriched,
         "count": count
     })))
+}
+
+// ---------------------------------------------------------------------------
+// Sub-cycle (d) Route 1 — POST /prepare  (simulation.py:359-639)
+//
+// Async LLM-driven prepare. Returns task_id immediately; the background OS thread
+// (spawn_prepare_simulation, DECISION-U026-d-1-REVISED) runs the 3-stage pipeline and
+// updates the task, polled via POST /prepare/status.
+//
+// Flow (architecture findings/u026-d-architecture.md §2):
+//   1. simulation_id (400 requireSimulationId)
+//   2. get_simulation None → 404 simulationNotFound
+//   3. force_regenerate (default false)
+//   4. if !force: check_simulation_prepared → if prepared → 200 ready/already_prepared
+//   5. get_project None → 404 projectNotFound
+//   6. simulation_requirement empty → 400 projectMissingRequirement
+//   7. document_text = get_extracted_text or ""
+//   8. entity_types / use_llm_for_profiles(true) / parallel_profile_count(5)
+//   9. SYNC entity-count preview (best-effort): resolve graph → filter_defined_entities(enrich=false)
+//  10. create_task("simulation_prepare", {simulation_id, project_id})
+//  11. status=PREPARING + entities_count/entity_types → save
+//  12. spawn worker (graph moved in; on graph-resolve failure use empty graph → worker FAILED)
+//  13. 200 {success, data:{simulation_id, task_id, status:preparing, message, already_prepared:false,
+//          expected_entities_count, entity_types}}
+//
+// `[!] U026-d-GRAPHREQ`: teri's prepare_simulation takes `graph:&KnowledgeGraph` as a REQUIRED
+//   input (no live Zep). If graph resolution fails (ZEP guard / no graph_build task), the route
+//   STILL creates the task + spawns with an empty graph → the worker reads 0 entities → FAILED
+//   terminal (faithful to Python's zero-entities→FAILED path). The failure is observable via
+//   /prepare/status as a failed task, NOT a route 500. A green end-to-end happy path requires a
+//   seeded graph_build task (same producer dep (b)/(f) accept).
+// `[~] U026-d-STAGE4`: copying_scripts band dead in teri (kept for total_stages=4 fidelity).
+// `[≠] U026-ZEPKEY` (graph-resolve guard kept), `[≠] U025-TRACEBACK` (500 omits live traceback).
+// ---------------------------------------------------------------------------
+
+/// Port of MiroFish `prepare_simulation` route (simulation.py:359-639).
+async fn prepare_simulation_route(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, ApiError> {
+    let body = body.map(|j| j.0).unwrap_or_else(|| serde_json::json!({}));
+
+    // Step 1: simulation_id (simulation.py:408-413).
+    let simulation_id = match body.get("simulation_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return Err(ApiError::client(
+                StatusCode::BAD_REQUEST,
+                crate::i18n::t("api.requireSimulationId"),
+            ));
+        }
+    };
+
+    // Step 2: get_simulation None → 404 (simulation.py:415-422). DECISION-U026-1: in-state Arc.
+    let mut sim_state =
+        match state.sim_manager.get_simulation(&simulation_id).map_err(ApiError::server)? {
+            Some(s) => s,
+            None => {
+                return Err(ApiError::client(
+                    StatusCode::NOT_FOUND,
+                    crate::i18n::t_args("api.simulationNotFound", &[("id", &simulation_id)]),
+                ));
+            }
+        };
+
+    // Step 3-4: already-prepared short-circuit (simulation.py:425-444).
+    let force_regenerate = body.get("force_regenerate").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !force_regenerate {
+        let (is_prepared, prepare_info) = check_simulation_prepared(&state.config, &simulation_id);
+        if is_prepared {
+            return Ok(Json(serde_json::json!({
+                "success": true,
+                "data": {
+                    "simulation_id": simulation_id,
+                    "status": "ready",
+                    "message": crate::i18n::t("api.alreadyPrepared"),
+                    "already_prepared": true,
+                    "prepare_info": prepare_info
+                }
+            })));
+        }
+    }
+
+    // Step 5: get_project None → 404 (simulation.py:449-454).
+    let pm = crate::models::project::ProjectManager::from_config(&state.config);
+    let project = match pm.get_project(&sim_state.project_id).map_err(ApiError::server)? {
+        Some(p) => p,
+        None => {
+            return Err(ApiError::client(
+                StatusCode::NOT_FOUND,
+                crate::i18n::t_args("api.projectNotFound", &[("id", &sim_state.project_id)]),
+            ));
+        }
+    };
+
+    // Step 6: simulation_requirement empty → 400 (simulation.py:457-462).
+    let simulation_requirement = project.simulation_requirement.clone().unwrap_or_default();
+    if simulation_requirement.is_empty() {
+        return Err(ApiError::client(
+            StatusCode::BAD_REQUEST,
+            crate::i18n::t("api.projectMissingRequirement"),
+        ));
+    }
+
+    // Step 7: document_text (simulation.py:465).
+    let document_text =
+        pm.get_extracted_text(&sim_state.project_id).ok().flatten().unwrap_or_default();
+
+    // Step 8: options (simulation.py:467-469).
+    let entity_types: Option<Vec<String>> =
+        body.get("entity_types").and_then(|v| v.as_array()).map(|arr| {
+            arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect::<Vec<_>>()
+        });
+    let use_llm_for_profiles =
+        body.get("use_llm_for_profiles").and_then(|v| v.as_bool()).unwrap_or(true);
+    let parallel_profile_count =
+        body.get("parallel_profile_count").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+
+    // Step 9: synchronous entity-count preview (best-effort, simulation.py:471-488).
+    // Resolve the graph ONCE; reused as the owned input moved into the worker.
+    // On resolution failure → warn + empty graph (worker reads 0 → FAILED; [!] U026-d-GRAPHREQ).
+    let graph = match load_entity_reader_graph(&state, &sim_state.graph_id).await {
+        Ok(g) => g,
+        Err(_) => {
+            tracing::warn!(
+                "同步获取实体数量失败（将在后台任务中重试）: graph resolve failed for graph_id={}",
+                sim_state.graph_id
+            );
+            crate::graph::KnowledgeGraph::new()
+        }
+    };
+    {
+        let reader = crate::services::entity_reader::KnowledgeGraphEntityReader::new(&graph);
+        let preview = reader.filter_defined_entities(entity_types.as_deref(), false);
+        sim_state.entities_count = preview.filtered_count;
+        sim_state.entity_types = preview.entity_types.iter().cloned().collect();
+    }
+
+    // Step 10: create task (simulation.py:491-498).
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert("simulation_id".to_string(), Value::String(simulation_id.clone()));
+    metadata.insert("project_id".to_string(), Value::String(sim_state.project_id.clone()));
+    let task_id =
+        crate::task::TaskManager::global().create_task("simulation_prepare", Some(metadata));
+
+    // Step 11: status=PREPARING + save (simulation.py:500-502). Persists entities_count/entity_types.
+    sim_state.status = SimulationStatus::Preparing;
+    state
+        .sim_manager
+        .save_simulation_state(&mut sim_state)
+        .map_err(ApiError::server)?;
+
+    // Capture response values before moving into the worker.
+    let expected_entities_count = sim_state.entities_count;
+    let preview_entity_types = sim_state.entity_types.clone();
+
+    // Step 12: spawn the background prepare worker (simulation.py:504-612).
+    let config_generator = crate::services::simulation_config::SimulationConfigGenerator::new(
+        crate::api::build_llm(&state.config),
+        state.config.llm.model.clone(),
+        state.config.llm.base_url.clone(),
+    );
+    crate::services::simulation_manager::spawn_prepare_simulation(
+        task_id.clone(),
+        state.sim_manager.clone(),
+        simulation_id.clone(),
+        simulation_requirement,
+        document_text,
+        entity_types,
+        use_llm_for_profiles,
+        parallel_profile_count,
+        crate::api::build_llm(&state.config),
+        graph,
+        config_generator,
+    );
+
+    // Step 13: immediate 200 response (simulation.py:614-625).
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": {
+            "simulation_id": simulation_id,
+            "task_id": task_id,
+            "status": "preparing",
+            "message": crate::i18n::t("api.prepareStarted"),
+            "already_prepared": false,
+            "expected_entities_count": expected_entities_count,
+            "entity_types": preview_entity_types
+        }
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Sub-cycle (d) Route 2 — POST /prepare/status  (simulation.py:642-752)
+//
+// Branch tree (architecture §3, evaluate in this order — Python control flow):
+//   B1. simulation_id present + check_simulation_prepared → 200 ready/100/already_prepared:true
+//   B2. task_id absent: (B2a) simulation_id present → 200 not_started/0; (B2b) neither → 400
+//   B3. task_id present → get_task:
+//        B3a. None: simulation_id+prepared → 200 ready/task_id/already_prepared; else 404 taskNotFound
+//        B3b. Some(t): to_dict + already_prepared:false → 200
+//
+// The two check_simulation_prepared calls (B1 then B3a) are intentional + Python-faithful
+// (the sim may finish between the two checks). `[≠] U025-TRACEBACK` on the outer 500.
+// ---------------------------------------------------------------------------
+
+/// Port of MiroFish `get_prepare_status` route (simulation.py:642-752).
+async fn prepare_status_route(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, ApiError> {
+    let body = body.map(|j| j.0).unwrap_or_else(|| serde_json::json!({}));
+
+    let task_id = body.get("task_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    let simulation_id =
+        body.get("simulation_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+
+    // B1: simulation_id present → check_simulation_prepared first (simulation.py:679-692).
+    if let Some(sim_id) = simulation_id {
+        let (is_prepared, prepare_info) = check_simulation_prepared(&state.config, sim_id);
+        if is_prepared {
+            return Ok(Json(serde_json::json!({
+                "success": true,
+                "data": {
+                    "simulation_id": sim_id,
+                    "status": "ready",
+                    "progress": 100,
+                    "message": crate::i18n::t("api.alreadyPrepared"),
+                    "already_prepared": true,
+                    "prepare_info": prepare_info
+                }
+            })));
+        }
+    }
+
+    // B2: task_id absent (simulation.py:695-711).
+    let task_id = match task_id {
+        None => {
+            if let Some(sim_id) = simulation_id {
+                // B2a: simulation_id present but not prepared → not_started.
+                return Ok(Json(serde_json::json!({
+                    "success": true,
+                    "data": {
+                        "simulation_id": sim_id,
+                        "status": "not_started",
+                        "progress": 0,
+                        "message": crate::i18n::t("api.notStartedPrepare"),
+                        "already_prepared": false
+                    }
+                })));
+            }
+            // B2b: neither present → 400.
+            return Err(ApiError::client(
+                StatusCode::BAD_REQUEST,
+                crate::i18n::t("api.requireTaskOrSimId"),
+            ));
+        }
+        Some(t) => t,
+    };
+
+    // B3: task_id present → get_task (simulation.py:713-745).
+    match crate::task::TaskManager::global().get_task(task_id) {
+        None => {
+            // B3a: task gone. If simulation_id present AND now prepared → 200 ready (2nd check).
+            if let Some(sim_id) = simulation_id {
+                let (is_prepared, prepare_info) = check_simulation_prepared(&state.config, sim_id);
+                if is_prepared {
+                    return Ok(Json(serde_json::json!({
+                        "success": true,
+                        "data": {
+                            "simulation_id": sim_id,
+                            "task_id": task_id,
+                            "status": "ready",
+                            "progress": 100,
+                            "message": crate::i18n::t("api.taskCompletedPrepared"),
+                            "already_prepared": true,
+                            "prepare_info": prepare_info
+                        }
+                    })));
+                }
+            }
+            Err(ApiError::client(
+                StatusCode::NOT_FOUND,
+                crate::i18n::t_args("api.taskNotFound", &[("id", &task_id)]),
+            ))
+        }
+        Some(task) => {
+            // B3b: task found → to_dict + already_prepared:false.
+            let mut d = match task.to_dict() {
+                Value::Object(m) => m,
+                _ => serde_json::Map::new(),
+            };
+            d.insert("already_prepared".to_string(), Value::Bool(false));
+            Ok(Json(serde_json::json!({ "success": true, "data": Value::Object(d) })))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7307,5 +7606,229 @@ mod tests {
         assert_eq!(files[1]["filename"], "b.txt");
         // third file has no filename key → 未知文件 default
         assert_eq!(files[2]["filename"], "未知文件");
+    }
+
+    // =======================================================================
+    // Sub-cycle (d) — POST /prepare + POST /prepare/status  (simulation.py:359-752)
+    // =======================================================================
+
+    async fn prep_post(
+        app: axum::Router,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (status, json)
+    }
+
+    // ---- /prepare -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn prepare_missing_simulation_id_400() {
+        let (app, _tmp) = test_app();
+        let (status, json) = prep_post(app, "/api/simulation/prepare", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["success"], false);
+        assert!(json.get("traceback").is_none(), "400 must not have traceback");
+    }
+
+    #[tokio::test]
+    async fn prepare_sim_not_found_404() {
+        let (app, _tmp) = test_app();
+        let (status, json) = prep_post(
+            app,
+            "/api/simulation/prepare",
+            serde_json::json!({"simulation_id": "sim_doesnotexist"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["success"], false);
+    }
+
+    #[tokio::test]
+    async fn prepare_already_prepared_short_circuit() {
+        // A prepared sim (status=ready + config_generated + required files) short-circuits to
+        // 200 ready/already_prepared:true WITHOUT spawning a prepare task.
+        let (state, sim_id, _tmp) = seed_prepared_sim("ready", true);
+        let app = crate::server::create_app(state);
+        let (status, json) =
+            prep_post(app, "/api/simulation/prepare", serde_json::json!({"simulation_id": sim_id}))
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["status"], "ready");
+        assert_eq!(json["data"]["already_prepared"], true);
+        assert!(json["data"].get("prepare_info").is_some(), "must carry prepare_info");
+        // No task_id in the already-prepared short-circuit (distinct from the spawn path).
+        assert!(json["data"].get("task_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn prepare_project_missing_requirement_400() {
+        // Sim in 'created' status (not prepared) whose project has NO simulation_requirement.
+        let (state, _tmp) = test_state();
+        let (project_id, _g) = seed_project_with_graph(&state); // no requirement set
+        let sim = state
+            .sim_manager
+            .create_simulation(&project_id, "graph-abc", true, true)
+            .expect("create sim");
+        let app = crate::server::create_app(state);
+        let (status, json) = prep_post(
+            app,
+            "/api/simulation/prepare",
+            serde_json::json!({"simulation_id": sim.simulation_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["success"], false);
+    }
+
+    #[tokio::test]
+    async fn prepare_happy_returns_preparing_with_task() {
+        // Project WITH a requirement → reaches spawn → immediate 200 preparing + task_id.
+        // (Graph 'graph-x' has no graph_build task → empty graph → preview 0; the background
+        //  worker FAILS harmlessly. We assert only the immediate response contract.)
+        let (state, _tmp) = test_state();
+        let pm = crate::models::project::ProjectManager::from_config(&state.config);
+        let mut p = pm.create_project("Prep Project").expect("seed project");
+        p.graph_id = Some("graph-x".to_string());
+        p.simulation_requirement = Some("如果武汉大学发布公告会怎样".to_string());
+        pm.save_project(&mut p).expect("save");
+        let sim = state
+            .sim_manager
+            .create_simulation(&p.project_id, "graph-x", true, true)
+            .expect("create sim");
+        let sim_id = sim.simulation_id.clone();
+
+        let app = crate::server::create_app(state);
+        let (status, json) =
+            prep_post(app, "/api/simulation/prepare", serde_json::json!({"simulation_id": sim_id}))
+                .await;
+        assert_eq!(status, StatusCode::OK, "happy prepare must return 200: {json}");
+        assert_eq!(json["success"], true);
+        let data = &json["data"];
+        assert_eq!(data["simulation_id"], sim_id);
+        assert_eq!(data["status"], "preparing");
+        assert_eq!(data["already_prepared"], false);
+        assert!(data["task_id"].as_str().is_some_and(|s| !s.is_empty()), "must return a task_id");
+        assert!(data["expected_entities_count"].is_number());
+        assert!(data["entity_types"].is_array());
+    }
+
+    // ---- /prepare/status ----------------------------------------------------
+
+    #[tokio::test]
+    async fn prepare_status_neither_id_400() {
+        let (app, _tmp) = test_app();
+        let (status, json) =
+            prep_post(app, "/api/simulation/prepare/status", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["success"], false);
+    }
+
+    #[tokio::test]
+    async fn prepare_status_sim_not_prepared_not_started() {
+        // simulation_id present, not prepared, no task_id → not_started/0.
+        let (state, _tmp) = test_state();
+        let (project_id, _g) = seed_project_with_graph(&state);
+        let sim = state
+            .sim_manager
+            .create_simulation(&project_id, "graph-abc", true, true)
+            .expect("create sim");
+        let app = crate::server::create_app(state);
+        let (status, json) = prep_post(
+            app,
+            "/api/simulation/prepare/status",
+            serde_json::json!({"simulation_id": sim.simulation_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["data"]["status"], "not_started");
+        assert_eq!(json["data"]["progress"], 0);
+        assert_eq!(json["data"]["already_prepared"], false);
+    }
+
+    #[tokio::test]
+    async fn prepare_status_sim_prepared_ready() {
+        let (state, sim_id, _tmp) = seed_prepared_sim("ready", true);
+        let app = crate::server::create_app(state);
+        let (status, json) = prep_post(
+            app,
+            "/api/simulation/prepare/status",
+            serde_json::json!({"simulation_id": sim_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["data"]["status"], "ready");
+        assert_eq!(json["data"]["progress"], 100);
+        assert_eq!(json["data"]["already_prepared"], true);
+    }
+
+    #[tokio::test]
+    async fn prepare_status_task_found_returns_to_dict() {
+        let (app, _tmp) = test_app();
+        let task_id = crate::task::TaskManager::global().create_task("simulation_prepare", None);
+        let (status, json) = prep_post(
+            app,
+            "/api/simulation/prepare/status",
+            serde_json::json!({"task_id": task_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["data"]["task_id"], task_id);
+        assert_eq!(json["data"]["already_prepared"], false);
+        // to_dict carries the status field (pending for a fresh task).
+        assert!(json["data"].get("status").is_some());
+    }
+
+    #[tokio::test]
+    async fn prepare_status_task_gone_no_sim_404() {
+        let (app, _tmp) = test_app();
+        let (status, json) = prep_post(
+            app,
+            "/api/simulation/prepare/status",
+            serde_json::json!({"task_id": "task-does-not-exist-xyz"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["success"], false);
+    }
+
+    /// B1 precedence: when simulation_id is PREPARED, the B1 short-circuit returns ready
+    /// FIRST — before task_id is even looked at — so the response carries NO task_id (the
+    /// B1 shape, distinct from B3a's task_id-echo). This is the Python control-flow order
+    /// (L679-692 runs before the task_id branch). The B3a task_id-echo path is only reachable
+    /// when B1 says not-prepared yet the sim becomes prepared between the two checks (a
+    /// non-deterministic race; covered by inspection per architecture §3).
+    #[tokio::test]
+    async fn prepare_status_b1_precedes_task_id_when_prepared() {
+        let (state, sim_id, _tmp) = seed_prepared_sim("ready", true);
+        let app = crate::server::create_app(state);
+        let (status, json) = prep_post(
+            app,
+            "/api/simulation/prepare/status",
+            serde_json::json!({"task_id": "task-gone-abc", "simulation_id": sim_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["data"]["status"], "ready");
+        assert_eq!(json["data"]["progress"], 100);
+        assert_eq!(json["data"]["already_prepared"], true);
+        // B1 shape carries prepare_info and NO task_id (unlike B3a).
+        assert!(json["data"].get("prepare_info").is_some());
+        assert!(json["data"].get("task_id").is_none(), "B1 precedes task_id → no task_id field");
     }
 }
