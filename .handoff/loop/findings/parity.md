@@ -3432,3 +3432,37 @@ The prior gate FAILED S-834 on ONE issue: Python's `close_simulation_env` catche
 - S-834: `[≠]` (PASS — the documented `[≠] U026-l-TIMEOUT` resolves the prior FAIL; tracked residual, producer-pending).
 
 Unit rollup: 2/2 symbols covered (S-833 `[x]`, S-834 `[≠]`). **U-026 sub-cycle (l) is PASS** — clears to commit. The two `[≠]` (TIMEOUT, ALREADYCLOSED) + one `[!]` (IPC-PRODUCER-PENDING) are tracked must-resolve-with-producer residuals, not downgrades.
+
+---
+
+## U-026 sub-cycle (m) — GET /history  (parity PASS round-1, 2026-06-19, 23rd→24th resume)
+
+**Unit:** U-026 simulation routes, sub-cycle (m) — `GET /history` (history list with project enrichment).
+**Symbol:** S-835 `get_simulation_history`.
+**Source X:** `MiroFish/backend/app/api/simulation.py:876-987` + helper `_get_report_id_for_simulation:817-873`.
+**Port Y:** `teri/src/api/simulation.rs::get_simulation_history` + 8 `history_*` tests.
+
+### Method
+Differential by reading BOTH sides (MiroFish runs need torch/creds → Python behavior verified by reading). Default-skeptical verifier (harness:rust-port-parity-verifier) ran `cargo test -p teri --lib api::simulation::tests::history` (8 passed) and traced every contract item to source.
+
+### Contract proven (8 items)
+1. **Key order (byte-observable, preserve_order):** 17 base `to_dict` keys, `current_round` UPDATED IN PLACE at pos 12 (IndexMap re-insert keeps position = Python `dict[k]=v`), then 8 appended: simulation_requirement, total_simulation_hours, runner_status, total_rounds, files, report_id, version, created_date. 25 keys total. `history_key_order_preserved` asserts the full order.
+2. **config block:** requirement default ""; total_simulation_hours echoes RAW JSON Number; recommended_rounds = `int(tsh*60/max(mpr||60,1))` truncate-toward-zero (`.trunc()`). No-config → "",0,0.
+3. **run_state block:** Some → current_round / runner_status.value (8 RunnerStatus values match) / total_rounds(>0 else recommended); None → 0/"idle"/recommended (get_run_state returns Ok(None), mirrors Python `if run_state:`).
+4. **files:** project.files[:3] → [{"filename": f.get("filename","未知文件")}]; missing project/empty → [].
+5. **report_id (FLAGGED item):** porter chose `list_reports(Some(id),1).first()` over loop_state-pointed `get_report_by_simulation`. **VERIFIER CONFIRMED MORE FAITHFUL, NOT a downgrade**: get_report_by_simulation (manager.rs:830) returns FIRST fs-match; Python returns NEWEST by created_at DESC; list_reports `sort_by(b.created_at.cmp(a.created_at))` stable = Python stable Timsort reverse → byte-faithful newest. Empty → null both sides.
+6. **limit:** `?limit` default 20, usize-parse → neg/non-numeric → 20. `[~] U026-m-NEGLIMIT` (U-025 precedent; Python type=int negative `[:-n]` is non-contractual). `history_limit_caps_results` + `history_bad_limit_falls_back_to_default`.
+7. **envelope:** {success,data,count} order; outer error → `ApiError::server` 500 {success,error,traceback} (`[≠] U025-TRACEBACK`).
+8. **created_date:** created_at[:10] char-slice (ASCII ISO); empty if absent.
+
+### Non-contractual edges (do NOT block — outside contract)
+- Corrupt meta.json missing graph_id/simulation_requirement → Rust `get_report` `?`-rejects vs Python reads only sim_id/report_id. Well-formed reports (always from `report.to_dict()`) have all keys → contractual domain identical. `[~]`.
+- Non-numeric minutes_per_round (string) → Python `max(str,1)` TypeError→500 vs Rust `.as_f64()→None→60`. Malformed config only. `[~]`.
+
+### Residual flags
+- `[!] U026-m-LIVEDATA` — run-state/config/report enrichment read real on-disk state; with no live producer they are the faithful empty-run snapshot (idle/0/recommended/None). Flips to richer values automatically when producers (U-028/029/030) land — same read path, no code change.
+
+### Verdict
+- S-835: `[x]` (PASS round-1). 9/9 symbols exercised at source.
+
+Unit rollup: 1/1 symbol covered. **U-026 sub-cycle (m) is PASS** — clears to commit. With (m) landed, only (d) prepare(+status) remains for U-026 sub-cycles a-m.

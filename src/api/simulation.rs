@@ -118,6 +118,10 @@ pub fn simulation_router(state: Arc<ApiState>) -> Router {
         // IMPORTANT: /list (static) BEFORE /:simulation_id (capture) — axum 0.7 route order.
         .route("/create", post(create_simulation))
         .route("/list", get(list_simulations))
+        // Sub-cycle (m): history list with project enrichment. Static 1-segment `/history`
+        // registered BEFORE `/:simulation_id` (capture) — axum 0.7 ranks static above capture,
+        // same `[!] U026-ROUTE-ORDER` rule as `/list`.
+        .route("/history", get(get_simulation_history))
         .route("/:simulation_id", get(get_simulation))
         // Sub-cycle (e): profiles/config read routes.
         //
@@ -550,6 +554,193 @@ async fn list_simulations(
     Ok(Json(serde_json::json!({
         "success": true,
         "data": data,
+        "count": count
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Sub-cycle (m) — GET /history  (simulation.py:876-987)
+//
+// Source: history list for the home page, each simulation enriched with project
+// details, run-state, file list, and report linkage.
+//
+// Source steps (simulation.py:911-979):
+//   1. limit = request.args.get('limit', 20, type=int)
+//   2. manager.list_simulations()[:limit]   — NO project_id filter (all sims)
+//   3. for each sim:
+//        sim_dict = sim.to_dict()                            # 17 keys
+//        config = manager.get_simulation_config(sim_id)
+//        if config:
+//          sim_dict["simulation_requirement"] = config.get("simulation_requirement", "")
+//          time_config = config.get("time_config", {})
+//          sim_dict["total_simulation_hours"] = time_config.get("total_simulation_hours", 0)
+//          recommended_rounds = int(tsh * 60 / max(minutes_per_round||60, 1))
+//        else:
+//          sim_dict["simulation_requirement"] = ""; total_simulation_hours = 0; recommended_rounds = 0
+//        run_state = SimulationRunner.get_run_state(sim_id)
+//        if run_state:
+//          current_round = run_state.current_round
+//          runner_status = run_state.runner_status.value
+//          total_rounds = run_state.total_rounds if > 0 else recommended_rounds
+//        else:
+//          current_round = 0; runner_status = "idle"; total_rounds = recommended_rounds
+//        project = ProjectManager.get_project(sim.project_id)
+//        files = [{"filename": f.get("filename","未知文件")} for f in project.files[:3]] or []
+//        report_id = _get_report_id_for_simulation(sim_id)   # NEWEST matching report or None
+//        version = "v1.0.2"
+//        created_date = sim_dict["created_at"][:10]
+//   4. return {success, data:[...], count}
+//
+// Key order per enriched sim (Python dict insertion order; preserve_order byte-observable):
+//   [17 base to_dict keys, with current_round UPDATED in place at pos 12],
+//   simulation_requirement, total_simulation_hours, runner_status, total_rounds,
+//   files, report_id, version, created_date.
+//   (current_round is re-inserted: IndexMap keeps its original position, updates value —
+//    matches Python's `dict[existing_key] = v` semantics.)
+//
+// `_get_report_id_for_simulation` faithfulness (simulation.py:817-873): Python collects ALL
+// reports whose meta.json `simulation_id` matches, sorts by `created_at` DESC, returns the
+// NEWEST `report_id` (or None). teri's `ReportManager::get_report_by_simulation` returns the
+// FIRST match in fs-iteration order — NOT newest — so it would diverge when a sim has multiple
+// reports. We instead use `list_reports(Some(sim_id), 1)` which sorts `created_at` DESC (same
+// stable-sort as Python) and take the first → byte-faithful "newest report_id".
+//
+// `[~] U026-m-NEGLIMIT`: `?limit` parsed as usize (negative/non-numeric → default 20), same
+//   U-025 precedent as the other limit routes. Python `type=int` would accept a negative and
+//   slice `[:-n]`; that edge is non-contractual and consistent with prior sub-cycles.
+// `[!] U026-m-LIVEDATA`: run-state/config/report enrichment all read real on-disk state; with
+//   no live producer the values are the faithful empty-run snapshot (idle/0/recommended/None).
+//   Flips to richer values automatically when producers (U-028/029/030) land — same read path.
+// `[≠] U025-TRACEBACK`: outer error → ApiError::server (3-key 500 shape).
+// ---------------------------------------------------------------------------
+
+/// Port of MiroFish `get_simulation_history` (simulation.py:876-987).
+async fn get_simulation_history(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    use serde_json::Map;
+
+    // Step 1: limit (simulation.py:912). type=int default 20; usize parse (U-025 precedent).
+    let limit = params.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(20);
+
+    // Step 2: list ALL simulations (no project_id filter), take [:limit] (simulation.py:914-915).
+    let simulations = state.sim_manager.list_simulations(None).map_err(ApiError::server)?;
+
+    // ProjectManager + ReportManager (constructed per Python: fresh instances, FS-backed).
+    let pm = crate::models::project::ProjectManager::from_config(&state.config);
+    let rm = crate::report::manager::ReportManager::new(&state.config.upload_folder);
+
+    let mut enriched: Vec<Value> = Vec::new();
+
+    // Step 3: enrich each sim (simulation.py:918-973). [:limit] applied via take().
+    for sim in simulations.into_iter().take(limit) {
+        // Base 17-key dict (simulation.py:920).
+        let mut sim_dict: Map<String, Value> = match sim.to_dict() {
+            Value::Object(m) => m,
+            _ => Map::new(),
+        };
+        let sim_id = sim.simulation_id.clone();
+
+        // ---- config block (simulation.py:923-936) ----
+        let config = state.sim_manager.get_simulation_config(&sim_id).map_err(ApiError::server)?;
+        let recommended_rounds: i64;
+        if let Some(cfg) = config.as_ref() {
+            // simulation_requirement: config.get("simulation_requirement", "")
+            let req = cfg
+                .get("simulation_requirement")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            sim_dict.insert("simulation_requirement".to_string(), Value::String(req));
+
+            // time_config = config.get("time_config", {})
+            let empty = Value::Object(Map::new());
+            let time_config = cfg.get("time_config").unwrap_or(&empty);
+
+            // total_simulation_hours = time_config.get("total_simulation_hours", 0) — RAW value
+            let tsh_val = time_config
+                .get("total_simulation_hours")
+                .cloned()
+                .unwrap_or(Value::Number(0.into()));
+            // recommended_rounds = int(tsh * 60 / max(minutes_per_round||60, 1))
+            let tsh_num = tsh_val.as_f64().unwrap_or(0.0);
+            let mpr = time_config.get("minutes_per_round").and_then(|v| v.as_f64()).unwrap_or(60.0);
+            recommended_rounds = (tsh_num * 60.0 / mpr.max(1.0)).trunc() as i64;
+
+            sim_dict.insert("total_simulation_hours".to_string(), tsh_val);
+        } else {
+            sim_dict.insert("simulation_requirement".to_string(), Value::String(String::new()));
+            sim_dict.insert("total_simulation_hours".to_string(), Value::Number(0.into()));
+            recommended_rounds = 0;
+        }
+
+        // ---- run-state block (simulation.py:939-948) ----
+        let run_state = state.sim_runner.get_run_state(&sim_id).await.map_err(ApiError::server)?;
+        if let Some(rs) = run_state {
+            // current_round UPDATES the existing key (stays at position 12).
+            sim_dict.insert("current_round".to_string(), Value::Number(rs.current_round.into()));
+            sim_dict.insert(
+                "runner_status".to_string(),
+                Value::String(rs.runner_status.as_str().to_string()),
+            );
+            let total_rounds =
+                if rs.total_rounds > 0 { rs.total_rounds } else { recommended_rounds };
+            sim_dict.insert("total_rounds".to_string(), Value::Number(total_rounds.into()));
+        } else {
+            sim_dict.insert("current_round".to_string(), Value::Number(0.into()));
+            sim_dict.insert("runner_status".to_string(), Value::String("idle".to_string()));
+            sim_dict.insert("total_rounds".to_string(), Value::Number(recommended_rounds.into()));
+        }
+
+        // ---- files block (simulation.py:951-958) ----
+        // project.files[:3] → [{"filename": f.get("filename","未知文件")}]; else [].
+        let project = pm.get_project(&sim.project_id).map_err(ApiError::server)?;
+        let files: Vec<Value> = match project {
+            Some(p) if !p.files.is_empty() => p
+                .files
+                .iter()
+                .take(3)
+                .map(|f| {
+                    let filename = f.get("filename").and_then(|v| v.as_str()).unwrap_or("未知文件");
+                    let mut fm = Map::with_capacity(1);
+                    fm.insert("filename".to_string(), Value::String(filename.to_string()));
+                    Value::Object(fm)
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        sim_dict.insert("files".to_string(), Value::Array(files));
+
+        // ---- report_id (simulation.py:961, helper :817-873) ----
+        // Faithful "newest report_id by created_at DESC", or null.
+        let report_id = rm
+            .list_reports(Some(&sim_id), 1)
+            .first()
+            .map(|r| Value::String(r.report_id.clone()))
+            .unwrap_or(Value::Null);
+        sim_dict.insert("report_id".to_string(), report_id);
+
+        // ---- version (simulation.py:964) ----
+        sim_dict.insert("version".to_string(), Value::String("v1.0.2".to_string()));
+
+        // ---- created_date = created_at[:10] (simulation.py:967-971) ----
+        // Python slices the first 10 chars (char-safe; ISO dates are ASCII). Empty if absent.
+        let created_date = sim_dict
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .map(|s| s.chars().take(10).collect::<String>())
+            .unwrap_or_default();
+        sim_dict.insert("created_date".to_string(), Value::String(created_date));
+
+        enriched.push(Value::Object(sim_dict));
+    }
+
+    // Step 4: success envelope (simulation.py:975-979). Key order: success, data, count.
+    let count = enriched.len();
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": enriched,
         "count": count
     })))
 }
@@ -6892,5 +7083,229 @@ mod tests {
             entity_type,
             et_strings
         );
+    }
+
+    // =======================================================================
+    // Sub-cycle (m) — GET /history  (simulation.py:876-987)
+    // =======================================================================
+
+    async fn get_history(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let resp = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (status, json)
+    }
+
+    /// No simulations → 200 {success:true, data:[], count:0}.
+    #[tokio::test]
+    async fn history_empty_no_sims() {
+        let (app, _tmp) = test_app();
+        let (status, json) = get_history(app, "/api/simulation/history").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["success"], true);
+        assert_eq!(json["count"], 0);
+        assert_eq!(json["data"].as_array().unwrap().len(), 0);
+    }
+
+    /// Single sim, no config / no run_state / no report → faithful empty-run defaults.
+    #[tokio::test]
+    async fn history_single_sim_defaults() {
+        let (state, _tmp) = test_state();
+        let (project_id, _g) = seed_project_with_graph(&state);
+        let sim = state
+            .sim_manager
+            .create_simulation(&project_id, "graph-abc", true, true)
+            .expect("create sim");
+        let created_at = sim.created_at.clone();
+
+        let app = crate::server::create_app(state);
+        let (status, json) = get_history(app, "/api/simulation/history").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["count"], 1);
+        let s = &json["data"][0];
+
+        // Enrichment defaults (no config, no run_state, no project files, no report).
+        assert_eq!(s["simulation_requirement"], "");
+        assert_eq!(s["total_simulation_hours"], 0);
+        assert_eq!(s["runner_status"], "idle");
+        assert_eq!(s["total_rounds"], 0);
+        assert_eq!(s["current_round"], 0);
+        assert!(s["files"].as_array().unwrap().is_empty(), "files must be []");
+        assert_eq!(s["report_id"], serde_json::Value::Null);
+        assert_eq!(s["version"], "v1.0.2");
+        // created_date = created_at[:10]
+        let expected_date: String = created_at.chars().take(10).collect();
+        assert_eq!(s["created_date"], expected_date);
+        // base to_dict key carried through
+        assert_eq!(s["status"], "created");
+    }
+
+    /// Config present with time_config → simulation_requirement + total_simulation_hours +
+    /// recommended_rounds become total_rounds (no run_state → uses recommended).
+    #[tokio::test]
+    async fn history_with_config_recommended_rounds() {
+        let (state, _tmp) = test_state();
+        let (project_id, _g) = seed_project_with_graph(&state);
+        let sim = state
+            .sim_manager
+            .create_simulation(&project_id, "graph-abc", true, true)
+            .expect("create sim");
+        let sim_id = sim.simulation_id.clone();
+
+        // Write a simulation_config.json with time_config (24h / 60min-per-round → 24 rounds).
+        let sim_dir = state.sim_manager.get_simulation_dir(&sim_id).expect("dir");
+        let cfg = serde_json::json!({
+            "simulation_requirement": "如果武汉大学发布公告会怎样",
+            "time_config": { "total_simulation_hours": 24, "minutes_per_round": 60 }
+        });
+        std::fs::write(sim_dir.join("simulation_config.json"), cfg.to_string()).unwrap();
+
+        let app = crate::server::create_app(state);
+        let (status, json) = get_history(app, "/api/simulation/history").await;
+        assert_eq!(status, StatusCode::OK);
+        let s = &json["data"][0];
+        assert_eq!(s["simulation_requirement"], "如果武汉大学发布公告会怎样");
+        assert_eq!(s["total_simulation_hours"], 24);
+        // recommended_rounds = int(24 * 60 / max(60,1)) = 24; no run_state → total_rounds = 24
+        assert_eq!(s["total_rounds"], 24);
+        assert_eq!(s["runner_status"], "idle");
+    }
+
+    /// recommended_rounds uses int() truncation and max(minutes_per_round,1).
+    /// 5h, 90min/round → 5*60/90 = 3.33.. → int() = 3.
+    #[tokio::test]
+    async fn history_recommended_rounds_truncates() {
+        let (state, _tmp) = test_state();
+        let (project_id, _g) = seed_project_with_graph(&state);
+        let sim = state
+            .sim_manager
+            .create_simulation(&project_id, "graph-abc", true, true)
+            .expect("create sim");
+        let sim_dir = state.sim_manager.get_simulation_dir(&sim.simulation_id).expect("dir");
+        let cfg = serde_json::json!({
+            "time_config": { "total_simulation_hours": 5, "minutes_per_round": 90 }
+        });
+        std::fs::write(sim_dir.join("simulation_config.json"), cfg.to_string()).unwrap();
+
+        let app = crate::server::create_app(state);
+        let (_status, json) = get_history(app, "/api/simulation/history").await;
+        assert_eq!(json["data"][0]["total_rounds"], 3);
+        // total_simulation_hours echoes the raw config value
+        assert_eq!(json["data"][0]["total_simulation_hours"], 5);
+    }
+
+    /// Key order is byte-observable (preserve_order). Verify the exact 25-key insertion order,
+    /// including current_round UPDATED IN PLACE at position 12 (not appended).
+    #[tokio::test]
+    async fn history_key_order_preserved() {
+        let (state, _tmp) = test_state();
+        let (project_id, _g) = seed_project_with_graph(&state);
+        state
+            .sim_manager
+            .create_simulation(&project_id, "graph-abc", true, true)
+            .expect("create sim");
+
+        let app = crate::server::create_app(state);
+        let (_status, json) = get_history(app, "/api/simulation/history").await;
+        let s = json["data"][0].as_object().expect("object");
+        let keys: Vec<&str> = s.keys().map(|k| k.as_str()).collect();
+        let expected = vec![
+            "simulation_id",
+            "project_id",
+            "graph_id",
+            "enable_twitter",
+            "enable_reddit",
+            "status",
+            "entities_count",
+            "profiles_count",
+            "entity_types",
+            "config_generated",
+            "config_reasoning",
+            "current_round", // UPDATED in place — stays at pos 12, not re-appended
+            "twitter_status",
+            "reddit_status",
+            "created_at",
+            "updated_at",
+            "error",
+            "simulation_requirement",
+            "total_simulation_hours",
+            "runner_status",
+            "total_rounds",
+            "files",
+            "report_id",
+            "version",
+            "created_date",
+        ];
+        assert_eq!(keys, expected, "history enriched key order must match Python dict order");
+    }
+
+    /// ?limit caps the number of returned sims ([:limit] slice).
+    #[tokio::test]
+    async fn history_limit_caps_results() {
+        let (state, _tmp) = test_state();
+        let (project_id, _g) = seed_project_with_graph(&state);
+        for _ in 0..3 {
+            state
+                .sim_manager
+                .create_simulation(&project_id, "graph-abc", true, true)
+                .expect("create sim");
+        }
+
+        let app = crate::server::create_app(state);
+        let (status, json) = get_history(app, "/api/simulation/history?limit=2").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["count"], 2, "limit=2 must cap to 2");
+        assert_eq!(json["data"].as_array().unwrap().len(), 2);
+    }
+
+    /// Non-numeric ?limit falls back to default 20 ([~] U026-m-NEGLIMIT / U-025 precedent).
+    #[tokio::test]
+    async fn history_bad_limit_falls_back_to_default() {
+        let (state, _tmp) = test_state();
+        let (project_id, _g) = seed_project_with_graph(&state);
+        state
+            .sim_manager
+            .create_simulation(&project_id, "graph-abc", true, true)
+            .expect("create sim");
+
+        let app = crate::server::create_app(state);
+        let (status, json) = get_history(app, "/api/simulation/history?limit=abc").await;
+        assert_eq!(status, StatusCode::OK);
+        // default 20 ≥ 1 sim → all returned
+        assert_eq!(json["count"], 1);
+    }
+
+    /// project.files[:3] → [{"filename": ...}] with the 未知文件 default for a missing key.
+    #[tokio::test]
+    async fn history_project_files_capped_and_defaulted() {
+        let (state, _tmp) = test_state();
+        let pm = crate::models::project::ProjectManager::from_config(&state.config);
+        let mut p = pm.create_project("Files Project").expect("seed project");
+        p.graph_id = Some("graph-files".to_string());
+        // 4 files: 3 with filename, 1 without (→ default). Only first 3 are kept.
+        p.files = vec![
+            serde_json::json!({"filename": "a.txt"}),
+            serde_json::json!({"filename": "b.txt"}),
+            serde_json::json!({"no_name": true}),
+            serde_json::json!({"filename": "d.txt"}),
+        ];
+        pm.save_project(&mut p).expect("save");
+        state
+            .sim_manager
+            .create_simulation(&p.project_id, "graph-files", true, true)
+            .expect("create sim");
+
+        let app = crate::server::create_app(state);
+        let (_status, json) = get_history(app, "/api/simulation/history").await;
+        let files = json["data"][0]["files"].as_array().expect("files array");
+        assert_eq!(files.len(), 3, "files must be capped at 3");
+        assert_eq!(files[0]["filename"], "a.txt");
+        assert_eq!(files[1]["filename"], "b.txt");
+        // third file has no filename key → 未知文件 default
+        assert_eq!(files[2]["filename"], "未知文件");
     }
 }
