@@ -171,30 +171,19 @@ pub fn validate_locale(raw: &str) -> String {
 
 /// Build the axum Router — port of MiroFish `create_app()`.
 ///
-/// This is a partial landing: the three blueprint sub-routers (/api/graph,
-/// /api/simulation, /api/report) are pending U-025/026/027 and are noted
-/// with explicit TODO comments below. The Router is fully functional for
-/// /health + middleware (CORS, logging, Accept-Language locale).
-pub fn create_app(_state: std::sync::Arc<ApiState>) -> Router {
-    // PENDING U-025: graph_bp at /api/graph
-    // PENDING U-026: simulation_bp at /api/simulation
-    // PENDING U-027: report_bp at /api/report
-    //
-    // When U-025/026/027 land, nest them here:
-    //   let api_router = Router::new()
-    //       .nest("/graph", graph_router(state.clone()))
-    //       .nest("/simulation", simulation_router(state.clone()))
-    //       .nest("/report", report_router(state.clone()));
-    //
-    // Then apply CORS to just the /api routes for exact MiroFish parity:
-    //   let api_with_cors = api_router.layer(cors_layer());
-    //   Router::new().route("/health", get(health_handler)).nest("/api", api_with_cors)
-    //       .layer(middleware::from_fn(logging_middleware))
-    //       .layer(middleware::from_fn(accept_language_middleware))
-
-    // S-024 element 3 — CORS: CorsLayer::permissive() (allow_origin Any)
-    // Source: CORS(app, resources={r"/api/*": {"origins": "*"}})
-    // Applied at the router level for now; will be scoped to /api/* when blueprints land.
+/// U-025 (sub-cycle a): graph blueprint is now wired under `/api/graph`.
+/// U-026 will add `.nest("/simulation", simulation_router(state.clone()))` to `api_router`.
+/// U-027 will add `.nest("/report", report_router(state.clone()))` to `api_router`.
+/// Both are one-line adds to the `api_router` below — the scaffold is ready.
+///
+/// CORS scoping: We apply CORS to the whole `api_router` (all `/api/*` routes) by layering
+/// on the nested sub-router before nesting it under `/api`.  This matches MiroFish's
+/// `CORS(app, resources={r"/api/*": {"origins": "*"}})` — CORS is scoped to /api/* only,
+/// NOT to /health.  Choice recorded: CORS applied to `api_router` (the /api nest), not the
+/// whole app, achieving exact MiroFish per-path scoping in axum 0.7.
+pub fn create_app(state: std::sync::Arc<ApiState>) -> Router {
+    // S-024 element 3 — CORS scoped to /api/* (MiroFish: resources={r"/api/*": {"origins": "*"}})
+    // Applied to api_router only, not the top-level router (so /health has no CORS headers).
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
 
     // Startup logging (faithful to app/__init__.py:37-41, 77)
@@ -202,13 +191,22 @@ pub fn create_app(_state: std::sync::Arc<ApiState>) -> Router {
     tracing::info!("MiroFish Backend 启动中...");
     tracing::info!("{}", "=".repeat(50));
 
+    // Blueprint sub-routers — U-025 (a): graph_bp lands here.
+    // U-026 adds: .nest("/simulation", simulation_router(state.clone()))
+    // U-027 adds: .nest("/report", report_router(state.clone()))
+    let api_router = Router::new()
+        .nest("/graph", crate::api::graph::graph_router(state.clone()))
+        // CORS scoped to /api/* (applied to api_router, not the top-level app)
+        .layer(cors);
+
     let router = Router::new()
+        // GET /health (S-025) — no CORS, outside /api/*
         .route("/health", get(health_handler))
-        // CORS applied to the whole router for now (scoped to /api/* after blueprints land)
-        .layer(cors)
-        // S-024 element 4 — request/response logging middleware
+        // /api/* with graph blueprint (and future simulation/report)
+        .nest("/api", api_router)
+        // S-024 element 4 — request/response logging middleware (all routes)
         .layer(middleware::from_fn(logging_middleware))
-        // S-040 — Accept-Language → locale middleware
+        // S-040 — Accept-Language → locale middleware (all routes)
         .layer(middleware::from_fn(accept_language_middleware));
 
     tracing::info!("MiroFish Backend 启动完成");

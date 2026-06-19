@@ -17,7 +17,7 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 3   # BUDGET REACHED; NEW SESSION 2026-06-18 (17th resume); CYCLE 17=U-024(h2) skeleton (FAIL→fix→PASS), 18=U-024(h3) section loop (PASS r1), 19=U-024(i) chat (PASS r1)
+cycles_this_session: 1   # NEW SESSION 2026-06-18 (18th resume); CYCLE 20=U-025(a+b) graph route seam + project routes (PASS r1)
 # CYCLE3 (12th resume) 2026-06-17: U-022 sub-cycle (c) MONITOR + offset-tail + graph-fire (S-605/613/614/615 + S-1056/U-047,
 #   5 [x]) — opus PASS (DECISION-17 Area 2, porter@opus). src/services/simulation_runner.rs: monitor_simulation (2s
 #   MONITOR_POLL_INTERVAL poll loop, per-platform file-exists guard, save_run_state per poll, loop-exit on U-048
@@ -671,3 +671,31 @@ next_iterate: U-022 [x] complete → U-017 port-fresh full implementation
 # exists; wire query_vec_similarity into insight_forge's sub-query loop replacing the keyword fallback] OR advance to
 # U-025/U-026/U-027 HTTP API routes (which is where h4 ReportSink→SSE adapter lands). After U-024's tail: the remaining
 # unported units per merge-ledger order. interview_agents stays honest-err until U-020 sim/ipc.rs lands.
+
+
+# CYCLE 20 (NEW SESSION 2026-06-18, 18th resume): U-025 sub-cycles (a)+(b) — graph route-layer SEAM + project routes.
+# architect@architect (findings/u025-architecture.md: shared seam DECISION-U025-1..4 inherited by U-026/U-027) +
+# porter@porter + parity@opus PASS (round-1). Landed (a)+(b) together — (a) infra not independently testable.
+# src/api/mod.rs: ApiError newtype IntoResponse (client {success:false,error} 2-key / client_with +extra / server
+# {success:false,error,traceback} 3-key) + build_llm(config)->OpenAiAdapter (DECISION-U025-1: per-request, NOT in
+# ApiState, NOT Arc<dyn LlmClient> — LlmClient non-dyn per DECISION-14; byte-faithful to MiroFish per-handler service
+# ctor) + pub mod graph. src/api/graph.rs: graph_router(Arc<ApiState>) wiring 4 project routes (get_project GET /
+# delete_project DELETE on /project/:id, list_projects GET /project/list, reset_project POST /project/:id/reset) —
+# Result<Json<Value>,ApiError>, ProjectManager::from_config per-handler (DECISION-U025-2: ApiState stays {config}).
+# server.rs: create_app UN-STUBBED — api_router=.nest("/graph",graph_router) under /api, CORS scoped /api/* (U-026/U-027
+# add 1 nest line each). Byte-faithful: Flask type=int fallback (?limit=abc→50 not 400); preserve_order bodies (get
+# [success,data] / list [success,data,count] / delete [success,message] / reset [success,message,data] / 404
+# [success,error] / 500 [success,error,traceback]); data==Project::to_dict (15 keys). U025-TRACEBACK [≠] UPHELD legit
+# (3-key shape kept, traceback value=Rust backtrace, non-contractual opaque). U025-ROUTE-ORDER [!] RESOLVED (axum 0.7
+# static-before-capture, real-HTTP-path tested — /api/graph/project/list hits list_projects not get_project("list")).
+# U025-CLONE deferred to c/d (OpenAiAdapter Clone for spawn). 16 new tests, 1247 green, clippy --all-targets clean,
+# 19 server tests not regressed. Atomic gate: X-parity PASS + Y-green + Y-not-regressed. Y-drift clean (develop 7c354a5).
+# S-794/795/796/797 [x]; S-024 create_app STAYS partial (flips [x] when all 3 blueprints U-025/026/027 land).
+# NEXT: U-025 (c) ontology/generate route 5 — axum Multipart + DefaultBodyLimit 50MB + allowed_file + per-file save/
+# extract/preprocess (CONFIRM FileParser/text-extract primitive landed = [!]U025-FILEPARSER; if absent, upstream sub-dep)
+# + build_llm->OntologyGenerator::generate + project save. DERIVE Clone on OpenAiAdapter ([!]U025-CLONE) to unblock (d).
+# Then (d) build route 6 [project-state machine + delegate build_graph_async; [!]U025-BUILD-PROJSTATE graph_id=task_id +
+# terminal status via task poll; [≠]U025-ZEPGUARD?], (e) task routes 7-8 [TaskManager::global, ∥], (f) data/delete 9-10
+# [gap routes LAST: [!]U025-GRAPHSTORE map graph_id→task_id→result["graph"], [≠]U025-ZEP-TEMPORAL]. After U-025: U-026
+# simulation routes (92KB Flask — large, needs own architect decomposition), U-027 report routes (where h4 ReportSink→SSE
+# adapter lands). U-024 tail still open: (b2) insight_forge OQ-3 vec-search, (h4) deferred to U-027.

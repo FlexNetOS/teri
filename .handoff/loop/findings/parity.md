@@ -2529,3 +2529,45 @@ flakiness — confirmed green single-threaded, unrelated to (i)). clippy -p teri
 PROBE HYGIENE: a temporary zzz_probe_regex_and_format test was inserted to capture the real Rust
 regex/render output, diffed against Python, then REMOVED. src/report/mod.rs restored to 5058 lines;
 `grep -c zzz_probe` = 0; crate builds clean. No probe artifact remains.
+
+---
+
+# U-025 sub-cycles (a)+(b) — Shared route seam + 4 project routes — PARITY VERDICT: PASS
+
+**Date:** 2026-06-18 · **Verifier:** opus (rust-port-parity gate) · **Source X:** `MiroFish/backend/app/api/graph.py:36-117` + `app/api/__init__.py` + `app/__init__.py:43,66-69` · **Rust Y:** `src/api/graph.rs`, `src/api/mod.rs`, `src/server.rs`
+
+## Verdict: PASS (for the (a) seam + the 4 (b) project routes). U-025 unit stays `- [ ]` pending sub-cycles (c)–(f).
+
+Symbols cleared to `- [x]`: **S-794, S-795, S-796, S-797** (4/4 of sub-cycle b). The (a) shared seam (ApiError/build_llm/graph_router/create_app un-stub) is verified and rolled under S-024 (U-003 create_app, which stays PARTIAL — flips only when all three blueprints U-025/026/027 land).
+
+## Per-route differential (status + EXACT JSON body — keys, order, values), proven via real HTTP through create_app
+
+| Route | Case | Status | Body (key order) | Source match |
+|---|---|---|---|---|
+| get_project | seeded | 200 | `{success,data:to_dict}` | data = Python to_dict, 15 keys IN ORDER ✓ |
+| get_project | missing | 404 | `{success,error}` (2-key, no traceback) | error=`api.projectNotFound` w/id ✓ |
+| get_project | corrupt json | 500 | `{success,error,traceback}` (3-key) | Flask has NO try/except → uncaught exception=500 ✓ FAITHFUL |
+| list_projects | empty/seeded | 200 | `{success,data,count}` | data array, count=len, created_at desc ✓ |
+| list_projects | `?limit=abc` | 200 | success envelope | Flask type=int bad→default 50 (NOT 400) ✓ |
+| list_projects | absent/`?limit=N` | 200 | — | absent→50, N→N ✓ |
+| delete_project | Ok(true) | 200 | `{success,message}` | api.projectDeleted w/id ✓ |
+| delete_project | Ok(false) | 404 | `{success,error}` | api.projectDeleteFailed w/id ✓ |
+| reset_project | missing | 404 | `{success,error}` | api.projectNotFound ✓ |
+| reset_project | ok | 200 | `{success,message,data}` | status machine ✓; graph_id/task_id/error→null ✓; data key order = to_dict ✓ |
+
+## Shared-seam adjudications
+
+- **U025-TRACEBACK `- [≠]` — UPHELD as legit non-contractual `[≠]`.** The 3-key shape `{success,error,traceback}` is byte-preserved (proven through HTTP on the corrupt-json 500). The `traceback` VALUE being a Rust `std::backtrace::Backtrace` string (not Python `traceback.format_exc()`) is non-contractual: the contractual keys are success+error; traceback is opaque debug text a frontend renders/ignores. The KEY IS PRESENT and POPULATED — this is NOT a key-drop / feature-skip. Survives the `[≠]` challenge.
+- **U025-ROUTE-ORDER `- [!]` — RESOLVED.** Proven via the real HTTP path (not a direct handler call): `GET /api/graph/project/list` returns the LIST envelope (`count`+`data` array), confirming axum 0.7 ranks static `/project/list` above the capture `/project/:project_id`. No overlap panic.
+- **ApiError IntoResponse:** client→2-key (no traceback) ✓; client_with→appends extra keys ✓; server→3-key ✓. All driven through `into_response()` + real HTTP.
+- **build_llm:** `OpenAiAdapter::new(&config.llm)` per-request, `#[allow(dead_code)]` (not called by (b)). Compiles, correctly shaped, mirrors MiroFish per-handler service construction (graph.py:217,390). NOT in ApiState (DECISION-U025-1). ✓
+- **create_app/routing:** `/api/graph/*` mount matches Flask `/api/graph` blueprint prefix ✓; `/health` still 200 ✓ (U-002/U-003 19 server tests pass); CORS scoped to `/api/*` — `/health` carries NO `access-control-allow-origin`, `/api/graph/*` carries it (proven w/ Origin header). ✓
+- **preserve_order:** `serde_json` `preserve_order` feature active (Cargo.toml:35); all body key orders byte-faithful (success before data/message/error; data before count; message before data). ✓
+
+## No-downgrade of Y
+
+- Full suite: **1247 passed, 6 ignored** (`cargo test -p teri`). clippy `--all-targets` clean. 16 graph tests + 19 server tests (17 U-002/U-003 + 2 added non-regression) pass.
+- The OTHER 6 graph routes (c–f: ontology/generate, build, task/:id, tasks, data/:id, delete/:id) are NOT wired (only 3 `.route` lines = 4 handler bindings) and have NO handler functions defined → axum default 404, NOT fake-200 placeholders. No silent stub.
+
+## Probe hygiene
+A temporary `tests/probe_u025.rs` (5 adversarial HTTP assertions: route-order, 500 3-key, reset/get key orders, CORS scoping) was inserted, run green (4 test fns ok), then REMOVED. Tree restored; `tests/probe_u025.rs` absent; crate builds clean. No probe artifact remains.

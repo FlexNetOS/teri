@@ -1,6 +1,12 @@
+pub mod graph;
 pub mod streaming;
 
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Json, Response},
+};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +145,105 @@ impl StreamConfig {
     pub fn reliable_delivery() -> Self {
         Self { max_buffer_size: 500 }
     }
+}
+
+// ---------------------------------------------------------------------------
+// ApiError — shared graph-API error type (U-025 shared seam; inherited by U-026/U-027)
+//
+// Maps to MiroFish's two `jsonify({...}), <status>` error envelopes:
+//   • client/404: {"success": false, "error": "<msg>"}
+//   • server/500: {"success": false, "error": "<msg>", "traceback": "<string>"}
+//
+// All success+error response bodies for /api/graph, /api/simulation, /api/report
+// MUST use these constructors so the wire shape is consistent and parity-verified.
+// ---------------------------------------------------------------------------
+
+/// Graph-API error type implementing `IntoResponse`.
+///
+/// Carries the exact `{success:false, error[, traceback]}` body MiroFish returns,
+/// plus the HTTP status code.  Returned as `Err(ApiError)` from handlers typed
+/// `Result<Json<Value>, ApiError>`.
+pub struct ApiError {
+    status: StatusCode,
+    body: Value,
+}
+
+impl ApiError {
+    /// Build a client-error response (4xx).
+    ///
+    /// Body: `{"success": false, "error": "<msg>"}` (2-key shape).
+    /// Mirrors MiroFish's `jsonify({"success": False, "error": t(...)})` + 40x status.
+    pub fn client(status: StatusCode, error_msg: impl Into<String>) -> Self {
+        Self {
+            status,
+            body: serde_json::json!({
+                "success": false,
+                "error": error_msg.into()
+            }),
+        }
+    }
+
+    /// Build a client-error response with extra keys appended after `error`.
+    ///
+    /// Body: `{"success": false, "error": "<msg>", ...extra}`.
+    /// Used by `/build` which also returns `"task_id"` in the 400 `graphBuilding` case
+    /// (graph.py:329: `jsonify({..., "task_id": project.graph_build_task_id})`).
+    pub fn client_with(
+        status: StatusCode,
+        error_msg: impl Into<String>,
+        extra: Map<String, Value>,
+    ) -> Self {
+        let mut map = Map::new();
+        map.insert("success".to_string(), Value::Bool(false));
+        map.insert("error".to_string(), Value::String(error_msg.into()));
+        for (k, v) in extra {
+            map.insert(k, v);
+        }
+        Self { status, body: Value::Object(map) }
+    }
+
+    /// Build a server-error response (500).
+    ///
+    /// Body: `{"success": false, "error": "<msg>", "traceback": "<string>"}` (3-key shape).
+    /// Mirrors MiroFish's `jsonify({"success": False, "error": str(e),
+    /// "traceback": traceback.format_exc()})` + 500.
+    ///
+    /// `[≠] U025-TRACEBACK`: the `traceback` VALUE is a Rust backtrace string, not a Python
+    /// stack.  The 3-key CONTRACT is preserved; the value being Rust text is non-contractual
+    /// (the frontend treats `traceback` as opaque debug text).
+    pub fn server(err: impl std::fmt::Display) -> Self {
+        let bt = std::backtrace::Backtrace::capture().to_string();
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: serde_json::json!({
+                "success": false,
+                "error": err.to_string(),
+                "traceback": bt
+            }),
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.status, Json(self.body)).into_response()
+    }
+}
+
+/// Construct an `OpenAiAdapter` from teri config for use within a single request.
+#[allow(dead_code)] // Used by sub-cycles (c)–(f); not yet called by (b)-only routes
+///
+/// Per-request construction is cheap (`reqwest::Client::new()` — no network, no handshake).
+/// Mirrors MiroFish's pattern of constructing `OntologyGenerator()` / `GraphBuilderService()`
+/// fresh inside each handler (graph.py:217, 390, 581, 609) — **not a downgrade**.
+///
+/// DECISION-U025-1: `ApiState` carries no LLM client because `LlmClient` has generic methods
+/// that are NOT dyn-compatible, and axum state cannot be generic.  Construct per-request.
+///
+/// `[!] U025-CLONE`: derive `Clone` on `OpenAiAdapter` is deferred to sub-cycle (c/d) when
+/// `build_graph_async`/spawn need it by value.  The project routes don't spawn — no Clone needed.
+pub(crate) fn build_llm(config: &crate::Config) -> crate::llm::OpenAiAdapter {
+    crate::llm::OpenAiAdapter::new(&config.llm)
 }
 
 pub struct ApiState {

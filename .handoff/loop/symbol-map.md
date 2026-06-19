@@ -935,10 +935,10 @@
 
 ## U-025 — `backend/app/api/graph.py` (Blueprint: `/api/graph`)
 
-- [ ] S-794 · `unit:U-025` · `route` · `GET /project/<project_id>` · handler `get_project` · `graph.py:37`
-- [ ] S-795 · `unit:U-025` · `route` · `GET /project/list` · handler `list_projects` · `graph.py:56`
-- [ ] S-796 · `unit:U-025` · `route` · `DELETE /project/<project_id>` · handler `delete_project` · `graph.py:71`
-- [ ] S-797 · `unit:U-025` · `route` · `POST /project/<project_id>/reset` · handler `reset_project` · `graph.py:90`
+- [x] S-794 · `unit:U-025` · `route` · `GET /project/<project_id>` · handler `get_project` · `graph.py:37` · **PARITY-VERIFIED 2026-06-18 (opus PASS).** 200 `{success,data:to_dict}` (data key order byte-matches Python to_dict, 15 keys); 404 `{success,error}` (2-key, no traceback, msg=`api.projectNotFound` w/ id); corrupt-json→500 3-key (Flask no try/except → uncaught exception=500, faithful). Driven via real HTTP through `create_app`.
+- [x] S-795 · `unit:U-025` · `route` · `GET /project/list` · handler `list_projects` · `graph.py:56` · **PARITY-VERIFIED 2026-06-18 (opus PASS).** 200 `{success,data:[…],count}` (key order success,data,count); `?limit` Flask `type=int` semantics replicated: absent→50, `?limit=abc`→50 (NOT 400), `?limit=N`→N; list order created_at desc (ProjectManager U-011). ROUTE-ORDER proven: `/project/list` resolves to `list_projects`, NOT `get_project("list")`, via axum static-before-capture through the real HTTP path.
+- [x] S-796 · `unit:U-025` · `route` · `DELETE /project/<project_id>` · handler `delete_project` · `graph.py:71` · **PARITY-VERIFIED 2026-06-18 (opus PASS).** Ok(true)→200 `{success,message:api.projectDeleted w/id}`; Ok(false)→404 `{success,error:api.projectDeleteFailed w/id}` (2-key). Note: teri `delete_project`→`Ok(false)` on absent (NOT Err) per S-133 — faithful to Python `return False`.
+- [x] S-797 · `unit:U-025` · `route` · `POST /project/<project_id>/reset` · handler `reset_project` · `graph.py:90` · **PARITY-VERIFIED 2026-06-18 (opus PASS).** Missing→404; else status machine `ontology.is_some()?OntologyGenerated:Created`, clears graph_id/graph_build_task_id/error, save, 200 `{success,message:api.projectReset,data:to_dict}` (key order success,message,data). Verified through HTTP: graph_id serializes null, status `"created"`/`"ontology_generated"`, data key order matches Python to_dict.
 - [ ] S-798 · `unit:U-025` · `route` · `POST /ontology/generate` · multipart: files+simulation_requirement+project_name · `graph.py:123`
 - [ ] S-799 · `unit:U-025` · `route` · `POST /build` · json: project_id, graph_name → build_graph_async · `graph.py:261`
 - [ ] S-800 · `unit:U-025` · `route` · `GET /task/<task_id>` · TaskManager status · `graph.py:535`
