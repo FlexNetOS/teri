@@ -74,7 +74,9 @@ use serde_json::Value;
 
 use crate::api::{ApiError, ApiState};
 use crate::graph::KnowledgeGraph;
+use crate::models::project::python_isoformat_local;
 use crate::services::simulation_manager::SimulationStatus;
+use crate::services::simulation_runner::RunnerStatus;
 
 // ---------------------------------------------------------------------------
 // Router factory — sub-cycle (c) adds the 3 create/get/list routes.
@@ -136,6 +138,9 @@ pub fn simulation_router(state: Arc<ApiState>) -> Router {
         // Sub-cycle (f): generate profiles directly from a graph (no simulation setup needed).
         // Static path — no conflict with any capture route.  Python: `POST /generate-profiles`.
         .route("/generate-profiles", post(generate_profiles))
+        // Sub-cycle (g): lifecycle — start + stop.  Both are static paths; no capture conflicts.
+        .route("/start", post(start_simulation))
+        .route("/stop", post(stop_simulation))
         .with_state(state)
 }
 
@@ -1157,6 +1162,459 @@ async fn generate_profiles(
         "success": true,
         "data": Value::Object(data_obj)
     })))
+}
+
+// ---------------------------------------------------------------------------
+// Sub-cycle (g) helpers + handlers
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// g-helper: coerce_max_rounds (Python `int(max_rounds)` semantics)
+//
+// Python `int(max_rounds)` exact semantics (U026-g-MAXROUNDS-FLOAT fix):
+//   - JSON integer number (e.g. 100)   → that i64 directly
+//   - JSON float number (e.g. 5.7)     → truncate toward zero (int(5.7)=5, int(-2.9)=-2),
+//                                         then apply ≤0 → maxRoundsPositive check.
+//                                         (Python `int(float)` truncates, it does NOT round.)
+//   - JSON string, strict integer only  → parse (int("5")==5, int("-3")==-3);
+//                                         "5.7" → ValueError → maxRoundsInvalid
+//                                         (Python `int("5.7")` raises; string path is strict.)
+//   - JSON bool                         → DECISION: current code routes bool through `_ =>`
+//                                         and returns maxRoundsInvalid.  Python `int(True)==1`
+//                                         / `int(False)==0` would differ, but JSON bool for
+//                                         max_rounds is a degenerate, non-contractual input.
+//                                         We preserve the current rejection (non-contractual).
+//   - null / absent                     → callers handle None before reaching here (no change).
+//   - int ≤ 0 (after truncation)        → maxRoundsPositive
+// ---------------------------------------------------------------------------
+
+fn coerce_max_rounds(v: &Value) -> Result<i64, ApiError> {
+    let n = match v {
+        Value::Number(n) => {
+            // JSON integer → direct
+            if let Some(i) = n.as_i64() {
+                i
+            } else if let Some(f) = n.as_f64() {
+                // JSON float → truncate toward zero, matching Python `int(float)` semantics.
+                // Examples: int(5.7)=5, int(0.5)=0, int(-2.9)=-2
+                // After truncation the ≤0 check below handles 0.5→0→maxRoundsPositive, etc.
+                f.trunc() as i64
+            } else {
+                // u128 overflow or other exotic case → invalid
+                return Err(ApiError::client(
+                    StatusCode::BAD_REQUEST,
+                    crate::i18n::t("api.maxRoundsInvalid"),
+                ));
+            }
+        }
+        Value::String(s) => {
+            // Numeric string → strict integer parse (Python `int("5")` == 5).
+            // Python `int("5.7")` raises ValueError → maxRoundsInvalid; same here.
+            s.parse::<i64>().map_err(|_| {
+                ApiError::client(StatusCode::BAD_REQUEST, crate::i18n::t("api.maxRoundsInvalid"))
+            })?
+        }
+        _ => {
+            return Err(ApiError::client(
+                StatusCode::BAD_REQUEST,
+                crate::i18n::t("api.maxRoundsInvalid"),
+            ));
+        }
+    };
+    if n <= 0 {
+        return Err(ApiError::client(
+            StatusCode::BAD_REQUEST,
+            crate::i18n::t("api.maxRoundsPositive"),
+        ));
+    }
+    Ok(n)
+}
+
+// ---------------------------------------------------------------------------
+// g-helper: check_simulation_prepared (Python `_check_simulation_prepared`, `:240-356`)
+//
+// Private fn — shared by /start (sub-cycle g2) and eventually /prepare (sub-cycle d).
+//
+// Returns `(is_prepared: bool, info: Value)`.
+//
+// Side effect: if `status == "preparing"` AND `config_generated` → auto-upgrades
+// `state.json` on disk to `status="ready"`, updating `updated_at` to
+// `python_isoformat_local()` (observable, tested). On write error: log warn, continue
+// (Python `:333-334`).
+// ---------------------------------------------------------------------------
+
+pub(crate) fn check_simulation_prepared(
+    config: &crate::Config,
+    simulation_id: &str,
+) -> (bool, Value) {
+    let sim_dir = std::path::PathBuf::from(&config.oasis_simulation_data_dir).join(simulation_id);
+
+    // Step 1: directory missing (Python :262-263)
+    if !sim_dir.exists() {
+        return (false, serde_json::json!({"reason": "模拟目录不存在"}));
+    }
+
+    // Step 2: required files check (Python :266-288)
+    let required_files = [
+        "state.json",
+        "simulation_config.json",
+        "reddit_profiles.json",
+        "twitter_profiles.csv",
+    ];
+    let mut existing_files: Vec<&str> = Vec::new();
+    let mut missing_files: Vec<&str> = Vec::new();
+    for f in &required_files {
+        if sim_dir.join(f).exists() {
+            existing_files.push(f);
+        } else {
+            missing_files.push(f);
+        }
+    }
+    if !missing_files.is_empty() {
+        return (
+            false,
+            serde_json::json!({
+                "reason": "缺少必要文件",
+                "missing_files": missing_files,
+                "existing_files": existing_files
+            }),
+        );
+    }
+
+    // Step 3: read + parse state.json (Python :291-296)
+    let state_file = sim_dir.join("state.json");
+    let raw = match std::fs::read_to_string(&state_file) {
+        Ok(r) => r,
+        Err(e) => {
+            return (false, serde_json::json!({"reason": format!("读取状态文件失败: {e}")}));
+        }
+    };
+    let mut state_data: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            return (false, serde_json::json!({"reason": format!("读取状态文件失败: {e}")}));
+        }
+    };
+
+    // Step 4: extract status + config_generated (Python :297-300)
+    let status = state_data.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let config_generated =
+        state_data.get("config_generated").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // Step 5: prepared statuses (Python :311)
+    let prepared_statuses = ["ready", "preparing", "running", "completed", "stopped", "failed"];
+    if prepared_statuses.contains(&status.as_str()) && config_generated {
+        // profiles_count (Python :316-321)
+        let profiles_path = sim_dir.join("reddit_profiles.json");
+        let profiles_count: u64 = std::fs::read_to_string(&profiles_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|v| v.as_array().map(|a| a.len() as u64))
+            .unwrap_or(0);
+
+        // AUTO-UPGRADE: preparing → ready (Python :323-334, OBSERVABLE side effect)
+        let mut effective_status = status.clone();
+        if status == "preparing" {
+            let now = python_isoformat_local();
+            if let Some(obj) = state_data.as_object_mut() {
+                obj.insert("status".to_string(), serde_json::json!("ready"));
+                obj.insert("updated_at".to_string(), serde_json::json!(now));
+            }
+            match serde_json::to_string_pretty(&state_data) {
+                Ok(json_str) => {
+                    if let Err(e) = std::fs::write(&state_file, json_str.as_bytes()) {
+                        // Python :333-334: catch, log warn, continue
+                        tracing::warn!("自动更新状态失败: {e}");
+                    } else {
+                        effective_status = "ready".to_string();
+                        tracing::info!("自动更新模拟状态: {} preparing -> ready", simulation_id);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("自动更新状态失败: {e}");
+                }
+            }
+        }
+
+        // Build info dict, key order matching Python `:337-346`
+        // entities_count, entity_types: from state_data (|| 0 / || [])
+        let entities_count =
+            state_data.get("entities_count").cloned().unwrap_or(serde_json::json!(0));
+        let entity_types = state_data.get("entity_types").cloned().unwrap_or(serde_json::json!([]));
+        let created_at = state_data.get("created_at").cloned().unwrap_or(Value::Null);
+        let updated_at = state_data.get("updated_at").cloned().unwrap_or(Value::Null);
+
+        // Use ordered Map to preserve key order (Python dict insertion order)
+        let mut info = serde_json::Map::new();
+        info.insert("status".to_string(), serde_json::json!(effective_status));
+        info.insert("entities_count".to_string(), entities_count);
+        info.insert("profiles_count".to_string(), serde_json::json!(profiles_count));
+        info.insert("entity_types".to_string(), entity_types);
+        info.insert("config_generated".to_string(), serde_json::json!(config_generated));
+        info.insert("created_at".to_string(), created_at);
+        info.insert("updated_at".to_string(), updated_at);
+        info.insert("existing_files".to_string(), serde_json::json!(existing_files));
+
+        (true, Value::Object(info))
+    } else {
+        // Not in prepared statuses or config_generated=false (Python :348-353)
+        (
+            false,
+            serde_json::json!({
+                "reason": format!(
+                    "状态不在已准备列表中或config_generated为false: status={status}, config_generated={config_generated}"
+                ),
+                "status": status,
+                "config_generated": config_generated
+            }),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// g1 — POST /stop  (Python :1644-1700)
+//
+// Source steps:
+//   1. data = request.get_json() or {}
+//   2. simulation_id required → 400 requireSimulationId
+//   3. runner.stop_simulation(id)  — ValueError(TeriError::Sim) → 400, Exception → 500
+//   4. manager.get_simulation(id); if Some → status=Paused + save_simulation_state
+//   5. return {success:true, data:run_state.to_dict()}
+//
+// Error mapping: TeriError::Sim → 400 (mirrors Python ValueError); all other errors → 500.
+// `[≠] U025-TRACEBACK`: outer except → ApiError::server (3-key 500 shape).
+// ---------------------------------------------------------------------------
+
+/// Map a runner `Result` to `ApiError`: `TeriError::Sim` → 400, all else → 500.
+///
+/// Mirrors Python's `ValueError` → 400 / `Exception` → 500 two-tier error contract in
+/// `/start` and `/stop` (simulation.py:1629-1641, :1688-1700).
+fn map_runner_err(err: crate::error::TeriError) -> ApiError {
+    match err {
+        crate::error::TeriError::Sim(msg) => ApiError::client(StatusCode::BAD_REQUEST, msg),
+        other => ApiError::server(other),
+    }
+}
+
+/// Port of MiroFish `stop_simulation` (simulation.py:1644-1700).
+///
+/// Body or {}; `simulation_id` required → 400 `requireSimulationId`.
+/// `runner.stop_simulation(id)` — ValueError→400, Exception→500.
+/// If simulation state found → status=Paused + save.
+/// 200 `{success:true, data:run_state.to_dict()}`.
+async fn stop_simulation(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, ApiError> {
+    // Step 1: body or {} (Python :1665)
+    let data = body.map(|Json(v)| v).unwrap_or_else(|| serde_json::json!({}));
+
+    // Step 2: simulation_id required (Python :1667-1672)
+    let id = data
+        .get("simulation_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ApiError::client(StatusCode::BAD_REQUEST, crate::i18n::t("api.requireSimulationId"))
+        })?;
+
+    // Step 3: runner.stop_simulation(id) — ValueError→400, Exception→500 (Python :1674)
+    let run_state = state.sim_runner.stop_simulation(id).await.map_err(map_runner_err)?;
+
+    // Step 4: update simulation status → Paused + save (Python :1676-1681)
+    if let Some(mut sim) = state.sim_manager.get_simulation(id).map_err(ApiError::server)? {
+        sim.status = SimulationStatus::Paused;
+        state.sim_manager.save_simulation_state(&mut sim).map_err(ApiError::server)?;
+    }
+
+    // Step 5: 200 response (Python :1683-1686)
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": run_state.to_dict()
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// g2 — POST /start  (Python :1451-1641)
+//
+// Ports the FULL boundary + state-machine + helpers.
+// ONE architect-sanctioned gap at the `RunInputs` construction point (GAP-U026-RUNINPUTS-BUILDER).
+// Every 400/404/state-machine path is fully ported and testable now.
+//
+// Source steps (abbreviated):
+//   1. body or {}; simulation_id required → 400 requireSimulationId
+//   2. platform default "parallel"; max_rounds optional; enable_graph_memory_update default false;
+//      force default false
+//   3. platform ∉ {twitter,reddit,parallel} → 400 invalidPlatform
+//   4. manager.get_simulation(id) → None → 404 simulationNotFound
+//   5. force_restarted = false
+//   6. if state.status != READY: check_simulation_prepared(id)
+//      - is_prepared: Running+live-run: force→stop(warn-swallow) else→400 simRunningForceHint
+//                    force→cleanup_simulation_logs+force_restarted=true
+//                    status→Ready+save
+//      - not prepared: 400 simNotReady{status}
+//   7. graph_id resolution (when enable_graph_memory_update)
+//      sim.graph_id || ProjectManager::get_project(project_id).graph_id → none→400 graphIdRequiredForMemory
+//   8. [!] GAP-U026-RUNINPUTS-BUILDER — return 500 honest error
+//      (no fabricated run_state, no MockLlm, no fake success)
+// ---------------------------------------------------------------------------
+
+/// Port of MiroFish `start_simulation` (simulation.py:1451-1641).
+///
+/// Full boundary port with ONE honest 500 at the RunInputs construction gap
+/// (GAP-U026-RUNINPUTS-BUILDER). All validation + state-machine paths are fully ported.
+async fn start_simulation(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, ApiError> {
+    // Step 1: body or {} (Python :1493)
+    let data = body.map(|Json(v)| v).unwrap_or_else(|| serde_json::json!({}));
+
+    // Step 2a: simulation_id required (Python :1495-1500)
+    let id = data
+        .get("simulation_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ApiError::client(StatusCode::BAD_REQUEST, crate::i18n::t("api.requireSimulationId"))
+        })?;
+
+    // Step 2b: platform default "parallel" (Python :1502)
+    let platform = data.get("platform").and_then(Value::as_str).unwrap_or("parallel");
+
+    // Step 2c: max_rounds optional — Python `int(max_rounds)` coercion (Python :1508-1520)
+    // None/Null → None; int/numeric-string → Ok(i64); ≤0 → maxRoundsPositive; non-numeric → maxRoundsInvalid
+    let max_rounds: Option<i64> = match data.get("max_rounds") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(coerce_max_rounds(v)?),
+    };
+
+    // Step 2d: flags (Python :1504-1505)
+    let enable_graph_memory_update =
+        data.get("enable_graph_memory_update").and_then(Value::as_bool).unwrap_or(false);
+    let force = data.get("force").and_then(Value::as_bool).unwrap_or(false);
+
+    // Step 3: platform validation (Python :1522-1526)
+    if !matches!(platform, "twitter" | "reddit" | "parallel") {
+        return Err(ApiError::client(
+            StatusCode::BAD_REQUEST,
+            crate::i18n::t_args("api.invalidPlatform", &[("platform", &platform)]),
+        ));
+    }
+
+    // Step 4: get_simulation → None → 404 (Python :1529-1536)
+    let mut sim =
+        state.sim_manager.get_simulation(id).map_err(ApiError::server)?.ok_or_else(|| {
+            ApiError::client(
+                StatusCode::NOT_FOUND,
+                crate::i18n::t_args("api.simulationNotFound", &[("id", &id)]),
+            )
+        })?;
+
+    // Step 5: force_restarted = false (Python :1538)
+    let mut force_restarted = false;
+
+    // Step 6: state-machine — if status != READY (Python :1541-1582)
+    if sim.status != SimulationStatus::Ready {
+        let (is_prepared, _info) = check_simulation_prepared(&state.config, id);
+
+        if is_prepared {
+            // If Running, check whether the runner process is truly running (Python :1547-1563)
+            if sim.status == SimulationStatus::Running
+                && let Some(rs) =
+                    state.sim_runner.get_run_state(id).await.map_err(ApiError::server)?
+                && rs.runner_status == RunnerStatus::Running
+            {
+                if force {
+                    // Force-stop; warn on error, swallow (Python :1554-1558)
+                    if let Err(e) = state.sim_runner.stop_simulation(id).await {
+                        tracing::warn!("停止模拟时出现警告: {e}");
+                    }
+                } else {
+                    return Err(ApiError::client(
+                        StatusCode::BAD_REQUEST,
+                        crate::i18n::t("api.simRunningForceHint"),
+                    ));
+                }
+            }
+
+            // Force → cleanup logs + mark force_restarted (Python :1565-1571)
+            if force {
+                let r = state.sim_runner.cleanup_simulation_logs(id).await;
+                if !r.success {
+                    tracing::warn!("清理日志时出现警告: {:?}", r.errors);
+                }
+                force_restarted = true;
+            }
+
+            // Reset status to Ready + save (Python :1574-1576)
+            sim.status = SimulationStatus::Ready;
+            state.sim_manager.save_simulation_state(&mut sim).map_err(ApiError::server)?;
+        } else {
+            // Not prepared → 400 simNotReady{status} (Python :1578-1582)
+            return Err(ApiError::client(
+                StatusCode::BAD_REQUEST,
+                crate::i18n::t_args("api.simNotReady", &[("status", &sim.status.as_str())]),
+            ));
+        }
+    }
+
+    // Step 7: graph_id resolution when enable_graph_memory_update (Python :1584-1601)
+    let graph_id: Option<String> = if enable_graph_memory_update {
+        // sim.graph_id is a plain String (not Option<String>)
+        let gid: Option<String> = if !sim.graph_id.is_empty() {
+            Some(sim.graph_id.clone())
+        } else {
+            // Try project.graph_id (Python :1590-1593)
+            crate::models::project::ProjectManager::from_config(&state.config)
+                .get_project(&sim.project_id)
+                .ok()
+                .flatten()
+                .and_then(|p| p.graph_id)
+                .filter(|s| !s.is_empty())
+        };
+        let gid = gid.ok_or_else(|| {
+            ApiError::client(
+                StatusCode::BAD_REQUEST,
+                crate::i18n::t("api.graphIdRequiredForMemory"),
+            )
+        })?;
+        Some(gid)
+    } else {
+        None
+    };
+
+    // Capture locals for the gap comment (prevent unused-variable warnings)
+    let _ = (max_rounds, enable_graph_memory_update, force_restarted, graph_id, platform);
+
+    // === [!] GAP-U026-RUNINPUTS-BUILDER =======================================
+    // Python (:1604-1627): run_state = SimulationRunner.start_simulation(id, platform,
+    //   max_rounds, enable_graph_memory_update, graph_id)
+    //   → state.status = RUNNING + save
+    //   → response = run_state.to_dict() + max_rounds_applied? + graph_memory_update_enabled
+    //                + force_restarted + graph_id?
+    //
+    // teri CANNOT build RunInputs<OpenAiAdapter> { engine, pool, graph, llm }:
+    //   • engine needs SimConfig::from_simulation_config (does not exist)
+    //   • pool needs profile→AgentPool reader (does not exist)
+    // Both are produced by U-028 (twitter) / U-029 (reddit) / U-030 (parallel).
+    //
+    // DO NOT call state.sim_runner.start_simulation with MockLlm / fake RunInputs.
+    // DO NOT fabricate a run_state or a 200 success.
+    //
+    // When U-028/029/030 land: build RunInputs here (SimConfig::from_simulation_config for engine;
+    //   profile reader for pool; load_entity_reader_graph wrapped Arc<Mutex<_>> for graph when
+    //   memory enabled; build_llm for llm), call state.sim_runner.start_simulation(...),
+    //   set sim.status=Running+save, assemble 200 response. ONE localized swap.
+    //
+    // [!] GRAPH-UPDATER-WIRING-PENDING: when memory is enabled and graph_id is resolved,
+    //   `graph_for_updater = Some(Arc::new(tokio::sync::Mutex::new(load_entity_reader_graph(&state, graph_id).await?)))`.
+    //   This wiring is specified but not live until the producer lands.
+    // ==========================================================================
+    Err(ApiError::server(format!(
+        "simulation runtime not available: no RunInputs builder for '{id}' \
+         (blocked on U-028/U-029/U-030 platform producers — GAP-U026-RUNINPUTS-BUILDER)"
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -3327,6 +3785,859 @@ mod tests {
                 "to_dict must have source_entity_type"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (g) helpers
+    // -----------------------------------------------------------------------
+
+    /// Seed a simulation with all 4 required files + state.json at the given status.
+    /// Returns `(state, sim_id, _tmp)`.
+    fn seed_prepared_sim(
+        sim_status: &str,
+        config_generated: bool,
+    ) -> (Arc<ApiState>, String, tempfile::TempDir) {
+        let (state, tmp) = test_state();
+        let pm = crate::models::project::ProjectManager::from_config(&state.config);
+        let mut p = pm.create_project("G Test Project").expect("seed project");
+        p.graph_id = Some("graph-g".to_string());
+        pm.save_project(&mut p).expect("save");
+        let sim = state
+            .sim_manager
+            .create_simulation(&p.project_id, "graph-g", true, true)
+            .expect("create sim");
+        let sim_id = sim.simulation_id.clone();
+
+        // Write required files
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join(&sim_id);
+        std::fs::create_dir_all(&sim_dir).expect("mkdir sim_dir");
+
+        // state.json
+        let now = crate::models::project::python_isoformat_local();
+        let state_json = serde_json::json!({
+            "status": sim_status,
+            "config_generated": config_generated,
+            "entities_count": 5,
+            "entity_types": ["Person"],
+            "created_at": now,
+            "updated_at": now
+        });
+        std::fs::write(
+            sim_dir.join("state.json"),
+            serde_json::to_string_pretty(&state_json).unwrap(),
+        )
+        .expect("write state.json");
+
+        // simulation_config.json
+        std::fs::write(sim_dir.join("simulation_config.json"), b"{}").expect("write config");
+
+        // reddit_profiles.json — a JSON array with 3 entries
+        std::fs::write(
+            sim_dir.join("reddit_profiles.json"),
+            b"[{\"name\":\"alice\"},{\"name\":\"bob\"},{\"name\":\"carol\"}]",
+        )
+        .expect("write reddit_profiles");
+
+        // twitter_profiles.csv — minimal CSV
+        std::fs::write(sim_dir.join("twitter_profiles.csv"), b"username\nalice\nbob\n")
+            .expect("write twitter_profiles");
+
+        // Update in-manager state to match the desired status (evict cache so it re-reads)
+        state.sim_manager.evict_cache_for_test(&sim_id);
+
+        // Patch the simulation_manager's cached SimulationState status if needed
+        // (we want the manager to return a state with the right status)
+        if sim_status != "created" {
+            // Re-read via get_simulation + patch + save (uses the manager's save which updates
+            // the cache — but the state.json we wrote above has the right sim_status, so we
+            // need to also update the manager's in-memory status if it cached "created").
+            // Simplest: just evict again; the manager will re-read our patched state.json.
+            state.sim_manager.evict_cache_for_test(&sim_id);
+        }
+
+        (state, sim_id, tmp)
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (g) — check_simulation_prepared
+    // -----------------------------------------------------------------------
+
+    /// check_simulation_prepared: missing sim_dir → (false, reason)
+    #[test]
+    fn check_prepared_missing_dir() {
+        let (_, tmp) = test_state();
+        let mut config = crate::Config::build_test();
+        config.oasis_simulation_data_dir = tmp.path().join("sims").to_string_lossy().to_string();
+        let (ok, info) = crate::api::simulation::check_simulation_prepared(&config, "sim_missing");
+        assert!(!ok);
+        assert!(info["reason"].as_str().unwrap().contains("不存在"));
+    }
+
+    /// check_simulation_prepared: missing required files → (false, missing_files)
+    #[test]
+    fn check_prepared_missing_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = crate::Config::build_test();
+        config.oasis_simulation_data_dir = tmp.path().to_string_lossy().to_string();
+        let sim_dir = tmp.path().join("sim_x");
+        std::fs::create_dir_all(&sim_dir).unwrap();
+        // Only write state.json; the other 3 are absent
+        std::fs::write(sim_dir.join("state.json"), b"{}").unwrap();
+
+        let (ok, info) = crate::api::simulation::check_simulation_prepared(&config, "sim_x");
+        assert!(!ok, "must be false when required files are missing");
+        let missing = info["missing_files"].as_array().expect("missing_files must be array");
+        assert!(!missing.is_empty(), "must report missing files");
+    }
+
+    /// check_simulation_prepared: status="preparing" + config_generated=true + all files
+    /// → auto-upgrades state.json to "ready" on disk (KEY observable side effect).
+    #[test]
+    fn check_prepared_preparing_auto_upgrades_to_ready() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = crate::Config::build_test();
+        config.oasis_simulation_data_dir = tmp.path().to_string_lossy().to_string();
+        let sim_dir = tmp.path().join("sim_prep");
+        std::fs::create_dir_all(&sim_dir).unwrap();
+
+        let initial_updated_at = "2025-01-01T00:00:00.000000";
+        let state_json = serde_json::json!({
+            "status": "preparing",
+            "config_generated": true,
+            "entities_count": 2,
+            "entity_types": ["Person"],
+            "created_at": initial_updated_at,
+            "updated_at": initial_updated_at
+        });
+        std::fs::write(
+            sim_dir.join("state.json"),
+            serde_json::to_string_pretty(&state_json).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(sim_dir.join("simulation_config.json"), b"{}").unwrap();
+        std::fs::write(
+            sim_dir.join("reddit_profiles.json"),
+            b"[{\"name\":\"alice\"},{\"name\":\"bob\"}]",
+        )
+        .unwrap();
+        std::fs::write(sim_dir.join("twitter_profiles.csv"), b"username\nalice\n").unwrap();
+
+        let (ok, info) = crate::api::simulation::check_simulation_prepared(&config, "sim_prep");
+
+        // Must return true
+        assert!(ok, "preparing+config_generated must be considered prepared");
+        // Returned info must show status=ready (after auto-upgrade)
+        assert_eq!(info["status"].as_str().unwrap(), "ready", "info.status must be ready");
+
+        // *** OBSERVABLE SIDE EFFECT: state.json on disk must now read status="ready" ***
+        let on_disk_raw = std::fs::read_to_string(sim_dir.join("state.json")).unwrap();
+        let on_disk: serde_json::Value = serde_json::from_str(&on_disk_raw).unwrap();
+        assert_eq!(
+            on_disk["status"].as_str().unwrap(),
+            "ready",
+            "state.json must have status=ready after auto-upgrade"
+        );
+        // updated_at must have changed (was initial_updated_at)
+        let new_updated_at = on_disk["updated_at"].as_str().unwrap();
+        assert_ne!(
+            new_updated_at, initial_updated_at,
+            "updated_at must be refreshed by auto-upgrade"
+        );
+    }
+
+    /// check_simulation_prepared: status="failed" + config_generated=true → (true, info)
+    /// (no auto-upgrade triggered — only "preparing" triggers it)
+    #[test]
+    fn check_prepared_failed_config_generated_is_prepared() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = crate::Config::build_test();
+        config.oasis_simulation_data_dir = tmp.path().to_string_lossy().to_string();
+        let sim_dir = tmp.path().join("sim_fail");
+        std::fs::create_dir_all(&sim_dir).unwrap();
+
+        let state_json = serde_json::json!({
+            "status": "failed",
+            "config_generated": true,
+            "entities_count": 0,
+            "entity_types": [],
+            "created_at": "2025-01-01T00:00:00",
+            "updated_at": "2025-01-01T00:00:00"
+        });
+        std::fs::write(
+            sim_dir.join("state.json"),
+            serde_json::to_string_pretty(&state_json).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(sim_dir.join("simulation_config.json"), b"{}").unwrap();
+        std::fs::write(sim_dir.join("reddit_profiles.json"), b"[]").unwrap();
+        std::fs::write(sim_dir.join("twitter_profiles.csv"), b"username\n").unwrap();
+
+        let (ok, info) = crate::api::simulation::check_simulation_prepared(&config, "sim_fail");
+        assert!(ok, "failed+config_generated must be prepared");
+        assert_eq!(info["status"].as_str().unwrap(), "failed");
+    }
+
+    /// check_simulation_prepared: config_generated=false → (false, ...)
+    #[test]
+    fn check_prepared_config_not_generated_is_not_prepared() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = crate::Config::build_test();
+        config.oasis_simulation_data_dir = tmp.path().to_string_lossy().to_string();
+        let sim_dir = tmp.path().join("sim_nocfg");
+        std::fs::create_dir_all(&sim_dir).unwrap();
+
+        let state_json = serde_json::json!({
+            "status": "ready",
+            "config_generated": false,
+            "entities_count": 0,
+            "entity_types": [],
+            "created_at": "2025-01-01T00:00:00",
+            "updated_at": "2025-01-01T00:00:00"
+        });
+        std::fs::write(
+            sim_dir.join("state.json"),
+            serde_json::to_string_pretty(&state_json).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(sim_dir.join("simulation_config.json"), b"{}").unwrap();
+        std::fs::write(sim_dir.join("reddit_profiles.json"), b"[]").unwrap();
+        std::fs::write(sim_dir.join("twitter_profiles.csv"), b"username\n").unwrap();
+
+        let (ok, _info) = crate::api::simulation::check_simulation_prepared(&config, "sim_nocfg");
+        assert!(!ok, "config_generated=false must not be prepared");
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (g) — cleanup_simulation_logs
+    // -----------------------------------------------------------------------
+
+    /// cleanup_simulation_logs: creates the scoped files, calls cleanup, verifies they are gone.
+    /// Config/profile files must NOT be deleted.
+    #[tokio::test]
+    async fn cleanup_simulation_logs_deletes_scoped_files_only() {
+        let (state, _tmp) = test_state();
+        let pm = crate::models::project::ProjectManager::from_config(&state.config);
+        let mut p = pm.create_project("Cleanup Test").expect("seed project");
+        p.graph_id = Some("graph-cl".to_string());
+        pm.save_project(&mut p).expect("save");
+        let sim = state
+            .sim_manager
+            .create_simulation(&p.project_id, "graph-cl", true, true)
+            .expect("create sim");
+        let sim_id = sim.simulation_id.clone();
+
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join(&sim_id);
+        std::fs::create_dir_all(&sim_dir).unwrap();
+        std::fs::create_dir_all(sim_dir.join("twitter")).unwrap();
+        std::fs::create_dir_all(sim_dir.join("reddit")).unwrap();
+
+        // Create the scoped files
+        let scoped_files = [
+            "run_state.json",
+            "simulation.log",
+            "stdout.log",
+            "stderr.log",
+            "env_status.json",
+        ];
+        for f in &scoped_files {
+            std::fs::write(sim_dir.join(f), b"data").unwrap();
+        }
+        std::fs::write(sim_dir.join("twitter").join("actions.jsonl"), b"{}").unwrap();
+        std::fs::write(sim_dir.join("reddit").join("actions.jsonl"), b"{}").unwrap();
+
+        // Create config/profile files that MUST NOT be deleted
+        std::fs::write(sim_dir.join("simulation_config.json"), b"{}").unwrap();
+        std::fs::write(sim_dir.join("reddit_profiles.json"), b"[]").unwrap();
+        std::fs::write(sim_dir.join("twitter_profiles.csv"), b"username\n").unwrap();
+        std::fs::write(sim_dir.join("state.json"), b"{}").unwrap();
+
+        // Run cleanup
+        let result = state.sim_runner.cleanup_simulation_logs(&sim_id).await;
+        assert!(result.success, "cleanup must succeed: {:?}", result.errors);
+
+        // Scoped files must be gone
+        for f in &scoped_files {
+            assert!(!sim_dir.join(f).exists(), "scoped file must be deleted: {f}");
+        }
+        assert!(!sim_dir.join("twitter").join("actions.jsonl").exists());
+        assert!(!sim_dir.join("reddit").join("actions.jsonl").exists());
+
+        // Config/profile files must remain
+        assert!(sim_dir.join("simulation_config.json").exists(), "config must survive cleanup");
+        assert!(sim_dir.join("reddit_profiles.json").exists(), "reddit profiles must survive");
+        assert!(sim_dir.join("twitter_profiles.csv").exists(), "twitter profiles must survive");
+        assert!(sim_dir.join("state.json").exists(), "state.json must survive cleanup");
+    }
+
+    /// cleanup_simulation_logs: missing sim_dir → success=true (Python :1129-1130)
+    #[tokio::test]
+    async fn cleanup_simulation_logs_missing_dir_is_success() {
+        let (state, _tmp) = test_state();
+        let result = state.sim_runner.cleanup_simulation_logs("sim_nonexistent_cl").await;
+        assert!(result.success, "missing sim_dir must return success=true");
+        assert!(result.message.is_some(), "must have a message");
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (g1) — POST /stop
+    // -----------------------------------------------------------------------
+
+    /// POST /stop — missing simulation_id → 400 requireSimulationId
+    #[tokio::test]
+    async fn stop_simulation_missing_id_400() {
+        let (app, _tmp) = test_app();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/stop")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "missing id must be 400");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+        assert!(json["error"].as_str().is_some(), "must have error");
+        assert!(json.get("traceback").is_none(), "400 must not have traceback");
+    }
+
+    /// POST /stop — empty body → 400 requireSimulationId (Python `or {}`)
+    #[tokio::test]
+    async fn stop_simulation_empty_body_400() {
+        let (app, _tmp) = test_app();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/stop")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+    }
+
+    /// POST /stop — simulation exists but not running → 400 (TeriError::Sim → ValueError → 400)
+    /// This exercises the map_runner_err 400 path without needing a live run.
+    #[tokio::test]
+    async fn stop_simulation_not_running_400() {
+        let (state, _tmp) = test_state();
+        let (project_id, _) = seed_project_with_graph(&state);
+        let sim = state
+            .sim_manager
+            .create_simulation(&project_id, "graph-abc", true, true)
+            .expect("create sim");
+        let sim_id = sim.simulation_id.clone();
+
+        let app = crate::server::create_app(state);
+        let body = serde_json::json!({"simulation_id": sim_id}).to_string();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/stop")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // No run_state.json → TeriError::Sim("模拟不存在") → map_runner_err → 400
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "not-running sim stop must be 400");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+        assert!(json.get("traceback").is_none(), "ValueError path must not have traceback");
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (g2) — POST /start
+    // -----------------------------------------------------------------------
+
+    /// POST /start — missing simulation_id → 400 requireSimulationId
+    #[tokio::test]
+    async fn start_simulation_missing_id_400() {
+        let (app, _tmp) = test_app();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/start")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+        assert!(json.get("traceback").is_none(), "400 must not have traceback");
+    }
+
+    /// POST /start — invalid platform → 400 invalidPlatform
+    #[tokio::test]
+    async fn start_simulation_bad_platform_400() {
+        let (app, _tmp) = test_app();
+        let body =
+            serde_json::json!({"simulation_id": "sim_x", "platform": "fediverse"}).to_string();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/start")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+        let error = json["error"].as_str().unwrap_or("");
+        assert!(error.contains("fediverse"), "error must mention the bad platform: {error}");
+    }
+
+    /// POST /start — max_rounds=0 → 400 maxRoundsPositive
+    #[tokio::test]
+    async fn start_simulation_max_rounds_zero_400() {
+        let (app, _tmp) = test_app();
+        let body = serde_json::json!({"simulation_id": "sim_x", "max_rounds": 0}).to_string();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/start")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+    }
+
+    /// POST /start — max_rounds=-5 → 400 maxRoundsPositive
+    #[tokio::test]
+    async fn start_simulation_max_rounds_negative_400() {
+        let (app, _tmp) = test_app();
+        let body = serde_json::json!({"simulation_id": "sim_x", "max_rounds": -5}).to_string();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/start")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+    }
+
+    /// POST /start — max_rounds="abc" (non-numeric string) → 400 maxRoundsInvalid
+    #[tokio::test]
+    async fn start_simulation_max_rounds_non_numeric_400() {
+        let (app, _tmp) = test_app();
+        let body = serde_json::json!({"simulation_id": "sim_x", "max_rounds": "abc"}).to_string();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/start")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+    }
+
+    /// POST /start — max_rounds="5" (numeric string) must be accepted (Python int("5")==5)
+    /// — validation passes; reaches 404 not-found (sim_x doesn't exist)
+    #[tokio::test]
+    async fn start_simulation_max_rounds_numeric_string_accepted() {
+        let (app, _tmp) = test_app();
+        let body =
+            serde_json::json!({"simulation_id": "sim_nonexistent", "max_rounds": "5"}).to_string();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/start")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // max_rounds="5" is valid (≥1) — must NOT get 400 maxRoundsInvalid.
+        // Should get 404 (sim not found) because sim_nonexistent doesn't exist.
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "numeric string max_rounds must pass validation and reach 404"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // U026-g-MAXROUNDS-FLOAT: float truncation tests (Python int(float) semantics)
+    // -----------------------------------------------------------------------
+
+    /// POST /start — max_rounds=5.7 (JSON float) → truncated to 5 → passes validation
+    /// (reaches 404 not-found because sim_nonexistent doesn't exist, not a 400)
+    #[tokio::test]
+    async fn start_simulation_max_rounds_float_truncated_accepted() {
+        let (app, _tmp) = test_app();
+        // Use a raw JSON string so serde_json preserves the float (5.7) exactly.
+        let body = r#"{"simulation_id": "sim_nonexistent", "max_rounds": 5.7}"#;
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/start")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // max_rounds=5.7 truncates to 5 (≥1) → must NOT be 400 maxRoundsInvalid.
+        // Reaches 404 because the simulation doesn't exist.
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "float max_rounds 5.7 must truncate to 5 and pass validation (reach 404)"
+        );
+    }
+
+    /// POST /start — max_rounds=0.5 (JSON float) → truncated to 0 → 400 maxRoundsPositive
+    #[tokio::test]
+    async fn start_simulation_max_rounds_float_zero_truncated_400() {
+        let (app, _tmp) = test_app();
+        let body = r#"{"simulation_id": "sim_x", "max_rounds": 0.5}"#;
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/start")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // 0.5 truncates to 0 → ≤0 → maxRoundsPositive (400)
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+    }
+
+    /// POST /start — max_rounds=-2.9 (JSON float) → truncated to -2 → 400 maxRoundsPositive
+    #[tokio::test]
+    async fn start_simulation_max_rounds_float_negative_truncated_400() {
+        let (app, _tmp) = test_app();
+        let body = r#"{"simulation_id": "sim_x", "max_rounds": -2.9}"#;
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/start")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // -2.9 truncates toward zero to -2 → ≤0 → maxRoundsPositive (400)
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+    }
+
+    /// POST /start — max_rounds="5.7" (JSON string) → 400 maxRoundsInvalid
+    /// (Python int("5.7") raises ValueError; string path is strict-integer only)
+    #[tokio::test]
+    async fn start_simulation_max_rounds_float_string_invalid_400() {
+        let (app, _tmp) = test_app();
+        let body = serde_json::json!({"simulation_id": "sim_x", "max_rounds": "5.7"}).to_string();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/start")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // "5.7" as a string → strict integer parse fails → 400 maxRoundsInvalid
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+    }
+
+    /// POST /start — unknown simulation_id → 404 simulationNotFound
+    #[tokio::test]
+    async fn start_simulation_not_found_404() {
+        let (app, _tmp) = test_app();
+        let body = serde_json::json!({"simulation_id": "sim_unknown_xyz"}).to_string();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/start")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+        let error = json["error"].as_str().unwrap_or("");
+        assert!(error.contains("sim_unknown_xyz"), "404 error must mention the sim id: {error}");
+    }
+
+    /// POST /start — sim exists but not prepared (status="created", config_generated=false)
+    /// → 400 simNotReady
+    #[tokio::test]
+    async fn start_simulation_not_ready_400() {
+        let (state, _tmp) = test_state();
+        let (project_id, _) = seed_project_with_graph(&state);
+        // Sim is created but has no prepared files → check_simulation_prepared returns false
+        let sim = state
+            .sim_manager
+            .create_simulation(&project_id, "graph-abc", true, true)
+            .expect("create sim");
+        let sim_id = sim.simulation_id.clone();
+
+        let app = crate::server::create_app(state);
+        let body = serde_json::json!({"simulation_id": sim_id}).to_string();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/start")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "not-prepared sim must be 400");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+        assert!(json.get("traceback").is_none(), "400 must not have traceback");
+    }
+
+    /// POST /start — enable_graph_memory_update=true without graph_id on project
+    /// → 400 graphIdRequiredForMemory.
+    ///
+    /// Uses a sim whose project has NO graph_id and the sim's own graph_id is also absent.
+    #[tokio::test]
+    async fn start_simulation_graph_id_required_for_memory_400() {
+        // We need a sim that is status=Ready (passes the state-machine gate) so we reach the
+        // graph_id resolution step. Seed with all prepared files.
+        let (state, _sim_id_prepared, _tmp) = seed_prepared_sim("ready", true);
+
+        // Override the project: strip graph_id from it so the fallback lookup also fails.
+        // Also strip graph_id from the SimulationState itself (it defaults to the project's).
+        // The sim's graph_id field comes from the project at create time; we need to directly
+        // set up a sim with empty graph_id.
+        //
+        // Easiest: create a project with NO graph_id, then create a simulation for it.
+        let pm = crate::models::project::ProjectManager::from_config(&state.config);
+        // Create p2 just to confirm the pattern; it won't be used directly
+        let _p2 = pm.create_project("No Graph Project 2").expect("seed");
+        // Do not set graph_id on p2
+
+        // Create a sim for p2 (graph_id="" passed through, then empty graph_id on state)
+        // The manager requires a graph_id; pass an empty string... actually it validates.
+        // We'll instead use a hack: patch the SimulationState's graph_id after creation.
+        // The simplest test: create sim with a fake graph_id, then patch the state.json
+        // and sim state to have empty graph_id, and set status=ready + config_generated=true.
+        let mut p2m = pm.create_project("No Graph Proj Memory").expect("seed2");
+        p2m.graph_id = Some("temp-g".to_string()); // needed to pass create_simulation
+        pm.save_project(&mut p2m).expect("save");
+        let sim2 = state
+            .sim_manager
+            .create_simulation(&p2m.project_id, "temp-g", true, true)
+            .expect("create sim2");
+        let sim2_id = sim2.simulation_id.clone();
+
+        // Patch state.json: set status=ready, config_generated=true, clear graph_id
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join(&sim2_id);
+        std::fs::create_dir_all(&sim_dir).unwrap();
+        let state_json = serde_json::json!({
+            "status": "ready",
+            "config_generated": true,
+            "graph_id": "",           // empty → will try project fallback
+            "entities_count": 0,
+            "entity_types": [],
+            "created_at": "2025-01-01T00:00:00",
+            "updated_at": "2025-01-01T00:00:00"
+        });
+        std::fs::write(
+            sim_dir.join("state.json"),
+            serde_json::to_string_pretty(&state_json).unwrap(),
+        )
+        .unwrap();
+        // Required files for check_simulation_prepared (though for ready sim they won't be checked)
+        std::fs::write(sim_dir.join("simulation_config.json"), b"{}").unwrap();
+        std::fs::write(sim_dir.join("reddit_profiles.json"), b"[]").unwrap();
+        std::fs::write(sim_dir.join("twitter_profiles.csv"), b"username\n").unwrap();
+
+        // Strip graph_id from the project too (make it None)
+        let mut p2m_reload = pm.get_project(&p2m.project_id).expect("get").expect("project exists");
+        p2m_reload.graph_id = None;
+        pm.save_project(&mut p2m_reload).expect("save again");
+
+        state.sim_manager.evict_cache_for_test(&sim2_id);
+
+        let app = crate::server::create_app(state);
+        let body = serde_json::json!({
+            "simulation_id": sim2_id,
+            "enable_graph_memory_update": true
+        })
+        .to_string();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/start")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "missing graph_id must be 400");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+        assert!(json.get("traceback").is_none(), "400 must not have traceback");
+    }
+
+    /// POST /start — fully prepared, valid request reaches the RunInputs gap → 500 GAP message.
+    ///
+    /// This is the KEY parity test for (g2): proves the entire boundary (validation +
+    /// state-machine + status=Ready) runs before the honest error, and that the handler
+    /// emits the structured GAP-U026-RUNINPUTS-BUILDER 500 (not a fabricated 200).
+    #[tokio::test]
+    async fn start_simulation_prepared_reaches_gap_500() {
+        // Seed a sim with status=ready (passes state-machine without triggering the branch)
+        let (state, _tmp) = test_state();
+        let (project_id, _) = seed_project_with_graph(&state);
+        let sim = state
+            .sim_manager
+            .create_simulation(&project_id, "graph-abc", true, true)
+            .expect("create sim");
+        let sim_id = sim.simulation_id.clone();
+
+        // Patch the sim to status=Ready in the manager cache + state.json
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join(&sim_id);
+        std::fs::create_dir_all(&sim_dir).unwrap();
+        let state_json = serde_json::json!({
+            "status": "ready",
+            "config_generated": true,
+            "entities_count": 0,
+            "entity_types": [],
+            "created_at": "2025-01-01T00:00:00",
+            "updated_at": "2025-01-01T00:00:00"
+        });
+        std::fs::write(
+            sim_dir.join("state.json"),
+            serde_json::to_string_pretty(&state_json).unwrap(),
+        )
+        .unwrap();
+        state.sim_manager.evict_cache_for_test(&sim_id);
+
+        let app = crate::server::create_app(state);
+        let body = serde_json::json!({"simulation_id": sim_id}).to_string();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/start")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Must be 500 with the GAP message — NOT a fabricated 200, NOT a 400/404
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "prepared sim must reach the gap and return 500"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false, "gap 500 must have success=false");
+
+        let error = json["error"].as_str().unwrap_or("");
+        assert!(
+            error.contains("GAP-U026-RUNINPUTS-BUILDER"),
+            "error must contain GAP marker: {error}"
+        );
+        assert!(
+            error.contains("runtime not available") || error.contains("no RunInputs"),
+            "error must describe the gap: {error}"
+        );
+
+        // Must have traceback (server 500 shape)
+        assert!(json.get("traceback").is_some(), "server 500 must have traceback key");
     }
 
     /// POST /generate-profiles — entity_types set-equality: response entity_types is a subset

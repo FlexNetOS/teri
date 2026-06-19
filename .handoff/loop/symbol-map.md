@@ -966,8 +966,8 @@
 - [x] S-817 · `unit:U-026` · `route` · `GET /<simulation_id>/config/download` · download_simulation_config · `simulation.py:1295` · PARITY-VERIFIED-IN-TERI 2026-06-19 (e)
 - [ ] S-818 · `unit:U-026` · `route` · `GET /script/<script_name>/download` · download_simulation_script · `simulation.py:1324`
 - [x] S-819 · `unit:U-026` · `route` · `POST /generate-profiles` · generate_profiles · `simulation.py:1378` · PARITY-VERIFIED-IN-TERI 2026-06-19 (f); block_in_place sync-wrapper (multi-thread runtime safe), format dispatch reddit/twitter/to_dict all exercised
-- [ ] S-820 · `unit:U-026` · `route` · `POST /start` · start_simulation · `simulation.py:1452`
-- [ ] S-821 · `unit:U-026` · `route` · `POST /stop` · stop_simulation · `simulation.py:1645`
+- [~] S-820 · `unit:U-026` · `route` · `POST /start` · start_simulation · `simulation.py:1452` · BOUNDARY-PARITY-VERIFIED-IN-TERI 2026-06-19 (g2); full validation+state-machine+check_simulation_prepared(auto-upgrade write)+cleanup_simulation_logs+graph_id resolution all ported+proven; 200-success path (spawn+run_state.to_dict) is [!] GAP-U026-RUNINPUTS-BUILDER deferred to U-028/029/030 (no RunInputs builder — honest-500, NO fabrication). Flips [x] when producer lands.
+- [x] S-821 · `unit:U-026` · `route` · `POST /stop` · stop_simulation · `simulation.py:1645` · PARITY-VERIFIED-IN-TERI 2026-06-19 (g1); FULL parity (stop→get→Paused→save, run_state.to_dict)
 - [ ] S-822 · `unit:U-026` · `route` · `GET /<simulation_id>/run-status` · get_run_status · `simulation.py:1706`
 - [ ] S-823 · `unit:U-026` · `route` · `GET /<simulation_id>/run-status/detail` · get_run_status_detail · `simulation.py:1764`
 - [ ] S-824 · `unit:U-026` · `route` · `GET /<simulation_id>/actions` · get_simulation_actions · `simulation.py:1865`

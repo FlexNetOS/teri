@@ -919,7 +919,8 @@ impl SimulationManager {
     ///
     /// `ensure_ascii=False` + `indent=2` is matched by `serde_json::to_string_pretty`
     /// which does NOT escape non-ASCII (UTF-8 raw), with 2-space indentation.
-    fn save_simulation_state(&self, state: &mut SimulationState) -> Result<()> {
+    // [!] SAVE-STATE-VISIBILITY — made pub(crate) for /start + /stop handlers (U-026 g1/g2).
+    pub(crate) fn save_simulation_state(&self, state: &mut SimulationState) -> Result<()> {
         // Step 1: bump updated_at (Python `datetime.now().isoformat()`)
         state.updated_at = python_isoformat_local();
 

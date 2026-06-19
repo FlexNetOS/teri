@@ -402,6 +402,21 @@ fn round_half_even_1dp(x: f64) -> f64 {
 ///   Python `field(default_factory=lambda: datetime.now().isoformat())`).
 /// - `max_recent_actions` (S-590): stored in the struct so `add_action` can
 ///   enforce the cap (Python `self.max_recent_actions` at L150).
+
+// CleanupResult — port of `cleanup_simulation_logs` return shape (U-026 sub-cycle g2).
+// Python returns a dict; handler checks `.get("success")` + `.get("errors")`.
+#[derive(Debug, Clone)]
+pub struct CleanupResult {
+    /// True iff no deletion errors occurred.
+    pub success: bool,
+    /// Names of successfully deleted files/paths.
+    pub cleaned_files: Vec<String>,
+    /// Deletion errors (absent key or None means no errors).
+    pub errors: Option<Vec<String>>,
+    /// Human-readable message (only set when sim_dir is absent).
+    pub message: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimulationRunState {
     /// Simulation ID (`simulation_runner.py:103`). S-572.
@@ -1398,6 +1413,87 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
 
         tracing::info!("模拟进程清理完成");
         // (5) The runs map was already drained above.
+    }
+
+    /// Delete per-run log files for a simulation — port of `cleanup_simulation_logs`
+    /// (MiroFish `simulation_runner.py:1103-1181`, U-026 sub-cycle g2).
+    ///
+    /// Scoped deletions (exactly `simulation_runner.py:1136-1147`):
+    ///   • Files in `{sim_dir}`: `run_state.json`, `simulation.log`, `stdout.log`,
+    ///     `stderr.log`, `twitter_simulation.db`, `reddit_simulation.db`, `env_status.json`.
+    ///   • In sub-dirs `["twitter", "reddit"]`: `{dir}/actions.jsonl`.
+    /// Each file: skip if absent (not an error); on `fs::remove` error → push name to `errors`.
+    ///
+    /// In-memory cleanup (`:1171-1173`): remove the run handle so a subsequent `get_run_state`
+    /// re-reads fresh from disk (Python `del cls._run_states[id]`). Idempotent when a
+    /// prior `stop_simulation` already removed it.
+    ///
+    /// `sim_dir` missing → returns `{success:true, message:"模拟目录不存在，无需清理"}`.
+    ///
+    /// Returns `CleanupResult { success, cleaned_files, errors, message }`.
+    /// The handler checks `result.success`; `errors` are warn-logged on failure.
+    pub async fn cleanup_simulation_logs(&self, simulation_id: &str) -> CleanupResult {
+        let sim_dir = self.sim_data_dir.join(simulation_id);
+
+        // sim_dir missing → success (Python :1129-1130)
+        if !sim_dir.exists() {
+            return CleanupResult {
+                success: true,
+                cleaned_files: vec![],
+                errors: None,
+                message: Some("模拟目录不存在，无需清理".to_string()),
+            };
+        }
+
+        let mut cleaned_files: Vec<String> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+
+        // Files in sim_dir (Python :1136-1141)
+        let root_files = [
+            "run_state.json",
+            "simulation.log",
+            "stdout.log",
+            "stderr.log",
+            "twitter_simulation.db",
+            "reddit_simulation.db",
+            "env_status.json",
+        ];
+        for name in &root_files {
+            let path = sim_dir.join(name);
+            if path.exists() {
+                match std::fs::remove_file(&path) {
+                    Ok(_) => cleaned_files.push(name.to_string()),
+                    Err(e) => errors.push(format!("{name}: {e}")),
+                }
+            }
+            // absent → skip, not an error (Python os.remove skips with FileNotFoundError handled)
+        }
+
+        // In sub-dirs twitter/reddit: actions.jsonl (Python :1143-1147)
+        for sub in &["twitter", "reddit"] {
+            let actions_path = sim_dir.join(sub).join("actions.jsonl");
+            if actions_path.exists() {
+                match std::fs::remove_file(&actions_path) {
+                    Ok(_) => cleaned_files.push(format!("{sub}/actions.jsonl")),
+                    Err(e) => errors.push(format!("{sub}/actions.jsonl: {e}")),
+                }
+            }
+        }
+
+        // In-memory cleanup: remove the run handle (Python :1171-1173 `del cls._run_states[id]`).
+        // Idempotent — if stop_simulation already removed it, this is a no-op.
+        {
+            let mut runs = self.runs.lock().await;
+            runs.remove(simulation_id);
+        }
+
+        let success = errors.is_empty();
+        CleanupResult {
+            success,
+            cleaned_files,
+            errors: if errors.is_empty() { None } else { Some(errors) },
+            message: None,
+        }
     }
 
     /// List the ids of all simulations whose task is not finished — port of
