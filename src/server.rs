@@ -191,11 +191,12 @@ pub fn create_app(state: std::sync::Arc<ApiState>) -> Router {
     tracing::info!("MiroFish Backend 启动中...");
     tracing::info!("{}", "=".repeat(50));
 
-    // Blueprint sub-routers — U-025 (a): graph_bp lands here.
-    // U-026 adds: .nest("/simulation", simulation_router(state.clone()))
+    // Blueprint sub-routers — U-025 (a): graph_bp; U-026 (a): simulation_bp (skeleton).
     // U-027 adds: .nest("/report", report_router(state.clone()))
     let api_router = Router::new()
         .nest("/graph", crate::api::graph::graph_router(state.clone()))
+        // U-026 (a): simulation blueprint — skeleton nested here; routes land in sub-cycles b–m.
+        .nest("/simulation", crate::api::simulation::simulation_router(state.clone()))
         // CORS scoped to /api/* (applied to api_router, not the top-level app)
         .layer(cors);
 

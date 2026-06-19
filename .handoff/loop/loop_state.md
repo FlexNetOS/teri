@@ -17,7 +17,27 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 3   # BUDGET REACHED; NEW SESSION 2026-06-18 (19th resume); CYCLE 23=U-025(d) build (PASS r1), 24=U-025(f) data/delete (FAIL→fix→PASS)→U-025 COMPLETE, 25=U-026 architect decomposition (design)
+cycles_this_session: 1   # NEW SESSION 2026-06-19 (20th resume); reset 0; CYCLE 26=U-026(a) ApiState runtime-state extension + simulation_router skeleton + nest (structural, gate PASS). PRIOR session 2026-06-18: 23=U-025(d) build, 24=U-025(f)→U-025 COMPLETE, 25=U-026 architect decomposition.
+# CYCLE 26 (NEW SESSION 2026-06-19, 20th resume): U-026 sub-cycle (a) ApiState runtime-state extension +
+#   simulation_router skeleton + nest — gate PASS (structural). DECISION-U026-1 REALIZED: ApiState (src/api/mod.rs)
+#   EXTENDED with sim_manager:Arc<SimulationManager> + sim_runner:Arc<SimulationRunner<OpenAiAdapter>> — concrete
+#   monomorphization at the state boundary (DECISION-U025-1 preserved: NO dyn, NO generic ApiState; build_llm always
+#   yields OpenAiAdapter so SimulationRunner<OpenAiAdapter> is one concrete type that lives in non-generic state).
+#   ApiState::new(config) builds BOTH internally (sim_manager=SimulationManager::from_config; graph_mgr=
+#   GraphMemoryManager::<OpenAiAdapter>::new() no-arg registry; runner=SimulationRunner::new(config.
+#   oasis_simulation_data_dir, graph_mgr, sim_manager.clone()) — runner SHARES the SAME sim_manager Arc so
+#   mark_state_json_stopped writes stay consistent) → constructor STAYS 1-arg → all 39 create_app/test call-sites
+#   UNCHANGED (the [!] ApiState::new sig-change risk mitigated exactly as architect §1 specified; blast radius=1
+#   constructor). NEW src/api/simulation.rs (pub mod simulation in api/mod.rs): simulation_router(Arc<ApiState>)->
+#   Router = Router::new().with_state(state) skeleton + full 33-route/13-sub-cycle (a-m) doc map. server.rs api_router
+#   += .nest("/simulation", simulation_router(state.clone())) (CORS-scoped /api/*). 1 skeleton test (monomorphization
+#   constructs through ApiState::new + router builds). teri 1298 green (+1), clippy --all-targets clean, Y-not-regressed
+#   (zero tests lost). GATE: this sub-cycle is router-only (no route LOGIC), so there is no X route-behavior to
+#   differential-verify — the atomic flip condition for a skeleton is {monomorphization compiles in axum State +
+#   Y-green + Y-not-regressed}, ALL PASS. The differential parity-verifier engages from sub-cycle (b) onward (real
+#   handlers). NEXT per architect §5 crit-path: (c) create/get/list ×3 [SimulationManager in-state + ProjectManager],
+#   then {b entities, e profiles/config, e2 script-dl, f generate-profiles} ∥-after-c, then g start/stop, then
+#   {h run-status, i actions/timeline/agent-stats, j posts/comments[empty-branch], k interview, l env/close, m history}.
 # CYCLE3 (12th resume) 2026-06-17: U-022 sub-cycle (c) MONITOR + offset-tail + graph-fire (S-605/613/614/615 + S-1056/U-047,
 #   5 [x]) — opus PASS (DECISION-17 Area 2, porter@opus). src/services/simulation_runner.rs: monitor_simulation (2s
 #   MONITOR_POLL_INTERVAL poll loop, per-platform file-exists guard, save_run_state per poll, loop-exit on U-048

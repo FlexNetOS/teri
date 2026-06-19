@@ -1,4 +1,5 @@
 pub mod graph;
+pub mod simulation;
 pub mod streaming;
 
 use axum::{
@@ -249,11 +250,48 @@ pub(crate) fn build_llm(config: &crate::Config) -> crate::llm::OpenAiAdapter {
 
 pub struct ApiState {
     pub config: crate::Config,
+    /// U-026: shared simulation registry — owns the `state.json` cache (cross-request
+    /// coherent) and is the SAME instance the runner holds (`sim_runner.manager`), so
+    /// `mark_state_json_stopped` writes stay consistent. DECISION-U026-1.
+    pub sim_manager: std::sync::Arc<crate::services::simulation_manager::SimulationManager>,
+    /// U-026: shared simulation runner — owns the live `runs` handle map, so a sim started
+    /// by `POST /simulation/start` is visible to later `GET /:id/run-status` / `POST /stop`
+    /// on subsequent requests. Concrete monomorphization over `OpenAiAdapter`
+    /// (DECISION-U026-1): `LlmClient` is not dyn-compatible and axum state cannot be generic,
+    /// but `build_llm()` always yields `OpenAiAdapter`, so `SimulationRunner<OpenAiAdapter>`
+    /// is a single concrete type that lives in non-generic state. DECISION-U025-1 preserved
+    /// (no `dyn`, no generic `ApiState`).
+    pub sim_runner: std::sync::Arc<
+        crate::services::simulation_runner::SimulationRunner<crate::llm::OpenAiAdapter>,
+    >,
 }
 
 impl ApiState {
+    /// Build app state from config.
+    ///
+    /// The simulation runtime registry (`sim_manager` + `sim_runner`) is constructed
+    /// **internally** from `config` so this stays a one-argument constructor — every
+    /// `create_app`/test call-site (39 of them) is unaffected by the U-026 state extension
+    /// (the architect's preferred mitigation; blast radius = this constructor only).
     pub fn new(config: crate::Config) -> Self {
-        Self { config }
+        // Shared simulation manager (U-023) — owns the state.json cache.
+        let sim_manager = std::sync::Arc::new(
+            crate::services::simulation_manager::SimulationManager::from_config(&config),
+        );
+        // Graph-memory manager (U-021) registry — builds per-platform updaters lazily; the
+        // concrete `OpenAiAdapter` monomorphization is fixed here at the state boundary.
+        let graph_mgr = std::sync::Arc::new(crate::services::graph_memory::GraphMemoryManager::<
+            crate::llm::OpenAiAdapter,
+        >::new());
+        // Shared runner (U-022) — shares the SAME manager Arc (so state.json writes are
+        // consistent) and uses the same sim-data dir as the manager.
+        let sim_runner =
+            std::sync::Arc::new(crate::services::simulation_runner::SimulationRunner::new(
+                std::path::PathBuf::from(&config.oasis_simulation_data_dir),
+                graph_mgr,
+                sim_manager.clone(),
+            ));
+        Self { config, sim_manager, sim_runner }
     }
 }
 
