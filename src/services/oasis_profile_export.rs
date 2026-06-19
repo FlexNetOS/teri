@@ -515,6 +515,47 @@ pub async fn generate_profiles_from_entities<L: LlmClient>(
     results.into_iter().flatten().collect()
 }
 
+/// `Send`-compatible wrapper around [`generate_profiles_from_entities`] for use in
+/// axum handlers and other `Send` async contexts.
+///
+/// `generate_profiles_from_entities` takes `progress_callback: &mut dyn FnMut(...)` — a
+/// trait object that is `!Send` — and holds the reference across `.await` points, making its
+/// future `!Send`.  Axum handlers must be `Send`.
+///
+/// This wrapper uses `tokio::task::block_in_place` to run the `!Send` future on the current
+/// thread (yielded to the runtime temporarily) without requiring `Send`, satisfying the axum
+/// handler's `Send` bound.
+///
+/// Used by the `POST /generate-profiles` handler (sub-cycle f), which returns profiles in
+/// the JSON response and therefore needs neither progress reporting nor realtime file writes.
+pub fn generate_profiles_no_cb<L: LlmClient>(
+    generator: &PersonaGenerator,
+    llm: &L,
+    entities: &[EntityNode],
+    graph: Option<&KnowledgeGraph>,
+    use_llm: bool,
+    parallel_count: usize,
+) -> Vec<(SocialProfile, String)> {
+    // `block_in_place` parks the current worker thread so `block_on` can safely be called
+    // from within a multi-threaded Tokio runtime without panicking.
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            let mut noop = |_: i64, _: i64, _: String| {};
+            generate_profiles_from_entities(
+                generator,
+                llm,
+                entities,
+                graph,
+                use_llm,
+                parallel_count,
+                None,
+                &mut noop,
+            )
+            .await
+        })
+    })
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Realtime-save helper (inner closure from MiroFish — not a public symbol)
 // ──────────────────────────────────────────────────────────────────────────────
@@ -582,6 +623,46 @@ fn build_persona_wrapper(profile: &SocialProfile, name: &str) -> Persona {
         traits: vec![],
         role: String::new(),
         social: Some(profile.clone()),
+    }
+}
+
+/// Format a batch of `(SocialProfile, entity_name)` pairs for the given platform string.
+///
+/// Mirrors the platform-dispatch in MiroFish `generate_profiles` (simulation.py:1423-1428):
+/// ```python
+/// if platform == "reddit":   profiles_data = [p.to_reddit_format() for p in profiles]
+/// elif platform == "twitter": profiles_data = [p.to_twitter_format() for p in profiles]
+/// else:                       profiles_data = [p.to_dict() for p in profiles]
+/// ```
+///
+/// Each pair is wrapped via `build_persona_wrapper` (which provides the `name` field that
+/// `to_reddit_format`/`to_twitter_format`/`to_dict` need) and then dispatched.  `None`
+/// results are dropped via `filter_map` — a `None` means the profile has no `social` field
+/// (unreachable for pairs produced by `generate_profiles_from_entities`, which always sets
+/// `social: Some(profile)` in the wrapper, but preserved for correctness; Python's list-comp
+/// also silently excludes objects that would produce a `None`-equivalent).
+///
+/// `[≠] U026-f-ORDER`: Python uses `to_dict` / `to_reddit_format` / `to_twitter_format` which
+/// return a Python `dict`; key ordering within each dict matches the source field order.  The
+/// Rust methods return `serde_json::Value::Object` (a `serde_json::Map`) which preserves
+/// insertion order — same contract.
+pub(crate) fn format_profiles_for_platform(
+    pairs: &[(SocialProfile, String)],
+    platform: &str,
+) -> Vec<serde_json::Value> {
+    match platform {
+        "reddit" => pairs
+            .iter()
+            .filter_map(|(profile, name)| build_persona_wrapper(profile, name).to_reddit_format())
+            .collect(),
+        "twitter" => pairs
+            .iter()
+            .filter_map(|(profile, name)| build_persona_wrapper(profile, name).to_twitter_format())
+            .collect(),
+        _ => pairs
+            .iter()
+            .filter_map(|(profile, name)| build_persona_wrapper(profile, name).to_dict())
+            .collect(),
     }
 }
 

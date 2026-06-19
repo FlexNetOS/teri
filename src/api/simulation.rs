@@ -133,6 +133,9 @@ pub fn simulation_router(state: Arc<ApiState>) -> Router {
         .route("/:simulation_id/config/realtime", get(get_config_realtime))
         .route("/:simulation_id/config/download", get(download_config))
         .route("/:simulation_id/config", get(get_config))
+        // Sub-cycle (f): generate profiles directly from a graph (no simulation setup needed).
+        // Static path — no conflict with any capture route.  Python: `POST /generate-profiles`.
+        .route("/generate-profiles", post(generate_profiles))
         .with_state(state)
 }
 
@@ -1011,6 +1014,149 @@ async fn download_config(
         .map_err(ApiError::server)?;
 
     Ok(resp)
+}
+
+// ---------------------------------------------------------------------------
+// Sub-cycle (f) — POST /generate-profiles  (simulation.py:1377-1446)
+//
+// Source steps:
+//   1. data = request.get_json() or {}   — tolerate absent/empty body
+//   2. graph_id required → 400 api.requireGraphId
+//   3. entity_types = data.get('entity_types')           — Option<Vec<String>>, may be null
+//      use_llm  = data.get('use_llm', True)             — default true
+//      platform = data.get('platform', 'reddit')         — default "reddit"
+//   4. load_entity_reader_graph (ZEP guard + task→graph); build reader; filter_defined_entities
+//   5. filtered.filtered_count == 0 → 400 api.noMatchingEntities
+//   6. generate_profiles_from_entities(entities, use_llm, parallel_count=5, realtime=None)
+//   7. format per platform: reddit→to_reddit_format, twitter→to_twitter_format, else→to_dict
+//   8. 200 {success, data:{platform, entity_types(sorted for determinism), count, profiles}}
+//   9. any unexpected error → 500 {success,error,traceback}
+//
+// Key order contract: platform → entity_types → count → profiles  (Python dict insertion order)
+//
+// `[≠] U026-ZEPKEY`: ZEP guard KEPT (from load_entity_reader_graph helper; same as sub-cycle b).
+// `[≠] U025-TRACEBACK`: 500 body carries Rust backtrace string, not Python stack.
+// `[~] U026-f-ENTITY_TYPES_ORDER`: Python `list(filtered.entity_types)` over a Python `set`
+//   has NO order guarantee.  teri uses `HashSet<String>` — also unordered.  We sort the Vec
+//   for determinism in the response and in tests (sort is a strict superset; the Python contract
+//   is set-equality, not sequence-equality).  The parity verifier adjudicates.
+// ---------------------------------------------------------------------------
+
+/// Port of MiroFish `generate_profiles` (simulation.py:1377-1446).
+///
+/// Tolerates absent/empty body like Python's `request.get_json() or {}`.
+async fn generate_profiles(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, ApiError> {
+    // Step 1: parse body (simulation.py:1391) — tolerate missing/null body → {}
+    let data = body.map(|j| j.0).unwrap_or_else(|| serde_json::json!({}));
+
+    // Step 2: graph_id required (simulation.py:1393-1398)
+    let graph_id = data.get("graph_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if graph_id.is_empty() {
+        return Err(ApiError::client(
+            StatusCode::BAD_REQUEST,
+            crate::i18n::t("api.requireGraphId"),
+        ));
+    }
+
+    // Step 3: optional params (simulation.py:1400-1402)
+    // entity_types: null/absent → None (pass all entity types through)
+    let entity_types: Option<Vec<String>> = data
+        .get("entity_types")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect());
+    // use_llm: default true
+    let use_llm = data.get("use_llm").and_then(|v| v.as_bool()).unwrap_or(true);
+    // platform: default "reddit"
+    let platform = data.get("platform").and_then(|v| v.as_str()).unwrap_or("reddit").to_string();
+
+    // Step 4: load graph (ZEP guard + task resolution) + build reader + filter entities
+    // (simulation.py:1404-1415)
+    //
+    // Borrow lifetime discipline: `graph` is an owned `KnowledgeGraph`.  The reader borrows
+    // `&graph` immutably, and `generate_profiles_from_entities` also borrows `Some(&graph)`
+    // immutably — both are shared borrows, which is fine in Rust.  `filtered.entities` is
+    // owned (Vec<EntityNode>), so it is independent of the reader's borrow once the reader
+    // is dropped.  We drop the reader explicitly before the await point (it is a synchronous
+    // value that implements no async; the borrow is stack-local and drops at the end of the
+    // let-binding scope when we take filtered).
+    let graph = load_entity_reader_graph(&state, &graph_id).await?;
+    let filtered = {
+        let reader = crate::services::entity_reader::KnowledgeGraphEntityReader::new(&graph);
+        reader.filter_defined_entities(entity_types.as_deref(), true)
+    }; // reader dropped here; `graph` still live below
+
+    // Step 5: zero-match guard (simulation.py:1411-1415)
+    if filtered.filtered_count == 0 {
+        return Err(ApiError::client(
+            StatusCode::BAD_REQUEST,
+            crate::i18n::t("api.noMatchingEntities"),
+        ));
+    }
+
+    // Step 6: generate profiles (simulation.py:1417-1421)
+    //
+    // Python: `generator = OasisProfileGenerator(); profiles = generator.generate_profiles_from_entities(entities, use_llm=use_llm)`
+    // teri: construct PersonaGenerator + build_llm per-request (DECISION-U025-1: LlmClient
+    // is not dyn-compatible so cannot live in ApiState; per-request construction matches
+    // MiroFish's per-request `OasisProfileGenerator()`).
+    //
+    // `graph = Some(&graph)`: Python passes `self.graph_id` for Zep enrichment; in teri the
+    // equivalent graph context is the deserialized KnowledgeGraph itself.  Reading the Rust
+    // fn body (oasis_profile_export.rs:411-416), `graph` is used to call
+    // `g.get_entity_by_id(id)` for context enrichment — i.e. it IS used and `Some` is correct.
+    //
+    // `parallel_count = 5`: matches Python's default (`parallel_count: int = 5`).
+    // `realtime_output = None`: this endpoint returns profiles in the JSON response, no file.
+    // `progress_callback = &mut |_,_,_| {}`: no-op; endpoint reports no progress.
+    // Construct the generator and LLM per-request (DECISION-U025-1: LlmClient is not
+    // dyn-compatible; same pattern as other handlers).
+    //
+    // Use `generate_profiles_no_cb` (the Send-compatible wrapper) because:
+    //   - The endpoint returns profiles in the JSON response — no realtime file write needed.
+    //   - The endpoint reports no progress — a no-op callback is correct.
+    //   - `generate_profiles_from_entities(&mut dyn FnMut)` is `!Send` (dyn FnMut is ?Send),
+    //     so it cannot be awaited in an axum handler future (which must be Send).
+    //     `generate_profiles_no_cb` uses a concrete no-op closure (Send; empty capture)
+    //     internally, making its future Send without touching the existing callers of
+    //     `generate_profiles_from_entities` (simulation_manager.rs).
+    let generator = crate::agent::PersonaGenerator::new();
+    let llm = crate::api::build_llm(&state.config);
+    let pairs = crate::services::oasis_profile_export::generate_profiles_no_cb(
+        &generator,
+        &llm,
+        &filtered.entities,
+        Some(&graph),
+        use_llm,
+        5,
+    );
+
+    // Step 7: format per platform (simulation.py:1423-1428)
+    let profiles_data =
+        crate::services::oasis_profile_export::format_profiles_for_platform(&pairs, &platform);
+
+    // Step 8: 200 success envelope (simulation.py:1430-1438)
+    //
+    // Key order: platform → entity_types → count → profiles  (Python dict insertion order).
+    //
+    // `[~] U026-f-ENTITY_TYPES_ORDER`: sorted for response determinism; Python contract is
+    // set-equality (Python `list(set)` order is arbitrary).
+    let mut entity_types_vec: Vec<String> = filtered.entity_types.into_iter().collect();
+    entity_types_vec.sort();
+    let count = profiles_data.len();
+
+    let mut data_obj = serde_json::Map::new();
+    data_obj.insert("platform".to_string(), serde_json::json!(platform));
+    data_obj.insert("entity_types".to_string(), serde_json::json!(entity_types_vec));
+    data_obj.insert("count".to_string(), serde_json::json!(count));
+    data_obj.insert("profiles".to_string(), serde_json::json!(profiles_data));
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": Value::Object(data_obj)
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -2888,6 +3034,342 @@ mod tests {
         assert!(
             data.get("summary").is_none(),
             "summary must be absent when config is empty object {{}}, got: {data}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (f) — POST /generate-profiles
+    // -----------------------------------------------------------------------
+
+    /// Seed a task with a small KnowledgeGraph (2 Person entities) for generate-profiles tests.
+    /// Returns (graph_id, entity_type_label).
+    fn seed_generate_profiles_graph() -> (String, String) {
+        use crate::graph::{Entity, EntityKind, KnowledgeGraph, Relation, RelationKind};
+
+        let alice_id = uuid::Uuid::parse_str("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap();
+        let bob_id = uuid::Uuid::parse_str("dddddddd-dddd-dddd-dddd-dddddddddddd").unwrap();
+
+        let mut graph = KnowledgeGraph::new();
+        let alice = Entity { id: alice_id, name: "Alice".to_string(), kind: EntityKind::Person };
+        let bob = Entity { id: bob_id, name: "Bob".to_string(), kind: EntityKind::Person };
+        let ai = graph.add_entity(alice).expect("add alice");
+        let bi = graph.add_entity(bob).expect("add bob");
+        graph.add_relation(ai, bi, Relation::new(RelationKind::RelatedTo, 0.8).expect("rel"));
+
+        let graph_json_str = graph.serialize_to_json().expect("serialize");
+        let graph_json: serde_json::Value = serde_json::from_str(&graph_json_str).expect("parse");
+        let result = serde_json::json!({
+            "graph_name": "GenProfilesTestGraph",
+            "graph_info": {"node_count": 2, "edge_count": 1, "entity_types": []},
+            "chunks_processed": 1,
+            "graph": graph_json,
+        });
+
+        let tm = crate::task::TaskManager::global();
+        let task_id = tm.create_task("graph_build", None);
+        tm.complete_task(&task_id, result);
+
+        let entity_type = EntityKind::Person.to_string();
+        (task_id, entity_type)
+    }
+
+    /// POST /generate-profiles — missing graph_id → 400 requireGraphId
+    #[tokio::test]
+    async fn generate_profiles_missing_graph_id_400() {
+        let (app, _tmp) = test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/generate-profiles")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "missing graph_id must 400");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+        let err = json["error"].as_str().unwrap_or("");
+        assert!(!err.is_empty(), "error field must be non-empty");
+    }
+
+    /// POST /generate-profiles — absent body tolerated (returns 400 requireGraphId, not 422)
+    #[tokio::test]
+    async fn generate_profiles_absent_body_tolerated() {
+        let (app, _tmp) = test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/generate-profiles")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Empty body → data = {} → no graph_id → 400, not 422/500
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "absent body must tolerate and produce 400 (no graph_id)"
+        );
+    }
+
+    /// POST /generate-profiles — entity_types filter that matches nothing → 400 noMatchingEntities
+    ///
+    /// Uses `use_llm=false` so the generator uses rule-based generation (no live LLM needed).
+    /// The entity_types filter "NonExistentType" produces filtered_count=0 on a Person-only graph.
+    #[tokio::test]
+    async fn generate_profiles_zero_match_entity_types_400() {
+        let (graph_id, _entity_type) = seed_generate_profiles_graph();
+        let (app, _tmp) = test_app();
+
+        let body = serde_json::json!({
+            "graph_id": graph_id,
+            "entity_types": ["NonExistentType"],
+            "use_llm": false,
+        })
+        .to_string();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/generate-profiles")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "zero-match must 400");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+        let err = json["error"].as_str().unwrap_or("");
+        assert!(!err.is_empty(), "noMatchingEntities error must be non-empty");
+    }
+
+    /// POST /generate-profiles — happy path, platform=reddit, use_llm=false
+    ///
+    /// Checks: 200, key order (platform→entity_types→count→profiles), count==profiles.len(),
+    /// platform field matches, each profile has at least the OASIS Reddit fields.
+    ///
+    /// `use_llm=false` is used so tests run without a live LLM (rule-based generation).
+    /// This matches the Python contract: `use_llm` is a parameter and `False` is valid.
+    ///
+    /// `multi_thread` flavor required: the handler uses `tokio::task::block_in_place` (which
+    /// needs a multi-threaded Tokio runtime) to call the `!Send` generator future from a
+    /// `Send` axum handler.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn generate_profiles_reddit_happy_200() {
+        let (graph_id, _entity_type) = seed_generate_profiles_graph();
+        let (app, _tmp) = test_app();
+
+        let body = serde_json::json!({
+            "graph_id": graph_id,
+            "use_llm": false,
+            "platform": "reddit",
+        })
+        .to_string();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/generate-profiles")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK, "reddit happy path must 200");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true);
+
+        let data = &json["data"];
+
+        // Key order: platform → entity_types → count → profiles
+        let keys: Vec<&str> = data.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["platform", "entity_types", "count", "profiles"],
+            "key order must be platform,entity_types,count,profiles"
+        );
+
+        // platform field
+        assert_eq!(data["platform"], "reddit");
+
+        // entity_types: set-equality — must contain the Person entity type label
+        let et = data["entity_types"].as_array().expect("entity_types must be an array");
+        assert!(!et.is_empty(), "entity_types must be non-empty for a Person graph");
+
+        // count == profiles.len()
+        let profiles = data["profiles"].as_array().expect("profiles must be array");
+        let count = data["count"].as_u64().expect("count must be a number");
+        assert_eq!(count as usize, profiles.len(), "count must equal profiles.len()");
+
+        // 2 entities seeded → 2 profiles
+        assert_eq!(profiles.len(), 2, "must generate one profile per entity");
+
+        // Each profile must have the Reddit OASIS required fields
+        for p in profiles {
+            assert!(p["user_id"].is_number(), "profile must have user_id");
+            assert!(p["username"].is_string(), "profile must have username (no underscore)");
+            assert!(p["name"].is_string(), "profile must have name");
+            assert!(p["bio"].is_string(), "profile must have bio");
+            assert!(p["persona"].is_string(), "profile must have persona");
+            assert!(p["karma"].is_number(), "reddit profile must have karma");
+            assert!(p["created_at"].is_string(), "profile must have created_at");
+        }
+    }
+
+    /// POST /generate-profiles — platform=twitter produces twitter-format profiles (has friend_count, no karma)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn generate_profiles_twitter_format() {
+        let (graph_id, _entity_type) = seed_generate_profiles_graph();
+        let (app, _tmp) = test_app();
+
+        let body = serde_json::json!({
+            "graph_id": graph_id,
+            "use_llm": false,
+            "platform": "twitter",
+        })
+        .to_string();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/generate-profiles")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK, "twitter path must 200");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true);
+
+        let data = &json["data"];
+        assert_eq!(data["platform"], "twitter");
+
+        let profiles = data["profiles"].as_array().expect("profiles must be array");
+        assert_eq!(profiles.len(), 2, "2 entities → 2 twitter profiles");
+
+        // Twitter format: must have friend_count; must NOT have karma (Reddit-only)
+        for p in profiles {
+            assert!(p["friend_count"].is_number(), "twitter profile must have friend_count");
+            assert!(p["follower_count"].is_number(), "twitter profile must have follower_count");
+            assert!(p["statuses_count"].is_number(), "twitter profile must have statuses_count");
+            assert!(
+                p.get("karma").is_none() || p["karma"].is_null(),
+                "twitter profile must NOT have karma (Reddit-only)"
+            );
+        }
+    }
+
+    /// POST /generate-profiles — platform=other uses to_dict() format (has karma + user_name)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn generate_profiles_other_platform_to_dict() {
+        let (graph_id, _entity_type) = seed_generate_profiles_graph();
+        let (app, _tmp) = test_app();
+
+        let body = serde_json::json!({
+            "graph_id": graph_id,
+            "use_llm": false,
+            "platform": "fediverse",   // any non-reddit/twitter value
+        })
+        .to_string();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/generate-profiles")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK, "other platform must 200");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true);
+
+        let data = &json["data"];
+        assert_eq!(data["platform"], "fediverse");
+
+        let profiles = data["profiles"].as_array().expect("profiles must be array");
+        assert_eq!(profiles.len(), 2, "2 entities → 2 to_dict profiles");
+
+        // to_dict format: uses user_name (with underscore), includes ALL fields
+        for p in profiles {
+            // to_dict uses "user_name" (underscore), not "username" (platform formats)
+            assert!(p["user_name"].is_string(), "to_dict must use 'user_name' key");
+            // to_dict includes source_entity_type
+            assert!(
+                !p["source_entity_type"].is_null() || p["source_entity_type"].is_string(),
+                "to_dict must have source_entity_type"
+            );
+        }
+    }
+
+    /// POST /generate-profiles — entity_types set-equality: response entity_types is a subset
+    /// of the graph's entity types when a matching filter is applied.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn generate_profiles_entity_types_set_equality() {
+        let (graph_id, entity_type) = seed_generate_profiles_graph();
+        let (app, _tmp) = test_app();
+
+        let body = serde_json::json!({
+            "graph_id": graph_id,
+            "use_llm": false,
+            "platform": "reddit",
+            "entity_types": [entity_type.clone()],
+        })
+        .to_string();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/generate-profiles")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true);
+
+        let data = &json["data"];
+        let et_arr = data["entity_types"].as_array().expect("entity_types must be array");
+        // Must include the entity_type we filtered on (set-equality check)
+        let et_strings: Vec<&str> = et_arr.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            et_strings.contains(&entity_type.as_str()),
+            "entity_types must contain the filtered type '{}', got {:?}",
+            entity_type,
+            et_strings
         );
     }
 }
