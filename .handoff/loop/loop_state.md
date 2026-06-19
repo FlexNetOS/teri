@@ -17,7 +17,7 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 2   # NEW SESSION 2026-06-18 (19th resume); CYCLE 23=U-025(d) build route (PASS r1), 24=U-025(f) data/delete (FAIL→fix→PASS) → U-025 COMPLETE 10/10
+cycles_this_session: 3   # BUDGET REACHED; NEW SESSION 2026-06-18 (19th resume); CYCLE 23=U-025(d) build (PASS r1), 24=U-025(f) data/delete (FAIL→fix→PASS)→U-025 COMPLETE, 25=U-026 architect decomposition (design)
 # CYCLE3 (12th resume) 2026-06-17: U-022 sub-cycle (c) MONITOR + offset-tail + graph-fire (S-605/613/614/615 + S-1056/U-047,
 #   5 [x]) — opus PASS (DECISION-17 Area 2, porter@opus). src/services/simulation_runner.rs: monitor_simulation (2s
 #   MONITOR_POLL_INTERVAL poll loop, per-platform file-exists guard, save_run_state per poll, loop-exit on U-048
@@ -823,3 +823,36 @@ next_iterate: U-022 [x] complete → U-017 port-fresh full implementation
 # line + simulation_router + handlers). Then U-027 report routes (api/report.py 29KB — where U-024's deferred h4
 # ReportSink→SSE adapter lands, exposing the ReACT per-section progress stream). U-024 tail still open: (b2) insight_forge
 # OQ-3 vec-search, (h4) deferred to U-027. After U-026/U-027: create_app S-024 flips [x] (all 3 blueprints landed).
+
+
+# CYCLE 25 (NEW SESSION 2026-06-18, 19th resume): U-026 ARCHITECT DECOMPOSITION (design only, no code).
+# rust-port-architect → findings/u026-architecture.md (196 lines) + merge-ledger U-026 class-pointer. api/simulation.py
+# = 92KB, **33 routes** (architect corrected from 31 — +env-status +close-env). REUSES the U-025-a shared route seam
+# (ApiError/build_llm/create_app — U-026 adds 1 .nest("/simulation") line + simulation_router + src/api/simulation.rs).
+# >>> DECISION-U026-1 (central, inherited by U-027): SimulationRunner<L> is GENUINELY generic (owns Arc<GraphMemoryManager
+# <L>>, spawns SimEngine::run::<L>) — can't be dyn. RESOLUTION = option (b) CONCRETE MONOMORPHIZATION: build_llm() always
+# returns OpenAiAdapter, so ApiState carries Arc<SimulationRunner<OpenAiAdapter>> + Arc<SimulationManager> (BOTH in-state,
+# NOT per-handler — the runner's runs HashMap + manager's Mutex<HashMap> cache must be cross-request-coherent: a sim
+# started by POST /start must be visible to /run-status + /stop). DECISION-U025-1 (no dyn, no generic axum state) preserved
+# — LLM monomorphized at the state-construction boundary. ApiState::new sig changes ([!] 30 create_app call-sites —
+# mitigated: build runner/manager from config internally, blast radius=1 constructor). KEY FINDINGS: NO SSE anywhere in
+# U-026 (all /realtime + /run-status are POLL-based one-shot JSON snapshots per source docstring — SSE is U-027's; blocks
+# porter from inventing streaming). report_id linkage NOT blocked on U-024 [~] (ReportManager::get_report_by_simulation
+# landed = _get_report_id_for_simulation equiv). GAPS (no silent drop): [!] GAP-U026-SOCIALDB (posts/comments/interview-
+# history read {platform}_simulation.db SQLite — blocked on sqlite feature OFF + DB producer U-028/029/030; port the
+# EMPTY-DB branch now = faithful current behavior, defer populated SELECT); [!] PRODUCER-PENDING (actions/timeline/agent-
+# stats/interview/env return faithful empty/not-found until producers land); [≠] U026-ZEPKEY (entities ZEP guard removed,
+# teri reads local graph by graph_id=task_id per U-025-f convention); [≠] U026-SCRIPTDL (/script/download serves
+# nonexistent run_*.py — owner-decision 404-vs-drop). SUB-CYCLE PLAN (13: a-m): a=ApiState-runtime-state+simulation_router
+# skeleton+nest [smallest, proves monomorphization compiles in axum state — DO FIRST] → c=create/get/list → fan out
+# {b=entities(graph_id=task_id), e=profiles/config+downloads, e2=script-dl, f=generate-profiles} → g=start/stop
+# (+_check_simulation_prepared helper) → {h=run-status/detail, i=world-state actions/timeline/agent-stats, j=posts/comments
+# [GAP-SOCIALDB], k=interview×4, l=env/close, m=history}. Deps + flags per group in findings/u026-architecture.md.
+# SESSION BUDGET REACHED (3 cycles: U-025(d) build, U-025(f) data/delete→U-025 COMPLETE, U-026 architect decomposition).
+# HANDOFF. NEXT sub-cycle on resume = U-026 (a) ApiState runtime-state extension + simulation_router skeleton + nest
+# (the smallest unit proving Arc<SimulationRunner<OpenAiAdapter>>+Arc<SimulationManager> monomorphization compiles in
+# axum State; mitigate the ApiState::new sig change by building runner/manager from config internally so the ~30 create_app
+# call-sites are unaffected). Then c→{b,e,e2,f}→g→{h,i,j,k,l,m} per the plan. After U-026: U-027 report routes (api/report.py
+# 29KB — inherits DECISION-U026-1 monomorphization + where U-024's deferred h4 ReportSink→SSE adapter lands, exposing the
+# ReACT per-section progress stream — U-027 IS where SSE lives). U-024 tail still open: (b2) insight_forge OQ-3 vec-search.
+# After U-026+U-027: create_app S-024 flips [x] (all 3 blueprints landed). MILESTONE: U-025 graph blueprint 100% done.
