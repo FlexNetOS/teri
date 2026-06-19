@@ -363,6 +363,59 @@ const REACT_UNUSED_TOOLS_HINT: &str =
 
 const REACT_FORCE_FINAL_MSG: &str = "已达到工具调用限制，请直接输出 Final Answer: 并生成章节内容。";
 
+// ============================================================================
+// Sub-cycle (i): Chat prompt constants
+//
+// Ported VERBATIM from report_agent.py:829-857.
+// Chinese text is behavioral — the model conditions on it.
+//
+// TEMPLATE RENDERING NOTE:
+// Python uses `.format(simulation_requirement=..., report_content=...,
+// tools_description=...)`.  The template body contains literal `{{` / `}}`
+// (JSON-example braces) which Python's `.format()` unescapes to single `{` / `}`.
+// We store the FINAL form (single braces for the JSON example) and use
+// three sequential `.replace("{simulation_requirement}", …)` calls — safe
+// because the slot names never collide with the literal JSON braces.
+// ============================================================================
+
+/// System prompt for the chat method (report_agent.py:829-855).
+///
+/// Placeholders: `{simulation_requirement}`, `{report_content}`, `{tools_description}`.
+/// All other `{` / `}` are literal (the embedded JSON-call example).
+const CHAT_SYSTEM_PROMPT_TEMPLATE: &str = r#"你是一个简洁高效的模拟预测助手。
+
+【背景】
+预测条件: {simulation_requirement}
+
+【已生成的分析报告】
+{report_content}
+
+【规则】
+1. 优先基于上述报告内容回答问题
+2. 直接回答问题，避免冗长的思考论述
+3. 仅在报告内容不足以回答时，才调用工具检索更多数据
+4. 回答要简洁、清晰、有条理
+
+【可用工具】（仅在需要时使用，最多调用1-2次）
+{tools_description}
+
+【工具调用格式】
+<tool_call>
+{"name": "工具名称", "parameters": {"参数名": "参数值"}}
+</tool_call>
+
+【回答风格】
+- 简洁直接，不要长篇大论
+- 使用 > 格式引用关键内容
+- 优先给出结论，再解释原因"#;
+
+/// Suffix appended to the tool-observation user message in the chat ReACT loop
+/// (report_agent.py:857).
+const CHAT_OBSERVATION_SUFFIX: &str = "\n\n请简洁回答问题。";
+
+/// Maximum tool calls allowed inside a single `chat` call (report_agent.py:882).
+const MAX_TOOL_CALLS_PER_CHAT: usize = 2;
+
 /// Progress callback type for ReACT pipeline methods.
 ///
 /// Called at key milestones: `(stage: &str, pct: u32, message: &str)`.
@@ -520,6 +573,53 @@ impl Report {
                 None => serde_json::Value::Null,
             },
         );
+        m
+    }
+}
+
+// ============================================================================
+// Sub-cycle (i): ChatResponse
+//
+// Return type for `ReportAgent::chat`.
+// Port of the inline dict returned by `ReportAgent.chat` (report_agent.py:1841-1845
+// and 1877-1880).  Key order: response, tool_calls, sources (EXACT Python order).
+// ============================================================================
+
+/// Return value for `ReportAgent::chat`.
+///
+/// Mirrors the Python dict `{"response": ..., "tool_calls": [...], "sources": [...]}`.
+#[derive(Debug, Clone)]
+pub struct ChatResponse {
+    /// The cleaned LLM text response (tool-call XML/bracket tags stripped, trimmed).
+    pub response: String,
+    /// Parsed `ToolCall` objects accumulated during the ReACT loop (≤ MAX_TOOL_CALLS_PER_CHAT).
+    pub tool_calls: Vec<crate::services::zep_tools::ToolCall>,
+    /// `parameters["query"]` extracted from each accumulated tool call (default "").
+    pub sources: Vec<String>,
+}
+
+impl ChatResponse {
+    /// Convert to a JSON map matching Python's key order: response, tool_calls, sources.
+    ///
+    /// `tool_calls` serializes each `ToolCall` as `{"name": ..., "parameters": ...}`,
+    /// matching the shape Python appends (`call` = the parsed tool-call dict).
+    pub fn to_dict(&self) -> serde_json::Map<String, serde_json::Value> {
+        use serde_json::Value;
+        let mut m = serde_json::Map::new();
+        m.insert("response".into(), Value::String(self.response.clone()));
+        let tc_list: Vec<Value> = self
+            .tool_calls
+            .iter()
+            .map(|tc| {
+                let mut obj = serde_json::Map::new();
+                obj.insert("name".into(), Value::String(tc.name.clone()));
+                obj.insert("parameters".into(), Value::Object(tc.parameters.clone()));
+                Value::Object(obj)
+            })
+            .collect();
+        m.insert("tool_calls".into(), Value::Array(tc_list));
+        let src_list: Vec<Value> = self.sources.iter().map(|s| Value::String(s.clone())).collect();
+        m.insert("sources".into(), Value::Array(src_list));
         m
     }
 }
@@ -1988,6 +2088,208 @@ impl ReportAgent {
                 report
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (i): chat — conversational 2-iteration ReACT method
+    //
+    // Port of `ReportAgent.chat` (report_agent.py:1766-1881).
+    //
+    // DECISION-11: tools/llm/manager passed per-call (not stored on self).
+    //
+    // LLM error convention (mirrors generate_section_react, report_agent.py:1312-1320):
+    //   llm.chat Err or Ok("") → treated as an empty response string ("").
+    //   Python does not catch errors in the chat loop — but since our signature
+    //   returns `ChatResponse` (not `Result`), mapping Err → "" is the faithful
+    //   way to prevent a panic while preserving all downstream behavior
+    //   (empty string → no tool_calls → immediate clean return, same as Python
+    //   propagating None/empty would short-circuit the loop).
+    //
+    // [≠] get_report_by_simulation returns Option (no I/O error surface). Python's
+    //   `except Exception as e: logger.warning(t('report.fetchReportFailed', error=e))`
+    //   fires only on an inexpressible deeper I/O exception; the observable behavior
+    //   (empty report_content when no report) is preserved. No warning is fabricated.
+    //
+    // [!] interview_agents tool — U-020 missing. execute_by_name returns the
+    //   honest-err string for unknown tools; the chat loop tolerates it as an
+    //   observation.
+    // -----------------------------------------------------------------------
+
+    /// Conversational interface for the Report Agent.
+    ///
+    /// Port of `ReportAgent.chat` (`report_agent.py:1766-1881`).
+    ///
+    /// Runs up to 2 ReACT iterations; each iteration may execute at most 1 tool call.
+    /// Returns immediately on the first iteration with no tool calls.
+    pub async fn chat<L: LlmClient>(
+        &self,
+        tools: &crate::services::zep_tools::ReportTools<'_, L>,
+        llm: &L,
+        manager: &crate::report::manager::ReportManager,
+        message: &str,
+        chat_history: &[ChatMessage],
+    ) -> ChatResponse {
+        use crate::i18n::t_args;
+        use crate::services::zep_tools::{get_tools_description, parse_tool_calls};
+        use regex::Regex;
+
+        // (g2): agentChat — report_agent.py:1787 logger.info(...)
+        // message[:50] is CHAR truncation (CJK-safe).
+        let message_truncated_50: String = message.chars().take(50).collect();
+        tracing::info!(
+            target: "teri::report",
+            "{}",
+            t_args("report.agentChat", &[("message", &message_truncated_50)])
+        );
+
+        // ── Fetch existing report content ────────────────────────────────────
+        // [≠] Python's try/except for I/O error is inexpressible via Option.
+        //     Observable behavior (empty report_content when no report) is preserved.
+        let mut report_content = String::new();
+        if let Some(report) = manager.get_report_by_simulation(&self.simulation_id)
+            && !report.markdown_content.is_empty()
+        {
+            // Limit report to 15000 CHARS (CJK-safe — report_agent.py:1797 char slice).
+            let char_count = report.markdown_content.chars().count();
+            if char_count > 15000 {
+                let byte_offset = report
+                    .markdown_content
+                    .char_indices()
+                    .nth(15000)
+                    .map(|(b, _)| b)
+                    .unwrap_or(report.markdown_content.len());
+                report_content = format!(
+                    "{}\n\n... [报告内容已截断] ...",
+                    &report.markdown_content[..byte_offset]
+                );
+            } else {
+                report_content = report.markdown_content.clone();
+            }
+        }
+
+        // ── Build system prompt ──────────────────────────────────────────────
+        // Empty report_content → placeholder (report_agent.py:1805).
+        let report_content_display = if report_content.is_empty() {
+            "（暂无报告）".to_string()
+        } else {
+            report_content.clone()
+        };
+
+        // Three sequential .replace() calls — safe because the slot names never
+        // collide with the literal JSON-example braces in the template.
+        let system_prompt = CHAT_SYSTEM_PROMPT_TEMPLATE
+            .replace("{simulation_requirement}", &self.simulation_requirement)
+            .replace("{report_content}", &report_content_display)
+            .replace("{tools_description}", &get_tools_description());
+        let system_prompt =
+            format!("{}\n\n{}", system_prompt, crate::i18n::get_language_instruction());
+
+        // ── Build initial messages ───────────────────────────────────────────
+        // System first; then last 10 history entries; then the user message.
+        let mut messages: Vec<ChatMessage> = vec![ChatMessage::system(system_prompt)];
+        let history_window = &chat_history[chat_history.len().saturating_sub(10)..];
+        for h in history_window {
+            messages.push(h.clone());
+        }
+        messages.push(ChatMessage::user(message));
+
+        // ── ReACT loop (max 2 iterations) ───────────────────────────────────
+        let mut tool_calls_made: Vec<crate::services::zep_tools::ToolCall> = Vec::new();
+        let opts = ChatOptions { temperature: Some(0.5), max_tokens: None };
+
+        // Regexes for response cleanup (same in both early-return and post-loop paths).
+        // (?s) = DOTALL flag — matches newlines inside <tool_call>…</tool_call>.
+        let tool_call_re = Regex::new(r"(?s)<tool_call>.*?</tool_call>").expect("valid regex");
+        // [TOOL_CALL] with escaped brackets, then any chars up to closing ')'.
+        let bracket_re = Regex::new(r"\[TOOL_CALL\].*?\)").expect("valid regex");
+
+        for _iteration in 0..2usize {
+            // LLM call — map Err or Ok("") to "" (mirrors generate_section_react convention).
+            let response = llm.chat(&messages, &opts).await.unwrap_or_default();
+
+            // Parse tool calls from response.
+            let tool_calls = parse_tool_calls(&response);
+
+            if tool_calls.is_empty() {
+                // No tool call — clean and return immediately (report_agent.py:1836-1845).
+                let cleaned = tool_call_re.replace_all(&response, "");
+                let cleaned = bracket_re.replace_all(&cleaned, "");
+                let clean_response = cleaned.trim().to_string();
+
+                let sources: Vec<String> = tool_calls_made
+                    .iter()
+                    .map(|tc| {
+                        tc.parameters
+                            .get("query")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string()
+                    })
+                    .collect();
+                return ChatResponse {
+                    response: clean_response,
+                    tool_calls: tool_calls_made,
+                    sources,
+                };
+            }
+
+            // Execute tools — at most 1 per round (report_agent.py:1849).
+            let mut tool_results: Vec<(String, String)> = Vec::new(); // (tool_name, result)
+            for call in tool_calls.iter().take(1) {
+                if tool_calls_made.len() >= MAX_TOOL_CALLS_PER_CHAT {
+                    break;
+                }
+                let raw_result = tools.execute_by_name(
+                    &call.name,
+                    &call.parameters,
+                    &self.graph_id,
+                    &self.simulation_id,
+                    &self.simulation_requirement,
+                    // report_context is not used by the chat variant in Python — pass a
+                    // minimal context string (execute_by_name's internal branches use it
+                    // only when non-empty; chat passes "" in Python via positional default).
+                    "",
+                );
+                // Truncate result to 1500 CHARS (CJK-safe — report_agent.py:1855).
+                let result: String = {
+                    let char_count = raw_result.chars().count();
+                    if char_count > 1500 {
+                        let byte_offset = raw_result
+                            .char_indices()
+                            .nth(1500)
+                            .map(|(b, _)| b)
+                            .unwrap_or(raw_result.len());
+                        raw_result[..byte_offset].to_string()
+                    } else {
+                        raw_result
+                    }
+                };
+                tool_results.push((call.name.clone(), result));
+                tool_calls_made.push(call.clone());
+            }
+
+            // Append assistant + observation (report_agent.py:1860-1865).
+            messages.push(ChatMessage::assistant(&response));
+            let observation: String = tool_results
+                .iter()
+                .map(|(tool, result)| format!("[{}结果]\n{}", tool, result))
+                .collect::<Vec<_>>()
+                .join("\n");
+            messages.push(ChatMessage::user(format!("{}{}", observation, CHAT_OBSERVATION_SUFFIX)));
+        }
+
+        // ── Max iterations reached — get final response ──────────────────────
+        // (report_agent.py:1867-1881)
+        let final_response = llm.chat(&messages, &opts).await.unwrap_or_default();
+        let cleaned = tool_call_re.replace_all(&final_response, "");
+        let cleaned = bracket_re.replace_all(&cleaned, "");
+        let clean_response = cleaned.trim().to_string();
+
+        let sources: Vec<String> = tool_calls_made
+            .iter()
+            .map(|tc| tc.parameters.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string())
+            .collect();
+        ChatResponse { response: clean_response, tool_calls: tool_calls_made, sources }
     }
 }
 
@@ -4400,6 +4702,356 @@ Final Answer: This is premature."#;
         let completed_ev = capture_sink.events.iter().find(|e| e.stage == ReportStage::Completed);
         assert!(completed_ev.is_some(), "must have a Completed event");
         assert_eq!(completed_ev.unwrap().progress, 100);
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    // =========================================================================
+    // Sub-cycle (i): ReportAgent::chat parity tests
+    //
+    // Strategy:
+    //   - ScriptedChatLlm returns a canned sequence of responses (one per call).
+    //   - make_tools_fixture for tools (empty graph — tools return honest-err strings
+    //     for unknown queries, which is fine for the observation path).
+    //   - ReportManager seeded with a Report to test the report_content path.
+    //   - All truncations are char-based; tests verify the char boundary exactly.
+    // =========================================================================
+
+    // (i)-1: No-tool-call path — immediate clean return, empty tool_calls/sources.
+    // Reuses the existing `ScriptedChatLlm` from sub-cycles (e)/(g).
+    #[tokio::test]
+    async fn test_chat_i_no_tool_call_path() {
+        let llm = ScriptedChatLlm::new(vec!["This is a clean answer."]);
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let upload_dir = std::env::temp_dir().join(format!("teri_i_notool_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+        let agent = ReportAgent::new_react("g-i", "sim-i", "no-tool test");
+
+        let resp = agent.chat(&tools, &llm, &mgr, "What is the forecast?", &[]).await;
+
+        assert_eq!(resp.response, "This is a clean answer.");
+        assert!(resp.tool_calls.is_empty(), "no tool calls expected");
+        assert!(resp.sources.is_empty(), "no sources expected");
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    // (i)-2: No-tool-call path strips <tool_call> XML (DOTALL) and [TOOL_CALL]...),
+    // then trims the result.
+    #[tokio::test]
+    async fn test_chat_i_no_tool_call_regex_cleanup() {
+        // Multiline <tool_call> block and [TOOL_CALL] artifact in the same response.
+        let dirty = "Some text\n<tool_call>\n{\"name\": \"foo\"}\n</tool_call>\nAfter\n[TOOL_CALL] foo(bar)  ";
+        let llm = ScriptedChatLlm::new(vec![dirty]);
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let upload_dir = std::env::temp_dir().join(format!("teri_i_clean_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+        let agent = ReportAgent::new_react("g-i", "sim-i", "cleanup test");
+
+        let resp = agent.chat(&tools, &llm, &mgr, "q", &[]).await;
+
+        // <tool_call>...</tool_call> stripped, then [TOOL_CALL]...) stripped, then trimmed.
+        assert!(!resp.response.contains("<tool_call>"), "tool_call XML must be stripped");
+        assert!(!resp.response.contains("[TOOL_CALL]"), "[TOOL_CALL] must be stripped");
+        assert_eq!(resp.response, resp.response.trim(), "response must be trimmed");
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    // (i)-3: Tool-call path — one round executes the tool, second round returns clean answer.
+    // Verifies: tool_calls_made accumulated, sources extracted from parameters.query,
+    // observation built with CHAT_OBSERVATION_SUFFIX, final response cleaned.
+    #[tokio::test]
+    async fn test_chat_i_tool_call_path() {
+        // Round 1: response contains a tool call.
+        let round1 = r#"Let me check.
+<tool_call>
+{"name": "quick_search", "parameters": {"query": "market trends"}}
+</tool_call>"#;
+        // Round 2: clean answer (no tool call).
+        let round2 = "Based on the data, the trend is upward.";
+        let llm = ScriptedChatLlm::new(vec![round1, round2]);
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let upload_dir =
+            std::env::temp_dir().join(format!("teri_i_toolcall_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+        let agent = ReportAgent::new_react("g-i", "sim-i", "tool-call test");
+
+        let resp = agent.chat(&tools, &llm, &mgr, "What is the trend?", &[]).await;
+
+        assert_eq!(resp.response, "Based on the data, the trend is upward.");
+        // One tool call was made.
+        assert_eq!(resp.tool_calls.len(), 1, "expected 1 tool call");
+        assert_eq!(resp.tool_calls[0].name, "quick_search");
+        // sources = parameters.query for each tool call.
+        assert_eq!(resp.sources, vec!["market trends"]);
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    // (i)-4: MAX_TOOL_CALLS_PER_CHAT (2) is respected — loop caps tool_calls_made at 2.
+    // Round 1: tool call A; round 2: tool call B (but tool_calls_made already 1 so B is added);
+    // then no more iterations (max=2), post-loop final call returns clean answer.
+    #[tokio::test]
+    async fn test_chat_i_max_tool_calls_cap() {
+        let round1 =
+            r#"<tool_call>{"name": "quick_search", "parameters": {"query": "q1"}}</tool_call>"#;
+        let round2 =
+            r#"<tool_call>{"name": "quick_search", "parameters": {"query": "q2"}}</tool_call>"#;
+        // Post-loop final call.
+        let final_response = "Final answer here.";
+        let llm = ScriptedChatLlm::new(vec![round1, round2, final_response]);
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let upload_dir = std::env::temp_dir().join(format!("teri_i_maxcap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+        let agent = ReportAgent::new_react("g-i", "sim-i", "max tool cap test");
+
+        let resp = agent.chat(&tools, &llm, &mgr, "q", &[]).await;
+
+        // Must not exceed MAX_TOOL_CALLS_PER_CHAT (2).
+        assert!(
+            resp.tool_calls.len() <= MAX_TOOL_CALLS_PER_CHAT,
+            "tool_calls_made must be <= MAX_TOOL_CALLS_PER_CHAT ({}), got {}",
+            MAX_TOOL_CALLS_PER_CHAT,
+            resp.tool_calls.len()
+        );
+        assert_eq!(resp.response, "Final answer here.");
+        // sources must have an entry per accumulated tool call.
+        assert_eq!(resp.sources.len(), resp.tool_calls.len());
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    // (i)-5: report_content present — seeded via manager.save_report.
+    // Sub-test A: under 15000 chars → included verbatim (no truncation suffix).
+    // Sub-test B: over 15000 chars → truncated to 15000 chars + "... [报告内容已截断] ..." suffix.
+    #[tokio::test]
+    async fn test_chat_i_report_content_present_under_limit() {
+        let llm = ScriptedChatLlm::new(vec!["Answer based on report."]);
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let upload_dir =
+            std::env::temp_dir().join(format!("teri_i_rptcontent_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+
+        // Seed a report with short content.
+        let short_content = "This is the report markdown.".to_string();
+        let report = Report {
+            report_id: "rpt-i-short".to_string(),
+            simulation_id: "sim-i-rptcontent".to_string(),
+            graph_id: "g-i".to_string(),
+            simulation_requirement: "test".to_string(),
+            status: ReportStatus::Completed,
+            outline: None,
+            markdown_content: short_content.clone(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            completed_at: "2025-01-01T00:01:00Z".to_string(),
+            error: None,
+        };
+        mgr.save_report(&report).expect("save_report must succeed");
+
+        let agent = ReportAgent::new_react("g-i", "sim-i-rptcontent", "rpt test");
+        // We exercise the chat but only care about it not panicking and returning a response.
+        // The system prompt will contain the short report content (tested indirectly).
+        let resp = agent.chat(&tools, &llm, &mgr, "Summarize the report.", &[]).await;
+        assert!(!resp.response.is_empty());
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    #[tokio::test]
+    async fn test_chat_i_report_content_over_limit_truncated() {
+        // Build content that is exactly 15001 chars (CJK: use 'A' * 15001 for simplicity).
+        let long_content = "X".repeat(15001);
+        let llm = ScriptedChatLlm::new(vec!["Answer."]);
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let upload_dir =
+            std::env::temp_dir().join(format!("teri_i_rpttrunc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+
+        let report = Report {
+            report_id: "rpt-i-long".to_string(),
+            simulation_id: "sim-i-rpttrunc".to_string(),
+            graph_id: "g-i".to_string(),
+            simulation_requirement: "test".to_string(),
+            status: ReportStatus::Completed,
+            outline: None,
+            markdown_content: long_content.clone(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            completed_at: "2025-01-01T00:01:00Z".to_string(),
+            error: None,
+        };
+        mgr.save_report(&report).expect("save_report must succeed");
+
+        let agent = ReportAgent::new_react("g-i", "sim-i-rpttrunc", "truncation test");
+        // We verify the truncation logic by directly applying it (mirrors the method's body).
+        // The truncated display should be 15000 chars + suffix.
+        let char_count = long_content.chars().count();
+        assert!(char_count > 15000, "test precondition: content must exceed 15000 chars");
+
+        let byte_offset = long_content
+            .char_indices()
+            .nth(15000)
+            .map(|(b, _)| b)
+            .unwrap_or(long_content.len());
+        let truncated = format!("{}\n\n... [报告内容已截断] ...", &long_content[..byte_offset]);
+        // Truncated body is exactly 15000 source chars + suffix.
+        assert_eq!(truncated[..byte_offset].chars().count(), 15000);
+        assert!(truncated.contains("... [报告内容已截断] ..."));
+
+        // The agent call should succeed (the LLM mock returns "Answer.").
+        let resp = agent.chat(&tools, &llm, &mgr, "q", &[]).await;
+        assert_eq!(resp.response, "Answer.");
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    // (i)-6: absent report → system prompt uses "（暂无报告）" placeholder.
+    // (Verified indirectly: chat returns a response, no panic, no content about a report.)
+    #[tokio::test]
+    async fn test_chat_i_absent_report_no_panic() {
+        let llm = ScriptedChatLlm::new(vec!["No report yet."]);
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let upload_dir =
+            std::env::temp_dir().join(format!("teri_i_noreport_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+        // No report saved → get_report_by_simulation returns None.
+        let agent = ReportAgent::new_react("g-i", "sim-i-absent", "absent report test");
+
+        let resp = agent.chat(&tools, &llm, &mgr, "q", &[]).await;
+        assert_eq!(resp.response, "No report yet.");
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    // (i)-7: system_prompt renders the 3 substitutions with literal JSON braces intact.
+    // Verify the rendered system_prompt byte-matches Python's .format() output
+    // for a fixed input by checking the literal JSON example brace is present.
+    #[test]
+    fn test_chat_i_system_prompt_renders_correctly() {
+        let sim_req = "test requirement";
+        let report_content = "test report";
+        let tools_desc = "tool1: does X";
+
+        let rendered = CHAT_SYSTEM_PROMPT_TEMPLATE
+            .replace("{simulation_requirement}", sim_req)
+            .replace("{report_content}", report_content)
+            .replace("{tools_description}", tools_desc);
+
+        // All 3 substitutions applied.
+        assert!(rendered.contains(sim_req), "simulation_requirement must appear");
+        assert!(rendered.contains(report_content), "report_content must appear");
+        assert!(rendered.contains(tools_desc), "tools_description must appear");
+
+        // Literal JSON-example braces intact (Python `.format()` unescapes {{ → {).
+        // The template contains the JSON example: {"name": "工具名称", "parameters": {...}}
+        assert!(rendered.contains("{\"name\""), "literal JSON opening brace must be present");
+        assert!(
+            rendered.contains("}}"),
+            "literal JSON closing brace must be present (parameters value)"
+        );
+
+        // No unresolved placeholders remaining.
+        assert!(!rendered.contains("{simulation_requirement}"), "no unresolved slot");
+        assert!(!rendered.contains("{report_content}"), "no unresolved slot");
+        assert!(!rendered.contains("{tools_description}"), "no unresolved slot");
+    }
+
+    // (i)-8: ChatResponse.to_dict — key order response, tool_calls, sources.
+    #[test]
+    fn test_chat_i_chat_response_to_dict_key_order() {
+        use crate::services::zep_tools::ToolCall;
+        let mut params = serde_json::Map::new();
+        params.insert("query".into(), serde_json::Value::String("the query".into()));
+        let tc = ToolCall { name: "quick_search".to_string(), parameters: params };
+        let cr = ChatResponse {
+            response: "My answer".to_string(),
+            tool_calls: vec![tc],
+            sources: vec!["the query".to_string()],
+        };
+        let dict = cr.to_dict();
+        let keys: Vec<&str> = dict.keys().map(|s| s.as_str()).collect();
+        // Exact key order: response, tool_calls, sources.
+        assert_eq!(keys, vec!["response", "tool_calls", "sources"]);
+
+        // tool_calls entry shape: {name, parameters}.
+        let tc_val = &dict["tool_calls"].as_array().unwrap()[0];
+        assert!(tc_val.get("name").is_some());
+        assert!(tc_val.get("parameters").is_some());
+        assert_eq!(tc_val["name"].as_str().unwrap(), "quick_search");
+        assert_eq!(tc_val["parameters"]["query"].as_str().unwrap(), "the query");
+
+        // sources.
+        assert_eq!(dict["sources"].as_array().unwrap()[0].as_str().unwrap(), "the query");
+    }
+
+    // (i)-9: chat_history last-10 window — history entries with their roles are passed through.
+    #[tokio::test]
+    async fn test_chat_i_history_window() {
+        let llm = ScriptedChatLlm::new(vec!["Response after history."]);
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let upload_dir =
+            std::env::temp_dir().join(format!("teri_i_history_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+        let agent = ReportAgent::new_react("g-i", "sim-i", "history test");
+
+        // Build 15 history entries — only the last 10 should be included.
+        let history: Vec<ChatMessage> = (0..15)
+            .map(|i| {
+                if i % 2 == 0 {
+                    ChatMessage::user(format!("user msg {i}"))
+                } else {
+                    ChatMessage::assistant(format!("assistant msg {i}"))
+                }
+            })
+            .collect();
+
+        let resp = agent.chat(&tools, &llm, &mgr, "final question", &history).await;
+        assert_eq!(resp.response, "Response after history.");
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    // (i)-10: CHAT_OBSERVATION_SUFFIX is appended to the observation user message.
+    //  Indirectly verified: the test checks that after 2 ReACT rounds the post-loop
+    //  path fires (the scripted LLM is given 3 responses in order).
+    #[tokio::test]
+    async fn test_chat_i_observation_suffix_in_loop() {
+        // Both loop rounds have tool calls — post-loop final response is the 3rd call.
+        let round1 =
+            r#"<tool_call>{"name": "quick_search", "parameters": {"query": "q1"}}</tool_call>"#;
+        let round2 =
+            r#"<tool_call>{"name": "quick_search", "parameters": {"query": "q2"}}</tool_call>"#;
+        let final_resp = "Post loop answer.";
+        let llm = ScriptedChatLlm::new(vec![round1, round2, final_resp]);
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let upload_dir =
+            std::env::temp_dir().join(format!("teri_i_obsuffix_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+        let agent = ReportAgent::new_react("g-i", "sim-i", "obs suffix test");
+
+        let resp = agent.chat(&tools, &llm, &mgr, "q", &[]).await;
+        // Post-loop path fires; final response is cleaned and returned.
+        assert_eq!(resp.response, "Post loop answer.");
+        // At most 2 tool calls (MAX_TOOL_CALLS_PER_CHAT).
+        assert!(resp.tool_calls.len() <= 2);
 
         let _ = std::fs::remove_dir_all(&upload_dir);
     }

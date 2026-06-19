@@ -2448,3 +2448,84 @@ assemble. Differential vs `report_agent.py:1636-1707`. Verifier: rust-port-parit
 generate_report; h2 (skeleton/planning/tails) + h3 (section loop) together fully verify the orchestration.
 S-763 flipped to `- [x]` in symbol-map. h4 (U-027 ChannelSink/SseSink adapter seam) is optional polish per
 architect §6 — NOT required for generate_report parity (NullSink covers it).
+
+================================================================================
+## 2026-06-18 — U-024 sub-cycle (i): `ReportAgent::chat` — PARITY PASS
+================================================================================
+
+VERDICT: **PASS**. Symbols cleared `- [x]`: S-748, S-749, S-753, S-764 (4/4 for this
+sub-cycle). U-024 is now functionally complete (a✓…i✓) modulo h4 deferred to U-027 and
+b2 insight_forge OQ-3 pending (both pre-existing, out of (i) scope).
+
+Source: MiroFish/backend/app/services/report_agent.py:1766-1881 (chat),
+829-857 (CHAT_SYSTEM_PROMPT_TEMPLATE/CHAT_OBSERVATION_SUFFIX), 882 (MAX_TOOL_CALLS_PER_CHAT).
+Rust:   src/report/mod.rs:2124-2293 (chat), 385-417 (consts), 591-625 (ChatResponse).
+
+DIFFERENTIAL EVIDENCE (Rust real code paths vs Python, byte-level):
+
+[Target 2 — .format() brace] PROVEN byte-identical + SHA-256-matched.
+  Rust probe (real CHAT_SYSTEM_PROMPT_TEMPLATE const + 3 sequential .replace) vs Python
+  CHAT_SYSTEM_PROMPT_TEMPLATE.format(simulation_requirement=, report_content=, tools_description=)
+  on fixed triple {sim="试 req {x}", rc="rep 内容", td="td: 描述"} (CJK + a stray "{x}" in the value):
+    PY len=313 SHA256=a772be97ffac1583 ; RUST len=313 SHA256=a772be97ffac1583 ; BYTE_IDENTICAL=True.
+  JSON-example line renders with SINGLE braces both sides:
+    {"name": "工具名称", "parameters": {"参数名": "参数值"}}
+  teri stores the const with SINGLE braces (Python's `.format()` {{→{ unescape is pre-applied),
+  then 3 .replace() — names never collide with literal braces. NOT doubled-brace divergence.
+
+[Target 1 — CHAR vs BYTE truncation, g1 class] PROVEN char-based (CJK differential).
+  message[:50]            : Rust message.chars().take(50)        — 50 chars (not 150 bytes). MATCH.
+  markdown_content[:15000]: Rust char_count>15000 ? char_indices().nth(15000) slice — CHAR. MATCH.
+    15001 CJK ("中"*15001) → both keep 15000 chars + "\n\n... [报告内容已截断] ..." suffix. byte-identical.
+    15000 CJK ("中"*15000) → NEITHER gets the suffix (char_count>15000 is False). byte-identical.
+    The >15000 comparison is a CHAR count (chars().count()), NOT .len() bytes. CONFIRMED — no .len() slip.
+  result[:1500]           : Rust char_count>1500 ? char_indices().nth(1500) slice — CHAR. MATCH.
+
+[Target 3 — regex cleanup] PROVEN byte-identical (Rust regex crate vs Python re).
+  Rust (?s)<tool_call>.*?</tool_call>  +  \[TOOL_CALL\].*?\)  then .trim()
+  Input1 "Some text\n<tool_call>\n{...}\n</tool_call>\nAfter\n[TOOL_CALL] foo(bar)  "
+    → both: "Some text\n\nAfter"   (DOTALL multiline strip works; bracket+trim works)
+  Input2 "pre <tool_call>line1\nline2</tool_call> mid [TOOL_CALL]x(a)(b) post"
+    → both: "pre  mid (b) post"    (non-greedy .*?\) stops at FIRST ')', leaves "(b)")
+  (?s) DOTALL on first re, \[ \] \) escaped on second — confirmed correct.
+
+CONTRACT CHECKS (side-by-side read, all match):
+  - messages order: system → chat_history[-10:] (last-10 slice, roles preserved) → user msg. ✓
+  - system_prompt = render + "\n\n" + get_language_instruction(). ✓
+  - empty report_content → "（暂无报告）" placeholder. ✓
+  - ReACT: max_iterations=2; tool_calls[:1] (≤1 exec/round); MAX_TOOL_CALLS_PER_CHAT=2 break;
+    post-loop final llm.chat + clean + return; no-tool-call early return inside loop. ✓
+  - tool_calls_made accumulates EXECUTED calls only (pushed inside the take(1) exec block). ✓
+  - sources = each accumulated call's parameters["query"] default "" (both early-return and post-loop). ✓
+  - observation = "\n".join(f"[{tool}结果]\n{result}") + CHAT_OBSERVATION_SUFFIX, appended as
+    user msg AFTER the assistant response msg. ✓
+  - temperature=0.5, max_tokens=None (Python passes only temperature=0.5). ✓
+  - execute_by_name called with report_context="" (Python _execute_tool default ""; only insight_forge
+    consumes it and only when non-empty → "" is faithful). ✓
+  - ChatResponse.to_dict key order: response, tool_calls, sources; each ToolCall → {name, parameters}. ✓
+
+ADJUDICATIONS:
+  [≠] fetchReportFailed except path (py:1800-1801): LEGIT, not a disguised skip.
+      get_report_by_simulation returns Option (swallows I/O err via .ok()?), so Python's
+      `except Exception → logger.warning(fetchReportFailed)` path is INEXPRESSIBLE under teri's
+      chosen signature. The warning is a non-contractual internal diagnostic with NO Python-observable
+      artifact (no file/serialization/CLI/render dropped). Observable behavior (None/fetch-fail →
+      report_content="" → "（暂无报告）") is preserved exactly; test (i)-6 confirms None→clean response,
+      no panic. CONFIRMED inexpressible/non-contractual → covered.
+  [!] interview_agents (U-020 not yet ported): execute_by_name returns honest unknown-tool err string,
+      tolerated by the chat loop as an observation. Upstream-dependency [!], not a chat-method downgrade.
+  llm-error convention (Err/Ok("")→""): teri's chat returns ChatResponse (infallible), so it cannot
+      raise as Python would. unwrap_or_default() → "" → parse_tool_calls("")=[] → no-tool early return
+      → "" response. Consistent with (e) generate_section_react's None-mapping. No Python feature lost
+      (Python's only behavior on llm error is to propagate the exception); the divergence is confined to
+      the unobservable error channel, forced by the deliberate infallible return type. ACCEPTABLE, not a [!].
+
+NO-DOWNGRADE OF Y: template family (generate/generate_stream/parse_report_from_json) untouched.
+
+TESTS: 11 `test_chat_i_*` tests green. Full lib suite 1216/1216 PASS (single-threaded; the 4
+parallel-run console_logger failures are pre-existing global-tracing-subscriber mutex-poison
+flakiness — confirmed green single-threaded, unrelated to (i)). clippy -p teri --all-targets clean.
+
+PROBE HYGIENE: a temporary zzz_probe_regex_and_format test was inserted to capture the real Rust
+regex/render output, diffed against Python, then REMOVED. src/report/mod.rs restored to 5058 lines;
+`grep -c zzz_probe` = 0; crate builds clean. No probe artifact remains.

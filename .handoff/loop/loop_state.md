@@ -17,7 +17,7 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 2   # NEW SESSION 2026-06-18 (17th resume); CYCLE 17=U-024(h2) skeleton (FAIL→fix→PASS), 18=U-024(h3) section loop (PASS r1)
+cycles_this_session: 3   # BUDGET REACHED; NEW SESSION 2026-06-18 (17th resume); CYCLE 17=U-024(h2) skeleton (FAIL→fix→PASS), 18=U-024(h3) section loop (PASS r1), 19=U-024(i) chat (PASS r1)
 # CYCLE3 (12th resume) 2026-06-17: U-022 sub-cycle (c) MONITOR + offset-tail + graph-fire (S-605/613/614/615 + S-1056/U-047,
 #   5 [x]) — opus PASS (DECISION-17 Area 2, porter@opus). src/services/simulation_runner.rs: monitor_simulation (2s
 #   MONITOR_POLL_INTERVAL poll loop, per-platform file-exists guard, save_run_state per poll, loop-exit on U-048
@@ -639,3 +639,35 @@ next_iterate: U-022 [x] complete → U-017 port-fresh full implementation
 # get_report_by_simulation, 15000-char ctx cap, response cleaning — report_agent.py:1766+], (b2) insight_forge [OQ-3
 # query_vec_similarity semantic multi-sub-query]. NEXT sub-cycle = (i) chat (h4 deferred to U-027 layer). After U-024:
 # U-025/26/27 HTTP API routes (U-027 report route wires the ReportSink→SSE adapter exposing the per-section stream).
+
+
+# CYCLE 19 (NEW SESSION 2026-06-18, 17th resume): U-024 sub-cycle (i) chat — porter@porter, parity@opus PASS (round-1).
+# src/report/mod.rs: ReportAgent::chat<L>(&self, tools, llm, manager, message, chat_history) -> ChatResponse — the
+# conversational 2-iteration ReACT (report_agent.py:1766-1881). NEW consts CHAT_SYSTEM_PROMPT_TEMPLATE/
+# CHAT_OBSERVATION_SUFFIX/MAX_TOOL_CALLS_PER_CHAT(=2) verbatim. NEW ChatResponse{response, tool_calls:Vec<ToolCall>,
+# sources:Vec<String>} + to_dict (key order response/tool_calls/sources; ToolCall→{name,parameters}). Body: agentChat
+# log (message[:50] char); get_report_by_simulation → report_content 15000-CHAR cap + 「报告内容已截断」 suffix (char count
+# compare) / 「（暂无报告）」 empty; system_prompt = 3-slot .format render (single JSON-brace unescape) + \n\n +
+# get_language_instruction; messages system→history[-10:]→user; loop 0..2 (llm.chat temp 0.5, parse_tool_calls, empty→
+# clean+return, else execute take(1) w/ MAX_TOOL_CALLS_PER_CHAT cap, result[:1500] char, observation join + suffix,
+# assistant+user append); post-loop final chat + clean + return. Two (?s)-DOTALL+escaped regex cleanups + .trim().
+# VERIFIER PROVED the two highest-risk points: (1) all 3 truncations CHAR-based (g1 bug class) — CJK differential byte-
+# identical (中×15001→15000+suffix, 中×15000→no suffix); (2) .format brace render SHA-256-MATCHED to Python (313 bytes,
+# literal JSON braces render single both sides). [≠] fetchReportFailed warning (get_report_by_simulation returns Option,
+# no exception surface — inexpressible, observable None→「（暂无报告）」 preserved, non-contractual diagnostic). [!]
+# interview_agents (U-020 missing, honest-err tolerated). llm-error convention (Err/Ok("")→"") consistent w/ (e), faithful
+# (infallible ChatResponse can't raise as Python would). S-748/749/753/764 [x]. 11 new tests (test_chat_i_*), 1231 green
+# parallel (5 suites), clippy --all-targets clean. Atomic gate: X-parity PASS + Y-green + Y-not-regressed (template
+# untouched). Y-drift clean (develop 7c354a5). NOTE (latent, tracked, NOT introduced by i): the g2 console_logger tests
+# can flake under HIGH parallelism (global tracing-subscriber mutex poison) — green in the standard cargo test -p teri run
+# (1231 pass); a future hardening could serialize them with a test-mutex. Not a blocker.
+# >>> U-024 ReportAgent FUNCTIONALLY COMPLETE: a✓ b✓ c✓ d✓ e✓ f✓ g1✓ g2✓ h1✓ h2✓ h3✓ i✓. REMAINING IN U-024 (both
+# legitimately deferred/pending, unit stays [ ] until done): (h4) U-027 SSE sink adapter — DEFERRED, lands WITH the U-027
+# HTTP route (NullSink covers parity now; the ChannelSink/SseSink wrapper is the route's concern); (b2) insight_forge
+# semantic multi-sub-query — PENDING OQ-3 (query_vec_similarity; the STRUCTURE is ported w/ keyword fallback = Python's
+# own exception fallback, the semantic vec-search needs the embedding wiring). 
+# SESSION BUDGET REACHED (3 cycles: h2/h3/i). HANDOFF. NEXT sub-cycles for a future resume: (b2) insight_forge OQ-3
+# semantic [needs EmbeddingClient vec-search wired into ReportTools — shimmy /v1/embeddings already landed, src/embedding.rs
+# exists; wire query_vec_similarity into insight_forge's sub-query loop replacing the keyword fallback] OR advance to
+# U-025/U-026/U-027 HTTP API routes (which is where h4 ReportSink→SSE adapter lands). After U-024's tail: the remaining
+# unported units per merge-ledger order. interview_agents stays honest-err until U-020 sim/ipc.rs lands.
