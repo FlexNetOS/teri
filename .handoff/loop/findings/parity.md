@@ -3287,3 +3287,74 @@ Every pre-gap path proven byte/status-faithful:
 1. `TimelineRound`: add `first_action_time: String`, `last_action_time: String`. On first insert seed both = action.timestamp. Per action update `last_action_time = action.timestamp`. (Mind sort order: `get_all_actions` returns DESC/newest-first, so the FIRST action seen per round is the LATEST — Python iterates the same DESC list and assigns `first_action_time` from the first-seen + overwrites `last_action_time` each iter, so faithfully: seed both from first-seen, then set `last_action_time` from each subsequent. Match Python's exact assignment, do not assume ASC.) Add both fields to `TimelineEntry` and append them (in that order) at the END of `to_value`, after `action_types`.
 2. `AgentStats::to_value`: move the `action_types` insert to BEFORE `first_action_time`/`last_action_time` so order = agent_id, agent_name, total_actions, twitter_actions, reddit_actions, action_types, first_action_time, last_action_time. (Verify the DESC-iteration first/last assignment matches Python :1082-1095 too.)
 3. Strengthen the two populated tests to assert the full key SET and order (serialize to string + compare, or assert the missing keys explicitly) so the gap can't re-hide.
+
+---
+
+## 2026-06-19 · U-026 sub-cycle (j) · social-DB read routes · VERDICT: PASS
+
+Gate: parity verifier (default-skeptical, fail-closed). Symbols S-827 (`GET /<id>/posts`),
+S-828 (`GET /<id>/comments`) → both `- [x]`. 2/2 symbols covered.
+
+Source X: MiroFish `simulation.py` `get_simulation_posts` (1987-2056), `get_simulation_comments`
+(2061-2120). Port Y: `src/api/simulation.rs` handlers + `social_db_path` + feature-gated
+`read_posts_response`/`read_comments_response`/`sqlite_row_to_object`.
+
+Tests run (both pass):
+- default build: `cargo test --lib -- get_posts get_comments` → 3 passed
+  (`get_posts_missing_db_empty_contract`, `get_comments_missing_db_empty_contract`,
+   `get_posts_db_exists_without_sqlite_feature_honest_500`).
+- sqlite build: `cargo test --lib --features sqlite -- get_posts_populated get_comments_populated`
+  → 2 passed (`get_posts_populated_from_sqlite`, `get_comments_populated_from_sqlite_with_post_id_filter`).
+
+Checkable surfaces — all confirmed:
+1. Missing-DB empty contracts byte-exact. posts → `{success:true, data:{platform, count:0,
+   posts:[], message}}` — exactly 4 data keys, NO `total`; platform defaults "reddit", echoes
+   `?platform` (test asserts both "reddit" and "twitter"). comments → `{success:true,
+   data:{count:0, comments:[]}}` — exactly 2 data keys. Populated posts has `total` but NO
+   `message` (verified in source + sqlite test). Key-set/values/envelope match.
+2. sim_dir mapping — FAITHFUL, not a divergence. Python read routes use
+   `dirname(app/api/simulation.py)/../../uploads/simulations/<id>` = `backend/uploads/simulations/<id>`.
+   `Config.OASIS_SIMULATION_DATA_DIR` (config.py:49) = `dirname(app/config.py)/../uploads/simulations`
+   = same dir. Producer/runner `RUN_STATE_DIR` (simulation_runner.py:208-211) =
+   `dirname(app/services/...)/../../uploads/simulations` = same dir, and writes
+   `{sim_dir}/{platform}_simulation.db` (runner:1751). ALL THREE Python paths resolve to the one
+   physical directory; the read routes just hand-roll it relative to a deeper file instead of reading
+   the config constant. teri consolidates to `oasis_simulation_data_dir/<id>` — the same dir its
+   `cleanup_simulation_logs` deletes `{twitter,reddit}_simulation.db` from (simulation_runner.rs:1436,
+   1457-1458) and where its producer will write. DB lands exactly where teri reads it. No divergence.
+   `social_db_path` is a plain join — NO dir creation (mirrors Python read-only `os.path.join`).
+3. Populated SELECT (sqlite) verified by test: `SELECT * FROM post ORDER BY created_at DESC LIMIT ?
+   OFFSET ?`; row→object keyed by column name (`sqlite_row_to_object`, Python `dict(row)`);
+   `COUNT(*)` total is UNPAGINATED (limit=1 → count 1, total 2); comments post_id filter
+   (`WHERE post_id = ?`, post_id=10 → 2 of 3); OperationalError (missing table) → empty via
+   `unwrap_or_else((Vec::new(), 0))` / `unwrap_or_default()`, NOT 500 — matches Python inner
+   `except sqlite3.OperationalError`.
+4. Honest-degradation: `#[cfg(not(feature="sqlite"))]` + DB-exists → 500 carrying
+   `GAP-U026-SOCIALDB`, never a silent empty (test asserts 500 + `success:false` + error contains
+   the gap id). ADJUDICATION: this is the CORRECT no-downgrade landing. Returning empty when a DB
+   with data exists but teri can't read it would be a SILENT downgrade (data loss disguised as
+   "no posts"). The honest 500 surfaces the missing capability instead of fabricating an empty
+   result. Right call.
+5. Flask `type=int` fallback: `params.get("limit").and_then(|s| s.parse::<usize>().ok())
+   .unwrap_or(50)` (offset → 0). Bad/non-numeric → default, never 400. Matches Flask
+   `request.args.get('limit', 50, type=int)`.
+6. `[!] GAP-U026-SOCIALDB` legitimate. Populated branch is genuinely producer+feature-gated: the
+   `*_simulation.db` producer is U-028 (twitter) / U-029 (reddit) / U-030 (parallel), all unported,
+   and the `sqlite` cargo feature is OFF by default (Cargo.toml). Today the DB never exists → both
+   routes return the missing-DB empty contract = the FAITHFUL current behavior (a sim that never ran
+   has no DB), not a stub. The `#[cfg(feature="sqlite")]` SELECT path is fully implemented and
+   test-verified against a hand-built real DB (data-starved in production only, not logic-starved).
+7. 500 path: connection-open failure → `Connection::open(...).map_err(ApiError::server)` → 500;
+   the two 200 branches (missing-DB empty, populated) carry no traceback-bearing error. `ApiError::server`
+   emits the 3-key `{success:false, error, traceback}` shape (`[≠] U025-TRACEBACK` for the value only).
+
+`[≠]` challenge: no NEW `[≠]` introduced by this unit. The only `[≠]` touched is the pre-existing
+`U025-TRACEBACK` on `ApiError::server` (traceback VALUE is a Rust backtrace string, not a Python
+stack) — non-contractual (frontend treats `traceback` as opaque debug text), 3-key CONTRACT
+preserved. Survives the bar (non-contractual). Not a feature-skip.
+
+Residual: `[!] GAP-U026-SOCIALDB` remains OPEN as a legitimate producer+feature frontier (clears
+when U-028/029/030 land AND the sqlite feature is enabled) — NOT a parity failure for this unit; the
+current-behavior branch is faithful and the deferred branch is implemented+tested. No `[~]`, no
+disguised-skip `[≠]`.
+

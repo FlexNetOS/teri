@@ -4313,10 +4313,10 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
                 };
 
                 if let Ok(rows) = iter {
-                    for row in rows {
-                        if let Ok(r) = row {
-                            results.push(r);
-                        }
+                    // flatten() yields only the Ok rows (skips any per-row error), behaviorally
+                    // identical to the prior `if let Ok(r) = row`.
+                    for r in rows.flatten() {
+                        results.push(r);
                     }
                 }
             }

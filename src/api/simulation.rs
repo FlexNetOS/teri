@@ -151,6 +151,9 @@ pub fn simulation_router(state: Arc<ApiState>) -> Router {
         .route("/:simulation_id/actions", get(get_simulation_actions))
         .route("/:simulation_id/timeline", get(get_simulation_timeline))
         .route("/:simulation_id/agent-stats", get(get_simulation_agent_stats))
+        // Sub-cycle (j): social-DB read routes (posts/comments). Distinct static 2nd segments.
+        .route("/:simulation_id/posts", get(get_simulation_posts))
+        .route("/:simulation_id/comments", get(get_simulation_comments))
         // Sub-cycle (e2): simulation-script download.  Static FIRST segment "script" — axum 0.7
         // ranks a static segment above the `/:simulation_id/...` capture at position 0, so
         // `/script/<name>/download` is unambiguous against the 3-segment `/:simulation_id/config/*`
@@ -1941,6 +1944,213 @@ async fn get_simulation_agent_stats(
             "stats": stats.iter().map(AgentStats::to_value).collect::<Vec<_>>()
         }
     })))
+}
+
+// ---------------------------------------------------------------------------
+// Sub-cycle (j) — social-DB read routes: posts / comments  (simulation.py:1987-2120).
+//
+// Both read `{sim_dir}/{platform}_simulation.db` (the OASIS per-platform SQLite produced by a
+// running social simulation).  teri locates it under the SAME single simulation dir every other
+// route uses (`oasis_simulation_data_dir/<id>`, where cleanup_simulation_logs deletes these very
+// `*_simulation.db` files) — NO dir-creation side effect (plain join, mirroring Python's
+// read-only `os.path.join`).
+//
+// `[!] GAP-U026-SOCIALDB` (architect findings/u026-architecture.md:123-128,162,187; same producer
+// frontier as GAP-SOCIAL-WORLDSTATE): the DB is written by the social-sim PRODUCER (U-028 twitter /
+// U-029 reddit / U-030 parallel), all unported, AND the SQLite read needs the `sqlite` cargo
+// feature (Cargo.toml:110, OFF by default).  So today the DB NEVER exists → both routes 200-return
+// the missing-DB empty contract, which is the FAITHFUL current behavior (a sim that never ran has
+// no DB).  That branch is ported + verifiable NOW.  The populated `SELECT` branch is implemented
+// behind `#[cfg(feature = "sqlite")]` (rusqlite, mirroring `get_interview_history_from_db`) so it
+// is correct + test-verifiable against a hand-built DB and ready when the producer lands; the
+// default (no-sqlite) build returns an HONEST 500 if a DB somehow exists (never a silent empty).
+// ---------------------------------------------------------------------------
+
+/// Locate `{sim_dir}/{file}` without creating the dir (read-only, mirrors Python `os.path.join`).
+fn social_db_path(state: &ApiState, simulation_id: &str, file: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(&state.config.oasis_simulation_data_dir)
+        .join(simulation_id)
+        .join(file)
+}
+
+/// Port of MiroFish `get_simulation_posts` (simulation.py:1987-2056).
+/// GET /:simulation_id/posts — posts from the platform's SQLite DB.
+async fn get_simulation_posts(
+    State(state): State<Arc<ApiState>>,
+    Path(simulation_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    let platform = params.get("platform").map(String::as_str).unwrap_or("reddit");
+    let limit = params.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(50);
+    let offset = params.get("offset").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+
+    let db_path = social_db_path(&state, &simulation_id, &format!("{platform}_simulation.db"));
+
+    // Missing DB → 200 with the 4-key empty contract + dbNotExist message (the faithful current
+    // behavior: no producer → no DB).
+    if !db_path.exists() {
+        return Ok(Json(serde_json::json!({
+            "success": true,
+            "data": {
+                "platform": platform,
+                "count": 0,
+                "posts": [],
+                "message": crate::i18n::t("api.dbNotExist")
+            }
+        })));
+    }
+
+    // DB exists → populated branch (deferred GAP-U026-SOCIALDB).
+    read_posts_response(&db_path, platform, limit, offset)
+}
+
+/// Port of MiroFish `get_simulation_comments` (simulation.py:2061-2120). Reddit-only.
+/// GET /:simulation_id/comments — comments from reddit_simulation.db, optional `post_id` filter.
+async fn get_simulation_comments(
+    State(state): State<Arc<ApiState>>,
+    Path(simulation_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    let post_id = params.get("post_id").map(String::as_str);
+    let limit = params.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(50);
+    let offset = params.get("offset").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+
+    let db_path = social_db_path(&state, &simulation_id, "reddit_simulation.db");
+
+    // Missing DB → 200 with the 2-key empty contract.
+    if !db_path.exists() {
+        return Ok(Json(serde_json::json!({
+            "success": true,
+            "data": { "count": 0, "comments": [] }
+        })));
+    }
+
+    read_comments_response(&db_path, post_id, limit, offset)
+}
+
+// --- Populated-branch readers (feature-gated) -------------------------------
+// `#[cfg(feature = "sqlite")]`: the real rusqlite SELECT path.  `#[cfg(not(...))]`: an honest 500
+// when a DB exists but teri was built without `sqlite` — never a silent empty (no-downgrade).
+
+/// Build a JSON object from a full SQLite row, keyed by column name (Python `dict(sqlite3.Row)`).
+#[cfg(feature = "sqlite")]
+fn sqlite_row_to_object(
+    row: &rusqlite::Row<'_>,
+    columns: &[String],
+) -> rusqlite::Result<serde_json::Map<String, Value>> {
+    use rusqlite::types::ValueRef;
+    let mut m = serde_json::Map::new();
+    for (i, name) in columns.iter().enumerate() {
+        let v = match row.get_ref(i)? {
+            ValueRef::Null => Value::Null,
+            ValueRef::Integer(n) => Value::Number(n.into()),
+            ValueRef::Real(f) => {
+                serde_json::Number::from_f64(f).map(Value::Number).unwrap_or(Value::Null)
+            }
+            ValueRef::Text(t) => Value::String(String::from_utf8_lossy(t).into_owned()),
+            ValueRef::Blob(b) => Value::String(String::from_utf8_lossy(b).into_owned()),
+        };
+        m.insert(name.clone(), v);
+    }
+    Ok(m)
+}
+
+#[cfg(feature = "sqlite")]
+fn read_posts_response(
+    db_path: &std::path::Path,
+    platform: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<Json<Value>, ApiError> {
+    use rusqlite::Connection;
+    // Outer try: connection failure → 500 (Python outer except). Inner OperationalError (e.g. no
+    // `post` table) → posts=[], total=0 (Python's `except sqlite3.OperationalError`).
+    let conn = Connection::open(db_path).map_err(ApiError::server)?;
+    let queried: rusqlite::Result<(Vec<serde_json::Map<String, Value>>, i64)> = (|| {
+        let mut stmt =
+            conn.prepare("SELECT * FROM post ORDER BY created_at DESC LIMIT ? OFFSET ?")?;
+        let cols: Vec<String> = stmt.column_names().iter().map(|s| (*s).to_string()).collect();
+        let rows = stmt.query_map(rusqlite::params![limit as i64, offset as i64], |r| {
+            sqlite_row_to_object(r, &cols)
+        })?;
+        let mut posts = Vec::new();
+        for r in rows {
+            posts.push(r?);
+        }
+        let total: i64 = conn.query_row("SELECT COUNT(*) FROM post", [], |r| r.get(0))?;
+        Ok((posts, total))
+    })();
+    let (posts, total) = queried.unwrap_or_else(|_| (Vec::new(), 0));
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": { "platform": platform, "total": total, "count": posts.len(), "posts": posts }
+    })))
+}
+
+#[cfg(not(feature = "sqlite"))]
+fn read_posts_response(
+    _db_path: &std::path::Path,
+    platform: &str,
+    _limit: usize,
+    _offset: usize,
+) -> Result<Json<Value>, ApiError> {
+    Err(ApiError::server(format!(
+        "{platform}_simulation.db exists but teri was built without the `sqlite` feature \
+         (GAP-U026-SOCIALDB — enable the sqlite feature + the U-028/029/030 producer)"
+    )))
+}
+
+#[cfg(feature = "sqlite")]
+fn read_comments_response(
+    db_path: &std::path::Path,
+    post_id: Option<&str>,
+    limit: usize,
+    offset: usize,
+) -> Result<Json<Value>, ApiError> {
+    use rusqlite::Connection;
+    let conn = Connection::open(db_path).map_err(ApiError::server)?;
+    let queried: rusqlite::Result<Vec<serde_json::Map<String, Value>>> = (|| {
+        let (sql, owned_pid) = match post_id {
+            Some(pid) => (
+                "SELECT * FROM comment WHERE post_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                Some(pid.to_string()),
+            ),
+            None => ("SELECT * FROM comment ORDER BY created_at DESC LIMIT ? OFFSET ?", None),
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let cols: Vec<String> = stmt.column_names().iter().map(|s| (*s).to_string()).collect();
+        let map_row = |r: &rusqlite::Row<'_>| sqlite_row_to_object(r, &cols);
+        let rows = match &owned_pid {
+            Some(pid) => {
+                stmt.query_map(rusqlite::params![pid, limit as i64, offset as i64], map_row)?
+            }
+            None => stmt.query_map(rusqlite::params![limit as i64, offset as i64], map_row)?,
+        };
+        let mut comments = Vec::new();
+        for r in rows {
+            comments.push(r?);
+        }
+        Ok(comments)
+    })();
+    let comments = queried.unwrap_or_default();
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": { "count": comments.len(), "comments": comments }
+    })))
+}
+
+#[cfg(not(feature = "sqlite"))]
+fn read_comments_response(
+    _db_path: &std::path::Path,
+    _post_id: Option<&str>,
+    _limit: usize,
+    _offset: usize,
+) -> Result<Json<Value>, ApiError> {
+    Err(ApiError::server(
+        "reddit_simulation.db exists but teri was built without the `sqlite` feature \
+         (GAP-U026-SOCIALDB — enable the sqlite feature + the U-028/029/030 producer)"
+            .to_string(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -4210,6 +4420,217 @@ mod tests {
         assert_eq!(stats[0]["total_actions"], 2);
         assert_eq!(stats[0]["first_action_time"], "2025-12-01T10:02:00");
         assert_eq!(stats[0]["last_action_time"], "2025-12-01T10:00:00");
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (j) — GET /:id/posts, /:id/comments  (social-DB reads)
+    //   Missing DB → 200 empty contract (faithful now). Populated SELECT behind
+    //   `sqlite` feature; no-sqlite-but-DB-exists → honest 500 ([!] GAP-U026-SOCIALDB).
+    // -----------------------------------------------------------------------
+
+    /// GET /:id/posts — no DB → 200 {platform, count:0, posts:[], message:dbNotExist}.
+    /// Default platform "reddit"; explicit ?platform is echoed.
+    #[tokio::test]
+    async fn get_posts_missing_db_empty_contract() {
+        let (state, _tmp) = test_state();
+        let app = crate::server::create_app(state);
+        // default platform = reddit
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_np/posts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true);
+        let data = &json["data"];
+        assert_eq!(data["platform"], "reddit");
+        assert_eq!(data["count"], 0);
+        assert_eq!(data["posts"], serde_json::json!([]));
+        assert!(data.get("message").is_some(), "missing-DB carries dbNotExist message");
+        // no `total` key on the empty branch (only on populated)
+        assert!(data.get("total").is_none());
+        assert_eq!(data.as_object().unwrap().len(), 4, "empty posts = 4 keys");
+
+        // explicit ?platform=twitter is echoed
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_np/posts?platform=twitter")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["data"]["platform"], "twitter");
+    }
+
+    /// GET /:id/comments — no DB → 200 {count:0, comments:[]} (2-key).
+    #[tokio::test]
+    async fn get_comments_missing_db_empty_contract() {
+        let (state, _tmp) = test_state();
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_nc/comments")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let data = &json["data"];
+        assert_eq!(data["count"], 0);
+        assert_eq!(data["comments"], serde_json::json!([]));
+        assert_eq!(data.as_object().unwrap().len(), 2, "empty comments = 2 keys");
+    }
+
+    /// No-sqlite build: a DB that DOES exist must produce an HONEST 500 (GAP-U026-SOCIALDB),
+    /// never a silent empty (no-downgrade). Only meaningful when built WITHOUT the sqlite feature.
+    #[cfg(not(feature = "sqlite"))]
+    #[tokio::test]
+    async fn get_posts_db_exists_without_sqlite_feature_honest_500() {
+        let (state, _tmp) = test_state();
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join("sim_db");
+        std::fs::create_dir_all(&sim_dir).unwrap();
+        std::fs::write(sim_dir.join("reddit_simulation.db"), b"not-empty").unwrap();
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_db/posts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DB present + no sqlite feature must be an honest 500, not a silent empty"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+        assert!(json["error"].as_str().unwrap().contains("GAP-U026-SOCIALDB"));
+    }
+
+    /// sqlite build: real SELECT over a hand-built `post` table — ordering, count, total, pagination.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn get_posts_populated_from_sqlite() {
+        let (state, _tmp) = test_state();
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join("sim_pp");
+        std::fs::create_dir_all(&sim_dir).unwrap();
+        {
+            let conn = rusqlite::Connection::open(sim_dir.join("reddit_simulation.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE post (post_id INTEGER, content TEXT, created_at TEXT);
+                 INSERT INTO post VALUES (1,'hello','2025-12-01T10:00:00');
+                 INSERT INTO post VALUES (2,'world','2025-12-01T10:01:00');",
+            )
+            .unwrap();
+        }
+        let app = crate::server::create_app(state);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_pp/posts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let data = &json["data"];
+        assert_eq!(data["platform"], "reddit");
+        assert_eq!(data["total"], 2);
+        assert_eq!(data["count"], 2);
+        // ORDER BY created_at DESC → post 2 first; row keyed by column name (Python dict(row)).
+        assert_eq!(data["posts"][0]["post_id"], 2);
+        assert_eq!(data["posts"][0]["content"], "world");
+
+        // ?limit=1 → count 1, total still 2 (COUNT(*) is unpaginated).
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_pp/posts?limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["data"]["count"], 1);
+        assert_eq!(json["data"]["total"], 2);
+    }
+
+    /// sqlite build: real SELECT over a `comment` table + optional post_id filter.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn get_comments_populated_from_sqlite_with_post_id_filter() {
+        let (state, _tmp) = test_state();
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join("sim_cc");
+        std::fs::create_dir_all(&sim_dir).unwrap();
+        {
+            let conn = rusqlite::Connection::open(sim_dir.join("reddit_simulation.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE comment (comment_id INTEGER, post_id INTEGER, content TEXT, created_at TEXT);
+                 INSERT INTO comment VALUES (1,10,'a','2025-12-01T10:00:00');
+                 INSERT INTO comment VALUES (2,10,'b','2025-12-01T10:01:00');
+                 INSERT INTO comment VALUES (3,20,'c','2025-12-01T10:02:00');",
+            )
+            .unwrap();
+        }
+        let app = crate::server::create_app(state);
+
+        // No filter → all 3.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_cc/comments")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["data"]["count"], 3);
+
+        // post_id=10 → 2 comments.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_cc/comments?post_id=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["data"]["count"], 2, "filtered to post_id 10");
     }
 
     // -----------------------------------------------------------------------
