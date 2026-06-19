@@ -73,7 +73,7 @@ anyhow = "1"
 thiserror = "1"
 
 # UUID for agent/world IDs
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }

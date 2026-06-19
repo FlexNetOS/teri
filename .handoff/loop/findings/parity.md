@@ -2786,3 +2786,153 @@ is faithfully implemented and DRIVEN:
 **VERDICT: PASS.** S-799 (`build_graph`, route 6) → `- [x]`; the `build_graph_async_with_completion`
 symbol verified as part of it. U-025 stays `- [ ]` pending sub-cycle (f) (S-802 `/data`, S-803 `/delete`).
 Test count: 1289 passed, 6 ignored.
+
+---
+
+## 2026-06-18 — U-025 sub-cycle (f): GET /data/:graph_id + DELETE /delete/:graph_id — VERDICT: FAIL
+
+**Scope:** S-802 (`GET /data/<graph_id>` → `get_graph_data`), S-803 (`DELETE /delete/<graph_id>` → `delete_graph`).
+Source: `MiroFish/backend/app/api/graph.py:569-622`, output shape `graph_builder.py:426-501`.
+Rust: `src/api/graph.rs` `get_graph_data` (921-1074), `delete_graph` (1093-1119).
+
+### Health gate (Y not downgraded)
+- `cargo test -p teri`: **1296 passed, 6 ignored** (5 suites). (a)-(e) routes + /health intact.
+- `cargo clippy -p teri --all-targets`: clean.
+
+### Differential checks (passing)
+- ZEP-missing → 500 2-key (no traceback) for BOTH routes: faithful (`get_graph_data_zep_missing_500`,
+  `delete_graph_zep_missing_500`).
+- graph-not-found → 500 server 3-key (traceback present): faithful (`get_graph_data_graph_not_found_500`).
+  Python's `builder.get_graph_data` raise → `except` → 500 w/ traceback; teri's `ApiError::server`.
+- Happy 200 envelope `{success,data:{graph_id,nodes[],edges[],node_count,edge_count}}`: faithful.
+- Node shape: 6 keys exact `{uuid,name,labels,summary,attributes,created_at}`; teri-present uuid←id,
+  name, labels←[kind]; summary=""/attributes={}/created_at=null. Verified by `assert_eq!(nobj.len(),6)`.
+- Edge shape: 14 keys exact; counts recomputed from arrays; node_map source/target name resolution correct.
+- valid_at/invalid_at: `Relation.valid_at: Option<(u64,Option<u64>)>` → start-string / end-string-or-null;
+  faithful to Python `str(valid_at) if valid_at else None`.
+- delete success → `{success:true,message:graphDeleted(id)}`, message contains id. i18n keys present.
+
+### ADJUDICATION 1 — edge `uuid` random-per-request: **DOWNGRADE → FAIL** (the offending item)
+graph.rs:1022 maps edge `uuid` ← `Uuid::new_v4()` **freshly per request per edge**. This is NOT a faithful
+`[≠]` and NOT what the architect mandated (4b lists edge fields as `[≠] inexpressible` → which means
+**default**, i.e. null, exactly as the porter did for `created_at`/`expired_at`/`episodes`). Random-per-call
+is a porter-invented value that breaks the contract:
+
+- **Python's `edge.uuid_` is the Zep server's STABLE edge identity** (graph.py:479; same `uuid_` used to key
+  `node_map` and to fetch episodes `uuid_=ep_uuid` in graph_builder.py). It is reused across calls — a real
+  identity a consumer references.
+- **A consumer DOES rely on edge-uuid stability.** `frontend/src/components/GraphPanel.vue`:
+  - `:116` `:key="loop.uuid || idx"` — Vue list-reconciliation key for self-loop edges.
+  - `:118/:122/:126/:129` `expandedSelfLoops.has(loop.uuid||idx)` / `toggleSelfLoop(loop.uuid||idx)` — the
+    self-loop expand/collapse UI state is a `Set` **keyed on edge `uuid`** (`expandedSelfLoops`, def `:255`,
+    mutate `:274-282`). Self-loop edges carry the full edge incl. `uuid` (`...e` at `:378-382`), so
+    `loop.uuid` IS the API edge uuid.
+  - The `|| idx` fallback was written for Python's **null** case (`v-if="loop.uuid"` at `:130`), i.e. a
+    *missing* uuid — NOT a *changing* one. With random-per-request uuids, every refetch changes the `:key`
+    and orphans the `expandedSelfLoops` Set entries → observable UI-state break (expanded items collapse /
+    wrong items stay flagged across `GET /data/:id` calls). Two GETs for the same edge return different
+    uuids — a genuine contract break, not a non-contractual artifact.
+- This is the same downgrade class as MiroFish→teri cycles 8-9: a portable observable behavior rationalized
+  away. Random uuid produces a **distinct (and wrong) observable output** vs Python's stable id.
+
+**Minimal fix (porter):** replace `Uuid::new_v4()` per request with the SAFER faithful value. Preferred:
+**deterministic v5** — `Uuid::new_v5(&namespace, key)` where `key` = `format!("{src}|{tgt}|{kind}")` (stable
+across calls, a real derived identity; survives refetch so the frontend Set/`:key` stays valid). Acceptable
+alternative: **`null`** (honest "no Zep uuid", consistent with the other `[≠]` Zep defaults `created_at:null`
+etc.; frontend's `|| idx` + `v-if="loop.uuid"` already handle null). Random-per-request is the one option that
+is BOTH non-deterministic AND a fake identity — reject it. Update the graph.rs:1010-1022 comment (which
+mis-claims "same observable semantics as Python") and add a test asserting two GETs return the SAME edge uuid
+(or null).
+
+### ADJUDICATION 2 — U025-GRAPHSTORE delete-no-op: **ACCEPTABLE `[!]`** (not a downgrade)
+`delete_graph` returns the faithful success envelope; TaskManager has no remove API so the in-memory task
+persists (subsequent `get_graph_data` still 200). This is recorded honestly (graph.rs:1106-1112,
+architecture §4b/§7 U025-GRAPHSTORE), the porter did NOT fabricate a deletion, and Python's Zep delete is
+itself fire-and-forget (no 404 for an already-absent graph). The *response contract* is byte-faithful; the
+durable-delete side effect is a genuinely-deferred substrate (a future `GraphStore` unit), surfaced to the
+owner — a recorded gap, not a silent drop. This `[!]` is sound. (It does not block S-803 on its own; S-803
+fails only by association with the shared edge-uuid defect via the `/data` round-trip contract — but S-803's
+own envelope is faithful. See verdict.)
+
+### ADJUDICATION 3 — U025-ZEP-TEMPORAL value defaults: **ACCEPTABLE `[≠]`** (key-preserved, same class as U-015)
+Every Python node/edge key is PRESENT (6/14 exact key sets verified by `nobj.len()==6`/`eobj.len()==14`);
+only the Zep-server VALUES default (summary=""/attributes={}/created_at=null/fact=""/expired_at=null/
+episodes=[]). This is the SAME class as U-015's Zep `[≠]` precedent (key preserved, value inexpressible) —
+the Zep server is genuinely absent, so the bitemporal VALUES cannot be produced. NOT a key drop. Sound.
+**Caveat:** edge `uuid` was incorrectly bundled into this `[≠]` by the porter — but uuid is NOT a Zep
+inexpressible value; teri CAN produce a stable deterministic uuid from its own (src,tgt,kind). So uuid does
+not belong in U025-ZEP-TEMPORAL; it is the Adjudication-1 downgrade.
+
+### VERDICT: **FAIL.** S-802 and S-803 stay `- [~]` (unproven). U-025 stays `- [ ]` (9/10 routes verified;
+sub-cycle (f) blocked on the edge-uuid fix). create_app S-024 remains partial regardless (U-026/U-027).
+Route back to porter: single defect — edge `uuid` random-per-request → make it deterministic-v5 (preferred)
+or null. All other (f) behavior is parity-faithful and will pass once the uuid is fixed. Test count: 1296.
+
+---
+
+## 2026-06-18 — U-025 sub-cycle (f) ROUND-2 RE-VERIFY (opus) — `GET /data/:id` + `DELETE /delete/:id`
+
+**VERDICT: PASS.** Round-1 FAIL defect (per-request `new_v4` edge uuid nondeterminism — a real
+contract break vs GraphPanel.vue's `:key` + expandedSelfLoops Set) is FIXED and verified. No new
+divergence. U-025 is **route-complete 10/10** and the UNIT flips to `- [x]`. S-802/S-803 → `- [x]`.
+
+### Check 1 — Determinism FIXED (the round-1 defect)
+- `get_graph_data` edge uuid now `Uuid::new_v5(&EDGE_NS, edge_key)` where `EDGE_NS = NAMESPACE_OID`
+  (fixed) and `edge_key = "{src_uuid}|{tgt_uuid}|{kind}|{valid_at_key}"` (graph.rs:1022/1037-1038).
+  `valid_at_key` encodes the temporal window (`none` / `start` / `start-end`) — disambiguates parallel
+  edges with different windows. Pure function of fixed inputs → deterministic by construction.
+- New test `get_graph_data_edge_uuid_deterministic_across_requests` (graph.rs:3383) drives
+  `GET /api/graph/data/:id` **TWICE** through the real HTTP app via `oneshot` and asserts
+  `edges[].uuid` identical across the two responses (NOT just calling a fn twice). RAN + passed
+  (0 ignored, confirmed via raw runner).
+- Independent cross-check: computed the expected v5 offline for the seeded edge
+  (src=1111…, tgt=2222…, kind `RelatedTo` (confirmed Display string at graph/mod.rs:72), valid_at None
+  → key tail `none`): `uuid5(NAMESPACE_OID, "11111111-…|22222222-…|RelatedTo|none")` =
+  `0c149838-c96f-5f70-80dc-c1e7123a93ed`. Deterministic + reproducible.
+
+### Check 2 — No new divergence
+- Node shape exactly 6 keys (uuid/name/labels/summary/attributes/created_at), edge exactly 14 keys
+  (uuid/name/fact/fact_type/source_node_uuid/target_node_uuid/source_node_name/target_node_name/
+  attributes/created_at/valid_at/invalid_at/expired_at/episodes) — asserted in
+  `get_graph_data_happy_200_exact_key_shape` (`eobj.len()==14`, `nobj.len()==6`). node_count/edge_count
+  == array lengths. teri-present fields + `[≠]` Zep defaults unchanged.
+- uuid documented as synthesized-but-stable identity under `[≠] U025-ZEP-TEMPORAL` (graph.rs:1010-1019,
+  1029-1031). The misleading "same observable semantics as Python" comment is gone; no leftover
+  `new_v4` in the handler (only a regression note in the test comment). NAMESPACE_OID + key + collision
+  behavior all documented.
+
+### Check 3 — Parallel-edge handling
+- Key includes `valid_at` to disambiguate same-(src,tgt,kind) edges with different windows. Truly
+  identical edges (same src/tgt/kind/window) collapse to the same uuid — acceptable: semantically
+  indistinguishable in teri's model (teri has no Zep server assigning distinct uuids). Documented, NOT
+  silent data loss. `SerRelation.valid_at` is `Option<(u64,Option<u64>)>` with `#[serde(default)]`,
+  matching `Relation.valid_at` (graph/mod.rs:93) — robust to graphs serialized before the field.
+
+### Check 4 — Round-1 PASSes still hold
+- get_graph_data: ZEP-missing 500 (2-key, no traceback), not-found 500 (3-key w/ traceback), happy 200
+  shape — all still pass. delete_graph: ZEP-missing 500, success envelope {success,message:graphDeleted(id)},
+  U025-GRAPHSTORE no-op (`delete_graph_task_persists_noop`) — all still pass. `[≠] U025-ZEP-TEMPORAL`
+  value-defaults + `[!] U025-GRAPHSTORE` acceptable.
+
+### Check 5 — Green
+- `cargo test -p teri`: **1297 passed, 6 ignored** (was 1296; +1 = the new determinism test).
+- The 7 graph (f) tests RAN + passed, 0 ignored (raw runner: get_graph_data_{zep_missing,graph_not_found,
+  happy,edge_uuid_deterministic}, delete_graph_{zep_missing,success_envelope,task_persists_noop}).
+- `cargo clippy -p teri --all-targets`: clean.
+- `Cargo.toml` uuid features now `["v4","v5","serde"]` — additive (no other crate behavior change).
+- (a)-(e) routes + /health non-regression test (`subcycle_f_non_regression_routes_ab_de_health`) passes.
+
+### U-025 final `[!]`/`[≠]` ledger (all challenged + survive)
+- `[≠] U025-ZEP-TEMPORAL` — Zep bitemporal node/edge fields teri's model cannot source; every Python
+  key PRESENT, only Zep-only values defaulted (== Python's `or ""`/`or {}`/`None` fallbacks). Edge uuid:
+  teri has no Zep server uuid → synthesized stable v5. **Non-contractual/inexpressible** — survives.
+- `[!] U025-GRAPHSTORE` — no durable graph-by-id store (graph lives in task result); delete is a no-op.
+  **Substrate-inexpressible** durable store; observable response output preserved. Survives `[!]`.
+- `[≠] U025-TRACEBACK` — server 500 `traceback` value is a Rust string, not a Python stack; 3-key shape
+  preserved. **Non-contractual** value — survives.
+- `[≠] U025-TASKNAME` — Python `f"构建图谱: {graph_name}"` → stable `"graph_build"` token; graph_name in
+  task metadata. **Non-observable** internal name — survives.
+- `[≠] U025-GRAPHID-TIMING` — graph_id set once at COMPLETED (not at spawn). **Non-observable** to polls
+  (visible only after handler returns either way). Survives.
+
+**Note:** create_app S-024 stays `- [~]` (PARTIAL) — pending U-026/U-027 blueprint mounts. NOT flipped.

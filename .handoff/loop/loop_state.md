@@ -17,7 +17,7 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 1   # NEW SESSION 2026-06-18 (19th resume); CYCLE 23=U-025(d) build route (PASS r1, architect-refined additive completion hook)
+cycles_this_session: 2   # NEW SESSION 2026-06-18 (19th resume); CYCLE 23=U-025(d) build route (PASS r1), 24=U-025(f) data/delete (FAIL→fix→PASS) → U-025 COMPLETE 10/10
 # CYCLE3 (12th resume) 2026-06-17: U-022 sub-cycle (c) MONITOR + offset-tail + graph-fire (S-605/613/614/615 + S-1056/U-047,
 #   5 [x]) — opus PASS (DECISION-17 Area 2, porter@opus). src/services/simulation_runner.rs: monitor_simulation (2s
 #   MONITOR_POLL_INTERVAL poll loop, per-platform file-exists guard, save_run_state per poll, loop-exit on U-048
@@ -794,3 +794,32 @@ next_iterate: U-022 [x] complete → U-017 port-fresh full implementation
 # U-026+U-027 also land. Then U-026 simulation routes (api/simulation.py 92KB — LARGE, needs own rust-port-architect
 # decomposition), U-027 report routes (h4 ReportSink→SSE adapter from U-024 lands here). U-024 tail: (b2) insight_forge
 # OQ-3, (h4) deferred to U-027.
+
+
+# CYCLE 24 (NEW SESSION 2026-06-18, 19th resume): U-025 sub-cycle (f) data/delete routes 9-10 → U-025 COMPLETE.
+# porter@porter, parity@opus FAIL→fix→PASS. src/api/graph.rs: get_graph_data GET /data/:graph_id (MAP-ONTO graph_id→
+# task_id→TaskManager::global().get_task(graph_id).result["graph"] (SerializableKnowledgeGraph {entities,edges}); reshape
+# into Python get_graph_data shape (graph_builder.py:495-501): {graph_id, nodes[6-key:uuid/name/labels/summary/attributes/
+# created_at], edges[14-key:uuid/name/fact/fact_type/source_node_uuid/target_node_uuid/source_node_name/target_node_name/
+# attributes/created_at/valid_at/invalid_at/expired_at/episodes], node_count, edge_count}; teri-present populated (entity
+# id/name/kind→labels; relation kind→name/fact_type, src/tgt uuids, names via node_map, valid_at/invalid_at from
+# Relation.valid_at), Zep-only [≠] U025-ZEP-TEMPORAL defaulted (summary ""/attributes {}/created_at null/fact ""/expired_at
+# null/episodes []) matching Python or-fallbacks; node/edge_count = array lengths. ZEP guard→500; not-found(no task/result/
+# graph)→500 server. delete_graph DELETE /delete/:graph_id (ZEP guard→500; success {success,message:graphDeleted(id)};
+# U025-GRAPHSTORE [!] no-op — TaskManager has no remove, durable GraphStore deferred). GATE CAUGHT a real downgrade: edge
+# uuid = Uuid::new_v4() PER-REQUEST (nondeterministic — two GETs of same edge return different uuids; verifier PROVED
+# frontend GraphPanel.vue uses edge uuid as Vue :key + self-loop expand Set state key → random uuid orphans UI state on
+# refetch) → FIXED deterministic Uuid::new_v5(NAMESPACE_OID, "{src}|{tgt}|{kind}|{valid_at}") (stable across calls/runs,
+# survives refetch; valid_at in key disambiguates parallel edges; verifier cross-computed v5 offline to confirm). Cargo.toml
+# +uuid "v5" feature (additive). ROUND-2 re-verify PASS. 10 new tests, 1297 green, clippy --all-targets clean. Atomic gate:
+# X-parity PASS + Y-green + Y-not-regressed (a-e routes + /health intact). Y-drift clean (develop 7c354a5). S-802/803 [x].
+# >>> U-025 graph routes UNIT COMPLETE — all 10 routes (S-794..S-803) [x], parity-verified in Y. Final U-025 [!]/[≠]
+# (all challenged+survived): U025-ZEP-TEMPORAL [≠], U025-GRAPHSTORE [!] (durable GraphStore = deferred own unit),
+# U025-TRACEBACK [≠], U025-TASKNAME [≠], U025-GRAPHID-TIMING [≠]. create_app S-024 STAYS [~] partial until U-026+U-027
+# blueprints land (their .nest() lines + own_router).
+# SESSION BUDGET REACHED at 2 of 3 cycles? NO — used cycle 3 for the U-026 architect decomposition (design, see below).
+# NEXT MAJOR UNIT: U-026 simulation routes (api/simulation.py = 92KB, the LARGEST route unit — needs its OWN
+# rust-port-architect decomposition like U-025 got; the shared route seam from U-025-a is REUSED: add 1 .nest("/simulation")
+# line + simulation_router + handlers). Then U-027 report routes (api/report.py 29KB — where U-024's deferred h4
+# ReportSink→SSE adapter lands, exposing the ReACT per-section progress stream). U-024 tail still open: (b2) insight_forge
+# OQ-3 vec-search, (h4) deferred to U-027. After U-026/U-027: create_app S-024 flips [x] (all 3 blueprints landed).

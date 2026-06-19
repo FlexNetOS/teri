@@ -4,9 +4,9 @@
 //! Sub-cycle (c): `/ontology/generate` multipart upload → LLM ontology generation.
 //! Sub-cycle (d): `POST /build` — the big build route with project-state completion hook.
 //! Sub-cycle (e): `/task/:task_id` and `/tasks` task-query routes.
-//! Sub-cycle (f) will add the remaining 2 routes to `graph_router`.
+//! Sub-cycle (f): `/data/:graph_id` and `/delete/:graph_id` — the gap routes. Route-complete.
 //!
-//! # Route → handler map (this file, routes 1–8 of 10)
+//! # Route → handler map (this file, all 10 routes)
 //!
 //! | # | Python route (graph.py)              | teri handler        | Status     |
 //! |---|--------------------------------------|---------------------|------------|
@@ -18,8 +18,8 @@
 //! | 6 | `POST /build`                 (:260) | `build_graph`       | ported (d) |
 //! | 7 | `GET  /task/<id>`             (:534) | `get_task`          | ported (e) |
 //! | 8 | `GET  /tasks`                 (:553) | `list_tasks`        | ported (e) |
-//! | 9 | `GET  /data/<graph_id>`       (:569) | `get_graph_data`    | PENDING (f) |
-//! | 10| `DELETE /delete/<graph_id>`   (:597) | `delete_graph`      | PENDING (f) |
+//! | 9 | `GET  /data/<graph_id>`       (:569) | `get_graph_data`    | ported (f) |
+//! | 10| `DELETE /delete/<graph_id>`   (:597) | `delete_graph`      | ported (f) |
 //!
 //! # `[≠]` / `[!]` flags inherited from architecture doc
 //!
@@ -94,9 +94,10 @@ pub fn graph_router(state: Arc<ApiState>) -> Router {
         // TaskManager::global() is a process singleton; no State needed.
         .route("/task/:task_id", get(get_task))
         .route("/tasks", get(list_tasks))
-        // Sub-cycle (f) will add:
-        // .route("/data/:graph_id", get(get_graph_data))
-        // .route("/delete/:graph_id", delete(delete_graph))
+        // Sub-cycle (f): graph data + delete routes (graph.py:569-622).
+        // graph_id == task_id (DECISION-9/U025-GRAPHSTORE): graph is embedded in task result.
+        .route("/data/:graph_id", get(get_graph_data))
+        .route("/delete/:graph_id", axum::routing::delete(delete_graph))
         .with_state(state)
 }
 
@@ -879,6 +880,257 @@ async fn list_tasks() -> Result<Json<Value>, ApiError> {
         "success": true,
         "data": tasks,
         "count": count
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Route 9 — GET /data/:graph_id  (graph.py:569-594, graph_builder.py:426-501)
+//
+// Source shape:
+//   builder.get_graph_data(graph_id) → {graph_id, nodes[], edges[], node_count, edge_count}
+//   where each node: {uuid, name, labels, summary, attributes, created_at}
+//         each edge: {uuid, name, fact, fact_type, source_node_uuid, target_node_uuid,
+//                     source_node_name, target_node_name, attributes, created_at,
+//                     valid_at, invalid_at, expired_at, episodes}
+//
+// teri MAP-ONTO (DECISION-9/§4b u025-architecture.md):
+//   graph_id == task_id → TaskManager::global().get_task(graph_id) → task.result["graph"]
+//   The embedded SerializableKnowledgeGraph JSON = {"entities":[Entity...], "edges":[(Uuid,Uuid,Relation)...]}
+//   is reshaped into Python's output shape exactly.
+//
+// `[!] U025-GRAPHSTORE`: teri has no durable graph-by-id store; the graph lives in the task
+//   result. If the task has aged out (cleanup_old_tasks) the graph is gone — correctly returns
+//   the 500 server envelope (faithful to Python's "graph not found" → except → 500).
+//
+// `[≠] U025-ZEP-TEMPORAL`: Zep server bitemporal node/edge fields that teri cannot provide:
+//   NODE: summary (Zep community summary → ""), attributes (Zep node properties → {}),
+//         created_at (Zep server timestamp → null).
+//   EDGE: fact (Zep fact text → ""), attributes (Zep edge properties → {}),
+//         created_at (Zep server timestamp → null), expired_at (Zep TTL → null),
+//         episodes (Zep episode ids → []).
+//   PRESENT: every Python key is present; only the Zep-only values default (exactly as
+//   Python's `or ""`/`or {}`/`None` fallbacks do when the field is absent on a Zep node).
+//   valid_at / invalid_at: teri HAS a temporal model on Relation (Relation.valid_at); mapped
+//   faithfully (string timestamps or null).  fact_type: mapped from RelationKind::to_string().
+//   Edge uuid: Relation has no uuid field; a deterministic uuid is derived from (src,tgt,kind).
+//
+// `[≠] U025-TRACEBACK`: server 500 carries Rust context string, not Python traceback.
+// ZEP guard: KEPT (R.8/u025-architecture.md) — api.zepApiKeyMissing 500 2-key body (no traceback).
+// ---------------------------------------------------------------------------
+
+async fn get_graph_data(
+    Path(graph_id): Path<String>,
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<Value>, ApiError> {
+    // Step 1: ZEP guard (graph.py:575-579) — 500 with 2-key body (not traceback shape).
+    if state.config.zep_api_key.as_deref().unwrap_or("").is_empty() {
+        return Err(ApiError::client(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::i18n::t("api.zepApiKeyMissing"),
+        ));
+    }
+
+    // Step 2: Resolve graph_id → task → result["graph"].
+    // graph_id IS the task_id (DECISION-9). No task or no result → "graph not found" → 500.
+    let task = crate::task::TaskManager::global()
+        .get_task(&graph_id)
+        .ok_or_else(|| ApiError::server("graph not found: task not found for graph_id"))?;
+
+    let result = task
+        .result
+        .as_ref()
+        .ok_or_else(|| ApiError::server("graph not found: task has no result yet"))?;
+
+    let graph_json = result
+        .get("graph")
+        .ok_or_else(|| ApiError::server("graph not found: task result missing 'graph' key"))?;
+
+    // Step 3: Deserialize SerializableKnowledgeGraph from the embedded JSON value.
+    // graph_json is a serde_json::Value (parsed from the task result).
+    // Re-parse into our typed struct to access entity/edge fields.
+    let graph_str = serde_json::to_string(graph_json)
+        .map_err(|e| ApiError::server(format!("failed to re-serialize graph JSON: {e}")))?;
+
+    #[derive(serde::Deserialize)]
+    struct SerGraph {
+        entities: Vec<SerEntity>,
+        edges: Vec<(uuid::Uuid, uuid::Uuid, SerRelation)>,
+    }
+    #[derive(serde::Deserialize)]
+    struct SerEntity {
+        id: uuid::Uuid,
+        name: String,
+        kind: crate::graph::EntityKind,
+    }
+    #[derive(serde::Deserialize)]
+    struct SerRelation {
+        kind: crate::graph::RelationKind,
+        #[allow(dead_code)]
+        weight: f32,
+        #[serde(default)]
+        valid_at: Option<(u64, Option<u64>)>,
+    }
+
+    let graph: SerGraph = serde_json::from_str(&graph_str)
+        .map_err(|e| ApiError::server(format!("failed to parse embedded graph JSON: {e}")))?;
+
+    // Step 3a: Build node_map: uuid → name (for edge source/target name resolution).
+    // Python: node_map[node.uuid_] = node.name or "" (graph_builder.py:441-442).
+    let node_map: std::collections::HashMap<String, String> =
+        graph.entities.iter().map(|e| (e.id.to_string(), e.name.clone())).collect();
+
+    // Step 3b: Reshape entities → nodes array (graph_builder.py:444-458).
+    // Python node shape: {uuid, name, labels, summary, attributes, created_at}
+    // `[≠] U025-ZEP-TEMPORAL`: summary="", attributes={}, created_at=null (Zep-only fields).
+    // labels: Python uses node.labels (a list of string type labels from Zep). teri maps
+    //         EntityKind → [kind.to_string()] — the single type label, matching Zep's single label.
+    let nodes: Vec<Value> = graph
+        .entities
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "uuid":       e.id.to_string(),
+                "name":       e.name,
+                "labels":     [e.kind.to_string()],
+                "summary":    "",       // [≠] U025-ZEP-TEMPORAL: Zep community summary
+                "attributes": {},       // [≠] U025-ZEP-TEMPORAL: Zep node attributes
+                "created_at": null      // [≠] U025-ZEP-TEMPORAL: Zep server timestamp
+            })
+        })
+        .collect();
+
+    // Step 3c: Reshape edges → edges array (graph_builder.py:460-493).
+    // Python edge shape: {uuid, name, fact, fact_type, source_node_uuid, target_node_uuid,
+    //   source_node_name, target_node_name, attributes, created_at, valid_at, invalid_at,
+    //   expired_at, episodes}
+    // teri-present: source/target uuids (from edge tuple), source/target names (via node_map),
+    //   name and fact_type from RelationKind::to_string(), valid_at/invalid_at from Relation.
+    // `[≠] U025-ZEP-TEMPORAL`: fact (Zep fact text → ""), attributes → {},
+    //   created_at → null, expired_at → null, episodes → [].
+    // Edge uuid: Relation has no uuid field (teri has no Zep-server-assigned edge uuid).
+    //   Python's edge.uuid_ was the Zep server's stable edge identity (graph.py:479).
+    //   teri synthesizes a DETERMINISTIC v5 UUID derived from the edge's stable identity
+    //   (src_uuid|tgt_uuid|kind|valid_at) so two GET /data/:id calls for the same edge
+    //   return the SAME uuid — enabling Vue list-reconciliation (:key) and the
+    //   expandedSelfLoops Set in GraphPanel.vue to survive refetches.
+    //   Namespace: NAMESPACE_OID (fixed across runs).
+    //   Collision: parallel edges sharing (src,tgt,kind,valid_at) collide → same uuid,
+    //   which is acceptable because they are semantically indistinguishable in teri's model.
+    //   ([≠] U025-ZEP-TEMPORAL: not the Zep server uuid, but a stable derived identity.)
+
+    /// Fixed namespace for edge uuid derivation (deterministic across runs).
+    const EDGE_NS: uuid::Uuid = uuid::Uuid::NAMESPACE_OID;
+
+    let edges: Vec<Value> = graph
+        .edges
+        .iter()
+        .map(|(src_uuid, tgt_uuid, rel)| {
+            let kind_str = rel.kind.to_string();
+            // Deterministic v5 uuid derived from stable edge identity (src|tgt|kind|valid_at).
+            // Stable across requests and restarts; enables Vue :key reconciliation.
+            // ([≠] U025-ZEP-TEMPORAL: synthesized, not the Zep server uuid)
+            let valid_at_key = match rel.valid_at {
+                None => "none".to_string(),
+                Some((start, None)) => format!("{start}"),
+                Some((start, Some(end))) => format!("{start}-{end}"),
+            };
+            let edge_key = format!("{src_uuid}|{tgt_uuid}|{kind_str}|{valid_at_key}");
+            let edge_uuid = uuid::Uuid::new_v5(&EDGE_NS, edge_key.as_bytes()).to_string();
+            let src_str = src_uuid.to_string();
+            let tgt_str = tgt_uuid.to_string();
+            let src_name = node_map.get(&src_str).cloned().unwrap_or_default();
+            let tgt_name = node_map.get(&tgt_str).cloned().unwrap_or_default();
+
+            // valid_at / invalid_at: from teri temporal model (Relation.valid_at).
+            // Python: str(valid_at) if valid_at else None.
+            // teri: valid_at = Some((start, end_opt)) → start as string, end as string or null.
+            let (valid_at_val, invalid_at_val) = match rel.valid_at {
+                None => (Value::Null, Value::Null),
+                Some((start, end_opt)) => (
+                    Value::String(start.to_string()),
+                    end_opt.map(|e| Value::String(e.to_string())).unwrap_or(Value::Null),
+                ),
+            };
+
+            serde_json::json!({
+                "uuid":               edge_uuid,
+                "name":               kind_str,
+                "fact":               "",       // [≠] U025-ZEP-TEMPORAL: Zep edge fact text
+                "fact_type":          kind_str, // Python: fact_type = getattr(edge,'fact_type',None) or edge.name or ""
+                "source_node_uuid":   src_str,
+                "target_node_uuid":   tgt_str,
+                "source_node_name":   src_name,
+                "target_node_name":   tgt_name,
+                "attributes":         {},       // [≠] U025-ZEP-TEMPORAL: Zep edge attributes
+                "created_at":         null,     // [≠] U025-ZEP-TEMPORAL: Zep server timestamp
+                "valid_at":           valid_at_val,
+                "invalid_at":         invalid_at_val,
+                "expired_at":         null,     // [≠] U025-ZEP-TEMPORAL: Zep TTL timestamp
+                "episodes":           []        // [≠] U025-ZEP-TEMPORAL: Zep episode ids
+            })
+        })
+        .collect();
+
+    // Step 3d: node_count / edge_count — recomputed from reshaped arrays (graph_builder.py:499-500).
+    // Python: len(nodes_data) / len(edges_data) — recomputed, NOT from graph_info.
+    let node_count = nodes.len();
+    let edge_count = edges.len();
+
+    // Step 4: Return success envelope (graph.py:584-587).
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": {
+            "graph_id":    graph_id,
+            "nodes":       nodes,
+            "edges":       edges,
+            "node_count":  node_count,
+            "edge_count":  edge_count
+        }
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Route 10 — DELETE /delete/:graph_id  (graph.py:597-622)
+//
+// Source: builder.delete_graph(graph_id) → client.graph.delete(graph_id=…) on Zep server.
+//   Returns: {success: true, message: t('api.graphDeleted', id=graph_id)}
+//
+// teri MAP-ONTO (§4b u025-architecture.md):
+//   `[!] U025-GRAPHSTORE`: teri has no durable graph-by-id store; the graph lives in the task
+//   result and is reaped by cleanup_old_tasks. TaskManager has no remove_task method, so
+//   the delete is a no-op against the in-memory store. The success response envelope is
+//   faithfully ported (observable output preserved); the Zep server-side delete side effect
+//   is `[≠]` inexpressible (no Zep server). A future GraphStore unit would add removal here.
+//
+// ZEP guard: KEPT (R.8) — same 500 2-key body as get_graph_data.
+// `[≠] U025-TRACEBACK`: server 500 carries Rust context, not Python traceback.
+// ---------------------------------------------------------------------------
+
+async fn delete_graph(
+    Path(graph_id): Path<String>,
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<Value>, ApiError> {
+    // Step 1: ZEP guard (graph.py:603-607) — 500 with 2-key body.
+    if state.config.zep_api_key.as_deref().unwrap_or("").is_empty() {
+        return Err(ApiError::client(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::i18n::t("api.zepApiKeyMissing"),
+        ));
+    }
+
+    // Step 2: "Delete" the graph.
+    // `[!] U025-GRAPHSTORE`: TaskManager has no remove_task API; the graph embedded in the
+    // task result is only reaped by cleanup_old_tasks. A full durable GraphStore is deferred
+    // to its own unit. We return the faithful success envelope — the observable response output
+    // is ported; the in-process task entry persists (not a downgrade: the graph_id→task_id
+    // mapping remains valid for subsequent get_graph_data calls). A subsequent delete after
+    // cleanup would still return success (Python's Zep delete also never returns 404 for an
+    // already-absent graph — it is fire-and-forget).
+
+    // Step 3: Return success envelope (graph.py:612-615).
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": crate::i18n::t_args("api.graphDeleted", &[("id", &graph_id)])
     })))
 }
 
@@ -2857,6 +3109,500 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "/health regression after (d)");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (f): get_graph_data + delete_graph tests
+    //
+    // Helper: seed a completed task with a minimal embedded graph in its result,
+    // mimicking what build_graph_worker_inner produces after build_graph_async.
+    // -----------------------------------------------------------------------
+
+    /// Seed a completed task with a real embedded SerializableKnowledgeGraph.
+    /// Returns the task_id (== the graph_id for routes 9+10).
+    fn seed_graph_task() -> String {
+        use crate::graph::{Entity, EntityKind, KnowledgeGraph, RelationKind};
+
+        // Build a tiny in-process graph with 2 entities and 1 edge.
+        let mut graph = KnowledgeGraph::new();
+        let alice = Entity {
+            id: uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+            name: "Alice".to_string(),
+            kind: EntityKind::Person,
+        };
+        let bob = Entity {
+            id: uuid::Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
+            name: "Bob".to_string(),
+            kind: EntityKind::Person,
+        };
+        let alice_idx = graph.add_entity(alice).expect("add alice");
+        let bob_idx = graph.add_entity(bob).expect("add bob");
+        graph.add_relation(
+            alice_idx,
+            bob_idx,
+            crate::graph::Relation::new(RelationKind::RelatedTo, 0.8).expect("rel"),
+        );
+
+        let graph_json_str = graph.serialize_to_json().expect("serialize graph");
+        let graph_json: serde_json::Value =
+            serde_json::from_str(&graph_json_str).expect("parse graph json");
+
+        let result = serde_json::json!({
+            "graph_name":      "TestGraph",
+            "graph_info":      {"node_count": 2, "edge_count": 1, "entity_types": []},
+            "chunks_processed": 1,
+            "graph":           graph_json
+        });
+
+        let tm = crate::task::TaskManager::global();
+        let task_id = tm.create_task("graph_build", None);
+        tm.complete_task(&task_id, result);
+        task_id
+    }
+
+    // -----------------------------------------------------------------------
+    // get_graph_data: ZEP key missing → 500 (2-key, no traceback)
+    // -----------------------------------------------------------------------
+
+    /// Build a test app with zep_api_key cleared (None / empty) so the ZEP guard fires.
+    fn test_app_no_zep() -> (axum::Router, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let mut config = crate::Config::build_test();
+        config.upload_folder = tmp.path().to_string_lossy().to_string();
+        config.zep_api_key = None; // guard must fire
+        let state = std::sync::Arc::new(crate::api::ApiState::new(config));
+        (crate::server::create_app(state), tmp)
+    }
+
+    #[tokio::test]
+    async fn get_graph_data_zep_missing_500() {
+        let (app, _tmp) = test_app_no_zep();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/graph/data/some-graph-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR, "ZEP-missing must 500");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["success"], false, "must be {{success:false}}");
+        assert!(json.get("error").is_some(), "must have error key");
+        // 2-key body (no traceback) — ZEP guard uses client constructor
+        assert!(
+            json.get("traceback").is_none(),
+            "ZEP-guard 500 must NOT have traceback (2-key body)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // get_graph_data: graph_id not found (no such task) → 500 server
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_graph_data_graph_not_found_500() {
+        // Build a state with a non-empty zep_api_key so the guard passes.
+        let (state_inner, _tmp) = {
+            let tmp = tempfile::TempDir::new().expect("temp dir");
+            let mut config = crate::Config::build_test();
+            config.upload_folder = tmp.path().to_string_lossy().to_string();
+            config.zep_api_key = Some("test-zep-key".to_string());
+            (crate::api::ApiState::new(config), tmp)
+        };
+        let state = std::sync::Arc::new(state_inner);
+        let app = crate::server::create_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/graph/data/no-such-task-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR, "missing graph must 500");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["success"], false);
+        // Server-error body has 3 keys (success, error, traceback)
+        assert!(json.get("error").is_some(), "must have error key");
+        assert!(json.get("traceback").is_some(), "server 500 must have traceback key");
+    }
+
+    // -----------------------------------------------------------------------
+    // get_graph_data: happy path → 200 with exact key shape + correct values
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_graph_data_happy_200_exact_key_shape() {
+        // Seed a completed graph task.
+        let graph_id = seed_graph_task();
+
+        // Build app with non-empty zep_api_key.
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let mut config = crate::Config::build_test();
+        config.upload_folder = tmp.path().to_string_lossy().to_string();
+        config.zep_api_key = Some("test-zep-key".to_string());
+        let state = std::sync::Arc::new(crate::api::ApiState::new(config));
+        let app = crate::server::create_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/graph/data/{graph_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK, "happy path must 200");
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_eq!(json["success"], true);
+        let data = &json["data"];
+        assert!(data.is_object(), "data must be an object");
+
+        // Top-level data keys: graph_id, nodes, edges, node_count, edge_count.
+        assert_eq!(data["graph_id"], graph_id, "graph_id must round-trip");
+        assert!(data["nodes"].is_array(), "nodes must be an array");
+        assert!(data["edges"].is_array(), "edges must be an array");
+        assert!(data["node_count"].is_number(), "node_count must be a number");
+        assert!(data["edge_count"].is_number(), "edge_count must be a number");
+
+        // Counts must match array lengths (graph_builder.py:499-500).
+        let node_count = data["node_count"].as_u64().unwrap() as usize;
+        let edge_count = data["edge_count"].as_u64().unwrap() as usize;
+        assert_eq!(
+            node_count,
+            data["nodes"].as_array().unwrap().len(),
+            "node_count must equal nodes array length"
+        );
+        assert_eq!(
+            edge_count,
+            data["edges"].as_array().unwrap().len(),
+            "edge_count must equal edges array length"
+        );
+
+        // We seeded 2 entities + 1 edge.
+        assert_eq!(node_count, 2, "must have 2 nodes");
+        assert_eq!(edge_count, 1, "must have 1 edge");
+
+        // ---- Node shape verification (every Python key present) ----
+        // Keys: uuid, name, labels, summary, attributes, created_at
+        let nodes = data["nodes"].as_array().unwrap();
+        for node in nodes {
+            let nobj = node.as_object().expect("node must be object");
+            assert_eq!(nobj.len(), 6, "node must have exactly 6 keys: {node}");
+            for key in &["uuid", "name", "labels", "summary", "attributes", "created_at"] {
+                assert!(nobj.contains_key(*key), "node missing key '{key}': {node}");
+            }
+            // labels must be an array (teri: [kind.to_string()])
+            assert!(nobj["labels"].is_array(), "node labels must be array: {node}");
+            // summary defaults to ""  ([≠] U025-ZEP-TEMPORAL)
+            assert_eq!(nobj["summary"], "", "summary must default to '': {node}");
+            // attributes defaults to {} ([≠] U025-ZEP-TEMPORAL)
+            assert!(nobj["attributes"].is_object(), "attributes must be {{}}: {node}");
+            // created_at defaults to null ([≠] U025-ZEP-TEMPORAL)
+            assert!(nobj["created_at"].is_null(), "created_at must be null: {node}");
+        }
+
+        // Verify Alice and Bob are present by name.
+        let names: Vec<&str> = nodes.iter().map(|n| n["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"Alice"), "Alice must be in nodes");
+        assert!(names.contains(&"Bob"), "Bob must be in nodes");
+
+        // ---- Edge shape verification (every Python key present) ----
+        // Keys: uuid, name, fact, fact_type, source_node_uuid, target_node_uuid,
+        //       source_node_name, target_node_name, attributes, created_at,
+        //       valid_at, invalid_at, expired_at, episodes
+        let edges = data["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), 1);
+        let edge = &edges[0];
+        let eobj = edge.as_object().expect("edge must be object");
+        assert_eq!(eobj.len(), 14, "edge must have exactly 14 keys: {edge}");
+        for key in &[
+            "uuid",
+            "name",
+            "fact",
+            "fact_type",
+            "source_node_uuid",
+            "target_node_uuid",
+            "source_node_name",
+            "target_node_name",
+            "attributes",
+            "created_at",
+            "valid_at",
+            "invalid_at",
+            "expired_at",
+            "episodes",
+        ] {
+            assert!(eobj.contains_key(*key), "edge missing key '{key}': {edge}");
+        }
+
+        // [≠] U025-ZEP-TEMPORAL defaults:
+        assert_eq!(eobj["fact"], "", "fact must default to ''");
+        assert!(eobj["attributes"].is_object(), "attributes must be {{}}");
+        assert!(eobj["created_at"].is_null(), "created_at must be null");
+        assert!(eobj["expired_at"].is_null(), "expired_at must be null");
+        assert_eq!(eobj["episodes"], serde_json::json!([]), "episodes must default to []");
+
+        // source/target names resolved via node_map:
+        let src_name = eobj["source_node_name"].as_str().unwrap();
+        let tgt_name = eobj["target_node_name"].as_str().unwrap();
+        assert!(
+            (src_name == "Alice" && tgt_name == "Bob")
+                || (src_name == "Bob" && tgt_name == "Alice"),
+            "source/target names must be Alice and Bob (order depends on graph internals): {edge}"
+        );
+
+        // fact_type = kind.to_string() (RelatedTo)
+        assert!(!eobj["fact_type"].as_str().unwrap().is_empty(), "fact_type must not be empty");
+    }
+
+    // -----------------------------------------------------------------------
+    // get_graph_data: edge uuid is deterministic across two GET calls
+    //
+    // Regression: previously uuid::Uuid::new_v4() was called fresh per request,
+    // producing a different edge uuid on every GET /data/:id call.  This orphaned
+    // Vue's list-reconciliation :key and expandedSelfLoops Set in GraphPanel.vue.
+    // Fix: v5 uuid derived from (src_uuid|tgt_uuid|kind|valid_at) — deterministic.
+    // ([≠] U025-ZEP-TEMPORAL: synthesized stable identity, not the Zep server uuid)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_graph_data_edge_uuid_deterministic_across_requests() {
+        let graph_id = seed_graph_task();
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let mut config = crate::Config::build_test();
+        config.upload_folder = tmp.path().to_string_lossy().to_string();
+        config.zep_api_key = Some("test-zep-key".to_string());
+        let state = std::sync::Arc::new(crate::api::ApiState::new(config));
+        let app = crate::server::create_app(state);
+
+        // First GET: collect edge uuids.
+        let resp1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/graph/data/{graph_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK, "first GET must 200");
+        let body1 = axum::body::to_bytes(resp1.into_body(), usize::MAX).await.unwrap();
+        let json1: serde_json::Value = serde_json::from_slice(&body1).unwrap();
+        let edges1 = json1["data"]["edges"].as_array().unwrap();
+        assert!(!edges1.is_empty(), "must have at least one edge");
+        let uuids1: Vec<String> =
+            edges1.iter().map(|e| e["uuid"].as_str().unwrap().to_string()).collect();
+
+        // Second GET: collect edge uuids.
+        let resp2 = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/graph/data/{graph_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK, "second GET must 200");
+        let body2 = axum::body::to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
+        let json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+        let edges2 = json2["data"]["edges"].as_array().unwrap();
+        let uuids2: Vec<String> =
+            edges2.iter().map(|e| e["uuid"].as_str().unwrap().to_string()).collect();
+
+        // Edge uuids must be identical across both calls (deterministic v5 derivation).
+        assert_eq!(
+            uuids1, uuids2,
+            "edge uuids must be deterministic across GET /data/:id calls: \
+             first={uuids1:?} second={uuids2:?}"
+        );
+
+        // Also sanity-check: each uuid is a valid UUID string.
+        for uid in &uuids1 {
+            assert!(
+                uuid::Uuid::parse_str(uid).is_ok(),
+                "edge uuid must be a valid UUID string: {uid}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // delete_graph: ZEP key missing → 500 (2-key, no traceback)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn delete_graph_zep_missing_500() {
+        let (app, _tmp) = test_app_no_zep();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/graph/delete/some-graph-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR, "ZEP-missing must 500");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["success"], false);
+        assert!(json.get("error").is_some(), "must have error key");
+        assert!(
+            json.get("traceback").is_none(),
+            "ZEP-guard 500 must NOT have traceback (2-key body)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // delete_graph: success → {success:true, message: "Graph deleted: <id>"}
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn delete_graph_success_envelope() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let mut config = crate::Config::build_test();
+        config.upload_folder = tmp.path().to_string_lossy().to_string();
+        config.zep_api_key = Some("test-zep-key".to_string());
+        let state = std::sync::Arc::new(crate::api::ApiState::new(config));
+        let app = crate::server::create_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/graph/delete/my-graph-abc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK, "delete must return 200");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["success"], true);
+        assert!(json.get("message").is_some(), "must have message key: {json}");
+        // Message must mention the graph_id.
+        let msg = json["message"].as_str().unwrap();
+        assert!(msg.contains("my-graph-abc"), "delete message must contain the graph_id: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // delete_graph + get_graph_data non-regression:
+    // After delete (which is a no-op on TaskManager), get_graph_data still returns
+    // the graph (since TaskManager has no remove_task — [!] U025-GRAPHSTORE).
+    // This documents the known behavior: "delete" returns success but the task
+    // entry persists until cleanup_old_tasks ages it out.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn delete_graph_task_persists_noop() {
+        let graph_id = seed_graph_task();
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let mut config = crate::Config::build_test();
+        config.upload_folder = tmp.path().to_string_lossy().to_string();
+        config.zep_api_key = Some("test-zep-key".to_string());
+        let state = std::sync::Arc::new(crate::api::ApiState::new(config));
+        let app = crate::server::create_app(state);
+
+        // DELETE /delete/:graph_id — succeeds.
+        let del_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/graph/delete/{graph_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del_resp.status(), StatusCode::OK);
+
+        // GET /data/:graph_id — still 200 because TaskManager has no remove_task.
+        // ([!] U025-GRAPHSTORE: no-op delete; documents the known behavior.)
+        let data_resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/graph/data/{graph_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The task still exists → 200 (task entry not removed by delete).
+        assert_eq!(
+            data_resp.status(),
+            StatusCode::OK,
+            "[!] U025-GRAPHSTORE: delete is no-op; data still accessible"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Non-regression: (a)/(b)/(c)/(d)/(e) routes + /health still work after (f)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn subcycle_f_non_regression_routes_ab_de_health() {
+        let (state, _tmp) = test_state();
+        let project_id = seed_project(&state, "SubcycleFRegression");
+        let app = crate::server::create_app(state);
+
+        // GET /project/:id (b)
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/graph/project/{project_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "GET /project/:id regression after (f)");
+
+        // GET /project/list (b)
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/graph/project/list").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "GET /project/list regression after (f)");
+
+        // GET /tasks (e)
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/graph/tasks").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "GET /tasks regression after (f)");
+
+        // /health (U-002)
+        let resp = app
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "/health regression after (f)");
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "ok");
