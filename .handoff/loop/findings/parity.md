@@ -2322,3 +2322,58 @@ re-verify. Symbols S-681..S-698 remain `- [~]`.
 **Build-health note (for build-health-auditor, NOT a parity finding):** `cargo fmt -p teri --check` flags 2 pre-existing porter lines in the h1 deliverable (manager.rs:1584 multi-line `update_progress` test call; mod.rs:591 `new_react` `Self{...}` line). Format is a commit precondition owned by build-health — fix before the unit ledger commits. Does not affect behavioral parity.
 
 **h1 OVERALL VERDICT: PASS.** The -1 fix matches Python byte-for-byte (key order + integer -1 + null + array), all 5 stage values are correct and agree with ReportStatus, the ReportSink scaffolding is a verified strict-superset substrate (not a drop), and nothing from generate_report was silently dropped — the orchestration is legitimately deferred to h2/h3 with tracked parity criteria.
+
+---
+
+## 2026-06-18 — U-024 sub-cycle (h2) ROUND-2 RE-VERIFY · `generate_report` skeleton · VERDICT: PASS
+
+**Scope:** Re-verify the porter's fix for the Round-1 FAIL (post-planning failure dropped the built
+outline from the FAILED `meta.json`). Skeleton scope only (planning + finalize/error tails); the
+per-section loop is h3.
+
+**Round-1 downgrade — CONFIRMED GONE.** `generate_report` (src/report/mod.rs:1535) now hoists the
+`report` object BEFORE the async try-body (mod.rs:1591). The try-body returns `std::io::Result<()>` and
+mutates `report` in place; the success arm returns it as `Completed`; the **error arm mutates the SAME
+object** — `status=Failed`, `error=Some(...)` — WITHOUT resetting `outline`/`markdown_content`/
+`completed_at` (mod.rs:1779-1780). This is the faithful map of Python's `except` (report_agent.py:1742-1743)
+which mutates the in-scope `report` already holding `.outline` (py:1615). `Report.to_dict` serializes
+`outline.to_dict() if self.outline else None` (py:462), so the retained outline lands in the FAILED
+`meta.json`.
+
+**On-disk assertion confirmed (not just in-memory).** New test `test_generate_report_h2_failed_meta_retains_outline`
+(mod.rs:3409) injects EISDIR on `full_report.md` (pre-creates it as a directory) so plan_outline +
+save_outline succeed but `assemble_full_report` fails post-planning. It asserts the ON-DISK `meta.json`
+(written by the error tail's best-effort `save_report`) has `status="failed"` AND non-null `outline` with
+`title="Future Prediction Report"` + 2 sections (mod.rs:3454-3479) — matching Python `save_report(report)`
+at py:1751. Re-ran the EISDIR probe independently: `cargo test test_generate_report_h2_failed_meta_retains_outline`
+= 1 passed.
+
+**No NEW divergence from the restructure.** Happy-path side-effect ORDER diffed step-by-step vs Python
+1577-1738 — identical: ensure_folder → ReportLogger+log_start → ConsoleLogger → update_progress(pending,0)
+→ save_report → status=Planning → update_progress(planning,5) → log_planning_start → emit(Planning,0) →
+plan_outline(prog//5 closure) → report.outline= → log_planning_complete → save_outline →
+update_progress(planning,15) → save_report → info(outlineSavedToFile) → status=Generating → assemble →
+status=Completed/completed_at → log_report_complete → save_report → update_progress(completed,100) →
+emit(Completed,100) → info(reportGenDone) → close console. progress.json sequence = pending 0 / planning 5 /
+planning 15 / completed 100. plan_cb rescale `(prog/5)` (mod.rs:1667) = Python `prog//5` (py:1613), test
+asserts 30//5=6, 80//5=16, 100//5=20 reach the sink. Error tail emits NO sink event, calls log_error,
+best-effort `let _ =` on save_report + update_progress(failed,-1), closes+clears console_logger
+(`self.console_logger.take()`, mod.rs:1800) — exact map of py:1740-1764. Diff vs HEAD: `src/report/mod.rs`
+ONLY, **884 insertions / 0 deletions** → template path (`generate_stream`/`generate`/`PredictionReport`,
+mod.rs:1304/1415/81) definitionally untouched.
+
+**Green.** `cargo test -p teri test_generate_report_h2` = **11 passed**. Full suite `cargo test -p teri` =
+**1214 passed / 6 ignored / 0 failed**. `cargo clippy --all-targets -p teri` = clean.
+
+**Legit `[!]` nondeterminism ledger (no `[≠]`):**
+- `report_id` = `report_{uuid12}` — random; tests pass explicit id, auto-gen verified by shape only.
+- `total_time_seconds` = wall time — asserted as number-shape, not value.
+- `created_at`/`completed_at` = local isoformat wall time — same posture.
+- `interview_agents` pending U-020 — honest-err `[!]` on the tool, not on generate_report. Loop tolerates it.
+
+**No `[≠]` introduced.** Every observable artifact the skeleton produces (meta.json, outline.json,
+progress.json sequence, agent_log.jsonl orchestration lines, sink events) is PORTED, none skipped.
+
+**h2 OVERALL VERDICT: PASS.** Round-1 downgrade fixed and regression-locked; no new divergence introduced
+by the restructure. S-763 cleared for the **h2 skeleton scope** (kept `- [~]` in symbol-map with the h2-PASS
+annotation; the section loop = h3 keeps the symbol open for full clearance).

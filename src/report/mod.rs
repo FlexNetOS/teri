@@ -1498,6 +1498,313 @@ impl ReportAgent {
 
         agents
     }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (h2): generate_report skeleton
+    //
+    // Port of `ReportAgent.generate_report` (report_agent.py:1532-1765).
+    //
+    // Scope: all control flow EXCEPT the per-section loop body (h3 adds that).
+    // Status machine: Pending → Planning → Generating → Completed (success)
+    //                                                  → Failed (error tail).
+    //
+    // The section loop placeholder: assemble_full_report is called immediately
+    // after status→Generating with no section files written, yielding a
+    // header-only full_report.md. h3 replaces this placeholder with the real loop.
+    //
+    // BORROW BRIDGE: ProgressCallback<'_> is `Fn` (not `FnMut`), but
+    // `ReportSink::event` requires `&mut self`. We bridge with `RefCell<&mut sink>`
+    // so closures can capture a shared reference to the cell and call `borrow_mut()`
+    // inside the `Fn` body. `sink` is a separate param from `self`, so the RefCell
+    // borrow is independent of the `&mut self` borrow on `plan_outline`.
+    // -----------------------------------------------------------------------
+
+    /// Orchestrate a full ReACT report run.
+    ///
+    /// Port of `ReportAgent.generate_report` (`report_agent.py:1532-1765`).
+    ///
+    /// # Arguments
+    /// * `tools`     — `ReportTools` bound to the graph; passed to `plan_outline`.
+    /// * `llm`       — LLM client.
+    /// * `manager`   — Instance-based `ReportManager` (holds the upload folder root).
+    /// * `sink`      — Progress/SSE surface (`NullSink` in tests).
+    /// * `report_id` — Optional explicit ID; `None` → `"report_{uuid12}"` auto-gen.
+    ///
+    /// Always returns a `Report`; the status is `Completed` on success, `Failed` on any error.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn generate_report<L: LlmClient>(
+        &mut self,
+        tools: &crate::services::zep_tools::ReportTools<'_, L>,
+        llm: &L,
+        manager: &crate::report::manager::ReportManager,
+        sink: &mut dyn crate::report::sink::ReportSink,
+        report_id: Option<String>,
+    ) -> Report {
+        use crate::models::project::python_isoformat_local;
+        use crate::report::sink::{ReportEvent, ReportStage};
+        use std::cell::RefCell;
+        use std::time::Instant;
+
+        // ── report_id: auto-gen or caller-supplied (report_agent.py:1561-1562) ──
+        // Python: `f"report_{uuid.uuid4().hex[:12]}"`
+        // Uuid::simple() = 32-char dashless hex; [:12] = first 12 chars.
+        let report_id = report_id.filter(|s| !s.is_empty()).unwrap_or_else(|| {
+            let hex = uuid::Uuid::new_v4().simple().to_string();
+            format!("report_{}", &hex[..12])
+        });
+
+        // ── start_time for total_time_seconds (report_agent.py:1563) ──
+        let start_time = Instant::now();
+
+        // ── Initial report template values — captured before the async try-body ──
+        // The async try-body constructs its OWN local `report` from these.
+        // This lets the error tail also build a `Failed` report without fighting
+        // the borrow checker over a moved-out value.
+        let created_at = python_isoformat_local();
+
+        // ── completed_section_titles: declared before the try-body so the error
+        //    tail can pass it to update_progress(failed) (report_agent.py:1575).
+        let completed_section_titles: Vec<String> = vec![];
+
+        // ── BORROW BRIDGE: wrap sink in RefCell so Fn closures can call borrow_mut ──
+        // This is safe: `sink_cell` is only used in this scope; we borrow it through
+        // shared refs inside `Fn` closures to satisfy the `ProgressCallback<'_>` bound.
+        let sink_cell = RefCell::new(sink as &mut dyn crate::report::sink::ReportSink);
+
+        // ── Helper to emit a top-level ReportEvent through the RefCell ──
+        let emit_event = |stage: ReportStage, progress: i32, message: &str| {
+            sink_cell.borrow_mut().event(&ReportEvent {
+                stage,
+                progress,
+                message: message.to_string(),
+                section_title: None,
+                section_index: None,
+                section_content: None,
+                report_id: report_id.clone(),
+            });
+        };
+
+        // ── Hoist `report` before the try-body so the error tail can mutate the
+        //    SAME object (matching Python's `except` which mutates the in-scope
+        //    `report` rather than constructing a fresh one).
+        //    report_agent.py:1577-1578: `report = Report(...)` before the try.
+        let mut report = Report {
+            report_id: report_id.clone(),
+            simulation_id: self.simulation_id.clone(),
+            graph_id: self.graph_id.clone(),
+            simulation_requirement: self.simulation_requirement.clone(),
+            status: ReportStatus::Pending,
+            outline: None,
+            markdown_content: String::new(),
+            created_at: created_at.clone(),
+            completed_at: String::new(),
+            error: None,
+        };
+
+        // ── Try-body (report_agent.py:1577-1738) ──
+        // Returns std::io::Result<()>; mutates `report` in place.
+        // `?` propagates any I/O error to the except tail.
+        let try_result: std::io::Result<()> = async {
+            // (report already constructed above)
+
+            // Step 1: ensure report folder (report_agent.py:1579)
+            manager.ensure_report_folder(&report_id)?;
+
+            // Step 2: init structured logger (report_agent.py:1581-1587)
+            let upload_folder = manager.upload_folder().ok_or_else(|| {
+                std::io::Error::other(
+                    "ReportManager has no upload_folder (reports_dir has no parent)",
+                )
+            })?;
+            self.report_logger =
+                Some(crate::report::logger::ReportLogger::new(&report_id, upload_folder)?);
+            if let Some(l) = &self.report_logger {
+                l.log_start(&self.simulation_id, &self.graph_id, &self.simulation_requirement);
+            }
+
+            // Step 3: init console logger (report_agent.py:1589-1590)
+            self.console_logger = Some(crate::report::console_logger::ReportConsoleLogger::new(
+                &report_id,
+                upload_folder,
+            )?);
+
+            // Step 4: update_progress(pending, 0) + save_report (report_agent.py:1592-1596)
+            manager.update_progress(
+                &report_id,
+                "pending",
+                0,
+                &crate::i18n::t("progress.initReport"),
+                None,
+                Some(&[]),
+            )?;
+            manager.save_report(&report)?;
+
+            // Step 5: status → Planning (report_agent.py:1599-1613)
+            report.status = ReportStatus::Planning;
+            manager.update_progress(
+                &report_id,
+                "planning",
+                5,
+                &crate::i18n::t("progress.startPlanningOutline"),
+                None,
+                Some(&[]),
+            )?;
+
+            // log_planning_start (report_agent.py:1606)
+            if let Some(l) = &self.report_logger {
+                l.log_planning_start();
+            }
+
+            // sink.event(planning, 0, startPlanningOutline) (report_agent.py:1608-1609)
+            emit_event(ReportStage::Planning, 0, &crate::i18n::t("progress.startPlanningOutline"));
+
+            // Step 6: call plan_outline with planning_closure (report_agent.py:1611-1614)
+            // The closure rescales prog//5 (integer division), matching Python line 1613.
+            // We capture &sink_cell (Fn, shared ref → compatible with ProgressCallback bound).
+            let plan_cb = |_stage: &str, prog: u32, msg: &str| {
+                sink_cell.borrow_mut().event(&ReportEvent {
+                    stage: ReportStage::Planning,
+                    progress: (prog / 5) as i32,
+                    message: msg.to_string(),
+                    section_title: None,
+                    section_index: None,
+                    section_content: None,
+                    report_id: report_id.clone(),
+                });
+            };
+            // plan_outline takes &self (immutable). plan_outline only reads graph_id,
+            // simulation_requirement, and report_logger, so the immutable reborrow is valid.
+            let outline = self.plan_outline(tools, llm, Some(&plan_cb)).await;
+            report.outline = Some(outline.clone());
+
+            // log_planning_complete (report_agent.py:1618)
+            if let Some(l) = &self.report_logger {
+                l.log_planning_complete(serde_json::Value::Object(outline.to_dict()));
+            }
+
+            // save outline + update_progress(planning, 15) + save_report (report_agent.py:1621-1626)
+            manager.save_outline(&report_id, &outline)?;
+            manager.update_progress(
+                &report_id,
+                "planning",
+                15,
+                &crate::i18n::t_args("progress.outlineDone", &[("count", &outline.sections.len())]),
+                None,
+                Some(&[]),
+            )?;
+            manager.save_report(&report)?;
+
+            // tracing::info outlineSavedToFile (report_agent.py:1628)
+            tracing::info!(
+                target: "teri::report",
+                "{}",
+                crate::i18n::t_args("report.outlineSavedToFile", &[("reportId", &report_id)])
+            );
+
+            // Step 7: status → Generating (report_agent.py:1631)
+            report.status = ReportStatus::Generating;
+
+            // total_sections for log_report_complete (h2: no loop yet — h3 adds it)
+            let total_sections = outline.sections.len();
+
+            // ── (h2) PLACEHOLDER: no section loop ──
+            // h3 will insert the per-section streaming loop here.
+            // For the skeleton, assemble immediately over the outline with no section files
+            // written. This yields a header+summary only markdown (documented h2 behavior).
+
+            // Step 8: assemble full report (report_agent.py:1707)
+            report.markdown_content = manager.assemble_full_report(&report_id, &outline)?;
+
+            // Step 9: status → Completed, completed_at, total_time (report_agent.py:1708-1712)
+            report.status = ReportStatus::Completed;
+            report.completed_at = python_isoformat_local();
+            let total_time_seconds = start_time.elapsed().as_secs_f64();
+
+            // log_report_complete (report_agent.py:1715-1719)
+            if let Some(l) = &self.report_logger {
+                l.log_report_complete(total_sections, total_time_seconds);
+            }
+
+            // save_report + update_progress(completed, 100) (report_agent.py:1722-1726)
+            manager.save_report(&report)?;
+            manager.update_progress(
+                &report_id,
+                "completed",
+                100,
+                &crate::i18n::t("progress.reportComplete"),
+                None,
+                Some(&completed_section_titles),
+            )?;
+
+            // sink.event(completed, 100, reportComplete) (report_agent.py:1728-1729)
+            emit_event(ReportStage::Completed, 100, &crate::i18n::t("progress.reportComplete"));
+
+            // tracing::info reportGenDone (report_agent.py:1731)
+            tracing::info!(
+                target: "teri::report",
+                "{}",
+                crate::i18n::t_args("report.reportGenDone", &[("reportId", &report_id)])
+            );
+
+            // Close console_logger on success tail (report_agent.py:1734-1736)
+            if let Some(mut cl) = self.console_logger.take() {
+                cl.close();
+            }
+
+            Ok(())
+        }
+        .await;
+
+        // ── except/error tail (report_agent.py:1740-1764) ──
+        // Python mutates the SAME `report` object (the one already holding
+        // `.outline`, `.markdown_content`, `.completed_at` from the try-body).
+        // We do the same: on Ok we return `report` as-is (Completed); on Err we
+        // mutate `status`/`error` on the SAME `report` without resetting the
+        // fields the try-body already set — so a post-planning I/O failure
+        // produces a Failed meta.json that still carries the outline.
+        match try_result {
+            Ok(()) => report,
+            Err(e) => {
+                let err_str = e.to_string();
+                // report_agent.py:1741: logger.error(t('report.reportGenFailed', error=str(e)))
+                tracing::error!(
+                    target: "teri::report",
+                    "{}",
+                    crate::i18n::t_args("report.reportGenFailed", &[("error", &err_str)])
+                );
+
+                // Mutate the SAME report — preserve outline/markdown_content/completed_at
+                // exactly as they were set by the try-body before the failure.
+                // (report_agent.py:1742-1744: report.status = "failed"; report.error = str(e))
+                report.status = ReportStatus::Failed;
+                report.error = Some(err_str.clone());
+
+                // log_error (report_agent.py:1746-1747)
+                if let Some(l) = &self.report_logger {
+                    l.log_error(&err_str, "failed", None);
+                }
+
+                // inner try: save_report + update_progress(failed, -1) — ignore errors
+                // (report_agent.py:1750-1757: `except: pass`)
+                let _ = manager.save_report(&report);
+                let _ = manager.update_progress(
+                    &report_id,
+                    "failed",
+                    -1,
+                    &crate::i18n::t_args("progress.reportFailed", &[("error", &err_str)]),
+                    None,
+                    Some(&completed_section_titles),
+                );
+
+                // Close console_logger on error tail (report_agent.py:1759-1762)
+                if let Some(mut cl) = self.console_logger.take() {
+                    cl.close();
+                }
+
+                report
+            }
+        }
+    }
 }
 
 impl Default for ReportAgent {
@@ -2745,6 +3052,583 @@ Final Answer: This is premature."#;
         assert!(
             !log_path.exists(),
             "agent_log.jsonl must NOT be created when report_logger is None"
+        );
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (h2): generate_report skeleton parity tests
+    //
+    // Strategy:
+    //   - MockChatJsonLlm returns a 2-section outline (already defined above).
+    //   - NullSink for sink (no SSE channel needed).
+    //   - Explicit report_id for determinism.
+    //   - Temp dir via std::env::temp_dir() for upload_folder.
+    //   - Assert: status Completed, progress.json write sequence, outline.json,
+    //     agent_log.jsonl (log_start / planning_start / planning_complete / report_complete),
+    //     and the error path (FailingChatJsonLlm → status Failed, progress=-1, log_error).
+    // -----------------------------------------------------------------------
+
+    /// Shared outline mock response for (h2) tests.
+    fn h2_outline_response() -> serde_json::Value {
+        serde_json::json!({
+            "title": "Future Prediction Report",
+            "summary": "A summary of predictions.",
+            "sections": [
+                {"title": "Section One"},
+                {"title": "Section Two"}
+            ]
+        })
+    }
+
+    /// Parse agent_log.jsonl and return all entries.
+    fn parse_agent_log(
+        dir: &std::path::Path,
+        report_id: &str,
+    ) -> Vec<serde_json::Map<String, serde_json::Value>> {
+        use std::io::BufRead as _;
+        let log_path = dir.join("reports").join(report_id).join("agent_log.jsonl");
+        if !log_path.exists() {
+            return vec![];
+        }
+        let f = std::fs::File::open(&log_path).expect("agent_log.jsonl must be readable");
+        std::io::BufReader::new(f)
+            .lines()
+            .filter_map(|l| {
+                let l = l.ok()?;
+                if l.trim().is_empty() {
+                    return None;
+                }
+                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&l).ok()
+            })
+            .collect()
+    }
+
+    /// Parse progress.json and return the map.
+    fn read_progress(
+        dir: &std::path::Path,
+        report_id: &str,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let path = dir.join("reports").join(report_id).join("progress.json");
+        let data = std::fs::read_to_string(&path).expect("progress.json must exist");
+        serde_json::from_str(&data).expect("progress.json must be valid JSON")
+    }
+
+    // ── (h2)-1: explicit report_id, happy path ───────────────────────────────
+
+    #[tokio::test]
+    async fn test_generate_report_h2_explicit_id_status_completed() {
+        let llm = MockChatJsonLlm { response: h2_outline_response() };
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let upload_dir = std::env::temp_dir().join(format!("teri_h2_happy_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+        let mut agent = ReportAgent::new_react("g-h2", "sim-h2", "test requirement");
+
+        let mut null_sink = crate::report::sink::NullSink;
+        let report = agent
+            .generate_report(
+                &tools,
+                &llm,
+                &mgr,
+                &mut null_sink,
+                Some("report_h2testexplicit".to_string()),
+            )
+            .await;
+
+        assert_eq!(report.report_id, "report_h2testexplicit");
+        assert_eq!(report.status, ReportStatus::Completed);
+        assert!(report.error.is_none());
+        // outline must be set
+        assert!(report.outline.is_some());
+        let outline = report.outline.as_ref().unwrap();
+        assert_eq!(outline.title, "Future Prediction Report");
+        assert_eq!(outline.sections.len(), 2);
+        // completed_at must be non-empty
+        assert!(!report.completed_at.is_empty());
+        // markdown_content must be non-empty (header assembled even with no sections)
+        assert!(!report.markdown_content.is_empty());
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    // ── (h2)-2: auto-gen report_id shape ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_generate_report_h2_autogen_id_shape() {
+        let llm = MockChatJsonLlm { response: h2_outline_response() };
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let upload_dir =
+            std::env::temp_dir().join(format!("teri_h2_autoid_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+        let mut agent = ReportAgent::new_react("g-h2", "sim-h2", "auto-id test");
+
+        let mut null_sink = crate::report::sink::NullSink;
+        // Pass None → auto-gen
+        let report = agent.generate_report(&tools, &llm, &mgr, &mut null_sink, None).await;
+
+        // Shape: ^report_[0-9a-f]{12}$
+        let id = &report.report_id;
+        let re = regex::Regex::new(r"^report_[0-9a-f]{12}$").unwrap();
+        assert!(re.is_match(id), "auto-gen report_id shape mismatch: {id:?}");
+
+        // Empty-string is also auto-generated
+        let mut null_sink2 = crate::report::sink::NullSink;
+        let report2 = agent
+            .generate_report(&tools, &llm, &mgr, &mut null_sink2, Some(String::new()))
+            .await;
+        let id2 = &report2.report_id;
+        assert!(re.is_match(id2), "empty-string report_id must be auto-gen: {id2:?}");
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    // ── (h2)-3: progress.json write sequence ─────────────────────────────────
+
+    #[tokio::test]
+    async fn test_generate_report_h2_progress_json_sequence() {
+        let llm = MockChatJsonLlm { response: h2_outline_response() };
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let upload_dir =
+            std::env::temp_dir().join(format!("teri_h2_progress_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+        let mut agent = ReportAgent::new_react("g-h2", "sim-h2", "progress test");
+        let report_id = "report_h2progresstest";
+
+        let mut null_sink = crate::report::sink::NullSink;
+        let report = agent
+            .generate_report(&tools, &llm, &mgr, &mut null_sink, Some(report_id.to_string()))
+            .await;
+
+        assert_eq!(report.status, ReportStatus::Completed, "must be Completed on success");
+
+        // Final progress.json must have progress=100, status="completed".
+        // (Python writes multiple times; we can only assert the FINAL state on disk.)
+        let progress = read_progress(&upload_dir, report_id);
+        assert_eq!(
+            progress.get("progress").and_then(|v| v.as_i64()),
+            Some(100),
+            "final progress must be 100"
+        );
+        assert_eq!(
+            progress.get("status").and_then(|v| v.as_str()),
+            Some("completed"),
+            "final status must be completed"
+        );
+        // completed_sections must be an array (even if empty in h2 skeleton)
+        assert!(
+            progress.get("completed_sections").map(|v| v.is_array()).unwrap_or(false),
+            "completed_sections must be an array"
+        );
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    // ── (h2)-4: outline.json saved ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_generate_report_h2_outline_json_saved() {
+        let llm = MockChatJsonLlm { response: h2_outline_response() };
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let upload_dir =
+            std::env::temp_dir().join(format!("teri_h2_outline_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+        let mut agent = ReportAgent::new_react("g-h2", "sim-h2", "outline test");
+        let report_id = "report_h2outlinetest";
+
+        let mut null_sink = crate::report::sink::NullSink;
+        agent
+            .generate_report(&tools, &llm, &mgr, &mut null_sink, Some(report_id.to_string()))
+            .await;
+
+        let outline_path = upload_dir.join("reports").join(report_id).join("outline.json");
+        assert!(outline_path.exists(), "outline.json must be saved");
+        let data: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&outline_path).unwrap()).unwrap();
+        assert_eq!(data["title"], "Future Prediction Report");
+        assert_eq!(data["sections"].as_array().unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    // ── (h2)-5: agent_log.jsonl orchestration lines ──────────────────────────
+
+    #[tokio::test]
+    async fn test_generate_report_h2_agent_log_orchestration_actions() {
+        let llm = MockChatJsonLlm { response: h2_outline_response() };
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let upload_dir =
+            std::env::temp_dir().join(format!("teri_h2_agentlog_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+        let mut agent = ReportAgent::new_react("g-h2", "sim-h2", "log test");
+        let report_id = "report_h2logtest";
+
+        let mut null_sink = crate::report::sink::NullSink;
+        agent
+            .generate_report(&tools, &llm, &mgr, &mut null_sink, Some(report_id.to_string()))
+            .await;
+
+        let entries = parse_agent_log(&upload_dir, report_id);
+        let actions: Vec<&str> = entries.iter().filter_map(|e| e["action"].as_str()).collect();
+
+        // Must contain these four orchestration-level log actions in order:
+        //   report_start, planning_start, planning_complete, report_complete
+        // (h3 will add section-level actions)
+        assert!(
+            actions.contains(&"report_start"),
+            "agent_log must have report_start; found: {actions:?}"
+        );
+        assert!(
+            actions.contains(&"planning_start"),
+            "agent_log must have planning_start; found: {actions:?}"
+        );
+        assert!(
+            actions.contains(&"planning_complete"),
+            "agent_log must have planning_complete; found: {actions:?}"
+        );
+        assert!(
+            actions.contains(&"report_complete"),
+            "agent_log must have report_complete; found: {actions:?}"
+        );
+
+        // Order check: report_start < planning_start < planning_complete < report_complete
+        let pos_start = actions.iter().position(|&a| a == "report_start").unwrap();
+        let pos_plan_start = actions.iter().position(|&a| a == "planning_start").unwrap();
+        let pos_plan_done = actions.iter().position(|&a| a == "planning_complete").unwrap();
+        let pos_done = actions.iter().position(|&a| a == "report_complete").unwrap();
+        assert!(pos_start < pos_plan_start, "report_start must precede planning_start");
+        assert!(pos_plan_start < pos_plan_done, "planning_start must precede planning_complete");
+        assert!(pos_plan_done < pos_done, "planning_complete must precede report_complete");
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    // ── (h2)-6: report_complete log has total_sections + total_time_seconds ──
+
+    #[tokio::test]
+    async fn test_generate_report_h2_report_complete_log_shape() {
+        let llm = MockChatJsonLlm { response: h2_outline_response() };
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let upload_dir =
+            std::env::temp_dir().join(format!("teri_h2_complete_log_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+        let mut agent = ReportAgent::new_react("g-h2", "sim-h2", "shape test");
+        let report_id = "report_h2completelog";
+
+        let mut null_sink = crate::report::sink::NullSink;
+        agent
+            .generate_report(&tools, &llm, &mgr, &mut null_sink, Some(report_id.to_string()))
+            .await;
+
+        let entries = parse_agent_log(&upload_dir, report_id);
+        let complete_entry = entries
+            .iter()
+            .find(|e| e["action"].as_str() == Some("report_complete"))
+            .expect("report_complete entry must exist");
+
+        let details = complete_entry["details"].as_object().unwrap();
+        // total_sections = 2 (the mock outline has 2 sections)
+        assert_eq!(details["total_sections"].as_u64(), Some(2), "total_sections must be 2");
+        // total_time_seconds must be a number (wall time — nondeterministic, assert shape)
+        assert!(details["total_time_seconds"].is_number(), "total_time_seconds must be a number");
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    // ── (h2)-7: error path → status Failed, progress=-1, log_error present ──
+
+    #[tokio::test]
+    async fn test_generate_report_h2_error_path_failed_status() {
+        // FailingChatJsonLlm makes plan_outline return the fallback outline
+        // (NOT an error — plan_outline catches and returns fallback). So to
+        // trigger the error tail we need an error from a later step.
+        //
+        // Strategy: use a manager pointed at a read-only path so save_report fails.
+        // But that's OS-dependent. Instead we rely on the fact that
+        // FailingChatJsonLlm makes plan_outline use the fallback (3 sections),
+        // and generate_report itself succeeds (the fallback is a valid outline).
+        // For a TRUE error-tail test we need a failing manager operation.
+        //
+        // We simulate this by using a path that doesn't exist and is not writable.
+        // On Linux the path /proc is not writable; use /proc/fake as upload_folder.
+        // This makes ensure_report_folder fail → error tail.
+        let llm = MockChatJsonLlm { response: h2_outline_response() };
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        // Use /proc as the upload_folder — ensure_report_folder cannot create dirs there.
+        let mgr = crate::report::manager::ReportManager::new(std::path::Path::new(
+            "/proc/teri_h2_fail_test_not_real",
+        ));
+        let mut agent = ReportAgent::new_react("g-h2", "sim-h2", "error path test");
+
+        let mut null_sink = crate::report::sink::NullSink;
+        let report = agent
+            .generate_report(
+                &tools,
+                &llm,
+                &mgr,
+                &mut null_sink,
+                Some("report_h2failtest".to_string()),
+            )
+            .await;
+
+        assert_eq!(report.status, ReportStatus::Failed, "status must be Failed on IO error");
+        assert!(report.error.is_some(), "error field must be set on Failed path");
+        // console_logger must be cleared (no leak)
+        assert!(agent.console_logger.is_none(), "console_logger must be None after error tail");
+    }
+
+    // ── (h2)-7b: post-planning failure retains outline in FAILED meta.json ────
+    //
+    // Regression test for the downgrade caught by the parity gate:
+    // Python's `except` block mutates the SAME `report` object that already has
+    // `.outline` set (from plan_outline at py:1615). So a post-planning I/O failure
+    // (e.g. EISDIR on full_report.md) must produce a Failed `meta.json` that
+    // STILL carries the outline — not a fresh `outline: null`.
+    //
+    // We inject the EISDIR by pre-creating `full_report.md` as a directory before
+    // calling generate_report, so:
+    //   - ensure_report_folder succeeds (dir already exists → create_dir_all is no-op)
+    //   - plan_outline succeeds → report.outline = Some(outline)
+    //   - save_outline, update_progress succeed
+    //   - assemble_full_report fails with EISDIR when it tries to write full_report.md
+    //   → error tail mutates the same `report` → meta.json on disk has non-null outline
+    #[tokio::test]
+    async fn test_generate_report_h2_failed_meta_retains_outline() {
+        let llm = MockChatJsonLlm { response: h2_outline_response() };
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let upload_dir =
+            std::env::temp_dir().join(format!("teri_h2_outline_retain_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let report_id = "report_h2outlineretain";
+
+        // Pre-create the report directory and put a directory where full_report.md would go.
+        // This means plan_outline can run and save outline.json, but assemble_full_report
+        // will fail with EISDIR when it tries to write to full_report.md.
+        let report_dir = upload_dir.join("reports").join(report_id);
+        std::fs::create_dir_all(&report_dir).expect("must create report_dir");
+        let full_report_path = report_dir.join("full_report.md");
+        std::fs::create_dir_all(&full_report_path)
+            .expect("must create full_report.md as a directory (EISDIR trap)");
+
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+        let mut agent = ReportAgent::new_react("g-h2", "sim-h2", "outline retain test");
+        let mut null_sink = crate::report::sink::NullSink;
+        let report = agent
+            .generate_report(&tools, &llm, &mgr, &mut null_sink, Some(report_id.to_string()))
+            .await;
+
+        // (a) Returned report must be Failed with an error message
+        assert_eq!(report.status, ReportStatus::Failed, "status must be Failed on EISDIR");
+        assert!(report.error.is_some(), "error field must be set");
+
+        // (b) Returned report must retain the outline (set before the EISDIR failure)
+        assert!(
+            report.outline.is_some(),
+            "outline must be retained in the failed report — got None (downgrade)"
+        );
+        let outline = report.outline.as_ref().unwrap();
+        assert_eq!(outline.title, "Future Prediction Report", "outline title must match");
+        assert_eq!(outline.sections.len(), 2, "outline must have 2 sections");
+
+        // (c) outline.json must exist on disk (save_outline ran before the failure)
+        let outline_json_path = report_dir.join("outline.json");
+        assert!(
+            outline_json_path.exists(),
+            "outline.json must be saved before the EISDIR failure"
+        );
+
+        // (d) meta.json on disk (written by error tail's save_report) must carry non-null outline
+        let meta_path = report_dir.join("meta.json");
+        assert!(meta_path.exists(), "meta.json must be written by the error tail");
+        let meta_raw = std::fs::read_to_string(&meta_path).expect("meta.json must be readable");
+        let meta: serde_json::Value =
+            serde_json::from_str(&meta_raw).expect("meta.json must be valid JSON");
+        assert_eq!(
+            meta.get("status").and_then(|v| v.as_str()),
+            Some("failed"),
+            "meta.json status must be 'failed'"
+        );
+        assert!(
+            meta.get("outline").map(|v| !v.is_null()).unwrap_or(false),
+            "meta.json outline must be non-null after post-planning failure — got null (downgrade)"
+        );
+        let meta_outline = meta.get("outline").unwrap();
+        assert_eq!(
+            meta_outline.get("title").and_then(|v| v.as_str()),
+            Some("Future Prediction Report"),
+            "meta.json outline.title must match"
+        );
+        assert_eq!(
+            meta_outline.get("sections").and_then(|v| v.as_array()).map(|a| a.len()),
+            Some(2),
+            "meta.json outline.sections must have 2 entries"
+        );
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    // ── (h2)-8: sink events emitted (planning + completed) ───────────────────
+
+    #[tokio::test]
+    async fn test_generate_report_h2_sink_events() {
+        use crate::report::sink::{ReportEvent, ReportSink, ReportStage};
+
+        struct CaptureSink {
+            events: Vec<(ReportStage, i32, String)>,
+        }
+        impl ReportSink for CaptureSink {
+            fn event(&mut self, ev: &ReportEvent) {
+                self.events.push((ev.stage, ev.progress, ev.message.clone()));
+            }
+        }
+
+        let llm = MockChatJsonLlm { response: h2_outline_response() };
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let upload_dir = std::env::temp_dir().join(format!("teri_h2_sink_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+        let mut agent = ReportAgent::new_react("g-h2", "sim-h2", "sink test");
+
+        let mut capture_sink = CaptureSink { events: vec![] };
+        agent
+            .generate_report(
+                &tools,
+                &llm,
+                &mgr,
+                &mut capture_sink,
+                Some("report_h2sinktest".to_string()),
+            )
+            .await;
+
+        // Must have at least:
+        //   - (Planning, 0, ...) from top-level emit before plan_outline
+        //   - (Planning, X, ...) from plan_outline via plan_cb (rescaled prog//5)
+        //   - (Completed, 100, ...) from top-level emit
+        let stages: Vec<ReportStage> = capture_sink.events.iter().map(|e| e.0).collect();
+        assert!(stages.contains(&ReportStage::Planning), "must have at least one Planning event");
+        assert!(stages.contains(&ReportStage::Completed), "must have a Completed event at end");
+
+        // The top-level planning emit must be (Planning, 0, ...)
+        let first_planning = capture_sink.events.iter().find(|e| e.0 == ReportStage::Planning);
+        assert!(first_planning.is_some(), "must have a planning event");
+        assert_eq!(first_planning.unwrap().1, 0, "first planning event must be progress=0");
+
+        // Completed event must have progress=100
+        let completed_ev = capture_sink.events.iter().find(|e| e.0 == ReportStage::Completed);
+        assert!(completed_ev.is_some(), "must have a completed event");
+        assert_eq!(completed_ev.unwrap().1, 100, "completed event must be progress=100");
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    // ── (h2)-9: console_logger closed on success tail ────────────────────────
+
+    #[tokio::test]
+    async fn test_generate_report_h2_console_logger_closed_on_success() {
+        let llm = MockChatJsonLlm { response: h2_outline_response() };
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let upload_dir =
+            std::env::temp_dir().join(format!("teri_h2_console_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+        let mut agent = ReportAgent::new_react("g-h2", "sim-h2", "console close test");
+
+        let mut null_sink = crate::report::sink::NullSink;
+        agent
+            .generate_report(
+                &tools,
+                &llm,
+                &mgr,
+                &mut null_sink,
+                Some("report_h2consoletest".to_string()),
+            )
+            .await;
+
+        // After generate_report, console_logger must be None (cleared on success tail)
+        assert!(
+            agent.console_logger.is_none(),
+            "console_logger must be None after generate_report (success tail)"
+        );
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    // ── (h2)-10: planning_closure rescale prog//5 ────────────────────────────
+
+    #[tokio::test]
+    async fn test_generate_report_h2_planning_closure_rescale() {
+        // Verify the planning_closure in generate_report rescales as prog//5.
+        // plan_outline emits at pct 0, 30, 80, 100.
+        // After //5: 0, 6, 16, 20. These reach the sink via the plan_cb closure.
+        use crate::report::sink::{ReportEvent, ReportSink, ReportStage};
+
+        struct CaptureSink {
+            events: Vec<(ReportStage, i32)>,
+        }
+        impl ReportSink for CaptureSink {
+            fn event(&mut self, ev: &ReportEvent) {
+                self.events.push((ev.stage, ev.progress));
+            }
+        }
+
+        let llm = MockChatJsonLlm { response: h2_outline_response() };
+        let graph = crate::graph::KnowledgeGraph::new();
+        let tools = make_tools_fixture(&graph, &llm);
+        let upload_dir =
+            std::env::temp_dir().join(format!("teri_h2_rescale_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        let mgr = crate::report::manager::ReportManager::new(&upload_dir);
+        let mut agent = ReportAgent::new_react("g-h2", "sim-h2", "rescale test");
+
+        let mut capture_sink = CaptureSink { events: vec![] };
+        agent
+            .generate_report(
+                &tools,
+                &llm,
+                &mgr,
+                &mut capture_sink,
+                Some("report_h2rescaletest".to_string()),
+            )
+            .await;
+
+        // Extract only Planning events emitted through the plan_cb closure.
+        // plan_outline emits at 0, 30, 80, 100; after //5 → 0, 6, 16, 20.
+        // (The top-level emit is also progress=0 on Planning.)
+        let planning_progs: Vec<i32> = capture_sink
+            .events
+            .iter()
+            .filter(|e| e.0 == ReportStage::Planning)
+            .map(|e| e.1)
+            .collect();
+
+        // 30//5 = 6, 80//5 = 16, 100//5 = 20 must appear among planning events.
+        assert!(
+            planning_progs.contains(&6),
+            "planning rescaled 30//5=6 must appear; events: {planning_progs:?}"
+        );
+        assert!(
+            planning_progs.contains(&16),
+            "planning rescaled 80//5=16 must appear; events: {planning_progs:?}"
+        );
+        assert!(
+            planning_progs.contains(&20),
+            "planning rescaled 100//5=20 must appear; events: {planning_progs:?}"
         );
 
         let _ = std::fs::remove_dir_all(&upload_dir);

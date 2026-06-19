@@ -17,7 +17,7 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 3   # BUDGET REACHED; CYCLE 14=U-024(g1), 15=U-024(g2), 16=U-024(h1) ReportSink foundation
+cycles_this_session: 1   # NEW SESSION 2026-06-18 (17th resume); CYCLE 17=U-024(h2) generate_report skeleton (FAIL→fix→PASS)
 # CYCLE3 (12th resume) 2026-06-17: U-022 sub-cycle (c) MONITOR + offset-tail + graph-fire (S-605/613/614/615 + S-1056/U-047,
 #   5 [x]) — opus PASS (DECISION-17 Area 2, porter@opus). src/services/simulation_runner.rs: monitor_simulation (2s
 #   MONITOR_POLL_INTERVAL poll loop, per-platform file-exists guard, save_run_state per poll, loop-exit on U-048
@@ -577,3 +577,36 @@ next_iterate: U-022 [x] complete → U-017 port-fresh full implementation
 # real assemble_full_report], (h4) U-027 SSE sink adapter [with U-027 routes]. Then (i) chat. (b2 insight_forge OQ-3;
 # interview_agents honest-err until U-020 sim/ipc.rs — confirmed MISSING — wired at h3.) After U-024: U-025/26/27 HTTP
 # API routes (U-027 report route exposes the ReACT per-section progress stream via a ReportSink→SSE adapter).
+
+
+# CYCLE 17 (NEW SESSION 2026-06-18, 17th resume): U-024 sub-cycle (h2) generate_report skeleton — porter@porter,
+# parity@opus FAIL→fix→PASS (round-2 re-verify). src/report/mod.rs: pub async fn generate_report<L>(&mut self, tools,
+# llm, manager:&ReportManager, sink:&mut dyn ReportSink, report_id:Option<String>)->Report. PORTED report_agent.py
+# 1532-1764 SKELETON (no per-section loop = h3): report_id auto-gen `report_{uuid4().simple()[..12]}` (shape-only,
+# explicit-id in tests) | empty-string→autogen; status machine Pending→Planning→Generating→Completed (happy) / Failed
+# (except); folder→ReportLogger(log_start)→ReportConsoleLogger→update_progress(pending,0)→save_report→Planning
+# (update_progress 5, log_planning_start, sink Planning(0))→plan_outline via prog//5 sink-closure→log_planning_complete
+# →save_outline→update_progress(planning,15)→Generating→PLACEHOLDER assemble_full_report (header+summary only, h3 adds
+# loop)→Completed/completed_at/total_time→log_report_complete→save_report→update_progress(completed,100)→sink
+# Completed(100)→console_logger.close(). Error tail: status=Failed, error, log_error, best-effort save_report+
+# update_progress(failed,-1) (Python except:pass), console_logger.close(). BORROW BRIDGE: ProgressCallback is `dyn Fn`
+# but ReportSink::event is &mut → wrapped sink in RefCell<&mut dyn ReportSink>, Fn closures borrow_mut (d/e signatures
+# UNCHANGED, no re-port). GATE CAUGHT a real downgrade (loop-driver pre-flagged, verifier confirmed empirically via
+# EISDIR-on-full_report.md injection): error tail built a FRESH failed_report with outline:None/markdown:""/completed_at:""
+# vs Python except mutating the SAME report object that already has .outline (py:1615) → Python's FAILED meta.json carries
+# the built outline, Rust's wrote null. FIXED: hoisted `report` BEFORE the async try-body (try-body returns io::Result<()>
+# mutating report in place; Ok(())=>report; error arm mutates SAME report, retains outline/markdown/completed_at). New
+# regression test test_generate_report_h2_failed_meta_retains_outline (EISDIR post-planning failure, asserts ON-DISK
+# meta.json non-null outline). 11 h2 tests + 1214 total green, clippy --all-targets clean. Atomic gate: X-parity PASS +
+# Y-green + Y-not-regressed (template generate_stream/generate/PredictionReport untouched, 884 ins/0 del). Y-drift clean
+# (develop 7c354a5 config/main only, no U-024 overlap). S-763 stays [~] w/ "h2-skeleton-PASS" annotation (full contract
+# completes at h3 section loop — NOT flipped [x] to avoid falsely asserting the section loop is verified). [!] ledger:
+# report_id/total_time/created_at/completed_at nondeterminism (legit, shape-only asserts); interview_agents honest-err
+# (U-020 pending). NO [≠] introduced. U-024 progress: a✓ b✓ c✓ d✓ e✓ f✓ g1✓ g2✓ h1✓ h2✓ | REMAINING:
+# (h3) per-section streaming loop [the for(i,section) loop: per-section progress 20+(i/total)*70, section sink-closure
+# (base+int(prog*0.7/total) rescale verbatim), generate_section_react (landed e), section.content=…, push context,
+# save_section IMMEDIATELY, push completed-title, log_section_full_complete, sink.event(Generating,section_content),
+# update_progress(generating, base+70/total); REAL assemble over populated section files. Replaces h2's placeholder
+# assemble. Deps h2,e,b,c. interview_agents still honest-err until U-020 sim/ipc.rs (MISSING).], (h4) U-027 SSE sink
+# adapter [with U-027 routes], (i) chat [conversational 2-iter ReACT, get_report_by_simulation, 15000-char ctx, response
+# cleaning]. (b2 insight_forge OQ-3 still pending.) Architect-in-loop (PR #44) governs structural sub-cycles.
