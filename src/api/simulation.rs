@@ -141,6 +141,11 @@ pub fn simulation_router(state: Arc<ApiState>) -> Router {
         // Sub-cycle (g): lifecycle — start + stop.  Both are static paths; no capture conflicts.
         .route("/start", post(start_simulation))
         .route("/stop", post(stop_simulation))
+        // Sub-cycle (h): poll-based run-status snapshots (NOT streaming).
+        // Both under /:simulation_id; the 3-segment `/run-status/detail` (static seg2 "detail")
+        // is distinct from the 2-segment `/run-status` by full-path match (axum 0.7).
+        .route("/:simulation_id/run-status", get(run_status))
+        .route("/:simulation_id/run-status/detail", get(run_status_detail))
         // Sub-cycle (e2): simulation-script download.  Static FIRST segment "script" — axum 0.7
         // ranks a static segment above the `/:simulation_id/...` capture at position 0, so
         // `/script/<name>/download` is unambiguous against the 3-segment `/:simulation_id/config/*`
@@ -1690,6 +1695,161 @@ async fn start_simulation(
         "simulation runtime not available: no RunInputs builder for '{id}' \
          (blocked on U-028/U-029/U-030 platform producers — GAP-U026-RUNINPUTS-BUILDER)"
     )))
+}
+
+// ---------------------------------------------------------------------------
+// Sub-cycle (h) Route 1 — GET /:simulation_id/run-status  (simulation.py:1705-1760)
+//
+// Poll-based one-shot snapshot ("用于前端轮询" — for frontend polling).  NOT streaming
+// (architect findings/u026-architecture.md §"No route in U-026 streams").
+//
+// Source steps:
+//   1. run_state = SimulationRunner.get_run_state(id)
+//   2. not run_state → 200 {success:true, data: <8-key idle stub>}
+//      (runner_status:"idle", current_round/total_rounds/progress_percent/
+//       twitter_actions_count/reddit_actions_count/total_actions_count all 0 — int 0,
+//       NOT the full to_dict shape; NOT 404)
+//   3. else → 200 {success:true, data: run_state.to_dict()}
+//   4. except → 500 traceback
+// ---------------------------------------------------------------------------
+
+/// Port of MiroFish `get_run_status` (simulation.py:1705-1760).
+async fn run_status(
+    State(state): State<Arc<ApiState>>,
+    Path(simulation_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    // Step 1: get_run_state (cache-then-file); except → 500.
+    let run_state =
+        state.sim_runner.get_run_state(&simulation_id).await.map_err(ApiError::server)?;
+
+    match run_state {
+        // Step 2: None → 200 with the 8-key idle stub (NOT 404, NOT full to_dict).
+        // progress_percent is the Python literal int 0 here (the full to_dict emits an f64).
+        None => Ok(Json(serde_json::json!({
+            "success": true,
+            "data": {
+                "simulation_id": simulation_id,
+                "runner_status": "idle",
+                "current_round": 0,
+                "total_rounds": 0,
+                "progress_percent": 0,
+                "twitter_actions_count": 0,
+                "reddit_actions_count": 0,
+                "total_actions_count": 0,
+            }
+        }))),
+        // Step 3: Some → 200 with full to_dict snapshot.
+        Some(rs) => Ok(Json(serde_json::json!({
+            "success": true,
+            "data": Value::Object(rs.to_dict())
+        }))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sub-cycle (h) Route 2 — GET /:simulation_id/run-status/detail  (simulation.py:1763-1850)
+//
+// One-shot detailed snapshot with embedded action lists (reads the U-047 actions.jsonl tail).
+// Query param: `platform` (twitter|reddit, optional) — filters all_actions + recent_actions.
+//
+// `[!] U026-h-ACTIONS-PRODUCER-PENDING`: the action lists come from `get_all_actions`, which
+// reads `{sim_dir}/{platform}/actions.jsonl`.  teri's SimEngine does not yet WRITE that log
+// (producer lands with U-028/029/030 platform runners), so on a started run the lists are
+// currently empty — a FAITHFUL no-op on a missing file (Python's reader also yields [] when the
+// file is absent), NOT a dropped feature.  The full route assembly + filter logic is ported and
+// proven now; the lists populate when the producer lands.
+//
+// Source assembly (simulation.py:1857-1878):
+//   result = run_state.to_dict()
+//   result["all_actions"]     = [a.to_dict() for a in get_all_actions(id, platform_filter)]
+//   result["twitter_actions"] = get_all_actions(id, "twitter") if not pf or pf=="twitter" else []
+//   result["reddit_actions"]  = get_all_actions(id, "reddit")  if not pf or pf=="reddit"  else []
+//   result["rounds_count"]    = len(run_state.rounds)
+//   result["recent_actions"]  = get_all_actions(id, platform_filter, round_num=current_round)
+//                               if current_round > 0 else []
+// None run_state → 200 {simulation_id, runner_status:"idle", all_actions:[],
+//                       twitter_actions:[], reddit_actions:[]}  (5-key idle stub)
+// ---------------------------------------------------------------------------
+
+/// Port of MiroFish `get_run_status_detail` (simulation.py:1763-1850).
+async fn run_status_detail(
+    State(state): State<Arc<ApiState>>,
+    Path(simulation_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    // Python `request.args.get('platform')`: None when absent, "" when `?platform=` (falsy).
+    let platform_filter: Option<&str> = params.get("platform").map(String::as_str);
+    // Python `not platform_filter` is True for both None and "" (empty string is falsy).
+    let filter_falsy = platform_filter.is_none_or(str::is_empty);
+
+    // Step 1: get_run_state; except → 500.
+    let run_state =
+        state.sim_runner.get_run_state(&simulation_id).await.map_err(ApiError::server)?;
+
+    let Some(rs) = run_state else {
+        // None → 200 with the 5-key idle stub.
+        return Ok(Json(serde_json::json!({
+            "success": true,
+            "data": {
+                "simulation_id": simulation_id,
+                "runner_status": "idle",
+                "all_actions": [],
+                "twitter_actions": [],
+                "reddit_actions": []
+            }
+        })));
+    };
+
+    // get_all_actions reads the actions.jsonl tail (U-047); platform_filter passed verbatim.
+    // An empty-string filter is FALSY (Python `not platform`) so get_all_actions("") reads BOTH
+    // platforms and skips the record filter — handled inside get_all_actions/read_actions_from_file.
+    let all_actions = state
+        .sim_runner
+        .get_all_actions(&simulation_id, platform_filter, None, None)
+        .map_err(ApiError::server)?;
+    // twitter/reddit lists are gated by Python's falsy `not pf or pf == "<platform>"`.
+    let twitter_actions = if filter_falsy || platform_filter == Some("twitter") {
+        state
+            .sim_runner
+            .get_all_actions(&simulation_id, Some("twitter"), None, None)
+            .map_err(ApiError::server)?
+    } else {
+        Vec::new()
+    };
+    let reddit_actions = if filter_falsy || platform_filter == Some("reddit") {
+        state
+            .sim_runner
+            .get_all_actions(&simulation_id, Some("reddit"), None, None)
+            .map_err(ApiError::server)?
+    } else {
+        Vec::new()
+    };
+    // recent_actions = current round's tail (only when a round has started).
+    let current_round = rs.current_round;
+    let recent_actions = if current_round > 0 {
+        state
+            .sim_runner
+            .get_all_actions(&simulation_id, platform_filter, None, Some(current_round))
+            .map_err(ApiError::server)?
+    } else {
+        Vec::new()
+    };
+
+    // Assemble: base to_dict() + the five extra keys (Python mutates the same dict in order).
+    let mut result = rs.to_dict();
+    let to_objs = |v: Vec<crate::services::simulation_runner::AgentAction>| {
+        Value::Array(v.into_iter().map(|a| Value::Object(a.to_dict())).collect())
+    };
+    result.insert("all_actions".into(), to_objs(all_actions));
+    result.insert("twitter_actions".into(), to_objs(twitter_actions));
+    result.insert("reddit_actions".into(), to_objs(reddit_actions));
+    result.insert("rounds_count".into(), Value::Number((rs.rounds.len() as i64).into()));
+    result.insert("recent_actions".into(), to_objs(recent_actions));
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": Value::Object(result)
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -3444,6 +3604,262 @@ mod tests {
             json["error"].as_str().unwrap().contains("run_twitter_simulation.py"),
             "must be download_script's unknownScript error, not config/download's 404"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (h) — GET /:id/run-status  and  /:id/run-status/detail
+    //   Poll snapshots. None run_state → idle stub (200, NOT 404). Detail action
+    //   lists read the U-047 tail (empty until U-028/029/030 producers wire it).
+    // -----------------------------------------------------------------------
+
+    /// Write a `run_state.json` so `get_run_state` loads a non-idle state from disk.
+    fn seed_run_state(state: &Arc<ApiState>, sim_id: &str, json: serde_json::Value) {
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join(sim_id);
+        std::fs::create_dir_all(&sim_dir).unwrap();
+        std::fs::write(sim_dir.join("run_state.json"), serde_json::to_vec(&json).unwrap()).unwrap();
+    }
+
+    /// GET /:id/run-status — no run_state → 200 with the 8-key idle stub (NOT 404).
+    #[tokio::test]
+    async fn run_status_idle_stub_when_no_run_state() {
+        let (state, _tmp) = test_state();
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_x/run-status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "idle run-status must be 200, not 404");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true);
+        let data = &json["data"];
+        assert_eq!(data["runner_status"], "idle");
+        assert_eq!(data["simulation_id"], "sim_x");
+        assert_eq!(data["current_round"], 0);
+        assert_eq!(data["total_actions_count"], 0);
+        // progress_percent is the Python int literal 0 in the idle stub (full to_dict emits f64).
+        assert!(
+            data["progress_percent"].is_i64() || data["progress_percent"].is_u64(),
+            "idle progress_percent must be integer 0, got {}",
+            data["progress_percent"]
+        );
+        assert_eq!(data.as_object().unwrap().len(), 8, "idle stub is exactly 8 keys");
+    }
+
+    /// GET /:id/run-status — run_state present → 200 with full to_dict (total_actions_count computed).
+    #[tokio::test]
+    async fn run_status_returns_to_dict_when_state_present() {
+        let (state, _tmp) = test_state();
+        seed_run_state(
+            &state,
+            "sim_run",
+            serde_json::json!({
+                "runner_status": "running",
+                "current_round": 5,
+                "total_rounds": 144,
+                "twitter_actions_count": 150,
+                "reddit_actions_count": 200,
+                "twitter_running": true,
+                "reddit_running": true,
+                "updated_at": "2025-12-01T10:30:00"
+            }),
+        );
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_run/run-status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let data = &json["data"];
+        assert_eq!(data["runner_status"], "running");
+        assert_eq!(data["current_round"], 5);
+        assert_eq!(data["total_actions_count"], 350, "computed twitter+reddit");
+        // The full to_dict carries process_pid (the idle stub does not) and is larger than 8 keys.
+        assert!(data.get("process_pid").is_some(), "full to_dict has process_pid");
+        assert!(data.as_object().unwrap().len() > 8, "full to_dict > idle stub");
+    }
+
+    /// GET /:id/run-status/detail — no run_state → 200 with the 5-key idle stub.
+    #[tokio::test]
+    async fn run_status_detail_idle_stub_when_no_run_state() {
+        let (state, _tmp) = test_state();
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_x/run-status/detail")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let data = &json["data"];
+        assert_eq!(data["runner_status"], "idle");
+        assert_eq!(data["all_actions"], serde_json::json!([]));
+        assert_eq!(data["twitter_actions"], serde_json::json!([]));
+        assert_eq!(data["reddit_actions"], serde_json::json!([]));
+        assert_eq!(data.as_object().unwrap().len(), 5, "detail idle stub is exactly 5 keys");
+    }
+
+    /// GET /:id/run-status/detail — run_state present, no actions.jsonl → base to_dict + the five
+    /// extra keys, all action lists empty (faithful no-op on missing tail; producer-pending).
+    #[tokio::test]
+    async fn run_status_detail_assembles_keys_with_empty_tail() {
+        let (state, _tmp) = test_state();
+        seed_run_state(
+            &state,
+            "sim_d",
+            serde_json::json!({"runner_status":"running","current_round":0,"total_rounds":10}),
+        );
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_d/run-status/detail")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let data = &json["data"];
+        assert_eq!(data["runner_status"], "running", "base to_dict merged");
+        assert_eq!(data["all_actions"], serde_json::json!([]));
+        assert_eq!(data["twitter_actions"], serde_json::json!([]));
+        assert_eq!(data["reddit_actions"], serde_json::json!([]));
+        assert_eq!(data["recent_actions"], serde_json::json!([]), "current_round 0 → no recent");
+        assert_eq!(data["rounds_count"], 0);
+    }
+
+    /// GET /:id/run-status/detail — actions.jsonl present → lists populate from the tail; the
+    /// `?platform=` filter gates twitter/reddit lists per Python's falsy semantics.
+    #[tokio::test]
+    async fn run_status_detail_reads_actions_tail_and_filters_platform() {
+        let (state, _tmp) = test_state();
+        seed_run_state(
+            &state,
+            "sim_act",
+            serde_json::json!({"runner_status":"running","current_round":1,"total_rounds":10}),
+        );
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join("sim_act");
+        std::fs::create_dir_all(sim_dir.join("twitter")).unwrap();
+        std::fs::create_dir_all(sim_dir.join("reddit")).unwrap();
+        std::fs::write(
+            sim_dir.join("twitter").join("actions.jsonl"),
+            b"{\"round\":1,\"timestamp\":\"2025-12-01T10:00:00\",\"agent_id\":3,\"agent_name\":\"T\",\"action_type\":\"CREATE_POST\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sim_dir.join("reddit").join("actions.jsonl"),
+            b"{\"round\":1,\"timestamp\":\"2025-12-01T10:01:00\",\"agent_id\":4,\"agent_name\":\"R\",\"action_type\":\"CREATE_COMMENT\"}\n",
+        )
+        .unwrap();
+        let app = crate::server::create_app(state);
+
+        // No filter: all_actions = both; twitter_actions = twitter; reddit_actions = reddit;
+        // recent_actions = current round (1) = both.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_act/run-status/detail")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let data = &json["data"];
+        assert_eq!(data["all_actions"].as_array().unwrap().len(), 2);
+        assert_eq!(data["twitter_actions"].as_array().unwrap().len(), 1);
+        assert_eq!(data["reddit_actions"].as_array().unwrap().len(), 1);
+        assert_eq!(data["recent_actions"].as_array().unwrap().len(), 2);
+        assert_eq!(data["twitter_actions"][0]["platform"], "twitter");
+        assert_eq!(data["reddit_actions"][0]["platform"], "reddit");
+
+        // ?platform=twitter: all_actions filtered to twitter; reddit_actions gated to [].
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_act/run-status/detail?platform=twitter")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let data = &json["data"];
+        assert_eq!(data["all_actions"].as_array().unwrap().len(), 1, "filtered to twitter");
+        assert_eq!(data["twitter_actions"].as_array().unwrap().len(), 1);
+        assert_eq!(data["reddit_actions"].as_array().unwrap().len(), 0, "reddit gated off");
+    }
+
+    /// Parity regression (gate-caught): empty-string `?platform=` is FALSY in Python
+    /// (`not platform` is True), so `get_all_actions("")` reads BOTH platform files and skips the
+    /// record-level filter. all_actions/recent_actions must read both — NOT be filtered to empty.
+    #[tokio::test]
+    async fn run_status_detail_empty_platform_query_reads_both() {
+        let (state, _tmp) = test_state();
+        seed_run_state(
+            &state,
+            "sim_e",
+            serde_json::json!({"runner_status":"running","current_round":1,"total_rounds":10}),
+        );
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join("sim_e");
+        std::fs::create_dir_all(sim_dir.join("twitter")).unwrap();
+        std::fs::create_dir_all(sim_dir.join("reddit")).unwrap();
+        std::fs::write(
+            sim_dir.join("twitter").join("actions.jsonl"),
+            b"{\"round\":1,\"timestamp\":\"2025-12-01T10:00:00\",\"agent_id\":3,\"agent_name\":\"T\",\"action_type\":\"CREATE_POST\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sim_dir.join("reddit").join("actions.jsonl"),
+            b"{\"round\":1,\"timestamp\":\"2025-12-01T10:01:00\",\"agent_id\":4,\"agent_name\":\"R\",\"action_type\":\"CREATE_COMMENT\"}\n",
+        )
+        .unwrap();
+        let app = crate::server::create_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_e/run-status/detail?platform=")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let data = &json["data"];
+        // Empty filter is falsy → both files read, no record filter applied.
+        assert_eq!(data["all_actions"].as_array().unwrap().len(), 2, "empty filter reads both");
+        assert_eq!(data["recent_actions"].as_array().unwrap().len(), 2, "empty filter recent=both");
+        // twitter/reddit lists also populate (`not platform` is True for both gates).
+        assert_eq!(data["twitter_actions"].as_array().unwrap().len(), 1);
+        assert_eq!(data["reddit_actions"].as_array().unwrap().len(), 1);
     }
 
     // -----------------------------------------------------------------------

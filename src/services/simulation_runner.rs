@@ -3890,7 +3890,13 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
         // Reddit log path: {sim_dir}/reddit/actions.jsonl
         let mut actions: Vec<AgentAction> = vec![];
 
-        if platform.is_none() || platform == Some("twitter") {
+        // Python `if not platform`: an empty-string platform ("") is falsy, so it reads BOTH
+        // platform files (and the inner record filter is skipped) — semantically identical to
+        // no filter. teri must treat `Some("")` the same way, not as a literal platform name
+        // (which would match neither file). See `_read_actions_from_file` filter guard below.
+        let no_filter = platform.is_none() || platform == Some("");
+
+        if no_filter || platform == Some("twitter") {
             let twitter_log = sim_dir.join("twitter").join("actions.jsonl");
             if twitter_log.exists() {
                 actions.extend(read_actions_from_file(
@@ -3903,7 +3909,7 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
             }
         }
 
-        if platform.is_none() || platform == Some("reddit") {
+        if no_filter || platform == Some("reddit") {
             let reddit_log = sim_dir.join("reddit").join("actions.jsonl");
             if reddit_log.exists() {
                 actions.extend(read_actions_from_file(
@@ -4432,8 +4438,12 @@ fn read_actions_from_file(
             TeriError::Sim(format!("Failed to parse JSON from {}: {}", log_path.display(), e))
         })?;
 
-        // Apply filters before building the action
-        if let Some(pf) = platform_filter {
+        // Apply filters before building the action.
+        // Python `if platform_filter and record_platform != platform_filter:` — an empty-string
+        // filter ("") is falsy, so the record-level platform filter is SKIPPED entirely (matches
+        // not-filtering). Guarding on `!p.is_empty()` keeps `Some("")` from filtering out every
+        // record (which carries a concrete "twitter"/"reddit" platform).
+        if let Some(pf) = platform_filter.filter(|p| !p.is_empty()) {
             let record_platform = data.get("platform").and_then(Value::as_str).unwrap_or("");
             if record_platform != pf && default_platform != Some(pf) {
                 continue;
