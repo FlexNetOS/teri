@@ -3358,3 +3358,77 @@ when U-028/029/030 land AND the sqlite feature is enabled) — NOT a parity fail
 current-behavior branch is faithful and the deferred branch is implemented+tested. No `[~]`, no
 disguised-skip `[≠]`.
 
+
+---
+
+## 2026-06-19 — U-026 sub-cycle (l): env-status (S-833) + close-env (S-834)
+
+VERDICT: **FAIL** (unit not PASS) — S-833 PASS `[x]`, S-834 `[~]` (newly-found undocumented divergence).
+Tests: `cargo test --quiet env_status` = 3 passed; `cargo test --quiet close_env` = 3 passed (6 total, 0 fail).
+
+### S-833 `POST /env-status` — PASS `[x]` (pure read, fully portable+tested today)
+Differential vs `simulation.py:2585-2647` + primitives `get_env_status_detail`/`check_env_alive`:
+1. missing simulation_id → 400 requireSimulationId (env_status_missing_simulation_id_400). Empty/`{}` body path mirrors Python `request.get_json() or {}` + filter(!empty).
+2. no env → 200, data = exactly 5 keys `{simulation_id, env_alive:false, twitter_available:false, reddit_available:false, message:envNotRunningShort}` (env_status_no_env_200_default_shape asserts len==5 + each value). Matches Python 200 body.
+3. env_status.json with `twitter_available:true` surfaces; env_alive stays false (independent: env_alive←check_env_alive, available flags←file) (env_status_reads_env_status_json). Confirms the two sources are not conflated.
+4. `env_status.get("x",False)` → teri `.get("x").and_then(Value::as_bool).unwrap_or(false)` — faithful default mapping.
+5. default-on-error: Python catches JSONDecodeError/OSError → default dict; teri route `.unwrap_or_default()` → empty Map → false/false via the `.get().unwrap_or(false)` fallbacks. Read error → false/false, 200 not 500. FAITHFUL. (Primitive itself also returns Ok(default) on parse error, runner.rs:4195-4198 — belt-and-suspenders, still false/false.)
+NOT IPC-gated — confirmed: pure file read, no run registration required. Fully portable + proven NOW.
+
+### S-834 `POST /close-env` — `[~]` FAIL (one checkable surface faithful; success-path carries an UNFLAGGED divergence)
+FAITHFUL + tested today:
+- missing simulation_id → 400 requireSimulationId (close_env_missing_simulation_id_400 asserts error == requireSimulationId).
+- valid id, no registered run → primitive Err(`Simulation not found: …`) = TeriError::Sim → map_runner_err → **400** (close_env_no_env_400 asserts 400 + no traceback). Python: no sim_dir → ValueError → 400. SAME status class. The 400 message is teri's English runner string vs Python CJK `模拟不存在` — this is the SAME translated-runner-message convention already accepted for the (g) start/stop map_runner_err precedent (S-833/834 siblings). NOT a new divergence class. Confirmed.
+- CJK literal `环境关闭命令已发送` (close-sent message): byte-for-byte identical to Python primitive (verified via utf-8 byte compare). It is a hardcoded literal in the Python PRIMITIVE (not an i18n key) → correctly preserved verbatim in the route, not run through t().
+- success-path shape (code-inspection, producer-pending): `{success: resp.status==CommandStatus::Completed, message:<CJK>, result: resp.result→Object|null, timestamp}` then outer `{success, data:result}`; IPCResponse.result is Option<Map> → map(Value::Object).unwrap_or(Null) matches Python `response.result` (dict) / absent. Correct shape.
+- status→Completed update: `get_simulation → if Some → status=Completed + save_simulation_state` mirrors Python :2693-2697 (manager.get_simulation → if state → COMPLETED → _save_simulation_state). Reachable only on close success. Faithful.
+
+`[!] U026-l-IPC-PRODUCER-PENDING`: CONFIRMED. The success path is genuinely IPC-gated — `close_simulation_env` requires a run in `self.runs` (a live IPC server, produced by U-028/029/030); none registered today → Err(no-run) → 400. env-status is NOT gated (above). Correct.
+
+`[≠] U026-l-ALREADYCLOSED`: ADJUDICATED DEFENSIBLE (producer-pending). Python primitive calls `check_env_alive()` FIRST and on not-alive returns the 2-key `{success:True, message:"环境已经关闭"}`. teri's primitive (runner.rs:4151-4160) omits the pre-check and always `send_close_env`. Rationale survives the `[≠]` bar: teri's `check_env_alive` is an in-process AtomicBool substitute for Python's cross-process `env_status.json` read (S-483 `[≠]`), and the branch is only reachable WITH a live registered IPC run — which doesn't exist pre-producer. Non-contractual today (unreachable), substrate-shaped. Flagged in the route comment. Acceptable as producer-pending — but MUST be re-verified for observable shape when the producer lands.
+
+**NEW FINDING (the FAIL): `[≠] U026-l-TIMEOUT` is UNFLAGGED.** Python's primitive has a THIRD branch the route comment does not mention: `except TimeoutError: return {success:True, message:"环境关闭命令已发送（等待响应超时，环境可能正在关闭）"}` (simulation_runner.py:1651-1656) → route returns **200, success:true**. teri's path: `send_command` elapsed → `Err(TeriError::Sim("…等待命令响应超时…"))` (simulation_ipc.rs:890/949) → route `.map_err(map_runner_err)?` → TeriError::Sim → **400, success:false**. So on an IPC close TIMEOUT: Python = 200/success (graceful "may be closing"), teri = 400/hard-error. This is a real producer-pending BEHAVIOR CHANGE (different status code AND success bool AND message) that is NOT recorded as a `[≠]`/`[!]` anywhere — only ALREADYCLOSED is flagged. Per fail-closed / "any divergence … leave `[~]`", an undocumented divergence on a ported surface cannot count as covered.
+
+MINIMAL FIX (route back to porter — tracking/doc, not necessarily logic):
+- EITHER add `[≠] U026-l-TIMEOUT` to the close_env_route comment + symbol-map S-834 row with rationale (Python's TimeoutError→200/success treats a timed-out close as "in progress"; teri's IPC timeout currently surfaces as 400 — adjudicate whether that is the intended port behavior or a branch to reproduce when the IPC producer lands),
+- OR (preferred for true parity) reproduce Python's catch: in close_env_route, map the IPC-timeout error specifically to the 200 `{success:true, data:{success:true, message:"<CJK timeout literal>"}}` shape rather than 400. Both branches are equally producer-pending, so this is a code-inspection + one-comment fix today; it is the success-path contract that will go live with U-028/029/030, so flagging it now prevents a silent downgrade landing with the producer.
+
+### Residual after this cycle
+- S-833: `[x]` (PASS, no residual).
+- S-834: `[~]` (FAIL) — blocked on flagging/handling `[≠] U026-l-TIMEOUT`.
+- `[!] U026-l-IPC-PRODUCER-PENDING` (close-env success path): legitimate, clears with U-028/029/030.
+- `[≠] U026-l-ALREADYCLOSED`: defensible producer-pending; re-verify observable shape when producer lands.
+- `[≠] U026-l-TIMEOUT`: must be created (currently undocumented → the FAIL trigger).
+
+Unit rollup: 1/2 symbols `[x]` (S-833). S-834 stays `[~]`. **U-026 sub-cycle (l) is NOT PASS** — do not commit the unit as parity-clean until S-834 is resolved.
+
+---
+
+## 2026-06-19 — U-026 sub-cycle (l) RE-VERIFY: `[≠] U026-l-TIMEOUT` documentation gate
+
+VERDICT: **PASS** — the prior FAIL is resolved. S-834 → `[x]`/`[≠]` (covered, with `[≠] U026-l-TIMEOUT` as a tracked producer-pending residual). U-026 sub-cycle (l) is now PASS (S-833 `[x]` + S-834 `[≠]`).
+Tests: `cargo test --quiet close_env` = 3 passed; `cargo test --quiet env_status` = 3 passed (6 total, 0 fail). `cargo build` green (cached — change is comment-only, route logic unchanged).
+
+### What was under test
+The prior gate FAILED S-834 on ONE issue: Python's `close_simulation_env` catches `TimeoutError`→**200** graceful `{success:true,message:"环境关闭命令已发送（等待响应超时，环境可能正在关闭）"}`, but teri maps the IPC close-timeout→**400** hard error, and this divergence was UNFLAGGED. The prior gate's minimal-fix option (a): "add `[≠] U026-l-TIMEOUT` to the close_env_route comment + S-834 row with rationale." That comment is now present (simulation.rs:2527-2535).
+
+### Verification (confirm/refute the three asks)
+1. **Divergence documented & accurate — CONFIRMED.** close_env_route header comment `[≠] U026-l-TIMEOUT` (simulation.rs:2527-2535) accurately states: Python 200-graceful vs teri 400 (status + success bool + message all diverge); root cause = `TeriError` has no `Timeout` variant; producer-pending/unreachable today; resolution plan ties to U-028/029/030 (add `TeriError::Timeout` → close-env 200-graceful / interview 504). The embedded CJK timeout literal is **byte-exact** vs Python source `simulation_runner.py:1655` (verified: `e78eaf…efbc89` 51 bytes, identical). Success-path CJK `环境关闭命令已发送` also byte-exact (route:2615 vs py:1647/2669).
+   - Source-of-truth re-read: the 200-graceful branch lives in the PRIMITIVE `SimulationRunner.close_simulation_env` (simulation_runner.py:1651-1656), not the route — so the route's `except ValueError→400 / except Exception→500` never sees the TimeoutError; the primitive returns a dict and the route falls through to `jsonify(...)` = HTTP 200. Comment's "Python returns 200" is correct.
+   - teri side re-read: `send_command` elapsed → `Err(TeriError::Sim("等待命令响应超时 (…秒)"))` (simulation_ipc.rs:946-957); `close_simulation_env` (simulation_runner.rs:4151-4161) calls `send_close_env`→`send_command`; route `.map_err(map_runner_err)?` (simulation.rs:2597) and `map_runner_err` maps `Sim→400` (simulation.rs:1492-1497). So elapsed close-timeout → 400/success:false. Comment's "teri 400" is correct.
+   - `TeriError` (error.rs:4-55): NO `Timeout` variant — confirmed. The 200-graceful-on-timeout shape is genuinely inexpressible without one.
+
+2. **Documenting `[≠]` vs porting a fragile string-match now — CORRECT CALL.** (a) Path is unreachable until the producer: `close_simulation_env` requires a registered run in `self.runs` (a live IPC server from U-028/029/030); none today → `Err("Simulation not found")` → 400 BEFORE any send/timeout (runner.rs:4156-4159). (b) teri cannot express 200-graceful-on-timeout without a `Timeout` error variant — adding one is a producer-coupled error-model change, not a local string hack; matching on the error *string* `"等待命令响应超时"` now would be fragile and would still need rework when the variant lands. (c) The identical `[≠] U026-k-TIMEOUT504` (interview IPC timeout → teri 400 vs Python 504, same no-`Timeout`-variant root cause, simulation.rs:2182-2187) was already adjudicated PASS as a producer-pending residual THIS session. Consistency demands the same verdict for the same class. This SURVIVES the `[≠]` bar (genuinely inexpressible in the destination substrate today) — it is NOT a portable-feature skip: there is no observable output being silently dropped on any reachable path (the divergent path cannot execute pre-producer), and the resolution is committed to the producer cycle, not waved away as "dest won't use it." Documenting it satisfies the fail-closed "no UNDOCUMENTED divergence" bar that triggered the original FAIL.
+
+3. **Nothing else regressed — CONFIRMED.** The change is comment-only: `cargo build` is cached/green (route code unchanged). The faithful surfaces from the prior review are intact and tested: missing simulation_id → 400 `requireSimulationId` (close_env_missing_simulation_id_400, simulation.rs:5453-5462); no registered run → 400 + no traceback (close_env_no_env_400, simulation.rs:5467-5480); success-path shape `{success:status==completed, message:"环境关闭命令已发送", result|null, timestamp}` + `{success, data:result}` + status→Completed save (simulation.rs:2599-2619) unchanged; `[≠] U026-l-ALREADYCLOSED` still flagged (route:2609-2611). env-status (S-833) unchanged & PASS.
+
+### Residual flags (carried into U-028/029/030 producer cycle)
+- `[!] U026-l-IPC-PRODUCER-PENDING` (close-env success path): legitimate; clears when a live IPC run is registered.
+- `[≠] U026-l-ALREADYCLOSED`: defensible producer-pending; re-verify observable shape when producer lands.
+- `[≠] U026-l-TIMEOUT`: NOW DOCUMENTED + adjudicated PASS (was the FAIL trigger). MUST resolve WITH the producer: add `TeriError::Timeout` → route close-env timeout to 200-graceful (the byte-exact CJK literal) / interview to 504. Re-verify the live 200/success/message shape when U-028/029/030 lands.
+
+### Verdict
+- S-833: `[x]` (unchanged, PASS).
+- S-834: `[≠]` (PASS — the documented `[≠] U026-l-TIMEOUT` resolves the prior FAIL; tracked residual, producer-pending).
+
+Unit rollup: 2/2 symbols covered (S-833 `[x]`, S-834 `[≠]`). **U-026 sub-cycle (l) is PASS** — clears to commit. The two `[≠]` (TIMEOUT, ALREADYCLOSED) + one `[!]` (IPC-PRODUCER-PENDING) are tracked must-resolve-with-producer residuals, not downgrades.

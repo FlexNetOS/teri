@@ -163,6 +163,9 @@ pub fn simulation_router(state: Arc<ApiState>) -> Router {
         .route("/interview/batch", post(interview_batch_route))
         .route("/interview/all", post(interview_all_route))
         .route("/interview/history", post(interview_history_route))
+        // Sub-cycle (l): env-status (pure read) + close-env (IPC). Both POST static paths.
+        .route("/env-status", post(env_status_route))
+        .route("/close-env", post(close_env_route))
         // Sub-cycle (e2): simulation-script download.  Static FIRST segment "script" — axum 0.7
         // ranks a static segment above the `/:simulation_id/...` capture at position 0, so
         // `/script/<name>/download` is unambiguous against the 3-segment `/:simulation_id/config/*`
@@ -2507,6 +2510,113 @@ fn interview_history_response(
         "success": true,
         "data": { "count": 0, "history": [] }
     })))
+}
+
+// ---------------------------------------------------------------------------
+// Sub-cycle (l) — env-status / close-env  (simulation.py:2585-2716).
+//
+// `POST /env-status` is a PURE read (check_env_alive + get_env_status_detail file read) — always
+// 200, fully portable + tested TODAY (no env → env_alive:false, both-available:false,
+// message:envNotRunningShort).
+//
+// `POST /close-env` drives the live IPC env (graceful close) — `[!] U026-l-IPC-PRODUCER-PENDING`:
+// close_simulation_env errors `Simulation not found` (→400) until a run with a live IPC server is
+// registered (U-028/029/030).  Validation + the no-env 400 are tested now; the success path
+// (IPC close → shape → status=Completed) is ported, code-inspection-verified, producer-pending.
+//
+// `[≠] U026-l-TIMEOUT` (must-resolve-with-producer): Python's close_simulation_env catches
+// `TimeoutError` and returns a GRACEFUL **200** `{success:true, message:"环境关闭命令已发送（等待
+// 响应超时，环境可能正在关闭）"}` (a close-timeout is treated as "probably closing").  teri's IPC
+// `send_command` folds an elapsed timeout into `TeriError::Sim`, so `map_runner_err` maps it to a
+// hard **400** — a status/success/message divergence.  Root cause is shared with
+// `[≠] U026-k-TIMEOUT504` (interview): teri's `TeriError` has NO `Timeout` variant.  Both are
+// UNREACHABLE today (the IPC timeout needs a live env from U-028/029/030), so this is a tracked
+// producer-pending divergence.  RESOLVE both together when the producer lands: add
+// `TeriError::Timeout` and route it → close-env 200-graceful (this CJK literal) / interview 504.
+// ---------------------------------------------------------------------------
+
+/// Port of MiroFish `get_env_status` route (simulation.py:2585-2647). POST /env-status.
+async fn env_status_route(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, ApiError> {
+    let data = body.map(|Json(v)| v).unwrap_or_else(|| serde_json::json!({}));
+
+    let simulation_id = data
+        .get("simulation_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ApiError::client(StatusCode::BAD_REQUEST, crate::i18n::t("api.requireSimulationId"))
+        })?;
+
+    // env_alive: Python check_env_alive (False when no env); teri Err(no-run) → false.
+    let env_alive = state.sim_runner.check_env_alive(simulation_id).await.unwrap_or(false);
+    // get_env_status_detail reads env_status.json (default when absent). Python catches read errors
+    // and returns the default too → unwrap_or_default() yields the false/false defaults.
+    let env_status = state.sim_runner.get_env_status_detail(simulation_id).unwrap_or_default();
+    let message = if env_alive {
+        crate::i18n::t("api.envRunning")
+    } else {
+        crate::i18n::t("api.envNotRunningShort")
+    };
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": {
+            "simulation_id": simulation_id,
+            "env_alive": env_alive,
+            "twitter_available": env_status.get("twitter_available").and_then(Value::as_bool).unwrap_or(false),
+            "reddit_available": env_status.get("reddit_available").and_then(Value::as_bool).unwrap_or(false),
+            "message": message
+        }
+    })))
+}
+
+/// Port of MiroFish `close_simulation_env` route (simulation.py:2649-2716). POST /close-env.
+async fn close_env_route(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, ApiError> {
+    let data = body.map(|Json(v)| v).unwrap_or_else(|| serde_json::json!({}));
+
+    let simulation_id = data
+        .get("simulation_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ApiError::client(StatusCode::BAD_REQUEST, crate::i18n::t("api.requireSimulationId"))
+        })?;
+    let timeout = parse_timeout(&data, 30.0);
+
+    // --- IPC-PRODUCER-PENDING: no env → Err(no-run) → map_runner_err → 400 (Python ValueError). ---
+    let resp = state
+        .sim_runner
+        .close_simulation_env(simulation_id, timeout)
+        .await
+        .map_err(map_runner_err)?;
+
+    // Success path: update the simulation status → Completed + save (Python :2697-2701).
+    if let Some(mut sim) =
+        state.sim_manager.get_simulation(simulation_id).map_err(ApiError::server)?
+    {
+        sim.status = SimulationStatus::Completed;
+        state.sim_manager.save_simulation_state(&mut sim).map_err(ApiError::server)?;
+    }
+
+    // Shape the "close command sent" result dict (Python close_simulation_env tail). The message
+    // is a hardcoded CJK literal in the Python primitive (NOT an i18n key) — preserved verbatim.
+    // `[≠] U026-l-ALREADYCLOSED`: teri's close_simulation_env always sends (no already-closed early
+    // return), so the Python 2-key {success,message:"环境已经关闭"} branch is not produced; this
+    // path is producer-pending regardless.
+    let completed = resp.status == CommandStatus::Completed;
+    let mut result = serde_json::Map::new();
+    result.insert("success".into(), Value::Bool(completed));
+    result.insert("message".into(), Value::String("环境关闭命令已发送".to_string()));
+    result.insert("result".into(), resp.result.clone().map(Value::Object).unwrap_or(Value::Null));
+    result.insert("timestamp".into(), Value::String(resp.timestamp.clone()));
+
+    Ok(Json(serde_json::json!({ "success": completed, "data": Value::Object(result) })))
 }
 
 // ---------------------------------------------------------------------------
@@ -5272,6 +5382,101 @@ mod tests {
         // Only the action='interview' row is returned.
         assert_eq!(json["data"]["count"], 1);
         assert_eq!(json["data"]["history"][0]["agent_id"], 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (l) — env-status (pure read) / close-env (IPC)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn env_status_missing_simulation_id_400() {
+        let (app, _t) = test_app();
+        let resp = app
+            .oneshot(post_json("/api/simulation/env-status", serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// No env → 200 with env_alive:false, both-available:false, envNotRunningShort message.
+    #[tokio::test]
+    async fn env_status_no_env_200_default_shape() {
+        let (app, _t) = test_app();
+        let resp = app
+            .oneshot(post_json(
+                "/api/simulation/env-status",
+                serde_json::json!({"simulation_id":"s_env"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["success"], true);
+        let data = &json["data"];
+        assert_eq!(data["simulation_id"], "s_env");
+        assert_eq!(data["env_alive"], false);
+        assert_eq!(data["twitter_available"], false);
+        assert_eq!(data["reddit_available"], false);
+        assert_eq!(data["message"], crate::i18n::t("api.envNotRunningShort"));
+        assert_eq!(data.as_object().unwrap().len(), 5, "env-status data = 5 keys");
+    }
+
+    /// env-status reads env_status.json: a file with twitter_available:true surfaces in the response.
+    #[tokio::test]
+    async fn env_status_reads_env_status_json() {
+        let (state, _tmp) = test_state();
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join("s_ef");
+        std::fs::create_dir_all(&sim_dir).unwrap();
+        std::fs::write(
+            sim_dir.join("env_status.json"),
+            br#"{"status":"running","twitter_available":true,"reddit_available":false,"timestamp":"2025-12-01T10:00:00"}"#,
+        )
+        .unwrap();
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(post_json(
+                "/api/simulation/env-status",
+                serde_json::json!({"simulation_id":"s_ef"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["data"]["twitter_available"], true, "read from env_status.json");
+        assert_eq!(json["data"]["reddit_available"], false);
+        // env_alive is still false (no live IPC env), independent of the file fields.
+        assert_eq!(json["data"]["env_alive"], false);
+    }
+
+    #[tokio::test]
+    async fn close_env_missing_simulation_id_400() {
+        let (app, _t) = test_app();
+        let resp = app
+            .oneshot(post_json("/api/simulation/close-env", serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"], crate::i18n::t("api.requireSimulationId"));
+    }
+
+    /// No registered run → close_simulation_env errors "not found" → 400 (Python ValueError).
+    /// The faithful IPC-PRODUCER-PENDING contract.
+    #[tokio::test]
+    async fn close_env_no_env_400() {
+        let (app, _t) = test_app();
+        let resp = app
+            .oneshot(post_json(
+                "/api/simulation/close-env",
+                serde_json::json!({"simulation_id":"s_noenv"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["success"], false);
+        assert!(json.get("traceback").is_none(), "400 must not have traceback");
     }
 
     // -----------------------------------------------------------------------
