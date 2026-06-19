@@ -141,6 +141,11 @@ pub fn simulation_router(state: Arc<ApiState>) -> Router {
         // Sub-cycle (g): lifecycle — start + stop.  Both are static paths; no capture conflicts.
         .route("/start", post(start_simulation))
         .route("/stop", post(stop_simulation))
+        // Sub-cycle (e2): simulation-script download.  Static FIRST segment "script" — axum 0.7
+        // ranks a static segment above the `/:simulation_id/...` capture at position 0, so
+        // `/script/<name>/download` is unambiguous against the 3-segment `/:simulation_id/config/*`
+        // routes (whose middle segment is the static "config", which never equals a script name).
+        .route("/script/:script_name/download", get(download_script))
         .with_state(state)
 }
 
@@ -1019,6 +1024,76 @@ async fn download_config(
         .map_err(ApiError::server)?;
 
     Ok(resp)
+}
+
+// ---------------------------------------------------------------------------
+// Sub-cycle (e2) — GET /script/:script_name/download  (simulation.py:1323-1372)
+//
+// Source steps:
+//   1. scripts_dir = abspath(__file__/../../scripts)        — backend/scripts/
+//   2. allowed_scripts = [run_twitter_simulation.py, run_reddit_simulation.py,
+//                         run_parallel_simulation.py, action_logger.py]
+//   3. script_name ∉ allowed → 400 {success:false, error: t('api.unknownScript',
+//                                    name=script_name, allowed=allowed_scripts)}
+//   4. script_path = scripts_dir / script_name
+//   5. not os.path.exists(script_path) → 404 {success:false,
+//                                    error: t('api.scriptFileNotFound', name=script_name)}
+//   6. else send_file(script_path, as_attachment=True, download_name=script_name)
+//   7. outer except → 500 traceback
+//
+// `[≠] U026-SCRIPTDL` (architect findings/u026-architecture.md:103/165/182; S-601):
+//   MiroFish serves `backend/scripts/run_*.py` — the OASIS *subprocess* runner scripts.
+//   teri's port is NATIVE in-process (DECISION-17: subprocess.Popen → tokio handles), so those
+//   `run_*.py` files DO NOT EXIST and have NO native equivalent (the same architectural reason
+//   `scripts_dir` was dropped from `get_run_instructions().to_dict()` in sub-cycle (c)).
+//
+//   Owner-decision (404 vs drop, architect flag at :165/:182): KEEP the route, return 404
+//   `scriptFileNotFound` — never drop (no-downgrade law: a route in X with no equivalent in Y
+//   is recorded, not silently removed) and never 200-empty (architect's explicit prohibition).
+//   The full validation boundary ports VERBATIM: step 2 allowed-list, step 3 400 `unknownScript`
+//   (with name + Python-`str(list)`-repr `allowed` interpolation) are byte-faithful and fully
+//   testable.  Only step 6 (file bytes) is inexpressible; teri's scripts dir is conceptually
+//   always empty, so a valid script name reaches exactly the 404 MiroFish itself returns when
+//   `os.path.exists(script_path)` is False — same status, same `scriptFileNotFound` body shape.
+// ---------------------------------------------------------------------------
+
+/// The four runner scripts MiroFish's `backend/scripts/` exposes for download.  Kept verbatim so
+/// the `unknownScript` validation contract (step 3) ports byte-for-byte.  teri does not ship these
+/// (native in-process simulation — `[≠] U026-SCRIPTDL`), so a valid name resolves to 404.
+const ALLOWED_SCRIPTS: [&str; 4] = [
+    "run_twitter_simulation.py",
+    "run_reddit_simulation.py",
+    "run_parallel_simulation.py",
+    "action_logger.py",
+];
+
+/// Port of MiroFish `download_simulation_script` (simulation.py:1323-1372).
+async fn download_script(Path(script_name): Path<String>) -> Result<Response, ApiError> {
+    // Step 3: validate against the allowed list → 400 unknownScript.
+    // Python interpolates `allowed=allowed_scripts`, i.e. `str(list)` → the list's repr with
+    // single-quoted items: `['run_twitter_simulation.py', 'run_reddit_simulation.py', ...]`.
+    if !ALLOWED_SCRIPTS.contains(&script_name.as_str()) {
+        let allowed_repr = format!(
+            "[{}]",
+            ALLOWED_SCRIPTS.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(", ")
+        );
+        return Err(ApiError::client(
+            StatusCode::BAD_REQUEST,
+            crate::i18n::t_args(
+                "api.unknownScript",
+                &[("name", &script_name), ("allowed", &allowed_repr)],
+            ),
+        ));
+    }
+
+    // Steps 4-6: `[≠] U026-SCRIPTDL` — teri ships no `run_*.py` (native in-process simulation).
+    // The scripts dir is conceptually always empty, so step 5's `os.path.exists` is always False:
+    // a valid script name reaches the SAME 404 `scriptFileNotFound` MiroFish returns for an absent
+    // file.  Never 200-empty, never drop the route.
+    Err(ApiError::client(
+        StatusCode::NOT_FOUND,
+        crate::i18n::t_args("api.scriptFileNotFound", &[("name", &script_name)]),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -3266,6 +3341,108 @@ mod tests {
             body_bytes.as_ref(),
             cfg_content.as_bytes(),
             "body must equal file content exactly"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (e2) — GET /script/:script_name/download
+    //   [≠] U026-SCRIPTDL: teri ships no run_*.py (native in-process simulation).
+    //   Validation boundary ports verbatim (400 unknownScript); a valid name → 404.
+    // -----------------------------------------------------------------------
+
+    /// GET /script/<name>/download — name NOT in the allowed list → 400 unknownScript.
+    /// The error interpolates `name` and the Python-`str(list)`-repr `allowed` list.
+    #[tokio::test]
+    async fn download_script_unknown_name_400() {
+        let (state, _tmp) = test_state();
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/script/not_a_real_script.py/download")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+        assert!(json.get("traceback").is_none(), "400 must not have traceback");
+        let err = json["error"].as_str().unwrap();
+        assert!(err.contains("not_a_real_script.py"), "error must name the bad script: {err}");
+        // Python `str(allowed_scripts)` repr is single-quoted; at least one allowed entry shows.
+        assert!(
+            err.contains("run_twitter_simulation.py"),
+            "error must list the allowed scripts: {err}"
+        );
+    }
+
+    /// GET /script/<name>/download — VALID name, but teri ships no run_*.py → 404
+    /// scriptFileNotFound ([≠] U026-SCRIPTDL: native in-process, scripts dir always empty).
+    /// Never 200, never empty body, never dropped.
+    #[tokio::test]
+    async fn download_script_valid_name_404_no_native_script() {
+        let (state, _tmp) = test_state();
+        let app = crate::server::create_app(state);
+        for name in [
+            "run_twitter_simulation.py",
+            "run_reddit_simulation.py",
+            "run_parallel_simulation.py",
+            "action_logger.py",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/simulation/script/{name}/download"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "valid script {name} must 404 (no native run_*.py)"
+            );
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["success"], false);
+            assert!(json.get("traceback").is_none(), "404 must not have traceback");
+            assert!(
+                json["error"].as_str().unwrap().contains(name),
+                "scriptFileNotFound must name the script"
+            );
+        }
+    }
+
+    /// Route disambiguation: `/script/<name>/download` (static seg0) must resolve to
+    /// `download_script`, NOT collide with the `/:simulation_id/config/download` capture route.
+    #[tokio::test]
+    async fn download_script_route_distinct_from_config_download() {
+        let (state, _tmp) = test_state();
+        let app = crate::server::create_app(state);
+        // A name shaped like a script reaches download_script → 400 (unknown), proving it did
+        // NOT route into config/download (which would 404 with configFileNotFound, no "allowed").
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/script/bogus.py/download")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            json["error"].as_str().unwrap().contains("run_twitter_simulation.py"),
+            "must be download_script's unknownScript error, not config/download's 404"
         );
     }
 
