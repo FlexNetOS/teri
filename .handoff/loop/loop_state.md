@@ -17,7 +17,7 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 1   # NEW SESSION 2026-06-18 (18th resume); CYCLE 20=U-025(a+b) graph route seam + project routes (PASS r1)
+cycles_this_session: 2   # NEW SESSION 2026-06-18 (18th resume); CYCLE 20=U-025(a+b) seam+project routes (PASS r1), 21=U-025(c) ontology route (FAIL→fix→PASS)
 # CYCLE3 (12th resume) 2026-06-17: U-022 sub-cycle (c) MONITOR + offset-tail + graph-fire (S-605/613/614/615 + S-1056/U-047,
 #   5 [x]) — opus PASS (DECISION-17 Area 2, porter@opus). src/services/simulation_runner.rs: monitor_simulation (2s
 #   MONITOR_POLL_INTERVAL poll loop, per-platform file-exists guard, save_run_state per poll, loop-exit on U-048
@@ -699,3 +699,39 @@ next_iterate: U-022 [x] complete → U-017 port-fresh full implementation
 # [gap routes LAST: [!]U025-GRAPHSTORE map graph_id→task_id→result["graph"], [≠]U025-ZEP-TEMPORAL]. After U-025: U-026
 # simulation routes (92KB Flask — large, needs own architect decomposition), U-027 report routes (where h4 ReportSink→SSE
 # adapter lands). U-024 tail still open: (b2) insight_forge OQ-3 vec-search, (h4) deferred to U-027.
+
+
+# CYCLE 21 (NEW SESSION 2026-06-18, 18th resume): U-025 sub-cycle (c) /ontology/generate route — porter@porter,
+# parity@opus FAIL→fix→PASS. src/api/graph.rs: generate_ontology (axum Multipart + DefaultBodyLimit 50MB via
+# config.max_content_length) → generate_ontology_inner<L:LlmClient>(pm,llm,sim_req,proj_name,addl_ctx,files). Steps
+# (graph.py:122-255): multipart parse + validation 400s (requireSimulationRequirement/requireFileUpload) → create_project
+# + simulation_requirement → per-file allowed_file + save_file_to_project(bytes) + SeedDocument::from_file().raw_text
+# (=FileParser.extract_text RAW) + preprocess_text (=TextProcessor) → document_texts + all_text header `\n\n=== {orig}
+# ===\n{text}` (NOT from_files whose header differs) → noDocProcessed-400+delete_project → total_text_length=all_text
+# .chars().count() (CHAR, g1-class) → save_extracted_text → build_llm→OntologyGenerator::new().generate(document_texts,
+# sim_req, addl_ctx_opt) → project.ontology 2-key projection {entity_types,edge_types} (drops other gen keys) +
+# analysis_summary separate (default "") + status OntologyGenerated → 6-key response {project_id,project_name,ontology,
+# analysis_summary,files(2-key {filename,size}),total_text_length}. Cargo.toml +axum multipart feature; src/llm.rs
+# #[derive(Clone)] OpenAiAdapter (U025-CLONE done, unblocks d spawn); src/api/mod.rs ApiError +Debug.
+# GATE CAUGHT 2 REAL ISSUES (no-downgrade gate working): (1) allowed_file used Path::extension() which DIFFERS from
+# Python os.path.splitext on leading-multi-dot basenames (..txt → Python ext='' REJECT / Rust accepted 'txt') — FIXED:
+# dedicated splitext-faithful allowed_file in graph.rs (basename → skip leading dots stem_start → rfind('.') in
+# non-leading portion → lowercase suffix → seed::is_allowed_ext canonical SUPPORTED_EXTENSIONS set; is_supported
+# UNCHANGED, only additive is_allowed_ext helper); (2) handler test-coverage gap — no test drove the REAL handler to 200,
+# phantom generate_ontology_inner doc-comment — FIXED: actually extracted generate_ontology_inner<L> (pure refactor,
+# steps 4-10), handler does 1-3 then calls it w/ build_llm; new test generate_ontology_inner_200_real_response_envelope
+# drives inner w/ MockLlmClient asserting real 6-key 200 envelope + CJK char-count. ROUND-2 re-verify PASS (13-case
+# allowed_file table hand-traced vs CPython os.path.splitext). U025-FILEPARSER resolved (pdfium from_file + preprocess).
+# U025-TRACEBACK [≠] carried (3-key 500 shape kept, value Rust backtrace). 17→+8 new tests, 1271 green, clippy clean.
+# Atomic gate: X-parity PASS + Y-green + Y-not-regressed (a/b routes + /health intact). Y-drift clean. S-798 [x].
+# NEXT: U-025 (d) build route 6 [POST /build, graph.py:260-529 — THE big one: ZEP_API_KEY config check→500
+# (U025-ZEPGUARD? [≠] keep, gate decides), JSON parse, project lookup→404, status-machine guards (CREATED→400
+# ontologyNotGenerated / GRAPH_BUILDING&&!force→400 +task_id / force-reset BUILDING|FAILED|COMPLETED), graph_name/chunk
+# resolution, extracted_text fetch→400, ontology fetch→400, create task + project GRAPH_BUILDING + graph_build_task_id +
+# save, delegate pipeline to build_graph_async (U-015, needs OpenAiAdapter Clone=done), set project.graph_id=task_id
+# (U025-BUILD-PROJSTATE [!]: build_graph_async has no project_id → terminal status via task poll), return {success,data:
+# {project_id,task_id,message}}]. Then (e) task routes 7-8 [TaskManager::global get/list, trivial, ∥ — could do FIRST as
+# a small cycle], (f) data/delete 9-10 [gap routes LAST: U025-GRAPHSTORE map graph_id→task_id→task.result["graph"]
+# reshape {nodes,edges,node_count,edge_count}, U025-ZEP-TEMPORAL [≠]]. After U-025: U-026 simulation routes (92KB Flask —
+# LARGE, own architect decomposition), U-027 report routes (h4 ReportSink→SSE adapter lands here). U-024 tail open:
+# (b2) insight_forge OQ-3, (h4) deferred to U-027.

@@ -23,7 +23,7 @@ redb = "2"
 tokio = { version = "1", features = ["full"] }
 
 # HTTP server (API layer)
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.7", features = ["macros", "multipart"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 

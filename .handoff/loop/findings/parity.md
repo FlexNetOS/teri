@@ -2571,3 +2571,87 @@ Symbols cleared to `- [x]`: **S-794, S-795, S-796, S-797** (4/4 of sub-cycle b).
 
 ## Probe hygiene
 A temporary `tests/probe_u025.rs` (5 adversarial HTTP assertions: route-order, 500 3-key, reset/get key orders, CORS scoping) was inserted, run green (4 test fns ok), then REMOVED. Tree restored; `tests/probe_u025.rs` absent; crate builds clean. No probe artifact remains.
+
+---
+
+## 2026-06-18 · U-025 sub-cycle (c) · `POST /ontology/generate` (S-798) + `allowed_file` → **FAIL** (opus)
+
+**Verdict: FAIL.** One genuine, observable behavioral divergence in the ported `allowed_file` symbol (a `Path::extension` vs `os.path.splitext` semantic mismatch on leading-multi-dot basenames). Symbol S-798 stays `- [ ]`. Full suite green (1264 passed, 6 ignored), clippy `--all-targets` clean, (a)+(b) routes + /health non-regressed, OpenAiAdapter `#[derive(Clone)]` additive (llm.rs:307) — but the divergence blocks the unit.
+
+### Adjudicated targets (file:line both sides)
+
+1. **CHAR-count (target 1): PASS.** Rust `all_text.chars().count() as i64` (graph.rs:437) == Python `len(all_text)` (graph.py:211) — both count Unicode scalars. Happy-path test (graph.rs:1304-1310) genuinely proves char≠byte: CJK `你好世界` (4 chars / 12 bytes), asserts `total_chars < byte_count`. A `.len()` slip would have been caught; it is correct.
+2. **all_text header format (target 2): PASS.** Rust `format!("\n\n=== {} ===\n{}", file_info.original_filename, text)` (graph.rs:418) byte-matches Python `f"\n\n=== {file_info['original_filename']} ===\n{text}"` (graph.py:201). Uses `SeedIngestor::from_file().raw_text` RAW (graph.rs:411) + `text_processor::preprocess_text` SEPARATELY (graph.rs:414) — NOT `from_files` (whose header `=== 文档 {idx}: {filename} ===` at seed/mod.rs:51 differs). `document_texts` holds the preprocessed per-file text (graph.rs:416). Correct.
+3. **ontology 2-key projection (target 3): PASS.** Rust projects exactly `{entity_types, edge_types}` with `unwrap_or(Value::Array(vec![]))` defaults (graph.rs:457-460) == Python `{"entity_types":…, "edge_types":…}` (graph.py:229-232), dropping any other generator keys. `analysis_summary` routed separately with `unwrap_or("")` (graph.rs:461-467) == graph.py:233. `generate` returns `Result<Value>` (ontology.rs:324) so the projection does real work (analysis_summary proves >2 keys returned).
+4. **Response body shape (target 4): PASS.** 6-key data in exact order project_id/project_name/ontology/analysis_summary/files/total_text_length (graph.rs:476-486) == graph.py:238-248. `files` is the 2-key `{filename,size}` shape (graph.rs:398-401) == graph.py:192-195. serde `preserve_order` proven across suite. (But see coverage gap — the 200 assembly is not exercised through the real handler.)
+5. **Validation 400s + ordering (target 5): PASS.** sim_req check (graph.rs:357-362) BEFORE file check (graph.rs:367-372) == graph.py:161-173. noDocProcessed calls `delete_project` THEN 400 (graph.rs:424-431) == graph.py:203-208; test `generate_ontology_400_no_docs_processed_disallowed_ext` (graph.rs:1147-1187) asserts the project WAS deleted (`projects.len()==0`). 500 → `ApiError::server` 3-key (tested graph.rs:913-929).
+6. **allowed_file (target 6): FAIL — divergence below.** Empty/no-dot/uppercase/only-dot/unknown-ext all correct, BUT leading-multi-dot basenames diverge.
+
+### THE DIVERGENCE (blocking)
+
+`allowed_file` (graph.rs:287-294 → `SeedIngestor::is_supported` seed/mod.rs:30-37) uses Rust `Path::extension()`, which differs from Python `os.path.splitext()[1]` on basenames that are ALL leading dots + a name with no internal dot:
+
+| input | Python `splitext[1]` → allowed (graph.py:30) | Rust `Path::extension` → allowed (seed/mod.rs:31) | match |
+|---|---|---|---|
+| `..txt` | `''` → **False** | `txt` → **true** | ✗ |
+| `...txt` | `''` → **False** | `txt` → **true** | ✗ |
+| `..md` | `''` → **False** | `md` → **true** | ✗ |
+| `.hidden.txt` | `.txt` → True | `txt` → true | ✓ |
+| `.a.txt`, `. .txt` | `.txt` → True | `txt` → true | ✓ |
+
+- **Input:** a `files` part with `filename="..txt"` (or `...txt`, `..md`) as the only upload.
+- **Expected (source):** Python rejects it (ext=`''`) → if sole file, `400 api.noDocProcessed` and the project is deleted.
+- **Actual (Rust):** Rust accepts it (ext=`txt`) → file saved, extracted, sent to LLM, `200`.
+
+This is the same class as the char-vs-byte slip: a destination-stdlib primitive (`Path::extension`) whose semantics differ from the source's (`os.path.splitext`'s documented "leading dots on the basename are not an extension separator" rule). It is observable (accept-vs-reject of a real upload) and contractual (`allowed_file` is a validation gate whose job is byte-faithful accept/reject parity). Not a `[≠]` (Python's behavior is trivially expressible in Rust). FAIL.
+
+### Minimal fix (route back to porter)
+
+In `allowed_file` (or `is_supported`), replicate `os.path.splitext`'s leading-dot rule: strip the basename's leading dots before taking the extension, e.g. take the substring after the LAST `.` but only if a non-dot, non-empty stem precedes it on the basename. Concretely: split basename on `.`; the extension is the final segment only when there is at least one non-empty, non-all-dots segment before it. The existing `allowed_file_only_dot_rejected` test (graph.rs:1001-1004) should be extended with `..txt`/`...txt`/`..md` → reject, plus `.hidden.txt`/`.a.txt` → accept (Python parity), to lock the fix.
+
+### Handler test-coverage gap (verdict: GAP — close it alongside the fix)
+
+The handler `generate_ontology` (graph.rs:313) hard-calls `build_llm` (concrete `OpenAiAdapter`, graph.rs:447) inline. The doc-comment at graph.rs:309-312 claims a `generate_ontology_inner` exists for mock injection — **it does not** (no such fn in the file). Consequence: NO test drives the real axum handler to a 200. The four e2e tests stop at a 400 before the LLM boundary; the "happy path" test (graph.rs:1268-1399) manually RE-IMPLEMENTS steps 4-10 with a `MockLlmClient` rather than calling the handler. So the handler's own project-state mutation (graph.rs:457-469) and response-assembly JSON build (graph.rs:476-486) — exactly the code the 6-key/2-key/key-order claims rest on — are executed by no test. The shapes are correct by reading, but unproven through the handler. Recommendation: extract a `generate_ontology_inner<L: LlmClient>(state, fields, files, llm: L)` that the axum handler delegates to with `build_llm`, and add ONE test through that inner with a `MockLlmClient` asserting the real 200 envelope (6 data keys, order, files 2-key, ontology 2-key). This closes the gap and makes the doc-comment honest. Bundle with the `allowed_file` fix.
+
+### Flag ledger (this sub-cycle)
+- `U025-FILEPARSER` (`- [!]`): RESOLVED — file text-extraction primitive landed (`SeedIngestor::from_file` raw_text + `text_processor::preprocess_text`); called correctly (raw + preprocess separately). Not a skip.
+- `U025-CLONE` (`- [!]`): DONE — `#[derive(Clone)]` on `OpenAiAdapter` (llm.rs:307); additive, fields all Clone, zero behavior change. Confirmed.
+
+### No-downgrade of Y
+- `cargo test -p teri`: **1264 passed, 6 ignored** (5 suites). `cargo clippy -p teri --all-targets`: clean.
+- (a)+(b) routes + `/health` non-regressed (route-order, get/list/delete/reset, health tests all green).
+
+**S-798 → stays `- [ ]`.** U-025 stays `- [ ]` (d/e/f also pending). Re-port the `allowed_file` extension rule + close the handler 200-path coverage gap, then re-verify.
+
+---
+
+## 2026-06-18 — U-025 sub-cycle (c) `/ontology/generate` ROUND-2 RE-VERIFY → **PASS**
+
+Re-verify of the two round-1 FAILs (porter fixed both). Source X: `MiroFish/backend/app/api/graph.py` (`allowed_file` 26-31, `generate_ontology` 122-255). Rust: `src/api/graph.rs`, `src/seed/mod.rs`, `src/api/mod.rs`.
+
+### FIX 1 — `allowed_file` now matches `os.path.splitext` — **CONFIRMED**
+Python ground truth captured via `os.path.splitext(f)[1].lower().lstrip('.')`. Rust `allowed_file` (graph.rs:306) rewritten: basename → empty/no-dot guard → `stem_start` (first non-dot index) → `after_leading` = `basename[stem_start..]` → `after_leading.rfind('.')` → lowercase suffix → `seed::is_allowed_ext` (canonical `SUPPORTED_EXTENSIONS`, NOT a 2nd hardcoded list). Traced all 13 table cases by hand + verified `Path::file_name` preserves leading dots (rustc probe):
+
+| input | Python ext | Rust verdict | match |
+|---|---|---|---|
+| `..txt` `...txt` `..md` | `''` | REJECT (after_leading has no dot) | ✓ |
+| `.txt` | `''` | REJECT | ✓ |
+| `.hidden.txt` `.a.txt` `..a.txt` | `.txt` | ACCEPT | ✓ |
+| `file.txt` `FILE.TXT` `a.PDF` | ext | ACCEPT (case-insensitive via `to_lowercase`) | ✓ |
+| `noext` `` (empty) `foo.exe` | — | REJECT | ✓ |
+
+- `seed::is_supported` (seed/mod.rs:40) UNCHANGED — still its own `Path::extension` codepath; only an **additive** `pub(crate) fn is_allowed_ext` (seed/mod.rs:30) was added, sharing the same `SUPPORTED_EXTENSIONS` const (no duplication). `json` in the canonical set is a pre-existing documented superset (not introduced here); all Python-set cases match exactly.
+- 6 new FIX-1 boundary tests present (graph.rs:1096-1130) covering both reject (`..txt`/`...txt`/`..md`) and accept (`.hidden.txt`/`.a.txt`/`..a.txt`) sides. Plus existing `.`/empty/no-dot/exe/uppercase coverage.
+
+### FIX 2 — handler now has REAL 200 coverage — **CONFIRMED**
+- `generate_ontology_inner<L: LlmClient>(pm, llm, simulation_requirement, project_name, additional_context, files) -> Result<Json<Value>, ApiError>` EXISTS (graph.rs:438), contains steps 4-10: create_project → per-file save/extract(`SeedIngestor::from_file`)/preprocess → noDocProcessed project-delete → `total_text_length = all_text.chars().count()` + save_extracted_text → `OntologyGenerator::new(llm).generate` → 2-key ontology projection → status `OntologyGenerated` + save → 6-key response envelope.
+- axum `generate_ontology` (graph.rs:354) does steps 1-3 (multipart single-pass collect + sim_req 400 + ≥1-named-file 400) then calls `generate_ontology_inner(&pm, build_llm(&state.config), …)`. **PURE REFACTOR** — char-count (`chars().count()`), header `\n\n=== {orig} ===\n{text}` (graph.rs:489), ontology 2-key {entity_types,edge_types}, 6-key data {project_id,project_name,ontology,analysis_summary,files,total_text_length}, files 2-key {filename,size} all intact vs round-1.
+- New test `generate_ontology_inner_200_real_response_envelope` (graph.rs:1143) drives the REAL inner fn with `MockLlmClient` → asserts 6-key data (count==6) + each key present + files array len==2 each 2-key + CJK char_count < byte_count + `ttl == char_count`. Old happy-path test (graph.rs:1514) now CALLS `generate_ontology_inner` (no re-implementation). Handler doc-comment (graph.rs:350) correctly references the real `generate_ontology_inner` (no phantom symbol).
+
+### No new divergence + green
+- Round-1 PASSes hold: char-count, header format, ontology projection, 6-key response, validation 400 ordering, noDocProcessed project deletion (test asserts `list_projects==0` post-400), 500 3-key shape.
+- `ApiError` `#[derive(Debug)]` (mod.rs:166) is **additive** — private fields, `client` 2-key / `server` 3-key / `client_with` shapes unchanged.
+- `cargo test -p teri`: **1271 passed, 6 ignored** (5 suites). `cargo clippy -p teri --all-targets`: clean. (a)+(b) routes + `/health` non-regressed. No probes/`todo!`/`dbg!` in graph.rs.
+- `[≠] U025-TRACEBACK` carried (3-key 500 contract preserved, value-only Rust-string divergence, non-contractual). `[!] U025-FILEPARSER` resolved, `[!] U025-CLONE` done.
+
+**VERDICT: PASS.** S-798 (`generate_ontology`, route 5) → `- [x]`. U-025 stays `- [ ]` (S-799–S-803 / sub-cycles d/e/f pending).

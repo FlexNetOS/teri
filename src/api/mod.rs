@@ -163,6 +163,7 @@ impl StreamConfig {
 /// Carries the exact `{success:false, error[, traceback]}` body MiroFish returns,
 /// plus the HTTP status code.  Returned as `Err(ApiError)` from handlers typed
 /// `Result<Json<Value>, ApiError>`.
+#[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     body: Value,

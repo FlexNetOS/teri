@@ -21,6 +21,16 @@ pub struct SeedDocument {
 
 pub struct SeedIngestor;
 
+/// Returns `true` if `ext` (already lowercased, no leading dot) is in the
+/// canonical allowed-extensions set (txt / md / markdown / pdf / json).
+///
+/// This is a thin helper so callers that compute the extension themselves
+/// (e.g. `allowed_file` in the upload API, which replicates `os.path.splitext`
+/// semantics) can reuse the same canonical set without hardcoding it twice.
+pub(crate) fn is_allowed_ext(ext: &str) -> bool {
+    SUPPORTED_EXTENSIONS.contains(&ext)
+}
+
 impl SeedIngestor {
     /// Returns `true` if the file's extension is in the supported set
     /// (txt, md, markdown, pdf, json — mirrors MiroFish `Config.ALLOWED_EXTENSIONS`).

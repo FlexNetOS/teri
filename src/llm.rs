@@ -300,6 +300,11 @@ pub trait LlmClient: Send + Sync {
 
 /// Adapter for providers using OpenAI's chat completions API format.
 /// Examples: OpenAI, Ollama, LM Studio, vLLM, Together AI, Groq
+///
+/// `Clone` is derived so that handlers in sub-cycles (c)+(d) can move the adapter
+/// into `OntologyGenerator::new` / `build_graph_async` by value after constructing
+/// it with `build_llm`. `reqwest::Client` is `Clone` (shared connection pool).
+#[derive(Clone)]
 pub struct OpenAiAdapter {
     base_url: String,
     api_key: String,
