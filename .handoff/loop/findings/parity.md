@@ -3236,3 +3236,54 @@ Every pre-gap path proven byte/status-faithful:
 - DEFERRED-TO-PRODUCER (impossible until U-028/029/030, flagged not dropped): /start's 200 body (`run_state.to_dict()` + the 4 added keys), the RUNNING persist, the actual spawn; /stop's 200 HTTP-wrapper Paused-persist over a *live HTTP-started* run.
 
 **VERDICT: PASS.** /stop = full parity. /start = full-boundary parity + the gap adjudicated a legitimate `[!]` (genuine inexpressibility-until-producer, no fabrication, gap is terminal). `_check_simulation_prepared` + `cleanup_simulation_logs` = faithful full ports incl. side effects. No disguised feature-skip; the one number-vs-string-float edge is a noted non-contractual `[~]`, not a downgrade.
+
+---
+
+## 2026-06-19 · U-026 sub-cycle (i) · world-state read routes · VERDICT: FAIL
+
+**Unit:** U-026 (i) — `GET /<sim>/actions` (S-824), `/timeline` (S-825), `/agent-stats` (S-826).
+**Port:** `.worktrees/mirofish-port/teri` `src/api/simulation.rs` handlers + `src/services/simulation_runner.rs` primitives.
+**Source X:** `MiroFish/backend/app/api/simulation.py:1864-1982`, primitives `simulation_runner.py:955-1100`.
+
+### VERDICT: FAIL — two observable-output downgrades in the timeline/agent-stats serialization
+
+`serde_json` is built with `features=["preserve_order"]` (Cargo.toml:35) → **JSON key insertion order is the wire order and IS contractually observable.**
+
+**[FAIL-1] timeline drops 2 fields (`first_action_time`, `last_action_time`).**
+- Source `get_timeline` result dict (`simulation_runner.py:1045-1054`) emits **9 keys** ending in `"first_action_time"` and `"last_action_time"` (tracked at :1026-1027,:1039).
+- Port `TimelineEntry` (simulation_runner.rs:4568-4577) has **no timestamp fields**; `TimelineRound` (:4528-4535) never tracks them — the porter left a bare comment "Track first/last timestamps ... we need to handle this" (:4021) and never did. `TimelineEntry::to_value` (:4581-4594) emits **7 keys**.
+- Input: any sim with ≥1 action → `/timeline`. Expected entry keys (Python): round_num, twitter_actions, reddit_actions, total_actions, active_agents_count, active_agents, action_types, **first_action_time, last_action_time**. Actual (Rust): the same minus the last two. A distinct observable output (frontend timeline view consumes these). This is a dropped-field DOWNGRADE, not a `[≠]`.
+
+**[FAIL-2] agent-stats key ORDER diverges (`action_types` misplaced).**
+- Source `get_agent_stats` dict (`simulation_runner.py:1075-1083`) order: agent_id, agent_name, total_actions, twitter_actions, reddit_actions, **action_types**, first_action_time, last_action_time.
+- Port `AgentStats::to_value` (simulation_runner.rs:4647-4654) order: agent_id, agent_name, total_actions, twitter_actions, reddit_actions, first_action_time, last_action_time, **action_types** (action_types emitted LAST).
+- With preserve_order the serialized byte order differs → not byte-exact. All 8 keys present but ordered wrong.
+
+### What PASSES (do not re-port)
+- **actions wrapper (S-824):** byte-exact. `{success:true,data:{count:len,actions:[to_dict]}}`. `AgentAction::to_dict` (simulation_runner.rs:199-216) = 9 keys, identical order to Python (:61-72). count==len confirmed. PASS.
+- **timeline/agent-stats envelope + count keys:** `rounds_count`/`agents_count` == list length, `success:true` envelope, nesting all correct. Only the inner entry shapes fail.
+- **Flask type=int fallback (item 3):** `?limit=abc`→default 100 confirmed green by `get_actions_reads_tail_with_pagination_and_int_fallback`. agent_id/round_num None-default path correct (`.and_then(parse).ok()` → None on absent/unparseable). PASS.
+- **platform empty-string (item 7):** `Some("")` treated as no_filter via `platform.is_none() || platform==Some("")` (simulation_runner.rs:3897) — consistent with the (h) fix. PASS.
+- **500 path (item 6):** primitive `Result::Err` → `.map_err(ApiError::server)`; no traceback on 200. PASS.
+- **Empty-log contract (item 5):** absent actions.jsonl → `count:0`/`[]` is FAITHFUL to Python on an absent log (Python reads tail → [] too). Not a stub. The `seed_actions` helper writes REAL jsonl so the populated tests genuinely exercise read+group+stats. The data-starved-in-prod gap is the legitimate `[!] U026-i-PRODUCER-PENDING` (producers land U-028/029/030).
+
+### Why the green tests did NOT catch this
+`get_timeline_empty_and_populated` (simulation.rs:4118-4122) asserts only `round_num` + `total_actions` present — written to the downgraded shape, so it passes blind to the 2 missing keys. `get_agent_stats_empty_and_populated` (:4172-4173) asserts only `agent_id`+`total_actions` present — never checks key order. Green build is necessary, not sufficient. Note: primitives S-621/S-622 are still `- [ ]` in symbol-map (NOT verified in U-022d as the prompt assumed) — consistent with the downgrade living in them.
+
+### `[≠]` adjudication — item 4, negative `?limit`
+`?limit=-5`: Python `int("-5")=-5` → slice `all[off:off-5]`; teri `parse::<usize>()` fails → default 100. **Adjudicated a defensible `[~]`/`[≠]`, NOT a blocking downgrade:** a negative limit is a non-contractual/nonsensical input (Python's own behavior on it — a backward slice yielding `[]` or fewer — is incidental, undocumented), and this is the SAME `parse::<usize>().unwrap_or(default)` precedent accepted for U-025 `?limit`. Consistent, non-material. Does NOT gate the unit. (The unit FAILs on FAIL-1/FAIL-2, not this.)
+
+### Residual flags
+- `[!] U026-i-PRODUCER-PENDING` — read path proven on real jsonl fixtures; data-starved in prod until SimEngine writes actions.jsonl (U-028/029/030). Faithful empty contract. Legitimate `[!]`.
+- `[~]` negative-`?limit` int divergence — non-contractual, consistent with U-025 precedent. Non-blocking.
+
+### Symbols
+- S-824 `/actions` → **`- [x]` eligible** (wrapper + actions serialization byte-exact, fallback/filter/empty all proven). [Verified PASS.]
+- S-825 `/timeline` → **stays `- [ ]`** (FAIL-1: 2 dropped fields).
+- S-826 `/agent-stats` → **stays `- [ ]`** (FAIL-2: key order wrong).
+- Unit U-026(i): **FAIL** (rollup: not all symbols `- [x]`/`- [≠]`).
+
+### Minimal fix (route back to porter)
+1. `TimelineRound`: add `first_action_time: String`, `last_action_time: String`. On first insert seed both = action.timestamp. Per action update `last_action_time = action.timestamp`. (Mind sort order: `get_all_actions` returns DESC/newest-first, so the FIRST action seen per round is the LATEST — Python iterates the same DESC list and assigns `first_action_time` from the first-seen + overwrites `last_action_time` each iter, so faithfully: seed both from first-seen, then set `last_action_time` from each subsequent. Match Python's exact assignment, do not assume ASC.) Add both fields to `TimelineEntry` and append them (in that order) at the END of `to_value`, after `action_types`.
+2. `AgentStats::to_value`: move the `action_types` insert to BEFORE `first_action_time`/`last_action_time` so order = agent_id, agent_name, total_actions, twitter_actions, reddit_actions, action_types, first_action_time, last_action_time. (Verify the DESC-iteration first/last assignment matches Python :1082-1095 too.)
+3. Strengthen the two populated tests to assert the full key SET and order (serialize to string + compare, or assert the missing keys explicitly) so the gap can't re-hide.

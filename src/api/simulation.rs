@@ -76,7 +76,7 @@ use crate::api::{ApiError, ApiState};
 use crate::graph::KnowledgeGraph;
 use crate::models::project::python_isoformat_local;
 use crate::services::simulation_manager::SimulationStatus;
-use crate::services::simulation_runner::RunnerStatus;
+use crate::services::simulation_runner::{AgentStats, RunnerStatus, TimelineEntry};
 
 // ---------------------------------------------------------------------------
 // Router factory — sub-cycle (c) adds the 3 create/get/list routes.
@@ -146,6 +146,11 @@ pub fn simulation_router(state: Arc<ApiState>) -> Router {
         // is distinct from the 2-segment `/run-status` by full-path match (axum 0.7).
         .route("/:simulation_id/run-status", get(run_status))
         .route("/:simulation_id/run-status/detail", get(run_status_detail))
+        // Sub-cycle (i): world-state read routes (actions/timeline/agent-stats). Distinct static
+        // 2nd segments under /:simulation_id; no capture conflicts.
+        .route("/:simulation_id/actions", get(get_simulation_actions))
+        .route("/:simulation_id/timeline", get(get_simulation_timeline))
+        .route("/:simulation_id/agent-stats", get(get_simulation_agent_stats))
         // Sub-cycle (e2): simulation-script download.  Static FIRST segment "script" — axum 0.7
         // ranks a static segment above the `/:simulation_id/...` capture at position 0, so
         // `/script/<name>/download` is unambiguous against the 3-segment `/:simulation_id/config/*`
@@ -1849,6 +1854,92 @@ async fn run_status_detail(
     Ok(Json(serde_json::json!({
         "success": true,
         "data": Value::Object(result)
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Sub-cycle (i) — world-state read routes: actions / timeline / agent-stats
+//   (simulation.py:1864-1980). Primitives ported + parity-verified in U-022(d).
+//
+// `[!] U026-i-PRODUCER-PENDING` (informational, NOT a port bug): all three read the
+// actions.jsonl tail (via SimulationRunner readers).  teri's SimEngine does not yet WRITE
+// that log (producer lands U-028/029/030), so they return the FAITHFUL empty contract — a
+// sim that produced no actions yields count 0 / empty lists.  Identical to Python on an
+// absent log.  Routes port + verify against THAT contract now.
+//
+// Flask `type=int` graceful-fallback (same convention as U-025 graph `?limit`): an absent
+// OR unparseable int param falls back to its default (NOT a 400).
+// ---------------------------------------------------------------------------
+
+/// Port of MiroFish `get_simulation_actions` (simulation.py:1864-1912).
+/// GET /:simulation_id/actions — paginated agent-action history.
+async fn get_simulation_actions(
+    State(state): State<Arc<ApiState>>,
+    Path(simulation_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    // Flask: limit default 100, offset default 0 (bad/absent → default).
+    let limit = params.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(100);
+    let offset = params.get("offset").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+    // platform: None when absent, Some("") when `?platform=` (falsy — handled in get_all_actions).
+    let platform = params.get("platform").map(String::as_str);
+    // agent_id / round_num: type=int, NO default → None on absent or unparseable.
+    let agent_id = params.get("agent_id").and_then(|s| s.parse::<i64>().ok());
+    let round_num = params.get("round_num").and_then(|s| s.parse::<i64>().ok());
+
+    let actions = state
+        .sim_runner
+        .get_actions(&simulation_id, limit, offset, platform, agent_id, round_num)
+        .map_err(ApiError::server)?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": {
+            "count": actions.len(),
+            "actions": actions.iter().map(|a| Value::Object(a.to_dict())).collect::<Vec<_>>()
+        }
+    })))
+}
+
+/// Port of MiroFish `get_simulation_timeline` (simulation.py:1918-1956).
+/// GET /:simulation_id/timeline — per-round summary timeline.
+async fn get_simulation_timeline(
+    State(state): State<Arc<ApiState>>,
+    Path(simulation_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    // Flask: start_round default 0; end_round type=int NO default → None.
+    let start_round = params.get("start_round").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    let end_round = params.get("end_round").and_then(|s| s.parse::<i64>().ok());
+
+    let timeline = state
+        .sim_runner
+        .get_timeline(&simulation_id, start_round, end_round)
+        .map_err(ApiError::server)?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": {
+            "rounds_count": timeline.len(),
+            "timeline": timeline.iter().map(TimelineEntry::to_value).collect::<Vec<_>>()
+        }
+    })))
+}
+
+/// Port of MiroFish `get_agent_stats` (simulation.py:1959-1980).
+/// GET /:simulation_id/agent-stats — per-agent activity statistics.
+async fn get_simulation_agent_stats(
+    State(state): State<Arc<ApiState>>,
+    Path(simulation_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let stats = state.sim_runner.get_agent_stats(&simulation_id).map_err(ApiError::server)?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": {
+            "agents_count": stats.len(),
+            "stats": stats.iter().map(AgentStats::to_value).collect::<Vec<_>>()
+        }
     })))
 }
 
@@ -3860,6 +3951,265 @@ mod tests {
         // twitter/reddit lists also populate (`not platform` is True for both gates).
         assert_eq!(data["twitter_actions"].as_array().unwrap().len(), 1);
         assert_eq!(data["reddit_actions"].as_array().unwrap().len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (i) — GET /:id/actions, /:id/timeline, /:id/agent-stats
+    //   Read the U-047 actions.jsonl tail. Empty contract until producers land;
+    //   read path proven with real jsonl fixtures.
+    // -----------------------------------------------------------------------
+
+    /// Seed a twitter actions.jsonl with the given raw lines (each a JSON object).
+    fn seed_actions(state: &Arc<ApiState>, sim_id: &str, platform: &str, lines: &[&str]) {
+        let dir = std::path::PathBuf::from(&state.config.oasis_simulation_data_dir)
+            .join(sim_id)
+            .join(platform);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = lines.join("\n") + "\n";
+        std::fs::write(dir.join("actions.jsonl"), body.as_bytes()).unwrap();
+    }
+
+    /// GET /:id/actions — no log → 200 {count:0, actions:[]} (faithful empty contract).
+    #[tokio::test]
+    async fn get_actions_empty_contract() {
+        let (state, _tmp) = test_state();
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_a/actions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["count"], 0);
+        assert_eq!(json["data"]["actions"], serde_json::json!([]));
+    }
+
+    /// GET /:id/actions — populated log → pagination via limit/offset; bad `?limit=` falls back
+    /// to the default (Flask type=int graceful fallback, NOT 400).
+    #[tokio::test]
+    async fn get_actions_reads_tail_with_pagination_and_int_fallback() {
+        let (state, _tmp) = test_state();
+        seed_actions(
+            &state,
+            "sim_b",
+            "twitter",
+            &[
+                r#"{"round":1,"timestamp":"2025-12-01T10:00:00","agent_id":1,"agent_name":"A","action_type":"X"}"#,
+                r#"{"round":1,"timestamp":"2025-12-01T10:01:00","agent_id":2,"agent_name":"B","action_type":"Y"}"#,
+                r#"{"round":2,"timestamp":"2025-12-01T10:02:00","agent_id":1,"agent_name":"A","action_type":"Z"}"#,
+            ],
+        );
+        let app = crate::server::create_app(state);
+
+        // limit=2 → 2 newest (sorted desc).
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_b/actions?limit=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["data"]["count"], 2);
+        assert_eq!(json["data"]["actions"].as_array().unwrap().len(), 2);
+
+        // Bad ?limit=abc → falls back to default 100 → all 3 (NOT a 400).
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_b/actions?limit=abc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "bad int must fall back, not 400");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["data"]["count"], 3);
+    }
+
+    /// GET /:id/actions — agent_id filter narrows results.
+    #[tokio::test]
+    async fn get_actions_agent_id_filter() {
+        let (state, _tmp) = test_state();
+        seed_actions(
+            &state,
+            "sim_f",
+            "twitter",
+            &[
+                r#"{"round":1,"timestamp":"2025-12-01T10:00:00","agent_id":1,"agent_name":"A","action_type":"X"}"#,
+                r#"{"round":1,"timestamp":"2025-12-01T10:01:00","agent_id":2,"agent_name":"B","action_type":"Y"}"#,
+            ],
+        );
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_f/actions?agent_id=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["data"]["count"], 1, "filtered to agent 1");
+        assert_eq!(json["data"]["actions"][0]["agent_id"], 1);
+    }
+
+    /// GET /:id/timeline — empty → {rounds_count:0, timeline:[]}; populated → per-round entries.
+    #[tokio::test]
+    async fn get_timeline_empty_and_populated() {
+        let (state, _tmp) = test_state();
+        // Empty
+        {
+            let app = crate::server::create_app(state.clone());
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/simulation/sim_c/timeline")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["data"]["rounds_count"], 0);
+            assert_eq!(json["data"]["timeline"], serde_json::json!([]));
+        }
+        // Populated: 2 actions in round 1, 1 in round 2 → 2 timeline entries.
+        seed_actions(
+            &state,
+            "sim_c",
+            "twitter",
+            &[
+                r#"{"round":1,"timestamp":"2025-12-01T10:00:00","agent_id":1,"agent_name":"A","action_type":"X"}"#,
+                r#"{"round":1,"timestamp":"2025-12-01T10:01:00","agent_id":2,"agent_name":"B","action_type":"Y"}"#,
+                r#"{"round":2,"timestamp":"2025-12-01T10:02:00","agent_id":1,"agent_name":"A","action_type":"Z"}"#,
+            ],
+        );
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_c/timeline")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["data"]["rounds_count"], 2);
+        let timeline = json["data"]["timeline"].as_array().unwrap();
+        assert_eq!(timeline.len(), 2);
+        // Full 9-key set + EXACT Python order (preserve_order makes this byte-observable).
+        let keys: Vec<&String> = timeline[0].as_object().unwrap().keys().collect();
+        assert_eq!(
+            keys,
+            vec![
+                "round_num",
+                "twitter_actions",
+                "reddit_actions",
+                "total_actions",
+                "active_agents_count",
+                "active_agents",
+                "action_types",
+                "first_action_time",
+                "last_action_time"
+            ],
+            "timeline entry must be the full 9-key Python shape in order"
+        );
+        // DESC-iteration semantics: round 1 has 10:00 + 10:01; first-seen (newest) = 10:01,
+        // last (oldest) = 10:00. Names are intentionally inverted vs chronology (matches Python).
+        assert_eq!(timeline[0]["round_num"], 1);
+        assert_eq!(timeline[0]["first_action_time"], "2025-12-01T10:01:00");
+        assert_eq!(timeline[0]["last_action_time"], "2025-12-01T10:00:00");
+    }
+
+    /// GET /:id/agent-stats — empty → {agents_count:0, stats:[]}; populated → per-agent stats.
+    #[tokio::test]
+    async fn get_agent_stats_empty_and_populated() {
+        let (state, _tmp) = test_state();
+        {
+            let app = crate::server::create_app(state.clone());
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/simulation/sim_d2/agent-stats")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["data"]["agents_count"], 0);
+            assert_eq!(json["data"]["stats"], serde_json::json!([]));
+        }
+        // Populated: agent 1 (2 actions), agent 2 (1 action) → 2 stats.
+        seed_actions(
+            &state,
+            "sim_d2",
+            "twitter",
+            &[
+                r#"{"round":1,"timestamp":"2025-12-01T10:00:00","agent_id":1,"agent_name":"A","action_type":"X"}"#,
+                r#"{"round":2,"timestamp":"2025-12-01T10:02:00","agent_id":1,"agent_name":"A","action_type":"Z"}"#,
+                r#"{"round":1,"timestamp":"2025-12-01T10:01:00","agent_id":2,"agent_name":"B","action_type":"Y"}"#,
+            ],
+        );
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_d2/agent-stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["data"]["agents_count"], 2);
+        let stats = json["data"]["stats"].as_array().unwrap();
+        assert_eq!(stats.len(), 2);
+        // Full 8-key set + EXACT Python order: action_types BEFORE the two timestamps.
+        let keys: Vec<&String> = stats[0].as_object().unwrap().keys().collect();
+        assert_eq!(
+            keys,
+            vec![
+                "agent_id",
+                "agent_name",
+                "total_actions",
+                "twitter_actions",
+                "reddit_actions",
+                "action_types",
+                "first_action_time",
+                "last_action_time"
+            ],
+            "agent-stats entry must be the full 8-key Python shape in order"
+        );
+        // Sorted by total_actions DESC → agent 1 (2 actions) first. DESC-iteration timestamps:
+        // agent 1's first-seen (newest) = 10:02, last (oldest) = 10:00.
+        assert_eq!(stats[0]["agent_id"], 1);
+        assert_eq!(stats[0]["total_actions"], 2);
+        assert_eq!(stats[0]["first_action_time"], "2025-12-01T10:02:00");
+        assert_eq!(stats[0]["last_action_time"], "2025-12-01T10:00:00");
     }
 
     // -----------------------------------------------------------------------

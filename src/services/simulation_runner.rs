@@ -4005,7 +4005,10 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
                 continue;
             }
 
-            let entry = rounds.entry(round_num).or_insert(TimelineRound::new(round_num));
+            // Python: `if round_num not in rounds: rounds[round_num] = {... first/last = timestamp}`
+            let entry = rounds
+                .entry(round_num)
+                .or_insert_with(|| TimelineRound::new(round_num, action.timestamp.clone()));
             entry.total_actions += 1;
 
             match action.platform.as_str() {
@@ -4018,7 +4021,9 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
 
             *entry.action_types.entry(action.action_type.clone()).or_insert(0) += 1;
 
-            // Track first/last timestamps (ascending order in our slice, so we need to handle this)
+            // Python: `r["last_action_time"] = action.timestamp` on every iteration (DESC order →
+            // ends up the OLDEST). first_action_time stays the first-seen (NEWEST).
+            entry.last_action_time = action.timestamp.clone();
         }
 
         // Convert to TimelineEntry and sort by round_num ascending
@@ -4060,7 +4065,10 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
 
             *entry.action_types.entry(action.action_type.clone()).or_insert(0) += 1;
 
-            // Update last_action_time (we're iterating newest-first, so first seen is latest)
+            // Python: `stats["last_action_time"] = action.timestamp` every iteration (DESC order →
+            // ends up the OLDEST). first_action_time stays first-seen (NEWEST). Was previously a
+            // bare comment — last_action_time never updated, so it was stuck at the newest stamp.
+            entry.last_action_time = action.timestamp.clone();
         }
 
         let mut result: Vec<AgentStats> =
@@ -4532,10 +4540,16 @@ struct TimelineRound {
     total_actions: usize,
     active_agents: std::collections::HashSet<i64>,
     action_types: std::collections::HashMap<String, usize>,
+    // Python tracks first/last action timestamps per round (simulation_runner.py:1024-1025,1039).
+    // Actions arrive newest-first (get_actions sorts DESC), so `first_action_time` ends up the
+    // NEWEST (set once on first-seen) and `last_action_time` the OLDEST (overwritten each iter) —
+    // the names are intentionally inverted relative to chronology, matching Python verbatim.
+    first_action_time: String,
+    last_action_time: String,
 }
 
 impl TimelineRound {
-    fn new(round_num: i64) -> Self {
+    fn new(round_num: i64, timestamp: String) -> Self {
         Self {
             round_num,
             twitter_actions: 0,
@@ -4543,6 +4557,8 @@ impl TimelineRound {
             total_actions: 0,
             active_agents: std::collections::HashSet::new(),
             action_types: std::collections::HashMap::new(),
+            first_action_time: timestamp.clone(),
+            last_action_time: timestamp,
         }
     }
 
@@ -4559,6 +4575,8 @@ impl TimelineRound {
                 .into_iter()
                 .map(|(k, v)| (k, Value::Number((v as i64).into())))
                 .collect(),
+            first_action_time: self.first_action_time,
+            last_action_time: self.last_action_time,
         }
     }
 }
@@ -4574,10 +4592,16 @@ pub struct TimelineEntry {
     pub active_agents: Vec<i64>,
     #[serde(rename = "action_types")]
     pub action_type_counts: serde_json::Map<String, Value>,
+    pub first_action_time: String,
+    pub last_action_time: String,
 }
 
 impl TimelineEntry {
     /// Convert to a JSON Value (for API responses).
+    ///
+    /// Key order is byte-exact with Python's timeline-entry dict (simulation_runner.py:1043-1053):
+    /// `round_num, twitter_actions, reddit_actions, total_actions, active_agents_count,
+    /// active_agents, action_types, first_action_time, last_action_time`.
     pub fn to_value(&self) -> Value {
         let mut m = Map::new();
         m.insert("round_num".into(), Value::Number(self.round_num.into()));
@@ -4590,6 +4614,8 @@ impl TimelineEntry {
             Value::Array(self.active_agents.iter().map(|&id| Value::Number(id.into())).collect()),
         );
         m.insert("action_types".into(), Value::Object(self.action_type_counts.clone()));
+        m.insert("first_action_time".into(), Value::String(self.first_action_time.clone()));
+        m.insert("last_action_time".into(), Value::String(self.last_action_time.clone()));
         Value::Object(m)
     }
 }
@@ -4642,6 +4668,10 @@ pub struct AgentStats {
 
 impl AgentStats {
     /// Convert to a JSON Value (for API responses).
+    ///
+    /// Key order is byte-exact with Python's agent-stats dict (simulation_runner.py:1075-1083):
+    /// `agent_id, agent_name, total_actions, twitter_actions, reddit_actions, action_types,
+    /// first_action_time, last_action_time` — `action_types` BEFORE the two timestamps.
     pub fn to_value(&self) -> Value {
         let mut m = Map::new();
         m.insert("agent_id".into(), Value::Number(self.agent_id.into()));
@@ -4649,9 +4679,9 @@ impl AgentStats {
         m.insert("total_actions".into(), Value::Number(self.total_actions.into()));
         m.insert("twitter_actions".into(), Value::Number(self.twitter_actions.into()));
         m.insert("reddit_actions".into(), Value::Number(self.reddit_actions.into()));
+        m.insert("action_types".into(), Value::Object(self.action_type_counts.clone()));
         m.insert("first_action_time".into(), Value::String(self.first_action_time.clone()));
         m.insert("last_action_time".into(), Value::String(self.last_action_time.clone()));
-        m.insert("action_types".into(), Value::Object(self.action_type_counts.clone()));
         Value::Object(m)
     }
 }
