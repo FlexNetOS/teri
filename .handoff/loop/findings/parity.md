@@ -3089,3 +3089,51 @@ sync these comments to the body-id form for accuracy; not a parity/behavior dive
 - **S-680 extension: PASS** (resolved) — `symbol-map.md` row updated.
 
 Sub-cycle (c) is clear to flip to `[x]` and commit.
+
+---
+
+## 2026-06-19 — U-026 sub-cycle (b): 3 entity-read routes (S-804/805/806) — PARITY PASS (opus)
+
+**Verifier:** rust-port-parity-verifier (differential, fail-closed). Worktree `port/mirofish`.
+**Source:** `MiroFish/backend/app/api/simulation.py:48-160` + `services/zep_entity_reader.py` + `utils/zep_paging.py`.
+**Rust:** `src/api/simulation.rs` (3 handlers + `load_entity_reader_graph` helper, registered in `simulation_router`).
+**Test count:** `cargo test -p teri` → **1327 passed, 6 ignored** (1323 baseline + 4 verifier-added). 21-test entity slice all green & executed (not skipped).
+
+### Route 1 — GET /entities/:graph_id  vs get_graph_entities (py:48-90) — PASS
+- ZEP guard: empty `config.zep_api_key` → 500 `api.zepApiKeyMissing` via `ApiError::client(INTERNAL_SERVER_ERROR,..)` → **2-key body, NO traceback** (`simulation.rs:146-151`; test `get_graph_entities_zep_guard_empty_500` asserts `traceback.is_none()`). Matches py:60-64.
+- `entity_types` CSV: `simulation.rs:204-212` = `split(',').map(trim).filter(!empty)`, `if v.is_empty(){None}` — byte-for-byte the py:67 comprehension incl. the `if s else None` + all-empty→None. Test `..._empty_entity_types_csv_treated_as_none` (`?entity_types=,+,` → None → all). PASS.
+- `enrich` parse: `simulation.rs:215` = `s.to_lowercase()=="true"` else default true — exact port of py:68 `.lower()=='true'` (NOT generic bool). **Verifier-added adversarial tests** prove it: `?enrich=1`→FALSE (no related_edges), `?enrich=yes`→FALSE, `?enrich=TRUE`→TRUE (edges populated), absent→TRUE, `?enrich=false`→FALSE. A generic bool-parse would fail `?enrich=1`; this REFUTED-and-survived. PASS.
+- success body `{success:true, data: FilteredEntities::to_dict()}` — route does NOT reshape; `to_dict` (entity_reader.rs:214) emits exactly `entities, entity_types, total_count, filtered_count`. PASS.
+
+### Route 2 — GET /entities/:graph_id/:entity_uuid  vs get_entity_detail (py:93-122) — PASS (with flagged [≠])
+- ZEP guard as above (test `get_entity_detail_zep_guard_500`). PASS.
+- reader `None` → 404 `t_args("api.entityNotFound",[("id",uuid)])` (`simulation.rs:254-257`). i18n key present en.json:341 / zh.json:341; `t_args` (`i18n/mod.rs:209`) does `result.replace("{id}", id)` — exact port of Python `t('api.entityNotFound', id=...)`. Test `get_entity_detail_not_found_404` asserts the uuid appears in the error string. PASS.
+- `Some` → `{success:true, data: EntityNode::to_dict()}` (7-key). Test `get_entity_detail_found_200`. PASS.
+
+### Route 3 — GET /entities/:graph_id/by-type/:entity_type  vs get_entities_by_type (py:126-156) — PASS
+- ZEP guard + same `enrich` rule (shared parse; adversarial tests above cover Route 1's identical code; Route 3 reuses it `simulation.rs:290`).
+- data key order EXACTLY `entity_type, count, entities` — built via explicit `serde_json::Map` insert order (`simulation.rs:302-305`). `count == entities.len()` enforced (`count = entities.len()`); tests `get_entities_by_type_happy_200` + `..._count_equals_len` assert `count == data.entities.len()` and `count==2`. PASS.
+
+### Routing edge — NON-vacuous, PASS
+`/entities/G/by-type/Person` (4 segs) resolves to get_entities_by_type, NOT get_entity_detail(uuid="by-type"). Test `route_by_type_not_captured_as_entity_uuid` asserts the RESPONSE SHAPE has `entity_type`+`count`+`entities` and NOT `uuid` — proving the right handler ran (axum segment-count disambiguation). Non-vacuous. PASS.
+
+### GRAPH-LOAD-FAILURE MAPPING — explicit verdict: defensible [≠]/[!], NOT a downgrade
+Challenge: does Python return EMPTY for an unknown graph_id, or propagate?
+- **Routes 1 & 3** (`filter_defined_entities` → `get_all_nodes` → `fetch_all_nodes`): `zep_paging.py:44` retries ONLY `(ConnectionError,TimeoutError,OSError,InternalServerError)`; an unknown-graph 4xx propagates (no try/except in `filter_defined_entities`) → route `except Exception` → **500+traceback**. An *empty* graph → `[]` → empty FilteredEntities (200). So Python's unknown-graph contract for R1/R3 is **500**. teri's `load_entity_reader_graph` task-not-found → 500 (`server`, 3-key+traceback; test `get_graph_entities_graph_not_found_500` asserts traceback present). **MATCH** — and consistent with the U-025(f) `get_graph_data` precedent + DECISION-9.
+- **Route 2** (`get_entity_with_context`, py:348-411): blanket `try/except → None` swallows ANY failure (incl. unknown graph_id) → route → **404**. teri Route 2 unknown-graph → **500** (verifier probe `probe_route2_unknown_graph_status` observed `500 Internal Server Error`). → **Status-code divergence (500 vs 404) on the unknown-graph_id input ONLY.**
+
+**Classification: defensible `[≠]` (inexpressible substrate boundary), recorded — not FAIL.** Rationale:
+  1. teri's reader borrows a locally-constructed `KnowledgeGraph` (graph_id==task_id, DECISION-9). For an absent graph there is NO task → no graph → the reader cannot be *constructed*; the load is a precondition that fails before the reader runs. Python's Zep client is always-constructable (network handle), so its blanket `except→None→404` is an artifact of that non-portable substrate, not a documented feature (the docstring describes only entity-not-found 404).
+  2. No feature dropped: the PRIMARY, documented Route-2 contract — valid graph + missing *entity* → **404** — IS ported and faithful (test `get_entity_detail_not_found_404`). Only the secondary absent-graph case differs, and only in status code (both are `{success:false,error}` error bodies).
+  3. Consistency: R1/R3 + `get_graph_data` all 500 on this same condition; Route-2 returning 404-on-absent-graph would be the *less* coherent choice under teri's load model.
+  This is a narrowing-of-input-domain forced by the substrate, with the real contract preserved → defensible `[≠]`, NOT a portable feature skipped. **Flagged here explicitly** (the porter's uniform task→500 mapping did not call out the R2 404-vs-500 asymmetry; now recorded).
+
+### Symbols
+- **S-804 get_graph_entities → PASS → `[x]`**
+- **S-805 get_entity_detail → PASS (with flagged [≠] on absent-graph status) → `[x]`**
+- **S-806 get_entities_by_type → PASS → `[x]`**
+
+### Verifier-added permanent regression guards (kept in tests)
+`enrich_one_is_false_no_edges`, `enrich_yes_is_false_no_edges`, `enrich_uppercase_true_is_true_has_edges`, `probe_route2_unknown_graph_status`.
+
+### OVERALL VERDICT: **PASS** (3/3 symbols). Observed test count: **1327 passed, 6 ignored**.

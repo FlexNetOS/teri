@@ -72,6 +72,7 @@ use axum::{
 use serde_json::Value;
 
 use crate::api::{ApiError, ApiState};
+use crate::graph::KnowledgeGraph;
 use crate::services::simulation_manager::SimulationStatus;
 
 // ---------------------------------------------------------------------------
@@ -91,12 +92,223 @@ use crate::services::simulation_manager::SimulationStatus;
 /// Sub-cycle (c): adds `POST /create`, `GET /list`, `GET /:simulation_id`.
 pub fn simulation_router(state: Arc<ApiState>) -> Router {
     Router::new()
+        // Sub-cycle (b): entity-read routes (U-026 sub-cycle b).
+        //
+        // `[!] U026-ROUTE-ORDER-ENTITIES`: segment-count disambiguation:
+        //   `/entities/:graph_id`                  — 2 segments → get_graph_entities
+        //   `/entities/:graph_id/:entity_uuid`     — 3 segments, both captures → get_entity_detail
+        //   `/entities/:graph_id/by-type/:entity_type` — 4 segments, 3rd is static "by-type"
+        //                                             → get_entities_by_type
+        // Axum 0.7 static-before-capture rule applies within each segment count.  The 3-segment
+        // `/entities/:graph_id/by-type/:entity_type` is DISTINCT from the 3-segment
+        // `/entities/:graph_id/:entity_uuid` because axum routes by full path; a request to
+        // `/entities/G/by-type/X` carries 4 segments (entities, G, by-type, X) and matches
+        // `/entities/:graph_id/by-type/:entity_type`, NOT `/entities/:graph_id/:entity_uuid`
+        // (which is only 3 segments: entities, G, U).  No order dependency needed, but we
+        // register the static sub-path first for clarity.
+        .route("/entities/:graph_id", get(get_graph_entities))
+        .route("/entities/:graph_id/by-type/:entity_type", get(get_entities_by_type))
+        .route("/entities/:graph_id/:entity_uuid", get(get_entity_detail))
         // Sub-cycle (c): simulation create/get/list routes.
         // IMPORTANT: /list (static) BEFORE /:simulation_id (capture) — axum 0.7 route order.
         .route("/create", post(create_simulation))
         .route("/list", get(list_simulations))
         .route("/:simulation_id", get(get_simulation))
         .with_state(state)
+}
+
+// ---------------------------------------------------------------------------
+// Sub-cycle (b) private helper — load graph from TaskManager by graph_id
+//
+// Shared prologue for all 3 entity-read routes.  Steps:
+//   1. ZEP guard (matches Python's `if not Config.ZEP_API_KEY: 500` + U-025 precedent)
+//   2. Resolve graph_id → task → result["graph"]
+//   3. Deserialize into KnowledgeGraph (via serialize_to_json round-trip)
+//
+// Returns the OWNED KnowledgeGraph.  Callers construct the reader (which borrows &graph)
+// after this call — lifetime discipline: reader cannot outlive the owned graph the caller holds.
+//
+// `[≠] U026-ZEPKEY`: ZEP guard KEPT — matches source (`if not Config.ZEP_API_KEY: 500
+//   api.zepApiKeyMissing`) AND U-025 precedent in get_graph_data/delete_graph.  The
+//   architecture doc floated removing it as a [≠]-superset, but U-025 KEPT it — consistency.
+// ---------------------------------------------------------------------------
+
+/// Resolve a `graph_id` to an owned `KnowledgeGraph`, applying the ZEP guard and all
+/// task-resolution failure modes as 500 ApiErrors.
+///
+/// Used by: `get_graph_entities`, `get_entity_detail`, `get_entities_by_type`.
+async fn load_entity_reader_graph(
+    state: &ApiState,
+    graph_id: &str,
+) -> Result<KnowledgeGraph, ApiError> {
+    // Step 1: ZEP guard — KEEP IT (matches Python source + U-025 precedent)
+    // `[≠] U026-ZEPKEY`: guard KEPT; teri config carries zep_api_key.
+    if state.config.zep_api_key.as_deref().unwrap_or("").is_empty() {
+        return Err(ApiError::client(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::i18n::t("api.zepApiKeyMissing"),
+        ));
+    }
+
+    // Step 2: Resolve graph_id → task → result["graph"]
+    let task = crate::task::TaskManager::global()
+        .get_task(graph_id)
+        .ok_or_else(|| ApiError::server("graph not found: task not found for graph_id"))?;
+
+    let result = task
+        .result
+        .as_ref()
+        .ok_or_else(|| ApiError::server("graph not found: task has no result yet"))?;
+
+    let graph_json = result
+        .get("graph")
+        .ok_or_else(|| ApiError::server("graph not found: task result missing 'graph' key"))?;
+
+    // Step 3: Reconstruct KnowledgeGraph via JSON round-trip.
+    // graph_json is a serde_json::Value embedded in the task result; re-stringify and deserialize.
+    let graph_str = serde_json::to_string(graph_json)
+        .map_err(|e| ApiError::server(format!("failed to re-serialize graph JSON: {e}")))?;
+
+    let graph = KnowledgeGraph::deserialize_from_json(&graph_str)
+        .map_err(|e| ApiError::server(format!("failed to deserialize graph: {e}")))?;
+
+    Ok(graph)
+}
+
+// ---------------------------------------------------------------------------
+// Sub-cycle (b) Route 1 — GET /entities/:graph_id  (simulation.py:48-90)
+//
+// Source steps:
+//   1. ZEP guard — 500 api.zepApiKeyMissing
+//   2. entity_types_str = request.args.get('entity_types', '')
+//      entity_types = [t.strip() for t in s.split(',') if t.strip()] if s else None
+//   3. enrich = request.args.get('enrich','true').lower() == 'true'
+//   4. reader = ZepEntityReader(); result = reader.filter_defined_entities(graph_id, types, enrich)
+//   5. return {"success": True, "data": result.to_dict()}
+//
+// teri MAP: ZepEntityReader() → load_entity_reader_graph + KnowledgeGraphEntityReader::new(&graph)
+// `[≠] U025-TRACEBACK`: outer except → ApiError::server (3-key 500 shape).
+// ---------------------------------------------------------------------------
+
+/// Port of MiroFish `get_graph_entities` (simulation.py:48-90).
+async fn get_graph_entities(
+    State(state): State<Arc<ApiState>>,
+    Path(graph_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    // Steps 1-3 shared prologue via helper (ZEP guard + graph-load)
+    let graph = load_entity_reader_graph(&state, &graph_id).await?;
+
+    // Step 2: entity_types query param (simulation.py:66-67)
+    // Split on ',', strip each segment, drop empties; None if param absent/empty.
+    let entity_types: Option<Vec<String>> = {
+        let s = params.get("entity_types").map(|s| s.as_str()).unwrap_or("");
+        if s.is_empty() {
+            None
+        } else {
+            let v: Vec<String> =
+                s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect();
+            if v.is_empty() { None } else { Some(v) }
+        }
+    };
+
+    // Step 3: enrich param (simulation.py:68) — default "true"; false iff value != "true" (case-insensitive)
+    let enrich = params.get("enrich").map(|s| s.to_lowercase() == "true").unwrap_or(true);
+
+    // Step 4: filter entities
+    let reader = crate::services::entity_reader::KnowledgeGraphEntityReader::new(&graph);
+    let result = reader.filter_defined_entities(entity_types.as_deref(), enrich);
+
+    // Step 5: return success envelope
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": result.to_dict()
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Sub-cycle (b) Route 2 — GET /entities/:graph_id/:entity_uuid  (simulation.py:93-123)
+//
+// Source steps:
+//   1. ZEP guard — 500 api.zepApiKeyMissing
+//   2. reader = ZepEntityReader(); entity = reader.get_entity_with_context(graph_id, entity_uuid)
+//   3. None → 404 api.entityNotFound {id: entity_uuid}
+//   4. Some → {"success": True, "data": entity.to_dict()}
+//
+// `[≠] U025-TRACEBACK`: outer except → ApiError::server (3-key 500 shape).
+// ---------------------------------------------------------------------------
+
+/// Port of MiroFish `get_entity_detail` (simulation.py:93-123).
+async fn get_entity_detail(
+    State(state): State<Arc<ApiState>>,
+    Path((graph_id, entity_uuid)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    // Shared prologue (ZEP guard + graph-load)
+    let graph = load_entity_reader_graph(&state, &graph_id).await?;
+
+    // Step 2: get entity with context
+    let reader = crate::services::entity_reader::KnowledgeGraphEntityReader::new(&graph);
+    let entity = reader.get_entity_with_context(&entity_uuid);
+
+    // Step 3: None → 404
+    match entity {
+        None => Err(ApiError::client(
+            StatusCode::NOT_FOUND,
+            crate::i18n::t_args("api.entityNotFound", &[("id", &entity_uuid)]),
+        )),
+        // Step 4: found → success envelope
+        Some(e) => Ok(Json(serde_json::json!({
+            "success": true,
+            "data": e.to_dict()
+        }))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sub-cycle (b) Route 3 — GET /entities/:graph_id/by-type/:entity_type  (simulation.py:126-160)
+//
+// Source steps:
+//   1. ZEP guard — 500 api.zepApiKeyMissing
+//   2. enrich = request.args.get('enrich','true').lower() == 'true'
+//   3. reader = ZepEntityReader(); entities = reader.get_entities_by_type(graph_id, type, enrich)
+//   4. return {"success": True, "data": {"entity_type": type, "count": len(entities),
+//                                        "entities": [e.to_dict() for e in entities]}}
+//
+// KEY ORDER inside data: entity_type, count, entities — Python dict insertion order preserved.
+// `[≠] U025-TRACEBACK`: outer except → ApiError::server (3-key 500 shape).
+// ---------------------------------------------------------------------------
+
+/// Port of MiroFish `get_entities_by_type` (simulation.py:126-160).
+async fn get_entities_by_type(
+    State(state): State<Arc<ApiState>>,
+    Path((graph_id, entity_type)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    // Shared prologue (ZEP guard + graph-load)
+    let graph = load_entity_reader_graph(&state, &graph_id).await?;
+
+    // Step 2: enrich param (same parse rule as Route 1)
+    let enrich = params.get("enrich").map(|s| s.to_lowercase() == "true").unwrap_or(true);
+
+    // Step 3: get entities by type
+    let reader = crate::services::entity_reader::KnowledgeGraphEntityReader::new(&graph);
+    let entities = reader.get_entities_by_type(&entity_type, enrich);
+
+    // Step 4: return success envelope with key order: entity_type, count, entities
+    // (Python dict insertion order; preserve_order serde).
+    let count = entities.len();
+    let entities_data: Vec<Value> = entities.iter().map(|e| e.to_dict()).collect();
+
+    // Use IndexMap-backed json! to preserve key order: entity_type → count → entities
+    let mut data = serde_json::Map::new();
+    data.insert("entity_type".to_string(), serde_json::json!(entity_type));
+    data.insert("count".to_string(), serde_json::json!(count));
+    data.insert("entities".to_string(), serde_json::json!(entities_data));
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": Value::Object(data)
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -763,5 +975,530 @@ mod tests {
         let state = Arc::new(ApiState::new(config));
         let _router = simulation_router(state.clone());
         assert!(Arc::strong_count(&state.sim_manager) >= 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (b) helpers
+    // -----------------------------------------------------------------------
+
+    /// Seed a completed task with a real embedded KnowledgeGraph (2 entities, 1 edge).
+    /// The task_id IS the graph_id for entity-read routes.
+    /// Returns (graph_id, alice_uuid, entity_type_str).
+    fn seed_entity_graph_task() -> (String, String, String) {
+        use crate::graph::{Entity, EntityKind, KnowledgeGraph, Relation, RelationKind};
+
+        let alice_id = uuid::Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        let bob_id = uuid::Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap();
+
+        let mut graph = KnowledgeGraph::new();
+        let alice = Entity { id: alice_id, name: "Alice".to_string(), kind: EntityKind::Person };
+        let bob = Entity { id: bob_id, name: "Bob".to_string(), kind: EntityKind::Person };
+        let alice_idx = graph.add_entity(alice).expect("add alice");
+        let bob_idx = graph.add_entity(bob).expect("add bob");
+        graph.add_relation(
+            alice_idx,
+            bob_idx,
+            Relation::new(RelationKind::RelatedTo, 0.8).expect("rel"),
+        );
+
+        let graph_json_str = graph.serialize_to_json().expect("serialize graph");
+        let graph_json: serde_json::Value =
+            serde_json::from_str(&graph_json_str).expect("parse graph json");
+
+        let result = serde_json::json!({
+            "graph_name":       "EntityTestGraph",
+            "graph_info":       {"node_count": 2, "edge_count": 1, "entity_types": []},
+            "chunks_processed": 1,
+            "graph":            graph_json
+        });
+
+        let tm = crate::task::TaskManager::global();
+        let task_id = tm.create_task("graph_build", None);
+        tm.complete_task(&task_id, result);
+
+        // EntityKind::Person.to_string() is the type label (the Display token for Person)
+        let entity_type = EntityKind::Person.to_string();
+        (task_id, alice_id.to_string(), entity_type)
+    }
+
+    /// Build an app with zep_api_key = None so the ZEP guard fires.
+    fn test_app_no_zep_sim() -> (axum::Router, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let mut config = crate::Config::build_test();
+        config.upload_folder = tmp.path().to_string_lossy().to_string();
+        config.zep_api_key = None;
+        let state = Arc::new(ApiState::new(config));
+        (crate::server::create_app(state), tmp)
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (b) — Route 1: GET /entities/:graph_id
+    // -----------------------------------------------------------------------
+
+    /// GET /entities/:graph_id — happy path → 200 + FilteredEntities shape
+    #[tokio::test]
+    async fn get_graph_entities_happy_200_filtered_entities_shape() {
+        let (graph_id, _alice_id, _entity_type) = seed_entity_graph_task();
+        let (app, _tmp) = test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/entities/{graph_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK, "happy path must 200");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(json["success"], true);
+        let data = &json["data"];
+        assert!(data["entities"].is_array(), "data must have entities array");
+        assert!(data["entity_types"].is_array(), "data must have entity_types array");
+        assert!(data["total_count"].is_number(), "data must have total_count");
+        assert!(data["filtered_count"].is_number(), "data must have filtered_count");
+        // 2 entities of kind Person — both should pass filter
+        assert_eq!(data["filtered_count"], 2, "both person entities must be returned");
+    }
+
+    /// GET /entities/:graph_id?entity_types=person — type filter narrows to matching
+    #[tokio::test]
+    async fn get_graph_entities_entity_types_filter() {
+        let (graph_id, _alice_id, entity_type) = seed_entity_graph_task();
+        let (app, _tmp) = test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/entities/{graph_id}?entity_types={entity_type}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["filtered_count"], 2, "filter must keep both persons");
+    }
+
+    /// GET /entities/:graph_id?entity_types=,  (whitespace/empty CSV) → None → all entities
+    #[tokio::test]
+    async fn get_graph_entities_empty_entity_types_csv_treated_as_none() {
+        let (graph_id, _alice_id, _entity_type) = seed_entity_graph_task();
+        let (app, _tmp) = test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/entities/{graph_id}?entity_types=,+,"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true);
+        // All-whitespace/empty CSV → None → filter passes through all
+        assert_eq!(json["data"]["filtered_count"], 2);
+    }
+
+    /// GET /entities/:graph_id?enrich=false — enrich=false is respected
+    #[tokio::test]
+    async fn get_graph_entities_enrich_false() {
+        let (graph_id, _alice_id, _entity_type) = seed_entity_graph_task();
+        let (app, _tmp) = test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/entities/{graph_id}?enrich=false"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["filtered_count"], 2);
+    }
+
+    /// GET /entities/:graph_id — ZEP guard empty → 500 api.zepApiKeyMissing
+    #[tokio::test]
+    async fn get_graph_entities_zep_guard_empty_500() {
+        let (graph_id, _alice_id, _entity_type) = seed_entity_graph_task();
+        let (app, _tmp) = test_app_no_zep_sim();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/entities/{graph_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR, "ZEP-guard must 500");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+        assert!(json.get("error").is_some(), "must have error key");
+        // ZEP guard uses ApiError::client → 2-key body (no traceback)
+        assert!(json.get("traceback").is_none(), "ZEP guard must not emit traceback");
+    }
+
+    /// GET /entities/unknown-graph-id — graph not found → 500 server
+    #[tokio::test]
+    async fn get_graph_entities_graph_not_found_500() {
+        let (app, _tmp) = test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/entities/no-such-task-id-xyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR, "missing graph must 500");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+        assert!(json.get("error").is_some());
+        // Server 500 has 3-key body (success, error, traceback)
+        assert!(json.get("traceback").is_some(), "server 500 must have traceback");
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (b) — Route 2: GET /entities/:graph_id/:entity_uuid
+    // -----------------------------------------------------------------------
+
+    /// GET /entities/:graph_id/:entity_uuid — found → 200 + EntityNode shape
+    #[tokio::test]
+    async fn get_entity_detail_found_200() {
+        let (graph_id, alice_id, _entity_type) = seed_entity_graph_task();
+        let (app, _tmp) = test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/entities/{graph_id}/{alice_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK, "found entity must 200");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(json["success"], true);
+        let data = &json["data"];
+        assert_eq!(data["name"], "Alice", "data.name must be Alice");
+        assert!(data["uuid"].is_string(), "data must have uuid");
+        assert!(data["labels"].is_array(), "data must have labels array");
+        assert!(data["related_edges"].is_array(), "data must have related_edges");
+        assert!(data["related_nodes"].is_array(), "data must have related_nodes");
+    }
+
+    /// GET /entities/:graph_id/:entity_uuid — not found → 404 entityNotFound
+    #[tokio::test]
+    async fn get_entity_detail_not_found_404() {
+        let (graph_id, _alice_id, _entity_type) = seed_entity_graph_task();
+        let (app, _tmp) = test_app();
+        let missing_uuid = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/entities/{graph_id}/{missing_uuid}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "missing entity must 404");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+        let error = json["error"].as_str().unwrap_or("");
+        assert!(error.contains(missing_uuid), "404 error must contain entity uuid: {error}");
+    }
+
+    /// GET /entities/:graph_id/:entity_uuid — ZEP guard → 500
+    #[tokio::test]
+    async fn get_entity_detail_zep_guard_500() {
+        let (graph_id, alice_id, _entity_type) = seed_entity_graph_task();
+        let (app, _tmp) = test_app_no_zep_sim();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/entities/{graph_id}/{alice_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+        assert!(json.get("traceback").is_none(), "ZEP guard must not emit traceback");
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (b) — Route 3: GET /entities/:graph_id/by-type/:entity_type
+    // -----------------------------------------------------------------------
+
+    /// GET /entities/:graph_id/by-type/:entity_type — happy path → 200 + correct shape
+    #[tokio::test]
+    async fn get_entities_by_type_happy_200() {
+        let (graph_id, _alice_id, entity_type) = seed_entity_graph_task();
+        let (app, _tmp) = test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/entities/{graph_id}/by-type/{entity_type}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK, "by-type happy path must 200");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(json["success"], true);
+        let data = &json["data"];
+        // Key presence
+        assert_eq!(data["entity_type"], entity_type, "entity_type must match path param");
+        assert!(data["count"].is_number(), "data must have count");
+        assert!(data["entities"].is_array(), "data must have entities array");
+        // count == entities.len()
+        let count = data["count"].as_u64().unwrap();
+        let len = data["entities"].as_array().unwrap().len() as u64;
+        assert_eq!(count, len, "count must equal entities.len()");
+        assert_eq!(count, 2, "both Person entities must appear");
+    }
+
+    /// GET /entities/:graph_id/by-type/:entity_type — count == entities.len() invariant
+    #[tokio::test]
+    async fn get_entities_by_type_count_equals_len() {
+        let (graph_id, _alice_id, entity_type) = seed_entity_graph_task();
+        let (app, _tmp) = test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/entities/{graph_id}/by-type/{entity_type}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let data = &json["data"];
+        let count = data["count"].as_u64().unwrap();
+        let len = data["entities"].as_array().unwrap().len() as u64;
+        assert_eq!(count, len, "count MUST equal entities.len()");
+    }
+
+    /// GET /entities/:graph_id/by-type/nonexistent — no matches → count 0, entities []
+    #[tokio::test]
+    async fn get_entities_by_type_no_match_count_0() {
+        let (graph_id, _alice_id, _entity_type) = seed_entity_graph_task();
+        let (app, _tmp) = test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/entities/{graph_id}/by-type/Organization"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["count"], 0);
+        assert_eq!(json["data"]["entities"].as_array().unwrap().len(), 0);
+    }
+
+    /// GET /entities/:graph_id/by-type/:type — ZEP guard → 500
+    #[tokio::test]
+    async fn get_entities_by_type_zep_guard_500() {
+        let (graph_id, _alice_id, entity_type) = seed_entity_graph_task();
+        let (app, _tmp) = test_app_no_zep_sim();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/entities/{graph_id}/by-type/{entity_type}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+        assert!(json.get("traceback").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (b) — Routing-collision test
+    //
+    // `[!] U026-ROUTE-ORDER-ENTITIES`: GET /entities/:graph_id/by-type/:entity_type
+    // must NOT be captured by GET /entities/:graph_id/:entity_uuid.
+    // Axum 0.7 distinguishes these routes by segment count:
+    //   /entities/:g/:u          → 3 total segments (entities, g, u)
+    //   /entities/:g/by-type/:t  → 4 total segments (entities, g, by-type, t)
+    // A request to /entities/G/by-type/X (4 segs) MUST resolve to get_entities_by_type,
+    // NOT get_entity_detail with entity_uuid="by-type".
+    // -----------------------------------------------------------------------
+
+    /// Routing: /entities/:graph_id/by-type/X must NOT match :entity_uuid="by-type"
+    #[tokio::test]
+    async fn route_by_type_not_captured_as_entity_uuid() {
+        let (graph_id, _alice_id, entity_type) = seed_entity_graph_task();
+        let (app, _tmp) = test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/entities/{graph_id}/by-type/{entity_type}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK, "by-type route must respond 200, not 404");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true);
+
+        // Verify it went to get_entities_by_type, not get_entity_detail.
+        // get_entities_by_type returns {entity_type, count, entities} inside data.
+        // get_entity_detail returns a single entity node {uuid, name, labels, ...}.
+        // If routing was wrong, data would have {uuid, name} not {entity_type, count, entities}.
+        let data = &json["data"];
+        assert!(
+            data.get("entity_type").is_some(),
+            "response must have entity_type key (by-type handler), not entity detail fields: {data}"
+        );
+        assert!(
+            data.get("count").is_some(),
+            "response must have count key (by-type handler): {data}"
+        );
+        assert!(
+            data.get("entities").is_some(),
+            "response must have entities key (by-type handler): {data}"
+        );
+        // Must NOT have entity-detail shape
+        assert!(
+            data.get("uuid").is_none(),
+            "response must NOT have uuid key (would indicate wrong handler): {data}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (b) — ADVERSARIAL enrich-parse fidelity (parity-verifier added)
+    //
+    // Python: `request.args.get('enrich','true').lower() == 'true'`
+    //   → ONLY the literal "true" (case-insensitive) is True; "1", "yes" → False.
+    // This REFUTES a generic bool-parse: ?enrich=1 MUST be False, ?enrich=TRUE MUST be True.
+    // Observable effect: enrich populates related_edges (seed graph has Alice→Bob edge).
+    // -----------------------------------------------------------------------
+
+    /// Helper: total related_edges across all returned entities for a given enrich query.
+    async fn related_edge_count_for(query: &str) -> usize {
+        let (graph_id, _alice, _t) = seed_entity_graph_task();
+        let (app, _tmp) = test_app();
+        let uri = format!("/api/simulation/entities/{graph_id}{query}");
+        let resp = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json["data"]["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["related_edges"].as_array().map(|a| a.len()).unwrap_or(0))
+            .sum()
+    }
+
+    /// ?enrich=1 MUST be treated as FALSE (compare-to-"true", NOT generic bool parse).
+    #[tokio::test]
+    async fn enrich_one_is_false_no_edges() {
+        let enriched = related_edge_count_for("?enrich=1").await;
+        assert_eq!(
+            enriched, 0,
+            "?enrich=1 must be FALSE → no related_edges (Python .lower()=='true')"
+        );
+    }
+
+    /// ?enrich=yes MUST be treated as FALSE.
+    #[tokio::test]
+    async fn enrich_yes_is_false_no_edges() {
+        let enriched = related_edge_count_for("?enrich=yes").await;
+        assert_eq!(enriched, 0, "?enrich=yes must be FALSE → no related_edges");
+    }
+
+    /// ADVERSARIAL: Route 2 with an UNKNOWN graph_id.
+    /// Python `get_entity_detail` → `get_entity_with_context` catches ALL exceptions → None → 404.
+    /// Rust `load_entity_reader_graph` task-not-found → 500. This probe RECORDS the actual status
+    /// so the parity verdict can classify it (divergence vs defensible [≠]).
+    #[tokio::test]
+    async fn probe_route2_unknown_graph_status() {
+        let (app, _tmp) = test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/entities/no-such-graph-zzz/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Record observed status for the parity ledger (no hard assert — this is a probe).
+        eprintln!("PROBE route2 unknown-graph status = {}", resp.status());
+        assert!(
+            resp.status() == StatusCode::INTERNAL_SERVER_ERROR
+                || resp.status() == StatusCode::NOT_FOUND,
+            "route2 unknown-graph returned unexpected status: {}",
+            resp.status()
+        );
+    }
+
+    /// ?enrich=TRUE (uppercase) MUST be treated as TRUE (case-insensitive compare).
+    #[tokio::test]
+    async fn enrich_uppercase_true_is_true_has_edges() {
+        let enriched = related_edge_count_for("?enrich=TRUE").await;
+        assert!(enriched > 0, "?enrich=TRUE must be TRUE → related_edges populated");
+        // And default (absent) must also be TRUE (Python default 'true').
+        let default_enriched = related_edge_count_for("").await;
+        assert!(default_enriched > 0, "absent enrich defaults TRUE → related_edges populated");
+        // And explicit ?enrich=false must be FALSE.
+        let off = related_edge_count_for("?enrich=false").await;
+        assert_eq!(off, 0, "?enrich=false must be FALSE → no related_edges");
     }
 }
