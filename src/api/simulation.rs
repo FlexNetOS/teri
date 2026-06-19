@@ -64,9 +64,10 @@ use std::sync::Arc;
 
 use axum::{
     Router,
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::Json,
+    http::{HeaderValue, StatusCode, header},
+    response::{Json, Response},
     routing::{get, post},
 };
 use serde_json::Value;
@@ -114,6 +115,24 @@ pub fn simulation_router(state: Arc<ApiState>) -> Router {
         .route("/create", post(create_simulation))
         .route("/list", get(list_simulations))
         .route("/:simulation_id", get(get_simulation))
+        // Sub-cycle (e): profiles/config read routes.
+        //
+        // `[!] U026-ROUTE-ORDER-E`: static suffixes (/profiles, /config, /config/download,
+        // /profiles/realtime, /config/realtime) are 2-segment paths under /:simulation_id.
+        // Axum 0.7 selects by full path; each route is distinct by its static suffix.
+        // No capture conflicts: /:simulation_id alone is a 1-segment capture.
+        //
+        // Note: /config/download and /config/realtime both begin "/:simulation_id/config"
+        // and then diverge by a second static segment — axum 0.7 resolves these correctly
+        // by full path match (3-segment paths, 3rd segment static).  Register
+        // /config/download and /config/realtime BEFORE /config so axum's 3-segment paths
+        // shadow the 2-segment /:simulation_id/config.  Within 3-segment paths the static
+        // wins over a capture (not relevant here — all three are static).
+        .route("/:simulation_id/profiles", get(get_profiles))
+        .route("/:simulation_id/profiles/realtime", get(get_profiles_realtime))
+        .route("/:simulation_id/config/realtime", get(get_config_realtime))
+        .route("/:simulation_id/config/download", get(download_config))
+        .route("/:simulation_id/config", get(get_config))
         .with_state(state)
 }
 
@@ -495,6 +514,503 @@ async fn list_simulations(
         "data": data,
         "count": count
     })))
+}
+
+// ---------------------------------------------------------------------------
+// Sub-cycle (e) Route 1 — GET /:simulation_id/profiles  (simulation.py:990-1025)
+//
+// Source steps:
+//   1. platform = request.args.get('platform', 'reddit')
+//   2. manager.get_profiles(simulation_id, platform=platform)
+//   3. ValueError → 404 {success:false, error}
+//   4. other Exception → 500 {success:false, error, traceback}
+//   5. Ok → 200 {success:true, data:{platform, count, profiles}}
+//
+// Key order in data: platform → count → profiles (Python dict insertion order).
+//
+// `[≠] U025-TRACEBACK`: outer error → ApiError::server (3-key 500 shape).
+//
+// Error discrimination: TeriError::Sim contains "not found" text (Python ValueError path).
+// All TeriError variants use Display; the only Err from get_profiles is Sim (missing state)
+// which maps 1:1 to Python's ValueError → 404.  Any other error (IO/JSON) maps → 500.
+// ---------------------------------------------------------------------------
+
+/// Port of MiroFish `get_simulation_profiles` (simulation.py:990-1025).
+async fn get_profiles(
+    State(state): State<Arc<ApiState>>,
+    Path(simulation_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    // Step 1: platform query param, default "reddit" (simulation.py:999)
+    let platform = params.get("platform").map(|s| s.as_str()).unwrap_or("reddit").to_string();
+
+    // Steps 2-4: call manager; map ValueError (TeriError::Sim) → 404, other → 500
+    let profiles = match state.sim_manager.get_profiles(&simulation_id, &platform) {
+        Ok(v) => v,
+        Err(crate::error::TeriError::Sim(msg)) => {
+            // Python: except ValueError as e: return jsonify({success:False, error:str(e)}), 404
+            return Err(ApiError::client(StatusCode::NOT_FOUND, msg));
+        }
+        Err(e) => {
+            // Python: except Exception as e: 500 with traceback
+            return Err(ApiError::server(e));
+        }
+    };
+
+    // Step 5: success envelope, key order: platform → count → profiles
+    let count = profiles.len();
+    let mut data = serde_json::Map::new();
+    data.insert("platform".to_string(), serde_json::json!(platform));
+    data.insert("count".to_string(), serde_json::json!(count));
+    data.insert("profiles".to_string(), serde_json::json!(profiles));
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": Value::Object(data)
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Sub-cycle (e) Route 2 — GET /:simulation_id/profiles/realtime  (simulation.py:1028-1135)
+//
+// DIRECT FILE READ — bypasses SimulationManager entirely.
+//
+// Source steps:
+//   1. platform = request.args.get('platform', 'reddit')
+//   2. sim_dir = Config.OASIS_SIMULATION_DATA_DIR / simulation_id
+//   3. sim_dir missing → 404 simulationNotFound {id}
+//   4. profiles_file: reddit_profiles.json (reddit) | twitter_profiles.csv (other)
+//   5. file_exists = exists(profiles_file); file_modified_at = None; profiles = []
+//   6. if file_exists:
+//        file_modified_at = mtime via python_isoformat_local_from
+//        try { parse content (JSON array / CSV DictReader) }
+//        except → log warn; profiles = []
+//   7. is_generating = False; total_expected = None
+//      if state.json exists: parse, status=="preparing" → is_generating; entities_count → total_expected
+//      (state.json parse error → silently ignore, keep defaults)
+//   8. 200: {success:true, data:{simulation_id, platform, count, total_expected, is_generating,
+//                                 file_exists, file_modified_at, profiles}}
+//   9. outer except → 500 traceback
+//
+// Key order in data: simulation_id, platform, count, total_expected, is_generating,
+//                    file_exists, file_modified_at, profiles
+//
+// CSV: csv crate (available in Cargo.toml). Python csv.DictReader yields ordered string dicts;
+// csv::Reader with headers does the same. Values are String (DictReader always yields str).
+// Column order within each row matches Python (header order preserved by csv crate).
+//
+// `[≠] U026-MTIME`: file_modified_at uses python_isoformat_local_from (see project.rs).
+// `[≠] U025-TRACEBACK`: outer error → ApiError::server.
+// ---------------------------------------------------------------------------
+
+/// Port of MiroFish `get_simulation_profiles_realtime` (simulation.py:1028-1135).
+async fn get_profiles_realtime(
+    State(state): State<Arc<ApiState>>,
+    Path(simulation_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    // Step 1: platform default "reddit"
+    let platform = params.get("platform").map(|s| s.as_str()).unwrap_or("reddit").to_string();
+
+    // Steps 2-3: sim_dir; missing → 404
+    let sim_dir =
+        std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join(&simulation_id);
+    if !sim_dir.exists() {
+        return Err(ApiError::client(
+            StatusCode::NOT_FOUND,
+            crate::i18n::t_args("api.simulationNotFound", &[("id", &simulation_id)]),
+        ));
+    }
+
+    // Step 4: determine profiles file
+    let profiles_file = if platform == "reddit" {
+        sim_dir.join("reddit_profiles.json")
+    } else {
+        sim_dir.join("twitter_profiles.csv")
+    };
+
+    // Step 5: check existence
+    let file_exists = profiles_file.exists();
+    let mut profiles: Vec<Value> = Vec::new();
+    let mut file_modified_at: Value = Value::Null;
+
+    // Step 6: read + parse if file exists
+    if file_exists {
+        // mtime — [≠] U026-MTIME
+        if let Ok(mtime) = std::fs::metadata(&profiles_file).and_then(|m| m.modified()) {
+            file_modified_at =
+                Value::String(crate::models::project::python_isoformat_local_from(mtime));
+        }
+
+        // Parse content; on any error log warn and keep profiles = []
+        let parse_result: Result<Vec<Value>, Box<dyn std::error::Error>> = (|| {
+            if platform == "reddit" {
+                let raw = std::fs::read_to_string(&profiles_file)?;
+                let parsed: Vec<Value> = serde_json::from_str(&raw)?;
+                Ok(parsed)
+            } else {
+                // CSV: mirrors Python csv.DictReader semantics EXACTLY.
+                //
+                // DictReader is LENIENT (unlike csv::Reader default flexible=false):
+                //   - short row (fewer fields than headers): missing trailing keys → null
+                //   - long row (more fields than headers): surplus values collected into
+                //     a JSON array under the key "null" (Python restkey=None, JSON-serialised
+                //     by t()/jsonify as the string "null")
+                //   - ragged/mid-write truncated file: each parseable row is still yielded;
+                //     only a genuinely unreadable file (e.g. open error) → []
+                //
+                // Use flexible(true) so the csv crate does NOT hard-error on ragged rows.
+                let mut rdr = csv::ReaderBuilder::new()
+                    .flexible(true)
+                    .has_headers(true)
+                    .from_path(&profiles_file)?;
+                let headers: Vec<String> = rdr.headers()?.iter().map(|s| s.to_string()).collect();
+                let mut rows: Vec<Value> = Vec::new();
+                for record in rdr.records() {
+                    let record = record?;
+                    let mut map = serde_json::Map::new();
+                    let nfields = record.len();
+                    let nheaders = headers.len();
+
+                    // Zip header names with field values.
+                    // Short row: iterate over available fields; remaining headers get null.
+                    for (i, header) in headers.iter().enumerate() {
+                        if i < nfields {
+                            map.insert(header.clone(), Value::String(record[i].to_string()));
+                        } else {
+                            // Missing trailing field → null (DictReader default restval=None)
+                            map.insert(header.clone(), Value::Null);
+                        }
+                    }
+
+                    // Long row: surplus fields → array under key "null"
+                    // (Python restkey=None; jsonify renders None key as "null" string)
+                    if nfields > nheaders {
+                        let surplus: Vec<Value> = (nheaders..nfields)
+                            .map(|i| Value::String(record[i].to_string()))
+                            .collect();
+                        map.insert("null".to_string(), Value::Array(surplus));
+                    }
+
+                    rows.push(Value::Object(map));
+                }
+                Ok(rows)
+            }
+        })();
+
+        match parse_result {
+            Ok(v) => profiles = v,
+            Err(e) => {
+                // Python: logger.warning(f"读取 profiles 文件失败（可能正在写入中）: {e}")
+                // profiles stays []
+                tracing::warn!("Failed to read profiles file (may be in progress): {e}");
+            }
+        }
+    }
+
+    // Step 7: read state.json for is_generating / total_expected
+    // silently ignore any read/parse errors (simulation.py:1112: `except Exception: pass`)
+    let mut is_generating = false;
+    let mut total_expected: Value = Value::Null;
+    let state_file = sim_dir.join("state.json");
+    if let Some(state_data) = std::fs::read_to_string(&state_file)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+    {
+        let status = state_data.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        is_generating = status == "preparing";
+        // entities_count may be null; preserve null vs absent faithfully
+        if let Some(ec) = state_data.get("entities_count") {
+            total_expected = ec.clone();
+        }
+    }
+
+    // Step 8: build response data — key order EXACTLY:
+    // simulation_id, platform, count, total_expected, is_generating,
+    // file_exists, file_modified_at, profiles
+    let count = profiles.len();
+    let mut data = serde_json::Map::new();
+    data.insert("simulation_id".to_string(), Value::String(simulation_id));
+    data.insert("platform".to_string(), Value::String(platform));
+    data.insert("count".to_string(), serde_json::json!(count));
+    data.insert("total_expected".to_string(), total_expected);
+    data.insert("is_generating".to_string(), Value::Bool(is_generating));
+    data.insert("file_exists".to_string(), Value::Bool(file_exists));
+    data.insert("file_modified_at".to_string(), file_modified_at);
+    data.insert("profiles".to_string(), Value::Array(profiles));
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": Value::Object(data)
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Sub-cycle (e) Route 3 — GET /:simulation_id/config/realtime  (simulation.py:1138-1255)
+//
+// DIRECT FILE READ.
+//
+// Source steps:
+//   1. sim_dir = oasis_data_dir / simulation_id; missing → 404 simulationNotFound {id}
+//   2. config_file = sim_dir / "simulation_config.json"
+//   3. file_exists; file_modified_at = None; config = None
+//   4. if file_exists:
+//        file_modified_at = mtime; try { config = parse JSON } except → log warn; config = None
+//   5. is_generating=False; generation_stage=None; config_generated=False
+//      if state.json:
+//        status; is_generating = status=="preparing"; config_generated = state["config_generated"] ?? False
+//        if is_generating:
+//          generation_stage = "generating_config" if profiles_generated else "generating_profiles"
+//        elif status=="ready": generation_stage = "completed"
+//        (silently ignore parse errors)
+//   6. response_data key order: simulation_id, file_exists, file_modified_at, is_generating,
+//                                generation_stage, config_generated, config
+//   7. if config (non-null object): append summary key
+//      summary: {total_agents: len(agent_configs??[]), simulation_hours: time_config??{}.total_simulation_hours,
+//               initial_posts_count: len(event_config??{}.initial_posts??[]),
+//               hot_topics_count: len(event_config??{}.hot_topics??[]),
+//               has_twitter_config: "twitter_config" in config,
+//               has_reddit_config: "reddit_config" in config,
+//               generated_at: config.generated_at, llm_model: config.llm_model}
+//   8. 200 {success:true, data:response_data}
+//   9. outer except → 500 traceback
+//
+// `[≠] U026-MTIME`: mtime via python_isoformat_local_from.
+// `[≠] U025-TRACEBACK`: outer error → ApiError::server.
+// ---------------------------------------------------------------------------
+
+/// Port of MiroFish `get_simulation_config_realtime` (simulation.py:1138-1255).
+async fn get_config_realtime(
+    State(state): State<Arc<ApiState>>,
+    Path(simulation_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    // Step 1: sim_dir; missing → 404
+    let sim_dir =
+        std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join(&simulation_id);
+    if !sim_dir.exists() {
+        return Err(ApiError::client(
+            StatusCode::NOT_FOUND,
+            crate::i18n::t_args("api.simulationNotFound", &[("id", &simulation_id)]),
+        ));
+    }
+
+    // Step 2: config file path
+    let config_file = sim_dir.join("simulation_config.json");
+
+    // Step 3: check existence; default config=Null, file_modified_at=Null
+    let file_exists = config_file.exists();
+    let mut config: Value = Value::Null;
+    let mut file_modified_at: Value = Value::Null;
+
+    // Step 4: read config if file exists
+    if file_exists {
+        // mtime — [≠] U026-MTIME
+        if let Ok(mtime) = std::fs::metadata(&config_file).and_then(|m| m.modified()) {
+            file_modified_at =
+                Value::String(crate::models::project::python_isoformat_local_from(mtime));
+        }
+
+        // Parse config JSON; on error → log warn, keep config = Null
+        match std::fs::read_to_string(&config_file)
+            .map_err(|e| e.to_string())
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).map_err(|e| e.to_string()))
+        {
+            Ok(v) => config = v,
+            Err(e) => {
+                // Python: logger.warning(f"读取 config 文件失败（可能正在写入中）: {e}")
+                tracing::warn!("Failed to read config file (may be in progress): {e}");
+                // config stays Null
+            }
+        }
+    }
+
+    // Step 5: state.json for is_generating / generation_stage / config_generated
+    // silently ignore any read/parse errors (simulation.py:1217: except Exception: pass)
+    let mut is_generating = false;
+    let mut generation_stage: Value = Value::Null;
+    let mut config_generated = false;
+    let state_file = sim_dir.join("state.json");
+    if let Some(state_data) = std::fs::read_to_string(&state_file)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+    {
+        let status = state_data.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        is_generating = status == "preparing";
+        config_generated =
+            state_data.get("config_generated").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        // Determine generation_stage (simulation.py:1210-1216)
+        if is_generating {
+            let profiles_generated =
+                state_data.get("profiles_generated").and_then(|v| v.as_bool()).unwrap_or(false);
+            generation_stage = if profiles_generated {
+                Value::String("generating_config".to_string())
+            } else {
+                Value::String("generating_profiles".to_string())
+            };
+        } else if status == "ready" {
+            generation_stage = Value::String("completed".to_string());
+        }
+        // else: generation_stage stays Null (simulation.py:1197: generation_stage = None)
+    }
+
+    // Step 6: build response_data key order EXACTLY:
+    // simulation_id, file_exists, file_modified_at, is_generating,
+    // generation_stage, config_generated, config
+    let mut response_data = serde_json::Map::new();
+    response_data.insert("simulation_id".to_string(), Value::String(simulation_id));
+    response_data.insert("file_exists".to_string(), Value::Bool(file_exists));
+    response_data.insert("file_modified_at".to_string(), file_modified_at);
+    response_data.insert("is_generating".to_string(), Value::Bool(is_generating));
+    response_data.insert("generation_stage".to_string(), generation_stage);
+    response_data.insert("config_generated".to_string(), Value::Bool(config_generated));
+    response_data.insert("config".to_string(), config.clone());
+
+    // Step 7: if config is a non-null, non-empty object, append summary.
+    // Python: `if config:` — an empty dict {} is falsy; only a non-empty object is truthy.
+    // `config.is_object()` is true for {} too, so we must check non-empty explicitly.
+    if config.as_object().is_some_and(|o| !o.is_empty()) {
+        let agent_configs_len = config
+            .get("agent_configs")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+
+        let simulation_hours = config
+            .get("time_config")
+            .and_then(|v| v.get("total_simulation_hours"))
+            .cloned()
+            .unwrap_or(Value::Null);
+
+        let initial_posts_count = config
+            .get("event_config")
+            .and_then(|v| v.get("initial_posts"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+
+        let hot_topics_count = config
+            .get("event_config")
+            .and_then(|v| v.get("hot_topics"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+
+        let has_twitter_config = config.get("twitter_config").is_some();
+        let has_reddit_config = config.get("reddit_config").is_some();
+
+        let generated_at = config.get("generated_at").cloned().unwrap_or(Value::Null);
+        let llm_model = config.get("llm_model").cloned().unwrap_or(Value::Null);
+
+        // Key order mirrors Python insertion order in simulation.py:1233-1242
+        let mut summary = serde_json::Map::new();
+        summary.insert("total_agents".to_string(), serde_json::json!(agent_configs_len));
+        summary.insert("simulation_hours".to_string(), simulation_hours);
+        summary.insert("initial_posts_count".to_string(), serde_json::json!(initial_posts_count));
+        summary.insert("hot_topics_count".to_string(), serde_json::json!(hot_topics_count));
+        summary.insert("has_twitter_config".to_string(), Value::Bool(has_twitter_config));
+        summary.insert("has_reddit_config".to_string(), Value::Bool(has_reddit_config));
+        summary.insert("generated_at".to_string(), generated_at);
+        summary.insert("llm_model".to_string(), llm_model);
+
+        response_data.insert("summary".to_string(), Value::Object(summary));
+    }
+
+    // Step 8: return success envelope
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": Value::Object(response_data)
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Sub-cycle (e) Route 4 — GET /:simulation_id/config  (simulation.py:1258-1291)
+//
+// Source steps:
+//   1. manager.get_simulation_config(simulation_id)
+//   2. None → 404 {success:false, error: t('api.configNotFound')}
+//   3. Some → 200 {success:true, data:config}
+//   4. outer except → 500 traceback
+//
+// `[≠] U025-TRACEBACK`: outer error → ApiError::server.
+// ---------------------------------------------------------------------------
+
+/// Port of MiroFish `get_simulation_config` (simulation.py:1258-1291).
+async fn get_config(
+    State(state): State<Arc<ApiState>>,
+    Path(simulation_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    // Step 1: fetch config via manager (simulation.py:1272)
+    let config = state
+        .sim_manager
+        .get_simulation_config(&simulation_id)
+        .map_err(ApiError::server)?;
+
+    // Step 2: None → 404 configNotFound (simulation.py:1274-1278)
+    match config {
+        None => Err(ApiError::client(StatusCode::NOT_FOUND, crate::i18n::t("api.configNotFound"))),
+        // Step 3: Some → 200 {success:true, data:config}
+        Some(cfg) => Ok(Json(serde_json::json!({
+            "success": true,
+            "data": cfg
+        }))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sub-cycle (e) Route 5 — GET /:simulation_id/config/download  (simulation.py:1294-1320)
+//
+// Source steps:
+//   1. manager._get_simulation_dir(simulation_id) (creates dir if needed)
+//   2. config_path = sim_dir / "simulation_config.json"
+//   3. config_path missing → 404 {success:false, error: t('api.configFileNotFound')}
+//   4. file present → send_file(config_path, as_attachment=True,
+//                               download_name="simulation_config.json")
+//      = HTTP 200, Content-Type: application/json,
+//        Content-Disposition: attachment; filename="simulation_config.json",
+//        body = file bytes
+//   5. outer except → 500 traceback
+//
+// This handler returns `Result<Response, ApiError>` (not `Json<Value>`) because the
+// success path is a raw file response, not a JSON envelope.
+//
+// `[≠] U025-TRACEBACK`: outer error → ApiError::server.
+// ---------------------------------------------------------------------------
+
+/// Port of MiroFish `download_simulation_config` (simulation.py:1294-1320).
+async fn download_config(
+    State(state): State<Arc<ApiState>>,
+    Path(simulation_id): Path<String>,
+) -> Result<Response, ApiError> {
+    // Step 1: get_simulation_dir (pub(crate); creates dir if absent, mirrors Python)
+    let sim_dir = state.sim_manager.get_simulation_dir(&simulation_id).map_err(ApiError::server)?;
+
+    // Step 2: config path
+    let config_path = sim_dir.join("simulation_config.json");
+
+    // Step 3: missing → 404 configFileNotFound
+    if !config_path.exists() {
+        return Err(ApiError::client(
+            StatusCode::NOT_FOUND,
+            crate::i18n::t("api.configFileNotFound"),
+        ));
+    }
+
+    // Step 4: read file bytes and build attachment response
+    // Python: send_file(path, as_attachment=True, download_name="simulation_config.json")
+    let bytes = std::fs::read(&config_path).map_err(ApiError::server)?;
+
+    let resp = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))
+        .header(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment; filename=\"simulation_config.json\""),
+        )
+        .body(axum::body::Body::from(Bytes::from(bytes)))
+        .map_err(ApiError::server)?;
+
+    Ok(resp)
 }
 
 // ---------------------------------------------------------------------------
@@ -1500,5 +2016,878 @@ mod tests {
         // And explicit ?enrich=false must be FALSE.
         let off = related_edge_count_for("?enrich=false").await;
         assert_eq!(off, 0, "?enrich=false must be FALSE → no related_edges");
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (e) test helpers
+    // -----------------------------------------------------------------------
+
+    /// Seed a simulation and return (state, sim_id, tmp) for sub-cycle (e) tests.
+    fn seed_sim(state: &Arc<ApiState>) -> (String,) {
+        let pm = crate::models::project::ProjectManager::from_config(&state.config);
+        let mut p = pm.create_project("E Test Project").expect("seed project");
+        p.graph_id = Some("graph-e".to_string());
+        pm.save_project(&mut p).expect("save project");
+        let sim = state
+            .sim_manager
+            .create_simulation(&p.project_id, "graph-e", true, true)
+            .expect("create sim");
+        (sim.simulation_id.clone(),)
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (e) Route 1 — GET /:simulation_id/profiles
+    // -----------------------------------------------------------------------
+
+    /// GET /:id/profiles — happy path: platform=reddit, no profiles file yet → empty array
+    #[tokio::test]
+    async fn get_profiles_happy_empty() {
+        let (state, _tmp) = test_state();
+        let (sim_id,) = seed_sim(&state);
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/{sim_id}/profiles"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK, "profiles must return 200");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true);
+        let data = &json["data"];
+        assert_eq!(data["platform"], "reddit");
+        assert_eq!(data["count"], 0);
+        assert!(data["profiles"].as_array().unwrap().is_empty());
+
+        // Key order: platform → count → profiles
+        let keys: Vec<&str> = data.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["platform", "count", "profiles"],
+            "key order must be platform,count,profiles"
+        );
+    }
+
+    /// GET /:id/profiles — nonexistent simulation_id → 404
+    #[tokio::test]
+    async fn get_profiles_not_found_404() {
+        let (app, _tmp) = test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_nonexistent/profiles")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+        assert!(json["error"].as_str().is_some(), "error field must be present");
+        // 404 is client error → 2-key body (no traceback)
+        assert!(json.get("traceback").is_none(), "404 must not have traceback");
+    }
+
+    /// GET /:id/profiles — with profiles file containing JSON array → count/profiles match
+    #[tokio::test]
+    async fn get_profiles_with_data() {
+        let (state, _tmp) = test_state();
+        let (sim_id,) = seed_sim(&state);
+
+        // Write a reddit_profiles.json into the sim dir
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join(&sim_id);
+        let profiles_data = serde_json::json!([{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]);
+        std::fs::write(sim_dir.join("reddit_profiles.json"), profiles_data.to_string()).unwrap();
+
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/{sim_id}/profiles"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["count"], 2);
+        assert_eq!(json["data"]["profiles"].as_array().unwrap().len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (e) Route 2 — GET /:simulation_id/profiles/realtime
+    // -----------------------------------------------------------------------
+
+    /// GET /:id/profiles/realtime — nonexistent sim_dir → 404
+    #[tokio::test]
+    async fn get_profiles_realtime_not_found_404() {
+        let (app, _tmp) = test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_no_dir/profiles/realtime")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+        assert!(json.get("traceback").is_none(), "404 must not have traceback");
+    }
+
+    /// GET /:id/profiles/realtime — file_exists=false → metadata shape correct
+    #[tokio::test]
+    async fn get_profiles_realtime_file_not_present_shape() {
+        let (state, _tmp) = test_state();
+        let (sim_id,) = seed_sim(&state);
+
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/{sim_id}/profiles/realtime"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true);
+        let data = &json["data"];
+        assert_eq!(data["simulation_id"], sim_id);
+        assert_eq!(data["platform"], "reddit");
+        assert_eq!(data["file_exists"], false);
+        assert!(
+            data["file_modified_at"].is_null(),
+            "file_modified_at must be null when file absent"
+        );
+        assert_eq!(data["is_generating"], false);
+        // total_expected mirrors state.json entities_count (0 after create, not null)
+        assert!(
+            data["total_expected"].is_number() || data["total_expected"].is_null(),
+            "total_expected must be a number or null"
+        );
+        assert_eq!(data["count"], 0);
+        assert!(data["profiles"].as_array().unwrap().is_empty());
+
+        // Key order assertion: simulation_id, platform, count, total_expected, is_generating,
+        //                      file_exists, file_modified_at, profiles
+        let keys: Vec<&str> = data.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "simulation_id",
+                "platform",
+                "count",
+                "total_expected",
+                "is_generating",
+                "file_exists",
+                "file_modified_at",
+                "profiles"
+            ],
+            "realtime profiles key order must match Python source"
+        );
+    }
+
+    /// GET /:id/profiles/realtime — file_exists=true → file_modified_at is non-null string,
+    ///   is_generating reads from state.json
+    #[tokio::test]
+    async fn get_profiles_realtime_file_exists_mtime_and_state() {
+        let (state, _tmp) = test_state();
+        let (sim_id,) = seed_sim(&state);
+
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join(&sim_id);
+
+        // Write profiles file
+        std::fs::write(
+            sim_dir.join("reddit_profiles.json"),
+            serde_json::json!([{"name":"Alice"}]).to_string(),
+        )
+        .unwrap();
+
+        // Write state.json with status=preparing and entities_count=50
+        std::fs::write(
+            sim_dir.join("state.json"),
+            serde_json::json!({"status":"preparing","entities_count":50}).to_string(),
+        )
+        .unwrap();
+
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/{sim_id}/profiles/realtime"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true);
+        let data = &json["data"];
+        assert_eq!(data["file_exists"], true);
+        // file_modified_at must be a non-null ISO string
+        assert!(
+            data["file_modified_at"].is_string(),
+            "file_modified_at must be a string when file exists"
+        );
+        let mtime_str = data["file_modified_at"].as_str().unwrap();
+        assert!(
+            mtime_str.starts_with("20"),
+            "file_modified_at must look like ISO datetime: {mtime_str}"
+        );
+        assert_eq!(data["is_generating"], true);
+        assert_eq!(data["total_expected"], 50);
+        assert_eq!(data["count"], 1);
+    }
+
+    /// GET /:id/profiles/realtime — is_generating transitions driven by state.json
+    #[tokio::test]
+    async fn get_profiles_realtime_is_generating_false_when_ready() {
+        let (state, _tmp) = test_state();
+        let (sim_id,) = seed_sim(&state);
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join(&sim_id);
+
+        // state.json with status=ready
+        std::fs::write(
+            sim_dir.join("state.json"),
+            serde_json::json!({"status":"ready","entities_count":10}).to_string(),
+        )
+        .unwrap();
+
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/{sim_id}/profiles/realtime"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["data"]["is_generating"], false);
+        assert_eq!(json["data"]["total_expected"], 10);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (e) Route 3 — GET /:simulation_id/config/realtime
+    // -----------------------------------------------------------------------
+
+    /// GET /:id/config/realtime — nonexistent sim_dir → 404
+    #[tokio::test]
+    async fn get_config_realtime_not_found_404() {
+        let (app, _tmp) = test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_no_dir/config/realtime")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+        assert!(json.get("traceback").is_none(), "404 must not have traceback");
+    }
+
+    /// GET /:id/config/realtime — file absent → file_exists=false, shape correct, key order
+    #[tokio::test]
+    async fn get_config_realtime_file_absent_shape_and_key_order() {
+        let (state, _tmp) = test_state();
+        let (sim_id,) = seed_sim(&state);
+
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/{sim_id}/config/realtime"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true);
+        let data = &json["data"];
+        assert_eq!(data["simulation_id"], sim_id);
+        assert_eq!(data["file_exists"], false);
+        assert!(data["file_modified_at"].is_null());
+        assert_eq!(data["is_generating"], false);
+        assert!(data["generation_stage"].is_null());
+        assert_eq!(data["config_generated"], false);
+        assert!(data["config"].is_null());
+        // summary must NOT be present when config is null
+        assert!(data.get("summary").is_none(), "summary must be absent when config=null");
+
+        // Key order: simulation_id, file_exists, file_modified_at, is_generating,
+        //            generation_stage, config_generated, config
+        let keys: Vec<&str> = data.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "simulation_id",
+                "file_exists",
+                "file_modified_at",
+                "is_generating",
+                "generation_stage",
+                "config_generated",
+                "config"
+            ],
+            "config/realtime key order must match Python source"
+        );
+    }
+
+    /// GET /:id/config/realtime — file present, state.json generating_profiles stage
+    #[tokio::test]
+    async fn get_config_realtime_generation_stage_generating_profiles() {
+        let (state, _tmp) = test_state();
+        let (sim_id,) = seed_sim(&state);
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join(&sim_id);
+
+        // state.json: preparing + profiles_generated=false → "generating_profiles"
+        std::fs::write(
+            sim_dir.join("state.json"),
+            serde_json::json!({
+                "status": "preparing",
+                "profiles_generated": false,
+                "config_generated": false
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // Write a valid config file
+        let cfg = serde_json::json!({
+            "agent_configs": [{"id":1},{"id":2}],
+            "time_config": {"total_simulation_hours": 24},
+            "event_config": {"initial_posts": [{"text":"hi"}], "hot_topics": ["ai","rust"]},
+            "twitter_config": {},
+            "generated_at": "2025-12-04T12:00:00",
+            "llm_model": "gpt-4"
+        });
+        std::fs::write(sim_dir.join("simulation_config.json"), cfg.to_string()).unwrap();
+
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/{sim_id}/config/realtime"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true);
+        let data = &json["data"];
+        assert_eq!(data["is_generating"], true);
+        assert_eq!(data["generation_stage"], "generating_profiles");
+        assert_eq!(data["config_generated"], false);
+        assert_eq!(data["file_exists"], true);
+        // file_modified_at must be non-null (mtime test — [≠] U026-MTIME)
+        assert!(
+            data["file_modified_at"].is_string(),
+            "file_modified_at must be set when file present"
+        );
+
+        // summary must be present because config is a non-null object
+        let summary = data.get("summary").expect("summary must be present when config is non-null");
+        assert_eq!(summary["total_agents"], 2);
+        assert_eq!(summary["simulation_hours"], 24);
+        assert_eq!(summary["initial_posts_count"], 1);
+        assert_eq!(summary["hot_topics_count"], 2);
+        assert_eq!(summary["has_twitter_config"], true);
+        assert_eq!(summary["has_reddit_config"], false);
+        assert_eq!(summary["generated_at"], "2025-12-04T12:00:00");
+        assert_eq!(summary["llm_model"], "gpt-4");
+
+        // Summary key order: total_agents, simulation_hours, initial_posts_count, hot_topics_count,
+        //                    has_twitter_config, has_reddit_config, generated_at, llm_model
+        let summary_keys: Vec<&str> =
+            summary.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        assert_eq!(
+            summary_keys,
+            [
+                "total_agents",
+                "simulation_hours",
+                "initial_posts_count",
+                "hot_topics_count",
+                "has_twitter_config",
+                "has_reddit_config",
+                "generated_at",
+                "llm_model"
+            ],
+            "summary key order must match Python source"
+        );
+    }
+
+    /// GET /:id/config/realtime — generation_stage transitions
+    #[tokio::test]
+    async fn get_config_realtime_generation_stage_transitions() {
+        let (state, _tmp) = test_state();
+        let (sim_id,) = seed_sim(&state);
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join(&sim_id);
+
+        // Test generating_config stage: preparing + profiles_generated=true
+        std::fs::write(
+            sim_dir.join("state.json"),
+            serde_json::json!({
+                "status": "preparing",
+                "profiles_generated": true,
+                "config_generated": false
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let app = crate::server::create_app(Arc::clone(&state));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/{sim_id}/config/realtime"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["data"]["generation_stage"], "generating_config");
+
+        // Test completed stage: status=ready
+        std::fs::write(
+            sim_dir.join("state.json"),
+            serde_json::json!({"status": "ready", "config_generated": true}).to_string(),
+        )
+        .unwrap();
+
+        let app2 = crate::server::create_app(Arc::clone(&state));
+        let resp2 = app2
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/{sim_id}/config/realtime"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes2 = axum::body::to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
+        let json2: serde_json::Value = serde_json::from_slice(&bytes2).unwrap();
+        assert_eq!(json2["data"]["generation_stage"], "completed");
+        assert_eq!(json2["data"]["config_generated"], true);
+        assert_eq!(json2["data"]["is_generating"], false);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (e) Route 4 — GET /:simulation_id/config
+    // -----------------------------------------------------------------------
+
+    /// GET /:id/config — config file absent → 404 configNotFound
+    #[tokio::test]
+    async fn get_config_not_found_404() {
+        let (state, _tmp) = test_state();
+        let (sim_id,) = seed_sim(&state);
+
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/{sim_id}/config"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+        assert!(json["error"].as_str().is_some());
+        assert!(json.get("traceback").is_none(), "404 must not have traceback");
+    }
+
+    /// GET /:id/config — config file present → 200 {success:true, data:config}
+    #[tokio::test]
+    async fn get_config_happy_200() {
+        let (state, _tmp) = test_state();
+        let (sim_id,) = seed_sim(&state);
+
+        // Write simulation_config.json
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join(&sim_id);
+        let cfg = serde_json::json!({"llm_model": "gpt-4", "agent_configs": []});
+        std::fs::write(sim_dir.join("simulation_config.json"), cfg.to_string()).unwrap();
+
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/{sim_id}/config"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["llm_model"], "gpt-4");
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-cycle (e) Route 5 — GET /:simulation_id/config/download
+    // -----------------------------------------------------------------------
+
+    /// GET /:id/config/download — config file absent → 404 configFileNotFound
+    #[tokio::test]
+    async fn download_config_not_found_404() {
+        let (state, _tmp) = test_state();
+        let (sim_id,) = seed_sim(&state);
+
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/{sim_id}/config/download"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], false);
+        assert!(json.get("traceback").is_none(), "404 must not have traceback");
+    }
+
+    /// GET /:id/config/download — config present → 200, Content-Disposition attachment,
+    ///   Content-Type application/json, body = file bytes
+    #[tokio::test]
+    async fn download_config_happy_200_attachment() {
+        let (state, _tmp) = test_state();
+        let (sim_id,) = seed_sim(&state);
+
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join(&sim_id);
+        let cfg_content = r#"{"llm_model":"gpt-4","agent_configs":[]}"#;
+        std::fs::write(sim_dir.join("simulation_config.json"), cfg_content).unwrap();
+
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/{sim_id}/config/download"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK, "download must return 200");
+
+        // Check headers
+        let content_type = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.contains("application/json"),
+            "Content-Type must be application/json, got: {content_type}"
+        );
+
+        let content_disp = resp
+            .headers()
+            .get(axum::http::header::CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_disp.contains("attachment"),
+            "Content-Disposition must contain 'attachment': {content_disp}"
+        );
+        assert!(
+            content_disp.contains("simulation_config.json"),
+            "Content-Disposition must contain filename: {content_disp}"
+        );
+
+        // Check body bytes match file content
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            body_bytes.as_ref(),
+            cfg_content.as_bytes(),
+            "body must equal file content exactly"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-1 regression: CSV DictReader semantics (flexible parsing)
+    // -----------------------------------------------------------------------
+
+    /// CSV short row: truncated file mid-write still yields earlier valid rows.
+    /// A file that ends abruptly (last row has fewer columns than the header)
+    /// must NOT drop all rows — earlier complete rows must still be returned,
+    /// and the short final row must be returned with null-padded missing keys.
+    #[tokio::test]
+    async fn get_profiles_realtime_csv_truncated_file_yields_valid_rows() {
+        let (state, _tmp) = test_state();
+
+        // We need a twitter-platform simulation. Seed a project and create the sim dir manually.
+        let pm = crate::models::project::ProjectManager::from_config(&state.config);
+        let mut p = pm.create_project("CSV Truncated Test").expect("seed project");
+        p.graph_id = Some("graph-csv-trunc".to_string());
+        pm.save_project(&mut p).expect("save project");
+        let sim = state
+            .sim_manager
+            .create_simulation(&p.project_id, "graph-csv-trunc", true, true)
+            .expect("create sim");
+        let sim_id = sim.simulation_id.clone();
+
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join(&sim_id);
+
+        // Write a CSV that is "truncated mid-write": second row has fewer fields than the header.
+        // Header: id,name,score  → 3 fields
+        // Row 1: 0,Alice,99      → complete (3 fields)
+        // Row 2: 1,Bob           → short (2 fields — truncated mid-write)
+        let csv_content = "id,name,score\n0,Alice,99\n1,Bob\n";
+        std::fs::write(sim_dir.join("twitter_profiles.csv"), csv_content).unwrap();
+
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/{sim_id}/profiles/realtime?platform=twitter"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true, "truncated CSV must not 500: {json}");
+
+        let data = &json["data"];
+        let profiles = data["profiles"].as_array().expect("profiles must be an array");
+
+        // Both rows must be returned (not dropped)
+        assert_eq!(profiles.len(), 2, "truncated CSV must yield 2 rows, not {}", profiles.len());
+
+        // Row 1 (complete): all fields present as strings
+        assert_eq!(profiles[0]["id"], "0");
+        assert_eq!(profiles[0]["name"], "Alice");
+        assert_eq!(profiles[0]["score"], "99");
+
+        // Row 2 (short): existing fields as strings, missing trailing key → null
+        assert_eq!(profiles[1]["id"], "1");
+        assert_eq!(profiles[1]["name"], "Bob");
+        assert!(
+            profiles[1]["score"].is_null(),
+            "missing trailing field must be null, got: {}",
+            profiles[1]["score"]
+        );
+    }
+
+    /// CSV short row explicit: header + "0,A,a,b,s\n1,Bob\n" → 2 row objects, NOT [].
+    /// Row 1 is full; row 2 has only one field with the remaining 4 headers null.
+    #[tokio::test]
+    async fn get_profiles_realtime_csv_short_row_null_padding() {
+        let (state, _tmp) = test_state();
+
+        let pm = crate::models::project::ProjectManager::from_config(&state.config);
+        let mut p = pm.create_project("CSV Short Row Test").expect("seed project");
+        p.graph_id = Some("graph-csv-short".to_string());
+        pm.save_project(&mut p).expect("save project");
+        let sim = state
+            .sim_manager
+            .create_simulation(&p.project_id, "graph-csv-short", true, true)
+            .expect("create sim");
+        let sim_id = sim.simulation_id.clone();
+
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join(&sim_id);
+
+        // Exactly the test case from the verifier: "0,A,a,b,s\n1,Bob\n" with 5-column header
+        // Header: 0,A,a,b,s  → 5 columns
+        // Row 1: 0,A,a,b,s   → 5 fields (complete)
+        // Row 2: 1,Bob        → 2 fields (3 trailing headers must be null)
+        let csv_content = "0,A,a,b,s\n0,A,a,b,s\n1,Bob\n";
+        std::fs::write(sim_dir.join("twitter_profiles.csv"), csv_content).unwrap();
+
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/{sim_id}/profiles/realtime?platform=twitter"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true);
+
+        let profiles = json["data"]["profiles"].as_array().expect("must be array");
+        // Must return 2 rows, NOT []
+        assert_eq!(profiles.len(), 2, "must return 2 rows (short row must not be dropped)");
+
+        // Row 1 (full): all 5 fields
+        assert_eq!(profiles[0]["0"], "0");
+        assert_eq!(profiles[0]["A"], "A");
+        assert_eq!(profiles[0]["a"], "a");
+        assert_eq!(profiles[0]["b"], "b");
+        assert_eq!(profiles[0]["s"], "s");
+
+        // Row 2 (short): first 2 fields set, remaining 3 headers null
+        assert_eq!(profiles[1]["0"], "1");
+        assert_eq!(profiles[1]["A"], "Bob");
+        assert!(profiles[1]["a"].is_null(), "3rd header must be null for short row");
+        assert!(profiles[1]["b"].is_null(), "4th header must be null for short row");
+        assert!(profiles[1]["s"].is_null(), "5th header must be null for short row");
+    }
+
+    /// CSV long row: surplus fields collected under key "null" as a JSON array.
+    #[tokio::test]
+    async fn get_profiles_realtime_csv_long_row_surplus_under_null_key() {
+        let (state, _tmp) = test_state();
+
+        let pm = crate::models::project::ProjectManager::from_config(&state.config);
+        let mut p = pm.create_project("CSV Long Row Test").expect("seed project");
+        p.graph_id = Some("graph-csv-long".to_string());
+        pm.save_project(&mut p).expect("save project");
+        let sim = state
+            .sim_manager
+            .create_simulation(&p.project_id, "graph-csv-long", true, true)
+            .expect("create sim");
+        let sim_id = sim.simulation_id.clone();
+
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join(&sim_id);
+
+        // Header has 2 columns; row has 4 fields → 2 surplus values
+        let csv_content = "name,age\nAlice,30,extra1,extra2\n";
+        std::fs::write(sim_dir.join("twitter_profiles.csv"), csv_content).unwrap();
+
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/{sim_id}/profiles/realtime?platform=twitter"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true);
+
+        let profiles = json["data"]["profiles"].as_array().expect("must be array");
+        assert_eq!(profiles.len(), 1);
+
+        let row = &profiles[0];
+        assert_eq!(row["name"], "Alice");
+        assert_eq!(row["age"], "30");
+
+        // Surplus fields must be under the "null" key as a JSON array of strings
+        let surplus = row["null"].as_array().expect("surplus must be under key 'null' as array");
+        assert_eq!(surplus.len(), 2, "must have 2 surplus values");
+        assert_eq!(surplus[0], "extra1");
+        assert_eq!(surplus[1], "extra2");
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-2 regression: config/realtime summary gate — empty object is falsy
+    // -----------------------------------------------------------------------
+
+    /// GET /:id/config/realtime — simulation_config.json containing {} (empty object)
+    /// must NOT have a "summary" key in the response (Python `if {}:` is False).
+    #[tokio::test]
+    async fn get_config_realtime_empty_object_config_no_summary() {
+        let (state, _tmp) = test_state();
+        let (sim_id,) = seed_sim(&state);
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join(&sim_id);
+
+        // Write simulation_config.json with an empty object
+        std::fs::write(sim_dir.join("simulation_config.json"), "{}").unwrap();
+
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/{sim_id}/config/realtime"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true);
+
+        let data = &json["data"];
+        // config should be the empty object itself
+        assert!(data["config"].is_object(), "config must be the parsed {{}} object");
+
+        // summary must NOT be present — Python `if {}:` is False
+        assert!(
+            data.get("summary").is_none(),
+            "summary must be absent when config is empty object {{}}, got: {data}"
+        );
     }
 }

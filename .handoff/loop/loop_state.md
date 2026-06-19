@@ -17,7 +17,7 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 3   # BUDGET REACHED. NEW SESSION 2026-06-19 (20th resume); reset 0; CYCLE 26=U-026(a) ApiState runtime-state ext + router skeleton (PASS), 27=U-026(c) create/get/list ×3 + DECISION-U026-2 RunInstructions native-guidance (FAIL→fix→PASS — gate caught id-in-path start-route, fixed to body-id), 28=U-026(b) entities ×3 (PASS r1 — verifier added enrich-parse guards + flagged R2-absent-graph [≠]). PRIOR session 2026-06-18: 23=U-025(d) build, 24=U-025(f)→U-025 COMPLETE, 25=U-026 architect decomposition.
+cycles_this_session: 1   # NEW SESSION 2026-06-19 (21st resume); reset 0. CYCLE 29=U-026(e) profiles/config reads ×5 (FAIL→fix→PASS round-2 — gate caught CSV flexible(false) dropping ragged mid-write rows + {}-summary-gate, both fixed; S-813..817 [x]; +17 tests 1327→1346). PRIOR session 2026-06-19 (20th resume): 26=U-026(a) ApiState runtime-state ext + router skeleton (PASS), 27=U-026(c) create/get/list ×3 + DECISION-U026-2 RunInstructions native-guidance (FAIL→fix→PASS), 28=U-026(b) entities ×3 (PASS r1).
 # CYCLE 28 (NEW SESSION 2026-06-19, 20th resume): U-026 sub-cycle (b) entities ×3 — porter→parity PASS round-1.
 #   S-804/805/806 [x]. 3 read-only routes mapping onto the LANDED KnowledgeGraphEntityReader (U-016) via a private
 #   load_entity_reader_graph helper (graph_id→TaskManager.get_task→result["graph"]→KnowledgeGraph::deserialize_from_json

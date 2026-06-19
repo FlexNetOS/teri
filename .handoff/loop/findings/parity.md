@@ -3137,3 +3137,53 @@ Challenge: does Python return EMPTY for an unknown graph_id, or propagate?
 `enrich_one_is_false_no_edges`, `enrich_yes_is_false_no_edges`, `enrich_uppercase_true_is_true_has_edges`, `probe_route2_unknown_graph_status`.
 
 ### OVERALL VERDICT: **PASS** (3/3 symbols). Observed test count: **1327 passed, 6 ignored**.
+
+---
+
+## 2026-06-19 (opus) — U-026 sub-cycle (e): profiles/config read routes ×5 — **FAIL**
+
+**Scope:** S-813 `GET /<id>/profiles`, S-814 `/profiles/realtime`, S-815 `/config/realtime`, S-816 `/config`, S-817 `/config/download` + MTIME helper `python_isoformat_local_from` (project.rs:67) + `get_simulation_dir` `pub(crate)` (simulation_manager.rs:901). 45 api::simulation tests pass.
+
+### VERDICT: FAIL — 2 downgrade-direction divergences (both UNTESTED). Symbols stay `- [ ]`.
+
+**DIVERGENCE 1 (downgrade) — S-814 `profiles/realtime`, CSV (twitter) ragged/truncated rows.**
+`api/simulation.rs:656` `csv::Reader::from_path` runs with the crate default `flexible(false)`: a row whose field-count ≠ header-count is a HARD csv error → caught by the handler's `try → []` → `profiles=[]`, `count=0`. Python `csv.DictReader` (simulation.py:1094-1095) is *lenient*: a SHORT row pads missing trailing fields with `None`→JSON `null`; a LONG row buckets extras under the `"null"` key — and **succeeds**. Differential (Python vs Rust, both through the full handler):
+| mid-write input | Python | Rust |
+|---|---|---|
+| `H + "0,Alice,alice,bio he"` (truncated mid-field, no NL) | `[{...,"description":null}]` | `[]` |
+| `H + "0,Alice"` (truncated after 2 fields) | `[{...3 nulls}]` | `[]` |
+| `H + "0,A,a,b,s\n1,Bob\n"` (row1 OK, row2 short) | **2 rows** (row1 complete + row2 null-padded) | `[]` (loses the valid row1 too) |
+
+This is NOT non-contractual: `/profiles/realtime` exists SPECIFICALLY to be polled DURING generation (its docstring + the `可能正在写入中` warning). The producer `oasis_profile_generator.py:1091-1117` writes the CSV row-by-row with `csv.writer`; a poll catching the file mid-`writerow` yields exactly these ragged/truncated states. So Python returns a non-empty `profiles` (and non-zero `count`) where Rust returns `[]`/`0` — strict information loss on the route's primary observable, on its designed use case. Fully EXPRESSIBLE in Rust (csv crate `.flexible(true)` + explicit zip-padding: short→pad with `null`, long→`"null"` key) → a portable feature silently narrowed under the shared `try/except`, NOT a defensible `[≠]`.
+**Fix:** make the csv reader flexible and replicate DictReader's short/long padding (missing trailing fields → `Value::Null`; surplus fields → collected under key `"null"`), then keep the catch-all → `[]` only for genuinely-unparseable content (e.g. broken quoting).
+Parity-preserved CSV facets (verified via Python `csv.DictReader` vs Rust csv-crate differential, 10 adversarial cases): header-ordered keys (teri `preserve_order` ON), all-string values, embedded-comma-quoted, embedded-escaped-quote `""`→`"`, empty field→`""`, CRLF, leading/trailing spaces preserved, trailing blank line dropped, no-data-rows→`[]`. ONLY ragged/truncated rows diverge.
+
+**DIVERGENCE 2 (downgrade-direction) — S-815 `config/realtime`, empty-object config `{}` summary edge (porter-flagged item #4).**
+`api/simulation.rs:848` `if config.is_object()` is TRUE for `{}` → `summary` appended. Python `if config:` (simulation.py:1232) is FALSE for `{}` (empty dict is falsy) → NO `summary`. Confirmed: Python emits NO `summary` key for a `{}` config; Rust emits `summary{total_agents:0, simulation_hours:null, ...}`. Observable divergence (extra key in the Rust body) on a reachable on-disk state (the route reads the file with no schema validation; `{}` is a valid placeholder/cleared/corrupt artifact). The handler's own comment (line 847, "non-null, non-empty object is truthy") contradicts the code — the intent was right, the predicate is wrong. NOTE: for non-object truthy/falsy JSON values (`[]`,`0`,`""`,`false`) Rust `is_object()` is FALSE = matches Python's "no summary" — the SOLE divergence is the empty object `{}`. Fully expressible → NOT a `[≠]`.
+**Fix:** `if config.is_object() && !config.as_object().map(|o| o.is_empty()).unwrap_or(true)` (i.e. non-empty object only).
+
+### Items 1–9 adjudication (per parity request)
+1. **`get_profiles` error→status (S-813): PARITY-PRESERVED.** `TeriError::Sim`→404 (Python `ValueError`, simulation_manager.py:485 `raise`), all else→500. Missing profiles FILE→`Ok([])` (manager S-678, NOT Err) matches Python `if not exists: return []`. No input where 404↔500 flips. Manager calls `_get_simulation_dir` (creates dir) — consistent with Rust.
+2. **`total_expected` raw clone: PARITY-PRESERVED.** simulation.rs:693-695 `state_data.get("entities_count").cloned()` → present(0)→`0`, absent→JSON `null`. Faithful to Python `.get("entities_count")` (stored int or None). Test `..._file_exists_mtime_and_state` pins `total_expected==50`.
+3. **CSV: DIVERGES — see DIVERGENCE 1** (ragged/truncated only; all other DictReader facets match).
+4. **`{}` summary edge: DIVERGES — see DIVERGENCE 2.**
+5. **Key ORDER: PARITY-PRESERVED (all routes).** `serde_json` `preserve_order` ON (Cargo.toml:35) + explicit `Map::insert` sequence. Pinned by tests: profiles `[platform,count,profiles]`; profiles_realtime `[simulation_id,platform,count,total_expected,is_generating,file_exists,file_modified_at,profiles]`; config_realtime `[simulation_id,file_exists,file_modified_at,is_generating,generation_stage,config_generated,config]`; summary 8-key `[total_agents,simulation_hours,initial_posts_count,hot_topics_count,has_twitter_config,has_reddit_config,generated_at,llm_model]`. All match Python dict insertion order.
+6. **`generation_stage` state machine: PARITY-PRESERVED (all 4 branches).** simulation.rs:818-831: preparing+profiles_generated→"generating_config"; preparing+!pg→"generating_profiles"; ready→"completed"; neither→`null`. Tests cover generating_profiles / generating_config / completed; the "neither"→null branch is exercised by `..._file_absent_shape` (no state.json → null).
+7. **MTIME (`python_isoformat_local_from`): PARITY-PRESERVED.** project.rs:67-76 micros==0→`%Y-%m-%dT%H:%M:%S`, else→`%.6f`; local naive, no tz. Matches Python `datetime.fromtimestamp(st_mtime).isoformat()` (zero-frac omission + 6-digit micros, verified vs reference). File-absent→`Value::Null` (simulation.rs:635/773). Sub-µs rounding-vs-truncation is a non-contractual opaque-display artifact.
+8. **`download_config` (S-817): PARITY-PRESERVED.** 200 = raw bytes + `Content-Type: application/json` + `Content-Disposition: attachment; filename="simulation_config.json"`; missing→404 `api.configFileNotFound`. Uses `sim_manager.get_simulation_dir` = Python `manager._get_simulation_dir` (S-671, both `makedirs`/`create_dir_all`) — **same path** as the realtime routes' direct `oasis_data_dir/<id>` join (both resolve to `{sim_data_dir}/{id}`). Test `download_config_happy_200_attachment` pins headers + byte-exact body.
+9. **i18n: PARITY-PRESERVED.** profiles ValueError msg from manager (`{id}`); realtime sim-missing→404 `api.simulationNotFound` (`t_args id`, en/zh:344); config→404 `api.configNotFound` (351); download→404 `api.configFileNotFound` (352). Correct key + 404 status per route; client errors → 2-key body (no traceback), confirmed by `*_404` tests asserting `traceback.is_none()`.
+
+### `[≠]` carried forward (legitimate, NOT part of this FAIL)
+- `[≠] U025-TRACEBACK` (500 bodies carry Rust string, 3-key shape preserved) — unchanged, defensible.
+- `[≠] U026-MTIME` — the helper itself is a faithful PORT (item 7), not a divergence.
+
+### Route status after this verdict
+- S-813 `profiles`: behavior MATCHES — but stays `- [ ]` (unit gate: a unit PASS requires ALL its symbols pass; the unit FAILs on S-814/S-815).
+- S-814 `profiles/realtime`: **FAIL (DIVERGENCE 1)** → `- [ ]`.
+- S-815 `config/realtime`: **FAIL (DIVERGENCE 2)** → `- [ ]`.
+- S-816 `config`: behavior MATCHES — stays `- [ ]` (unit not yet PASS).
+- S-817 `config/download`: behavior MATCHES — stays `- [ ]` (unit not yet PASS).
+
+### Route back to porter (minimal fixes)
+1. `api/simulation.rs:~656` — `csv::ReaderBuilder::new().flexible(true).from_path(...)`; replicate DictReader padding (zip header→record; missing trailing → `Value::Null`; surplus fields → push under key `"null"`). Add a ragged/truncated-CSV differential test (incl. the "row1 OK, row2 short → 2 rows" case).
+2. `api/simulation.rs:848` — gate summary on non-empty object: `if config.as_object().is_some_and(|o| !o.is_empty())`. Add a `config={}` → no-summary test.

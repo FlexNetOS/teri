@@ -898,7 +898,7 @@ impl SimulationManager {
     /// Port of `_get_simulation_dir` (`simulation_manager.py:139-143`).
     ///
     /// Python: `sim_dir = os.path.join(SIMULATION_DATA_DIR, simulation_id); os.makedirs(sim_dir, exist_ok=True); return sim_dir`
-    fn get_simulation_dir(&self, simulation_id: &str) -> Result<PathBuf> {
+    pub(crate) fn get_simulation_dir(&self, simulation_id: &str) -> Result<PathBuf> {
         let sim_dir = self.sim_data_dir.join(simulation_id);
         std::fs::create_dir_all(&sim_dir)?;
         Ok(sim_dir)

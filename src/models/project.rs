@@ -57,6 +57,24 @@ pub(crate) fn python_isoformat_local() -> String {
     }
 }
 
+/// Format an ARBITRARY `SystemTime` as local naive ISO exactly like Python's
+/// `datetime.fromtimestamp(st_mtime).isoformat()`:
+/// — local time (no tz suffix, same semantics as `datetime.fromtimestamp` with no `tz=`)
+/// — microsecond fraction ONLY when non-zero (Python omits `.000000` for whole-second mtimes)
+///
+/// Used by `[≠] U026-MTIME`: the realtime file-stat routes need to format an arbitrary
+/// mtime, not just `now()`.  `python_isoformat_local` (above) formats `now()` only.
+pub(crate) fn python_isoformat_local_from(t: std::time::SystemTime) -> String {
+    let dt: chrono::DateTime<chrono::Local> = t.into();
+    let naive = dt.naive_local();
+    let micros = naive.and_utc().timestamp_subsec_micros();
+    if micros == 0 {
+        naive.format("%Y-%m-%dT%H:%M:%S").to_string()
+    } else {
+        naive.format("%Y-%m-%dT%H:%M:%S%.6f").to_string()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ProjectStatus  (S-098..S-103)
 // ---------------------------------------------------------------------------
