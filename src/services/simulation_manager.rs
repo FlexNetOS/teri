@@ -15,7 +15,7 @@
 //! - `list_simulations`            — S-677
 //! - `get_profiles`                — S-678
 //! - `get_simulation_config`       — S-679
-//! - `get_run_instructions`        — S-680 (partial: see substrate note below)
+//! - `get_run_instructions`        — S-680 (DECISION-U026-2: [≠] narrowed; native-expressed)
 //!
 //! Sub-cycle (d) — `prepare_simulation` (L230-458, S-675) — PORTED.
 //!
@@ -711,33 +711,53 @@ mod tests {
 // default `"./uploads/simulations"`).  The `from_config` constructor takes that
 // value; `new(path)` is provided for tests (matching the `ProjectManager` pattern).
 //
-// ## get_run_instructions substrate note (S-680) [≠]
+// ## get_run_instructions native guidance (S-680) — DECISION-U026-2
 //
-// The Python `get_run_instructions` returns command strings that run MiroFish's
-// OASIS Python subprocess scripts:
+// The Python `get_run_instructions` returned OASIS Python-script subprocess commands:
 //   `python {scripts_dir}/run_twitter_simulation.py --config {config_path}`
 //   `conda activate MiroFish`  etc.
 //
-// teri has NO `scripts/run_*_simulation.py` and no conda env — it runs the
-// SimEngine in-process (substrate decision, locked by the port architect).
-// Fabricating these Python-script command strings would produce commands that
-// CANNOT run in teri's substrate, which is a worse downgrade than admitting
-// the gap.  This is a genuine [≠]-substrate case (NOT "won't use" — the strings
-// are inexpressible in teri's runtime).
+// DECISION-U026-2 (EXTEND-X, NOT [≠]): teri now emits NATIVE run-guidance.
+// Python's per-platform subprocess strings become per-platform HTTP start calls:
+//   `POST /api/simulation/start  body: {"simulation_id":"…","platform":"twitter"}`
+//   `POST /api/simulation/start  body: {"simulation_id":"…","platform":"reddit"}`
+//   `POST /api/simulation/start  body: {"simulation_id":"…","platform":"parallel"}`
 //
-// The structural fields that ARE expressible (simulation_dir, config_file) are
-// ported faithfully.  The commands/instructions strings are omitted with a clear
-// key and note indicating teri's native invocation path.
+// The [≠] is NARROWED to only: `scripts_dir` (no scripts dir in teri) and the
+// literal `python run_*.py` / `conda activate` strings (no Python, no conda).
+// Everything else is NATIVE-EXPRESSED: simulation_dir, config_file, commands (map),
+// instructions (string), substrate_note (retained for self-documentation).
+// The carry-forward gate from U-023 (S-680 partial) is SATISFIED by this unit.
 
 // ---------------------------------------------------------------------------
 // RunInstructions
 // ---------------------------------------------------------------------------
 
+/// Per-platform native start invocations (mirrors Python `commands{twitter,reddit,parallel}`).
+///
+/// Python emitted shell commands like `python run_twitter_simulation.py --config …`.
+/// teri's native analog is the HTTP start call with the platform in the JSON body.
+///
+/// S-680 (DECISION-U026-2)
+#[derive(Debug, Clone)]
+pub struct RunCommands {
+    /// Native invocation string for the Twitter platform.
+    pub twitter: String,
+    /// Native invocation string for the Reddit platform.
+    pub reddit: String,
+    /// Native invocation string for the parallel (both-platform) run.
+    pub parallel: String,
+}
+
 /// Return value of [`SimulationManager::get_run_instructions`].
 ///
-/// Structural fields from Python are ported; the OASIS Python-script command strings
-/// are not expressible in teri's substrate (see module-level note) and are replaced
-/// with a teri-native indicator.
+/// Native teri run-guidance for a prepared (READY) simulation.
+/// Python returned Python-script subprocess commands; teri returns the native
+/// in-process invocation: `POST /api/simulation/start` (SimulationRunner→SimEngine).
+///
+/// DECISION-U026-2: `[≠]` narrowed to `scripts_dir` and the literal Python/conda strings only.
+/// All other fields (`simulation_dir`, `config_file`, `commands`, `instructions`) are now
+/// NATIVE-EXPRESSED. The carry-forward gate from U-023 (S-680) is satisfied.
 ///
 /// S-680
 #[derive(Debug, Clone)]
@@ -752,15 +772,59 @@ pub struct RunInstructions {
     /// Port of Python `"config_file"` key.
     pub config_file: PathBuf,
 
-    /// [≠]-substrate: the Python source also returns `scripts_dir` (pointing to
-    /// MiroFish's `backend/scripts/`) and `commands` dict (Python subprocess invocations
-    /// for `run_twitter_simulation.py`, `run_reddit_simulation.py`,
-    /// `run_parallel_simulation.py`) plus `instructions` string (conda activate steps).
-    /// These are genuinely inexpressible in teri's substrate: teri uses the native
-    /// in-process `SimEngine` (no Python scripts, no conda env), so fabricating
-    /// those path strings would produce commands that cannot run.  Callers should
-    /// invoke `SimEngine::run` instead of shelling out to Python.
+    /// NATIVE analog of Python `"commands"`. Per-platform native HTTP start invocations.
+    /// Keys: twitter, reddit, parallel (same three as Python). Values: the HTTP start call
+    /// carrying that platform — `POST /api/simulation/start  body: {"simulation_id":"…","platform":"…"}`.
+    ///
+    /// DECISION-U026-2 (NATIVE-EXPRESSED).
+    pub commands: RunCommands,
+
+    /// NATIVE analog of Python `"instructions"`. Human-readable description of the
+    /// in-process SimEngine run path (no conda, no Python scripts).
+    ///
+    /// DECISION-U026-2 (NATIVE-EXPRESSED).
+    pub instructions: String,
+
+    /// [≠]-substrate marker: documents that `scripts_dir` / Python-script / conda commands
+    /// are inexpressible in teri's substrate. Retained so existing test coverage stays green
+    /// and the gap remains self-documenting in the API payload.
+    ///
+    /// [≠] residual: `scripts_dir` (no scripts dir in teri) + Python/conda literal strings.
     pub substrate_note: &'static str,
+}
+
+impl RunInstructions {
+    /// Serialize to a `serde_json::Value::Object` using `serde_json::Map` (preserve_order).
+    ///
+    /// Exact key order (matches DECISION-U026-2 contract):
+    /// `simulation_dir`, `config_file`, `commands` (nested `{twitter,reddit,parallel}`),
+    /// `instructions`, `substrate_note`.
+    ///
+    /// `scripts_dir` is the ONLY omitted Python key ([≠] `scripts_dir` — teri has no scripts dir).
+    pub fn to_dict(&self) -> Value {
+        let mut map = Map::with_capacity(5);
+
+        map.insert(
+            "simulation_dir".to_string(),
+            Value::String(self.simulation_dir.to_string_lossy().into_owned()),
+        );
+        map.insert(
+            "config_file".to_string(),
+            Value::String(self.config_file.to_string_lossy().into_owned()),
+        );
+
+        // commands: nested object with twitter/reddit/parallel (Python key order)
+        let mut cmds = Map::with_capacity(3);
+        cmds.insert("twitter".to_string(), Value::String(self.commands.twitter.clone()));
+        cmds.insert("reddit".to_string(), Value::String(self.commands.reddit.clone()));
+        cmds.insert("parallel".to_string(), Value::String(self.commands.parallel.clone()));
+        map.insert("commands".to_string(), Value::Object(cmds));
+
+        map.insert("instructions".to_string(), Value::String(self.instructions.clone()));
+        map.insert("substrate_note".to_string(), Value::String(self.substrate_note.to_string()));
+
+        Value::Object(map)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -812,6 +876,17 @@ impl SimulationManager {
     /// `SIMULATION_DATA_DIR = os.path.join(dirname(__file__), '../../uploads/simulations')`.
     pub fn from_config(config: &crate::config::Config) -> Self {
         SimulationManager::new(Path::new(&config.oasis_simulation_data_dir).to_path_buf())
+    }
+
+    /// Evict a single entry from the in-memory cache.
+    ///
+    /// Test-only helper: after patching `state.json` on disk, call this so the next
+    /// `get_simulation` re-reads the file rather than returning the cached (stale) state.
+    #[cfg(test)]
+    pub fn evict_cache_for_test(&self, simulation_id: &str) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.remove(simulation_id);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1615,15 +1690,43 @@ impl SimulationManager {
         let sim_dir = self.get_simulation_dir(simulation_id)?;
         let config_file = sim_dir.join("simulation_config.json");
 
+        // DECISION-U026-2: native run-guidance via the HTTP start endpoint
+        // (SimulationRunner→SimEngine). The authoritative start route is `POST /start`
+        // (`simulation.py:1451`, teri S-820) which takes `simulation_id` AND `platform` in
+        // the JSON BODY — there is NO `/<id>/start` path route. Python's per-platform
+        // `python run_*.py --config` strings become per-platform body-id start invocations.
+        let endpoint = "POST /api/simulation/start";
+        let mk = |platform: &str| {
+            format!(
+                r#"{endpoint}  body: {{"simulation_id":"{simulation_id}","platform":"{platform}"}}"#
+            )
+        };
+
         Ok(RunInstructions {
             simulation_dir: sim_dir,
             config_file,
-            // [≠]-substrate: MiroFish Python OASIS subprocess commands cannot run in teri.
-            // teri uses SimEngine::run in-process.  See module-level substrate note.
-            substrate_note: "OASIS Python subprocess commands (run_twitter_simulation.py, \
-                             run_reddit_simulation.py, run_parallel_simulation.py, conda activate) \
-                             are inexpressible in teri's substrate. \
-                             Use SimEngine::run() instead.",
+            commands: RunCommands {
+                twitter: mk("twitter"),
+                reddit: mk("reddit"),
+                parallel: mk("parallel"),
+            },
+            instructions: format!(
+                "teri runs this prepared simulation in-process via SimEngine (no Python scripts, \
+                 no conda env). Start it through the running API server:\n\
+                 1. Ensure `teri serve` is running.\n\
+                 2. POST /api/simulation/start with JSON body \
+                 {{\"simulation_id\": \"{simulation_id}\", \
+                 \"platform\": \"twitter\"|\"reddit\"|\"parallel\", \"max_rounds\": <opt int>, \
+                 \"enable_graph_memory_update\": <opt bool>, \"force\": <opt bool>}}.\n\
+                 The default platform is \"parallel\". The runner drives SimEngine directly; \
+                 no subprocess is spawned."
+            ),
+            // [≠] residual (NARROWED by DECISION-U026-2): only scripts_dir and the literal
+            // python/conda command strings are inexpressible in teri's substrate.
+            substrate_note: "MiroFish's Python OASIS subprocess commands \
+                (run_twitter_simulation.py, run_reddit_simulation.py, run_parallel_simulation.py) \
+                and `conda activate MiroFish` are inexpressible in teri's substrate (no Python scripts, \
+                no conda). teri runs the SimEngine in-process via the /start endpoint above.",
         })
     }
 }
@@ -2034,11 +2137,13 @@ mod manager_tests {
         let mgr = SimulationManager::new(&dir);
 
         let state = mgr.create_simulation("p", "g", true, true).unwrap();
+        let sim_id = &state.simulation_id;
 
-        let instr = mgr.get_run_instructions(&state.simulation_id).unwrap();
+        let instr = mgr.get_run_instructions(sim_id).unwrap();
 
+        // --- Existing asserts (simulation_dir / config_file / substrate_note) ---
         assert!(
-            instr.simulation_dir.ends_with(&state.simulation_id),
+            instr.simulation_dir.ends_with(sim_id),
             "simulation_dir must point to sim dir: {:?}",
             instr.simulation_dir
         );
@@ -2053,6 +2158,69 @@ mod manager_tests {
             "substrate_note must direct caller to SimEngine: {}",
             instr.substrate_note
         );
+
+        // --- DECISION-U026-2: new commands / instructions asserts ---
+
+        // Each per-platform command must reference the HTTP start endpoint and that platform.
+        for (platform, cmd) in [
+            ("twitter", &instr.commands.twitter),
+            ("reddit", &instr.commands.reddit),
+            ("parallel", &instr.commands.parallel),
+        ] {
+            assert!(
+                cmd.contains("/start"),
+                "commands.{platform} must reference the /start endpoint: {cmd}"
+            );
+            assert!(
+                cmd.contains(platform),
+                "commands.{platform} must name its platform in the body: {cmd}"
+            );
+            assert!(
+                cmd.contains(sim_id.as_str()),
+                "commands.{platform} must contain the simulation id: {cmd}"
+            );
+            // Route SHAPE (regression guard, parity-gate FAIL fix): the authoritative start
+            // route is `POST /api/simulation/start` with simulation_id in the BODY — there is
+            // NO `/<id>/start` path route (simulation.py:1451, S-820). The guidance must point
+            // at the real, routable endpoint, and must NOT put the id in the URL path.
+            assert!(
+                cmd.contains("POST /api/simulation/start"),
+                "commands.{platform} must reference the body-id start route exactly: {cmd}"
+            );
+            assert!(
+                !cmd.contains(&format!("/simulation/{sim_id}/start")),
+                "commands.{platform} must NOT use the nonexistent id-in-path /<id>/start route: {cmd}"
+            );
+            assert!(
+                cmd.contains(&format!(r#""simulation_id":"{sim_id}""#)),
+                "commands.{platform} must carry simulation_id in the JSON body: {cmd}"
+            );
+        }
+
+        // instructions must mention SimEngine (in-process) and be non-empty.
+        assert!(
+            !instr.instructions.is_empty(),
+            "instructions must be non-empty (DECISION-U026-2)"
+        );
+        assert!(
+            instr.instructions.contains("SimEngine"),
+            "instructions must mention SimEngine (in-process path): {}",
+            instr.instructions
+        );
+
+        // to_dict: spot-check key presence and nested commands shape.
+        let dict = instr.to_dict();
+        assert!(dict.get("simulation_dir").is_some(), "to_dict must contain simulation_dir");
+        assert!(dict.get("config_file").is_some(), "to_dict must contain config_file");
+        assert!(dict.get("commands").is_some(), "to_dict must contain commands");
+        assert!(dict.get("instructions").is_some(), "to_dict must contain instructions");
+        assert!(dict.get("substrate_note").is_some(), "to_dict must contain substrate_note");
+        assert!(dict.get("scripts_dir").is_none(), "[≠] scripts_dir must NOT appear in to_dict");
+
+        let cmds = dict.get("commands").unwrap();
+        assert!(cmds.get("twitter").is_some(), "commands must have twitter key");
+        assert!(cmds.get("reddit").is_some(), "commands must have reddit key");
+        assert!(cmds.get("parallel").is_some(), "commands must have parallel key");
     }
 
     // -----------------------------------------------------------------------

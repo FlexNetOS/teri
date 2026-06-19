@@ -17,7 +17,25 @@ dest_base: develop
 #   Zep Cloud SaaS graph/memory → teri petgraph (src/graph) + redb (src/memory) — map-onto-substrate
 #   OASIS Python subprocess sim → teri native SimEngine (src/sim) — map-onto-substrate (REIMPLEMENT-in-Y)
 cycle_budget: 3
-cycles_this_session: 1   # NEW SESSION 2026-06-19 (20th resume); reset 0; CYCLE 26=U-026(a) ApiState runtime-state extension + simulation_router skeleton + nest (structural, gate PASS). PRIOR session 2026-06-18: 23=U-025(d) build, 24=U-025(f)→U-025 COMPLETE, 25=U-026 architect decomposition.
+cycles_this_session: 2   # NEW SESSION 2026-06-19 (20th resume); reset 0; CYCLE 26=U-026(a) ApiState runtime-state ext + router skeleton (PASS), 27=U-026(c) create/get/list ×3 + DECISION-U026-2 RunInstructions native-guidance (FAIL→fix→PASS — gate caught id-in-path start-route, fixed to body-id). PRIOR session 2026-06-18: 23=U-025(d) build, 24=U-025(f)→U-025 COMPLETE, 25=U-026 architect decomposition.
+# CYCLE 27 (NEW SESSION 2026-06-19, 20th resume): U-026 sub-cycle (c) create/get/list ×3 + DECISION-U026-2 —
+#   architect→porter→parity FAIL→fix→PASS. THE GATE EARNED ITS KEEP TWICE this cycle: (1) I (loop driver) caught
+#   that the architect's §3 group-c table SILENTLY DROPPED the get_simulation READY→run_instructions branch AND the
+#   U-023 carry-forward gate ("U-026 route MUST emit NATIVE run-guidance not just substrate_note") — routed the
+#   RunInstructions extension to the architect (DECISION-U026-2, findings/u026-c-run-instructions.md: EXTEND not [≠],
+#   RunInstructions += commands:RunCommands{twitter,reddit,parallel}+instructions:String+to_dict(); scripts_dir the
+#   only [≠] drop). (2) The parity-verifier caught the native commands referenced POST /api/simulation/{id}/start
+#   (id-in-PATH) — a NONEXISTENT route: authoritative start is POST /start with simulation_id+platform in BODY
+#   (simulation.py:1451-1505, S-820; grep-confirmed no /<id>/start) → unroutable when (g) lands → FIXED to
+#   POST /api/simulation/start body:{simulation_id,platform} + synced doc-comments + added route-SHAPE regression
+#   asserts in BOTH tests so it can't recur → re-verified PASS. LANDED src/api/simulation.rs 3 handlers (create:
+#   project_id 400/projectNotFound 404/graphNotBuilt 400/enable_*default-true/state.sim_manager in-state Arc per
+#   DECISION-U026-1; get: 404 + READY-gate run_instructions; list: ?project_id only, NO ?limit source-confirmed).
+#   Router static-before-capture (/create,/list,/:simulation_id). i18n keys byte-identical en/zh w/ {id} interp.
+#   S-807/810/811 [x] + S-680 extension resolved. teri 1309 green (+13), clippy --all-targets clean, Y-not-regressed.
+#   NEXT per architect §5: (b) entities ×3 [KnowledgeGraphEntityReader U-016 + graph-load-by-id, [≠]U026-ZEPKEY] OR
+#   (e profiles/config, e2 script-dl, f generate-profiles) ∥-after-c; then g start/stop (needs _check_simulation_prepared
+#   helper port); then h run-status, i actions/timeline/agent-stats, j posts/comments(empty-branch), k interview, l env/close, m history.
 # CYCLE 26 (NEW SESSION 2026-06-19, 20th resume): U-026 sub-cycle (a) ApiState runtime-state extension +
 #   simulation_router skeleton + nest — gate PASS (structural). DECISION-U026-1 REALIZED: ApiState (src/api/mod.rs)
 #   EXTENDED with sim_manager:Arc<SimulationManager> + sim_runner:Arc<SimulationRunner<OpenAiAdapter>> — concrete

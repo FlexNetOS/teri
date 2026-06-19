@@ -2936,3 +2936,156 @@ divergence. U-025 is **route-complete 10/10** and the UNIT flips to `- [x]`. S-8
   (visible only after handler returns either way). Survives.
 
 **Note:** create_app S-024 stays `- [~]` (PARTIAL) — pending U-026/U-027 blueprint mounts. NOT flipped.
+
+---
+
+# U-026 sub-cycle (c) — 3 simulation routes + RunInstructions extension — 2026-06-19 (opus, parity-verifier)
+
+**Verdict: FAIL** (2 PASS / 1 FAIL among routes; the extension FAILs). Worktree `port/mirofish`,
+`/home/drdave/Desktop/meta/.worktrees/mirofish-port/teri`. Differential read X(`MiroFish`)↔Y(teri),
+plus `cargo test -p teri` = **1309 passed / 6 ignored / 0 failed**; all 8 sub-cycle-(c) tests pass
+individually.
+
+## Route 1 — POST /create (S-807) — PASS
+Differential vs `simulation.py:165-237`. Every branch matches:
+- empty body→`{}` (`body: Option<Json<Value>>` → `unwrap_or(json!({}))`, sim.rs:129) = `request.get_json() or {}`.
+- missing/empty project_id→400 `api.requireProjectId` (sim.rs:134-139). `.as_str().unwrap_or("")` makes
+  ""≡missing, matching Python's falsy `not project_id`.
+- project-not-found→404 `api.projectNotFound` id-interpolated (sim.rs:144-150). i18n: teri en/zh strings
+  byte-identical to MiroFish `locales/{en,zh}.json:322`; teri `t_args` `{id}`-replace (i18n/mod.rs:232-234)
+  mirrors Python `value.replace('{id}',str(v))` (locale.py:59-61). Default locale zh both sides.
+- graph_id = body.graph_id (non-empty) else project.graph_id; empty→400 `api.graphNotBuilt` (sim.rs:156-168).
+  `.filter(|s| !s.is_empty())` correctly mirrors Python `body.graph_id or project.graph_id` empty-string semantics.
+- enable_twitter/reddit default-true (sim.rs:171-174); body false honored.
+- success `{success:true, data: state.to_dict()}` — `SimulationState::to_dict` (mgr.rs:300-335) is the
+  17-key, declaration-order, status-as-`.value`-string, error-null port verified in U-023; route does not reshape.
+- 500→`ApiError::server` 3-key `{success,error,traceback}` (`[≠] U025-TRACEBACK`, shape preserved).
+
+## Route 3 — GET /list (S-811) — PASS
+Differential vs `simulation.py:788-814`.
+- `?project_id` filter → `list_simulations(Option<&str>)` (mgr.rs:1565-1597): None→all, Some→`project_id==pid`,
+  skips `.`-prefixed + non-dir, empty when dir absent — faithful to `simulation.py:463-479`.
+- body `{success,data:[to_dict...],count:len}`, key order data-then-count; `count==data.len()` (test-confirmed).
+- **`?limit` refutation:** independently read `simulation.py:797` — Python reads ONLY
+  `request.args.get('project_id')`. NO `?limit`. Porter's claim CONFIRMED; no narrowing.
+
+## Route 2 — GET /:simulation_id (S-810) — **FAIL** (the carry-forward gate)
+Differential vs `simulation.py:755-785`. Correct parts:
+- not-found→404 `api.simulationNotFound` id-interpolated (sim.rs:220-231).
+- success `{success,data:result}`, `result=state.to_dict()`.
+- READY gate exact: `if sim_state.status == SimulationStatus::Ready` (sim.rs:238) = Python
+  `state.status == SimulationStatus.READY`. `Ready.as_str()=="ready"` matches `to_dict` status serialization.
+  Test `get_simulation_happy_path` proves a non-READY (created) sim has NO `run_instructions`;
+  `get_simulation_ready_has_run_instructions` proves a patched-to-ready sim DOES.
+- `run_instructions = RunInstructions::to_dict()` key order `simulation_dir, config_file,
+  commands{twitter,reddit,parallel}, instructions, substrate_note` (mgr.rs:804-827); `scripts_dir` ABSENT —
+  the ONE justified `[≠]` drop (teri has no `backend/scripts/` dir; survives the `[≠]` challenge:
+  genuinely inexpressible). `commands`/`instructions` are NATIVE-EXPRESSED (correct in KIND — NOT a feature
+  skip; the prose-only `substrate_note` downgrade the U-023 gate warned about was correctly avoided).
+
+**DEFECT (no-downgrade / actionable-guidance):** the native guidance strings reference
+`POST /api/simulation/{simulation_id}/start` — simulation_id in the URL **path** (mgr.rs:1696-1718,
+both `commands.*` and `instructions`). But the authoritative start route is `POST /start` with
+`simulation_id` carried in the **JSON body**:
+  - Python: `@simulation_bp.route('/start', ...)` (`simulation.py:1451`), id read via
+    `data.get('simulation_id')` (`simulation.py:1495`). There is NO `/<simulation_id>/start` route in source
+    (grep-confirmed: exactly one start decorator).
+  - teri ledger row **S-820** = `POST /start` (`simulation.py:1452`) → sub-cycle (g) will mount
+    `POST /api/simulation/start`. Architecture route-table line 184 also lists `/start` (not `/:id/start`).
+So the guidance points at a path (`/api/simulation/{id}/start`) that will NOT exist once (g) lands. The
+prompt names this exact FAIL condition ("the guidance isn't pointing at a nonexistent path"). NATIVE-EXPRESSED
+guidance must be CONCRETE & ACTIONABLE against the real endpoint; an id-in-path URL against a body-id route is
+a non-actionable, wrong instruction → correctness defect, not a `[≠]`.
+
+  - INPUT: GET a READY simulation `sim_abc`.
+  - EXPECTED (faithful native): `commands.twitter` ≈
+    `POST /api/simulation/start  body: {"simulation_id":"sim_abc","platform":"twitter"}`
+    and `instructions` directing `POST /api/simulation/start` with `simulation_id` in the body.
+  - ACTUAL: `commands.twitter` = `POST /api/simulation/sim_abc/start  body: {"platform":"twitter"}`
+    (id in path, omitted from body) → unroutable against the real `POST /start`.
+
+> Note: the design doc `u026-c-run-instructions.md` (L17) and this prompt both *assumed* `/:id/start`, but
+> the authoritative source + ledger S-820 say `/start` (body id). The source is authoritative; the guidance
+> must match it (or sub-cycle (g) must mount `/:id/start` AND adjust S-820 — but that would diverge from the
+> faithful Python port, so the guidance is the correct thing to fix).
+
+## RunInstructions / get_run_instructions extension (S-680) — **FAIL**
+Additive change is well-formed: signature unchanged (`get_run_instructions(&self,&str)->Result<RunInstructions>`),
+`[≠]` narrowed to `scripts_dir`+conda literals (folded into `substrate_note`), `to_dict` key order correct,
+`scripts_dir` absent. The test `get_run_instructions_structural_fields` (mgr.rs:2130-2203) was EXTENDED, not
+weakened — OLD asserts (`simulation_dir`/`config_file`/`substrate_note`/SimEngine) survive alongside the new
+`commands`/`instructions` asserts; no coverage deleted. BUT the produced strings carry the same id-in-path
+defect as Route 2. The existing tests pass only because they assert `cmd.contains("/start")` +
+`cmd.contains(platform)` + `cmd.contains(sim_id)` — they DON'T assert the route SHAPE, so the wrong path
+slips through. Extension is UNPROVEN until the path is fixed.
+
+## Symbols (4 in scope): 2/4 covered
+- [x] S-807 (POST /create) · [x] S-811 (GET /list) · [~] S-810 (GET /:id — FAIL) · S-680 extension FAIL.
+
+## Required fix (route back to porter)
+In `simulation_manager.rs::get_run_instructions` (mgr.rs:1696-1718), change `commands.{twitter,reddit,parallel}`
+and `instructions` from `POST /api/simulation/{id}/start  body:{"platform":…}` to the body-id form:
+`POST /api/simulation/start  body:{"simulation_id":"{id}","platform":"…"}`, mirroring the authoritative
+`start_simulation` contract (`simulation.py:1451-1505`, ledger S-820). Then add a route-SHAPE assert to
+`get_run_instructions_structural_fields` (and the route test) so the defect cannot recur. Re-verify Route 2 + S-680.
+
+**Test count observed: 1309 passed, 6 ignored, 0 failed.**
+
+---
+
+## 2026-06-19 (opus) — U-026 sub-cycle (c) RE-VERIFY: S-810 + S-680 extension → PASS
+
+Re-verification of the two items FAILed on 2026-06-19 (Routes 1 & 3 untouched, not re-litigated).
+Worktree: `/home/drdave/Desktop/meta/.worktrees/mirofish-port/teri` (branch `port/mirofish`).
+Source: `/home/drdave/Desktop/meta/MiroFish`.
+
+### Prior FAIL (now fixed)
+Native run-guidance referenced `POST /api/simulation/{simulation_id}/start` (id-in-PATH) — an
+unrouteable route. Authoritative start route is `POST /start` with `simulation_id` + `platform` in
+the JSON BODY (`MiroFish .../api/simulation.py:1451`, params at `1495-1505`; ledger S-820).
+
+### (1) S-810 — `GET /:simulation_id` READY gate → **PASS**
+- `get_run_instructions` (`simulation_manager.rs:1689-1731`): `endpoint = "POST /api/simulation/start"`
+  (`:1698`); `mk(platform)` emits `body:{"simulation_id":"{id}","platform":"{platform}"}` (`:1699-1703`).
+  All three `commands.{twitter,reddit,parallel}` and the `instructions` prose (`:1713-1723`) use the
+  body-id form. NO id-in-path string in the function body (commands or prose).
+- READY handler `api/simulation.rs:238-247`: `status == SimulationStatus::Ready` →
+  inserts `run_instructions = get_run_instructions(...).to_dict()` into `result`.
+- Full path routable: `server.rs:199` nests `simulation_router` under `/simulation`, under `/api`
+  (`server.rs:207`) → `/api/simulation`; (g) adds `POST /start` → `POST /api/simulation/start`. ✓
+- `to_dict()` (`simulation_manager.rs:804-827`) key order
+  `simulation_dir, config_file, commands{twitter,reddit,parallel}, instructions, substrate_note`;
+  `scripts_dir` absent. ✓
+- `platform` named in each command; `instructions` mentions SimEngine + in-process path;
+  `substrate_note` present. ✓
+- Cross-check vs real start params (`simulation.py:1495-1505`): simulation_id (req), platform
+  (default parallel), max_rounds, enable_graph_memory_update, force — instructions prose at
+  `:1717-1720` describes all five faithfully. ✓
+
+### (2) S-680 extension — `RunInstructions`/`get_run_instructions` + tests → **PASS**
+- Additive: signature unchanged; U-023 structural asserts (simulation_dir/config_file/substrate_note)
+  retained alongside the new ones (`simulation_manager.rs:2144-2160`).
+- Regression guard `get_run_instructions_structural_fields` (`simulation_manager.rs:2186-2197`):
+  asserts `cmd.contains("POST /api/simulation/start")`, `!cmd.contains("/simulation/{id}/start")`,
+  and the body `"simulation_id":"{id}"`. NON-VACUOUS — a revert to id-in-path makes
+  `contains("POST /api/simulation/start")` false AND `!contains(id-in-path)` false → test FAILS.
+- Route guard `get_simulation_ready_has_run_instructions` (`api/simulation.rs:673-680`):
+  asserts `cmd.contains("POST /api/simulation/start")` (the strong, non-vacuous guard) plus the
+  id-in-path-absent check. Fails on revert. ✓
+
+### Build / tests
+`cargo test -p teri`: **1309 passed, 6 ignored, 0 failed.** Both named tests pass individually:
+`get_run_instructions_structural_fields` ✓, `get_simulation_ready_has_run_instructions` ✓.
+
+### Non-blocking note (doc-only; flag to porter, does NOT gate)
+Stale id-in-path strings `POST /api/simulation/{id}/start` linger in DOC COMMENTS only —
+`RunCommands`/`RunInstructions` rustdoc (`simulation_manager.rs:722-724, 756, 777`) and the
+module DECISION note. These are not in any executable code path or serialized output (`to_dict()`
+emits none of this prose), and the contract tests assert the correct shape. Recommend the porter
+sync these comments to the body-id form for accuracy; not a parity/behavior divergence.
+
+### VERDICT
+- **S-810: PASS** — `symbol-map.md` → `[x]`.
+- **S-680 extension: PASS** (resolved) — `symbol-map.md` row updated.
+
+Sub-cycle (c) is clear to flip to `[x]` and commit.
