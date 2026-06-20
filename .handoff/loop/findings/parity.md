@@ -3743,3 +3743,46 @@ Tried to REFUTE on 9 axes; all hold:
 **Conclusion:** Sub-cycle (e) parity-clean. +9 tests (1472→1481). clippy --all-targets +
 --all-features clean. Y-not-regressed. Atomic gate PASS. (U-027 UNIT row stays open — only the
 (f) async-generate keystone remains; after (f), create_app S-024 flips [x].)
+
+---
+
+## U-027 sub-cycle (f) — async-generate KEYSTONE (POST /generate, /generate/status) — PASS → U-027 COMPLETE
+
+**Gate verdict: PASS (2026-06-19, 26th resume). 5 symbols `- [x]` (S-852j-n). U-027 COMPLETE (all 6 sub-cycles a-f).**
+
+Highest-risk sub-cycle (async background task, OS-thread spawn, task lifecycle).
+Differential re-verification against `report.py:25-272`. Verifier refuted on 8 axes; all hold:
+
+1. **Decision (i) OS-thread** — generate_report IS `!Send` (RefCell<&mut dyn ReportSink>
+   borrowed through Fn closures across the section .awaits, mod:1672) → tokio::spawn won't
+   compile → spawn_report_generation mirrors spawn_prepare_simulation VERBATIM (std::thread +
+   current_thread runtime, locale capture+with_locale, rt-build-fail→fail_task). Faithful port
+   of Python threading.Thread(daemon=True). Blast-radius 0. No Send/borrow bug.
+2. **/generate validation order** — sim_id 400 → get_simulation 404 → `!force_regenerate &&
+   COMPLETED` short-circuit → project 404 → graph_id 400 (missingGraphIdEnsure, DISTINCT source
+   key from chat's missingGraphId — both confirmed in en/zh) → requirement 400. Exact order.
+3. **Eager report_id + task** — report_{uuid_hex[:12]}, create_task("report_generate",
+   {sim,graph,report_id}), immediate 200 6-key {simulation_id,report_id,task_id,status:generating,
+   message,already_generated:false}.
+4. **Worker fidelity** — PROCESSING/0/initReportAgent → generate_report(...,sink,Some(report_id))
+   → save_report[Err→fail_task=Python outer except] → COMPLETED→complete_task else
+   fail_task(error or reportGenerateFailed empty→default).
+5. **TaskUpdateSink** — ReportEvent→update_task(progress as i64, `[{stage}] {message}`),
+   stage=to_status_str() lowercase. Holds only String → Send.
+6. **`[≠] U027-f-GRAPHRESOLVE-EAGER`** — route resolves graph (load_entity_reader_graph, ZEP
+   guard) + passes owned graph to worker, vs Python lazy-in-thread. Graph-error → sync 500 vs
+   Python generating+failed-task. Consistent with spawn_prepare_simulation precedent; primary
+   contract (valid graph → generating+bg-gen) faithful. LEGITIMATE.
+7. **/generate/status** — simulation_id-truthy(!is_empty)+COMPLETED short-circuit (200
+   already_completed:true progress:100 reportGenerated) → not task_id 400 requireTaskOrSimId →
+   get_task None 404 taskNotFound{id} → 200 task.to_dict. No reachable 500 (infallible substrate)
+   → source no-traceback outer-except moot.
+8. **`[!] U027-f-LLM-GATED` test adequacy** — 200 returns pre-LLM; ALL pre-spawn paths tested
+   (7 generate + 4 status) + worker-to-terminal-state. generate_report ALWAYS returns terminal
+   Report (Completed/Failed, never Pending — graceful LLM-fallback Completes even w/o LLM; this
+   is the substrate's real behavior, confirmed NOT a test-mask). No gap, no over-permissive assert.
+
+**Conclusion:** Sub-cycle (f) parity-clean → **U-027 COMPLETE** (18 handlers / 17 paths, all
+parity-verified). +12 tests (1481→1493). clippy --all-targets + --all-features clean.
+Y-not-regressed. Atomic gate PASS. create_app S-024 now has all 3 blueprints nested (U-025✓/026✓/
+027✓); only register_cleanup (U-023/U-049) remains before S-024 itself flips.

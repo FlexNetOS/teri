@@ -40,9 +40,11 @@ use serde_json::Value;
 
 use crate::api::simulation::load_entity_reader_graph;
 use crate::api::{ApiError, ApiState};
-use crate::llm::ChatMessage;
+use crate::graph::KnowledgeGraph;
+use crate::llm::{ChatMessage, OpenAiAdapter};
 use crate::report::ReportStatus;
 use crate::report::manager::ReportManager;
+use crate::report::sink::{ReportEvent, ReportSink};
 use crate::services::zep_tools::ReportTools;
 
 /// Build the `/report` sub-router. Mirrors `simulation_router` (DECISION-U026-1 state).
@@ -79,6 +81,10 @@ pub fn report_router(state: Arc<ApiState>) -> Router {
         .route("/tools/statistics", post(tools_statistics_route))
         // ── Sub-cycle (e): chat (POST, seg-0 static) ──
         .route("/chat", post(chat_route))
+        // ── Sub-cycle (f): async generate keystone (POST, seg-0 statics) ──
+        // /generate (1-seg) + /generate/status (2-seg) — distinct by full path.
+        .route("/generate", post(generate_report_route))
+        .route("/generate/status", post(generate_status_route))
         .with_state(state)
 }
 
@@ -702,8 +708,369 @@ async fn chat_route(
     })))
 }
 
-// Sub-cycle (f) appends its routes + handlers in its own commit:
-//   (f) generate + generate/status (async keystone).
+// ===========================================================================
+// Sub-cycle (f) — async generate keystone  (report.py:25-272)
+//
+// The HARDEST sub-cycle: an async background report-generation task. Two routes:
+//   POST /generate        — validate + resolve, create report_id + task eagerly,
+//                           spawn the generation worker, return {report_id,task_id,
+//                           status:"generating"} IMMEDIATELY (report.py:25-200).
+//   POST /generate/status — poll the task (simulation_id completed short-circuit
+//                           then task_id lookup) (report.py:203-272).
+//
+// ## Decision (i) — OS-thread + current-thread runtime (NOT tokio::spawn)
+//
+// `ReportAgent::generate_report` (mod:1635) is `!Send`: it wraps the `&mut dyn
+// ReportSink` in a `RefCell` (mod:1672) and borrows it through `Fn` closures held
+// LIVE across the section-generation `.await`s. `RefCell` is `!Sync` → a future
+// holding that borrow across `.await` is `!Send` → it cannot be awaited inside a
+// `tokio::spawn` worker (which requires `+ Send`). This is the SAME property that
+// forced DECISION-U026-d-1-REVISED for `prepare_simulation`. So we reuse the
+// `spawn_prepare_simulation` template VERBATIM (simulation_manager.rs:1836): a
+// dedicated `std::thread::spawn` running a `current_thread` tokio runtime drives the
+// `!Send` future on one thread → ZERO signature changes to the U-024-verified
+// `generate_report` (blast radius 0). This is also the faithful port of Python's
+// `threading.Thread(target=run_generate, daemon=True)` (report.py:179).
+//
+// The progress callback (Python `progress_callback(stage,progress,msg)` →
+// `task_manager.update_task`, report.py:146-151) maps to `TaskUpdateSink` — a
+// `ReportSink` that fans each `ReportEvent` to `TaskManager::update_task`.
+//
+// ## `[≠] U027-f-GRAPHRESOLVE-EAGER` (consistent with the prepare-route precedent)
+// Python resolves the graph LAZILY inside the worker thread (ReportAgent builds
+// ZepToolsService there). teri resolves it in the ROUTE via `load_entity_reader_graph`
+// (ZEP guard + task→graph) and passes the owned `KnowledgeGraph` into the worker —
+// EXACTLY as the U-026(d) prepare route passes an owned graph to
+// `spawn_prepare_simulation`. So a graph-resolution failure (empty zep key / no
+// graph_build task) returns a synchronous 500 here rather than Python's "generating"
+// + background failed-task. The PRIMARY contract (valid graph → generating + bg
+// generation) is faithful; on graph error the report does not generate either way
+// (frontend observes it via the error vs a failed `/generate/status`). Same
+// substrate-forced eager-resolution already accepted for prepare.
+//
+// `[!] U027-f-LLM-GATED`: the worker drives the LLM (full report pipeline); the 200
+// "generating" response returns BEFORE the LLM runs, so the route is tested without a
+// live LLM (the detached worker fails its task on a missing LLM — no test impact).
+// `[≠] U026-ZEPKEY` / `[≠] U025-TRACEBACK` inherited. `/generate/status`'s outer 500
+// has NO traceback in source (report.py:269-272) but teri's status handler has no
+// reachable server-error path (get_report_by_simulation/get_task are infallible), so
+// the divergence is unreachable.
+// ===========================================================================
+
+/// A `ReportSink` that forwards each progress event to `TaskManager::update_task`.
+///
+/// Port of Python's `progress_callback(stage, progress, message)` →
+/// `task_manager.update_task(task_id, progress=progress, message=f"[{stage}] {message}")`
+/// (report.py:146-151). The stage is rendered as its lowercase status string (matching
+/// what Python's agent passes as `stage`), prefixed in brackets onto the message.
+struct TaskUpdateSink {
+    task_id: String,
+}
+
+impl ReportSink for TaskUpdateSink {
+    fn event(&mut self, ev: &ReportEvent) {
+        let message = format!("[{}] {}", ev.stage.to_status_str(), ev.message);
+        crate::task::TaskManager::global().update_task(
+            &self.task_id,
+            None,
+            Some(ev.progress as i64),
+            Some(message),
+            None,
+            None,
+            None,
+        );
+    }
+}
+
+/// Spawn the report-generation worker on a dedicated OS thread + current-thread tokio
+/// runtime (Decision (i)). Mirrors `spawn_prepare_simulation` verbatim.
+#[allow(clippy::too_many_arguments)]
+fn spawn_report_generation(
+    task_id: String,
+    graph_id: String,
+    simulation_id: String,
+    simulation_requirement: String,
+    report_id: String,
+    llm: OpenAiAdapter,
+    graph: KnowledgeGraph,
+    upload_folder: String,
+) {
+    // Capture locale before spawning (report.py:125), re-apply in the thread.
+    let locale = crate::i18n::get_locale();
+    let task_id_worker = task_id.clone();
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::error!("report worker runtime build failed: {e}");
+                crate::task::TaskManager::global().fail_task(&task_id_worker, e.to_string());
+                return;
+            }
+        };
+        rt.block_on(crate::i18n::with_locale(locale, async move {
+            report_generate_worker(
+                task_id_worker,
+                graph_id,
+                simulation_id,
+                simulation_requirement,
+                report_id,
+                llm,
+                graph,
+                upload_folder,
+            )
+            .await;
+        }));
+    });
+}
+
+/// Inner worker — port of `run_generate` (report.py:128-176).
+///
+/// `pub(crate)` so tests can drive it directly on a current-thread runtime (bypassing
+/// the OS-thread spawn), mirroring `prepare_worker`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn report_generate_worker(
+    task_id: String,
+    graph_id: String,
+    simulation_id: String,
+    simulation_requirement: String,
+    report_id: String,
+    llm: OpenAiAdapter,
+    graph: KnowledgeGraph,
+    upload_folder: String,
+) {
+    use crate::task::{TaskManager, TaskStatus};
+
+    // Step 1: PROCESSING, progress 0, initReportAgent (report.py:131-136).
+    TaskManager::global().update_task(
+        &task_id,
+        Some(TaskStatus::Processing),
+        Some(0),
+        Some(crate::i18n::t("api.initReportAgent")),
+        None,
+        None,
+        None,
+    );
+
+    // Step 2-4: build agent + tools + manager + sink, generate (report.py:139-157).
+    let mut agent =
+        crate::report::ReportAgent::new_react(&graph_id, &simulation_id, &simulation_requirement);
+    let tools = ReportTools::new(&graph, &llm);
+    let manager = ReportManager::new(&upload_folder);
+    let mut sink = TaskUpdateSink { task_id: task_id.clone() };
+    let report = agent
+        .generate_report(&tools, &llm, &manager, &mut sink, Some(report_id.clone()))
+        .await;
+
+    // Step 5: save_report (report.py:160). An I/O failure here maps to Python's
+    // outer `except → fail_task(str(e))`.
+    if let Err(e) = manager.save_report(&report) {
+        TaskManager::global().fail_task(&task_id, format!("save_report failed: {e}"));
+        return;
+    }
+
+    // Step 6: terminal transition (report.py:162-172).
+    if report.status == ReportStatus::Completed {
+        TaskManager::global().complete_task(
+            &task_id,
+            serde_json::json!({
+                "report_id": report.report_id,
+                "simulation_id": simulation_id,
+                "status": "completed"
+            }),
+        );
+    } else {
+        // Python: `report.error or t('api.reportGenerateFailed')`.
+        let err = report
+            .error
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| crate::i18n::t("api.reportGenerateFailed"));
+        TaskManager::global().fail_task(&task_id, err);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /generate  (report.py:25-200)
+// ---------------------------------------------------------------------------
+async fn generate_report_route(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, ApiError> {
+    let data = parse_tools_body(body);
+
+    // Step 1: simulation_id required (report.py:53-58).
+    let simulation_id =
+        data.get("simulation_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if simulation_id.is_empty() {
+        return Err(ApiError::client(
+            StatusCode::BAD_REQUEST,
+            crate::i18n::t("api.requireSimulationId"),
+        ));
+    }
+    // Step 2: force_regenerate default false (report.py:60).
+    let force_regenerate = data.get("force_regenerate").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // Step 3: resolve simulation (report.py:63-70).
+    let sim_state = state.sim_manager.get_simulation(&simulation_id).map_err(ApiError::server)?;
+    let sim_state = match sim_state {
+        None => {
+            return Err(ApiError::client(
+                StatusCode::NOT_FOUND,
+                crate::i18n::t_args("api.simulationNotFound", &[("id", &simulation_id)]),
+            ));
+        }
+        Some(s) => s,
+    };
+
+    // Step 4: existing-completed-report short-circuit unless force_regenerate (report.py:73-85).
+    if !force_regenerate
+        && let Some(existing) = report_manager(&state).get_report_by_simulation(&simulation_id)
+        && existing.status == ReportStatus::Completed
+    {
+        return Ok(Json(serde_json::json!({
+            "success": true,
+            "data": {
+                "simulation_id": simulation_id,
+                "report_id": existing.report_id,
+                "status": "completed",
+                "message": crate::i18n::t("api.reportAlreadyExists"),
+                "already_generated": true
+            }
+        })));
+    }
+
+    // Step 5: resolve project (report.py:88-93).
+    let pm = crate::models::project::ProjectManager::from_config(&state.config);
+    let project = pm.get_project(&sim_state.project_id).map_err(ApiError::server)?;
+    let project = match project {
+        None => {
+            return Err(ApiError::client(
+                StatusCode::NOT_FOUND,
+                crate::i18n::t_args("api.projectNotFound", &[("id", &sim_state.project_id)]),
+            ));
+        }
+        Some(p) => p,
+    };
+
+    // Step 6: graph_id = state.graph_id or project.graph_id (report.py:95-100).
+    // NOTE: the missing-graph i18n key here is `missingGraphIdEnsure` (NOT chat's
+    // `missingGraphId`).
+    let graph_id = if !sim_state.graph_id.is_empty() {
+        sim_state.graph_id.clone()
+    } else {
+        project.graph_id.clone().unwrap_or_default()
+    };
+    if graph_id.is_empty() {
+        return Err(ApiError::client(
+            StatusCode::BAD_REQUEST,
+            crate::i18n::t("api.missingGraphIdEnsure"),
+        ));
+    }
+
+    // Step 7: simulation_requirement REQUIRED here (report.py:102-107) — unlike /chat.
+    let simulation_requirement = project.simulation_requirement.clone().unwrap_or_default();
+    if simulation_requirement.is_empty() {
+        return Err(ApiError::client(
+            StatusCode::BAD_REQUEST,
+            crate::i18n::t("api.missingSimRequirement"),
+        ));
+    }
+
+    // Step 8: eagerly mint report_id (report.py:110-111).
+    let report_id = format!("report_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+
+    // Step 9: resolve the graph + llm in the route (`[≠] U027-f-GRAPHRESOLVE-EAGER`,
+    // consistent with spawn_prepare_simulation). ZEP guard fires here.
+    let graph = load_entity_reader_graph(&state, &graph_id).await?;
+    let llm = crate::api::build_llm(&state.config);
+
+    // Step 10: create the async task eagerly (report.py:114-122).
+    let mut metadata: HashMap<String, Value> = HashMap::new();
+    metadata.insert("simulation_id".to_string(), Value::String(simulation_id.clone()));
+    metadata.insert("graph_id".to_string(), Value::String(graph_id.clone()));
+    metadata.insert("report_id".to_string(), Value::String(report_id.clone()));
+    let task_id = crate::task::TaskManager::global().create_task("report_generate", Some(metadata));
+
+    // Step 11: spawn the worker (report.py:179-180).
+    spawn_report_generation(
+        task_id.clone(),
+        graph_id,
+        simulation_id.clone(),
+        simulation_requirement,
+        report_id.clone(),
+        llm,
+        graph,
+        state.config.upload_folder.clone(),
+    );
+
+    // Step 12: immediate response (report.py:182-192).
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": {
+            "simulation_id": simulation_id,
+            "report_id": report_id,
+            "task_id": task_id,
+            "status": "generating",
+            "message": crate::i18n::t("api.reportGenerateStarted"),
+            "already_generated": false
+        }
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// POST /generate/status  (report.py:203-272)
+//   simulation_id completed short-circuit → then task_id lookup.
+//   No reachable 500 in teri (get_report_by_simulation/get_task are infallible),
+//   so source's no-traceback outer-except (report.py:269-272) is moot.
+// ---------------------------------------------------------------------------
+async fn generate_status_route(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, ApiError> {
+    let data = parse_tools_body(body);
+    let task_id = data.get("task_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let simulation_id =
+        data.get("simulation_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    // Step 1: simulation_id completed short-circuit (report.py:232-245).
+    // Python `if simulation_id:` is truthy — empty string skips.
+    if !simulation_id.is_empty()
+        && let Some(existing) = report_manager(&state).get_report_by_simulation(&simulation_id)
+        && existing.status == ReportStatus::Completed
+    {
+        return Ok(Json(serde_json::json!({
+            "success": true,
+            "data": {
+                "simulation_id": simulation_id,
+                "report_id": existing.report_id,
+                "status": "completed",
+                "progress": 100,
+                "message": crate::i18n::t("api.reportGenerated"),
+                "already_completed": true
+            }
+        })));
+    }
+
+    // Step 2: task_id required (report.py:247-251).
+    if task_id.is_empty() {
+        return Err(ApiError::client(
+            StatusCode::BAD_REQUEST,
+            crate::i18n::t("api.requireTaskOrSimId"),
+        ));
+    }
+
+    // Step 3: task lookup (report.py:253-264).
+    match crate::task::TaskManager::global().get_task(&task_id) {
+        None => Err(ApiError::client(
+            StatusCode::NOT_FOUND,
+            crate::i18n::t_args("api.taskNotFound", &[("id", &task_id)]),
+        )),
+        Some(task) => Ok(Json(serde_json::json!({
+            "success": true,
+            "data": task.to_dict()
+        }))),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1560,5 +1927,264 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "fallback resolves, then ZEP 500");
         assert_eq!(json["success"], false);
+    }
+
+    // =======================================================================
+    // Sub-cycle (f) — async generate keystone (POST /generate, /generate/status)
+    //
+    // The 200 "generating" response returns BEFORE the detached worker drives the
+    // LLM (`[!] U027-f-LLM-GATED`), so the route is testable without a live LLM. All
+    // pre-spawn validation/resolution paths + both short-circuits + the status-route
+    // contract are covered. (The worker itself is the U-024-verified generate_report
+    // wired through TaskUpdateSink; its LLM round-trip is producer-gated.)
+    // =======================================================================
+
+    /// Seed a project (graph_id = a real graph_build task_id, requirement set) + a
+    /// simulation referencing it, so /generate resolves all the way to the spawn.
+    /// Returns the simulation_id.
+    fn seed_generate_ready(state: &Arc<ApiState>) -> String {
+        let graph_task_id = seed_graph_task();
+        let pm = crate::models::project::ProjectManager::from_config(&state.config);
+        let mut p = pm.create_project("GenProj").expect("project");
+        p.graph_id = Some(graph_task_id);
+        p.simulation_requirement = Some("Analyze the public sentiment.".to_string());
+        pm.save_project(&mut p).expect("save");
+        let sim = state
+            .sim_manager
+            .create_simulation(&p.project_id, "", true, true)
+            .expect("create sim");
+        sim.simulation_id
+    }
+
+    // ---- /generate ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn generate_missing_simulation_id_400() {
+        let (state, _t) = test_state();
+        let app = crate::server::create_app(state);
+        let (status, json) = post_json(app, "/api/report/generate", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["success"], false);
+    }
+
+    #[tokio::test]
+    async fn generate_simulation_not_found_404() {
+        let (state, _t) = test_state();
+        let app = crate::server::create_app(state);
+        let (status, json) = post_json(
+            app,
+            "/api/report/generate",
+            serde_json::json!({"simulation_id": "sim_ghost"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["success"], false);
+    }
+
+    /// force_regenerate=false + an existing COMPLETED report → 200 already_generated.
+    #[tokio::test]
+    async fn generate_already_completed_short_circuit() {
+        let (state, _t) = test_state();
+        let sim = state
+            .sim_manager
+            .create_simulation("proj_x", "g1", true, true)
+            .expect("create sim");
+        seed(&state, &make_report("report_done", &sim.simulation_id, ReportStatus::Completed));
+        let app = crate::server::create_app(state);
+        let (status, json) = post_json(
+            app,
+            "/api/report/generate",
+            serde_json::json!({"simulation_id": sim.simulation_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let d = &json["data"];
+        assert_eq!(d["already_generated"], true);
+        assert_eq!(d["status"], "completed");
+        assert_eq!(d["report_id"], "report_done");
+    }
+
+    #[tokio::test]
+    async fn generate_project_not_found_404() {
+        let (state, _t) = test_state();
+        let sim = state
+            .sim_manager
+            .create_simulation("ghost_project", "g1", true, true)
+            .expect("create sim");
+        let app = crate::server::create_app(state);
+        let (status, json) = post_json(
+            app,
+            "/api/report/generate",
+            serde_json::json!({"simulation_id": sim.simulation_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["success"], false);
+    }
+
+    #[tokio::test]
+    async fn generate_missing_graph_id_400() {
+        let (state, _t) = test_state();
+        let pm = crate::models::project::ProjectManager::from_config(&state.config);
+        let mut p = pm.create_project("NoGraph").expect("project");
+        p.graph_id = None;
+        p.simulation_requirement = Some("req".to_string());
+        pm.save_project(&mut p).expect("save");
+        let sim = state
+            .sim_manager
+            .create_simulation(&p.project_id, "", true, true)
+            .expect("create sim");
+        let app = crate::server::create_app(state);
+        let (status, json) = post_json(
+            app,
+            "/api/report/generate",
+            serde_json::json!({"simulation_id": sim.simulation_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["success"], false);
+    }
+
+    /// graph_id present but simulation_requirement empty → 400 missingSimRequirement.
+    #[tokio::test]
+    async fn generate_missing_requirement_400() {
+        let (state, _t) = test_state();
+        let pm = crate::models::project::ProjectManager::from_config(&state.config);
+        let mut p = pm.create_project("NoReq").expect("project");
+        p.graph_id = Some("g1".to_string());
+        p.simulation_requirement = None;
+        pm.save_project(&mut p).expect("save");
+        let sim = state
+            .sim_manager
+            .create_simulation(&p.project_id, "g1", true, true)
+            .expect("create sim");
+        let app = crate::server::create_app(state);
+        let (status, json) = post_json(
+            app,
+            "/api/report/generate",
+            serde_json::json!({"simulation_id": sim.simulation_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["success"], false);
+    }
+
+    /// Full happy path → 200 "generating" with report_id + task_id, already_generated:false.
+    /// (The detached worker drives the LLM; we assert only the immediate response.)
+    #[tokio::test]
+    async fn generate_happy_returns_generating() {
+        let (state, _t) = test_state();
+        let simulation_id = seed_generate_ready(&state);
+        let app = crate::server::create_app(state);
+        let (status, json) = post_json(
+            app,
+            "/api/report/generate",
+            serde_json::json!({"simulation_id": simulation_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "happy generate must 200; got {json}");
+        let d = &json["data"];
+        assert_eq!(d["status"], "generating");
+        assert_eq!(d["already_generated"], false);
+        assert_eq!(d["simulation_id"], simulation_id);
+        assert!(d["report_id"].as_str().unwrap().starts_with("report_"), "report_id: {d}");
+        assert!(!d["task_id"].as_str().unwrap().is_empty(), "task_id present");
+    }
+
+    // ---- /generate/status ---------------------------------------------------
+
+    #[tokio::test]
+    async fn status_require_task_or_sim_400() {
+        let (state, _t) = test_state();
+        let app = crate::server::create_app(state);
+        let (status, json) =
+            post_json(app, "/api/report/generate/status", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["success"], false);
+    }
+
+    #[tokio::test]
+    async fn status_task_not_found_404() {
+        let (state, _t) = test_state();
+        let app = crate::server::create_app(state);
+        let (status, json) = post_json(
+            app,
+            "/api/report/generate/status",
+            serde_json::json!({"task_id": "task_ghost"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["success"], false);
+    }
+
+    /// simulation_id with a COMPLETED report → 200 already_completed:true, progress 100.
+    #[tokio::test]
+    async fn status_simulation_completed_short_circuit() {
+        let (state, _t) = test_state();
+        seed(&state, &make_report("report_sc", "sim_sc", ReportStatus::Completed));
+        let app = crate::server::create_app(state);
+        let (status, json) = post_json(
+            app,
+            "/api/report/generate/status",
+            serde_json::json!({"simulation_id": "sim_sc"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let d = &json["data"];
+        assert_eq!(d["already_completed"], true);
+        assert_eq!(d["status"], "completed");
+        assert_eq!(d["progress"], 100);
+        assert_eq!(d["report_id"], "report_sc");
+    }
+
+    /// A real task → 200 with task.to_dict (task_id echoed, status present).
+    #[tokio::test]
+    async fn status_task_found_returns_to_dict() {
+        let (state, _t) = test_state();
+        let task_id = crate::task::TaskManager::global().create_task("report_generate", None);
+        let app = crate::server::create_app(state);
+        let (status, json) =
+            post_json(app, "/api/report/generate/status", serde_json::json!({"task_id": task_id}))
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["data"]["task_id"], task_id);
+        assert!(json["data"]["status"].is_string());
+    }
+
+    /// `report_generate_worker` drives the task to a TERMINAL state. We run the worker
+    /// directly (current-thread runtime via #[tokio::test]) over an empty graph with an
+    /// unreachable LLM; `generate_report` has graceful LLM-failure fallbacks and still
+    /// produces a report, so the worker reaches `complete_task` (or `fail_task` on a
+    /// save error) — either way the task moves OFF pending/processing. This exercises
+    /// the worker's PROCESSING→terminal transition + save_report + result/error wiring.
+    #[tokio::test]
+    async fn worker_drives_task_to_terminal_state() {
+        let (state, _t) = test_state();
+        let task_id = crate::task::TaskManager::global().create_task("report_generate", None);
+        let llm = crate::api::build_llm(&state.config);
+        let graph = crate::graph::KnowledgeGraph::new(); // empty graph
+        report_generate_worker(
+            task_id.clone(),
+            "g1".to_string(),
+            "sim_w".to_string(),
+            "req".to_string(),
+            format!("report_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]),
+            llm,
+            graph,
+            state.config.upload_folder.clone(),
+        )
+        .await;
+        let task = crate::task::TaskManager::global().get_task(&task_id).expect("task");
+        let v = task.to_dict();
+        let st = v["status"].as_str().unwrap();
+        assert!(
+            st == "completed" || st == "failed",
+            "worker must reach a terminal state (not stuck pending/processing), got {v}"
+        );
+        // On completion the result carries the report_id + simulation_id (report.py:165-169).
+        if st == "completed" {
+            assert_eq!(v["result"]["simulation_id"], "sim_w");
+            assert!(v["result"]["report_id"].as_str().unwrap().starts_with("report_"));
+        }
     }
 }
