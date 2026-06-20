@@ -857,6 +857,71 @@ impl SimEngine {
             }
             None => PerPlatform { slots: Vec::new() },
         };
+
+        // Round-0 initial-events injection (U-030 §6, `run_parallel_simulation.py:1171-1211`).
+        // Emitted BEFORE the main loop, AFTER `simulation_start`: `round_start(0, 0)` fans out to ALL
+        // loggers; each `event_config.initial_posts` entry resolves to the pool agent whose
+        // `social.user_id == poster_agent_id` and routes a `CREATE_POST` record (round 0) to that
+        // agent's platform logger, counted into that platform's total; an unresolvable
+        // `poster_agent_id` is skipped (Python `except Exception: pass`); `round_end(0, count)` fans
+        // out. Round-0 CREATE_POSTs count toward `total_actions` per platform (Python increments
+        // `total_actions` per initial post, L1199-1201). Python ALSO `env.step`s the posts into the
+        // world so later agents react — teri's `WorldState` has no OASIS post-graph, so the
+        // world-injection is the known `[≠]U028-OASIS-INTERNALS` substrate gap; the round-0
+        // actions.jsonl RECORDS are differentially portable. Always emits round-0 start/end when a
+        // producer is installed (Python logs them even with no initial_posts).
+        if let Some(ref producer) = self.producer {
+            for (_, logger) in producer.loggers.iter() {
+                logger.log_round_start(0, 0).map_err(|e| log_err("round_start", e))?;
+            }
+            let mut round0_counts: PerPlatform<i64> = PerPlatform::zeroed(&producer.loggers);
+            let initial_posts = producer
+                .config
+                .get("event_config")
+                .and_then(|ec| ec.get("initial_posts"))
+                .and_then(serde_json::Value::as_array);
+            if let Some(posts) = initial_posts {
+                for post in posts {
+                    let poster_id = post
+                        .get("poster_agent_id")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
+                    let content =
+                        post.get("content").and_then(serde_json::Value::as_str).unwrap_or("");
+                    // Resolve poster_agent_id → the pool agent with that OASIS user_id, then route
+                    // to its platform logger. Unresolvable id (or platform with no logger) → skip.
+                    let routed = pool.agents.iter().find_map(|a| {
+                        a.persona.social.as_ref().and_then(|s| {
+                            (s.user_id as i64 == poster_id)
+                                .then(|| {
+                                    producer.loggers.get(s.platform).map(|l| (s.platform, l, a))
+                                })
+                                .flatten()
+                        })
+                    });
+                    if let Some((platform, logger, agent)) = routed {
+                        let args = serde_json::json!({ "content": content });
+                        logger
+                            .log_action(
+                                0,
+                                poster_id,
+                                &agent.persona.name,
+                                "CREATE_POST",
+                                Some(&args),
+                                None,
+                                true,
+                            )
+                            .map_err(|e| log_err("log_action", e))?;
+                        round0_counts.add(platform, 1);
+                    }
+                }
+            }
+            for (platform, logger) in producer.loggers.iter() {
+                let count = round0_counts.get(*platform);
+                logger.log_round_end(0, count).map_err(|e| log_err("round_end", e))?;
+                total_actions.add(*platform, count);
+            }
+        }
         let minutes_per_round = self.producer.as_ref().map(RunProducer::minutes_per_round);
 
         for tick_idx in 0..self.config.max_ticks {
@@ -2271,41 +2336,50 @@ mod producer_tests {
             .expect("run");
 
         let recs = read_jsonl(&log_path);
-        // 1 sim_start + per round (1 round_start + 2 actions + 1 round_end) ×2 + 1 sim_end = 10.
-        assert_eq!(recs.len(), 10, "stream length: {recs:?}");
+        // 1 sim_start + round-0 (round_start + round_end, no initial_posts) + per round
+        // (1 round_start + 2 actions + 1 round_end) ×2 + 1 sim_end = 12.
+        assert_eq!(recs.len(), 12, "stream length: {recs:?}");
 
         // simulation_start first.
         assert_eq!(recs[0]["event_type"], "simulation_start");
         assert_eq!(recs[0]["agents_count"], 2);
         assert_eq!(recs[0]["total_rounds"], 2, "1h*2 = 2 (logger's own formula)");
 
-        // Round 1 (1-based): round_start, 2× CREATE_POST, round_end(count=2).
+        // Round 0 (initial-events phase): round_start(0,0) + round_end(0,0); no initial_posts here.
         assert_eq!(recs[1]["event_type"], "round_start");
-        assert_eq!(recs[1]["round"], 1, "rounds are 1-based (round_num+1)");
-        assert_eq!(recs[1]["simulated_hour"], 0, "(0*30/60)%24 = 0");
-        assert_eq!(recs[2]["action_type"], "CREATE_POST");
-        assert_eq!(recs[2]["round"], 1);
-        assert_eq!(recs[2]["action_args"], serde_json::json!({ "content": "hi" }));
-        assert_eq!(recs[2]["success"], true);
-        assert_eq!(recs[3]["action_type"], "CREATE_POST");
-        assert_eq!(recs[4]["event_type"], "round_end");
+        assert_eq!(recs[1]["round"], 0, "round-0 is the initial-events phase");
+        assert_eq!(recs[1]["simulated_hour"], 0);
+        assert_eq!(recs[2]["event_type"], "round_end");
+        assert_eq!(recs[2]["round"], 0);
+        assert_eq!(recs[2]["actions_count"], 0, "no initial_posts in this config");
+
+        // Round 1 (1-based): round_start, 2× CREATE_POST, round_end(count=2).
+        assert_eq!(recs[3]["event_type"], "round_start");
+        assert_eq!(recs[3]["round"], 1, "rounds are 1-based (round_num+1)");
+        assert_eq!(recs[3]["simulated_hour"], 0, "(0*30/60)%24 = 0");
+        assert_eq!(recs[4]["action_type"], "CREATE_POST");
         assert_eq!(recs[4]["round"], 1);
-        assert_eq!(recs[4]["actions_count"], 2);
+        assert_eq!(recs[4]["action_args"], serde_json::json!({ "content": "hi" }));
+        assert_eq!(recs[4]["success"], true);
+        assert_eq!(recs[5]["action_type"], "CREATE_POST");
+        assert_eq!(recs[6]["event_type"], "round_end");
+        assert_eq!(recs[6]["round"], 1);
+        assert_eq!(recs[6]["actions_count"], 2);
 
         // Round 2.
-        assert_eq!(recs[5]["event_type"], "round_start");
-        assert_eq!(recs[5]["round"], 2);
-        assert_eq!(recs[8]["event_type"], "round_end");
-        assert_eq!(recs[8]["actions_count"], 2);
+        assert_eq!(recs[7]["event_type"], "round_start");
+        assert_eq!(recs[7]["round"], 2);
+        assert_eq!(recs[10]["event_type"], "round_end");
+        assert_eq!(recs[10]["actions_count"], 2);
 
         // simulation_end last: total_rounds == max_ticks (config-derived), total_actions == 4.
-        assert_eq!(recs[9]["event_type"], "simulation_end");
-        assert_eq!(recs[9]["total_rounds"], 2);
-        assert_eq!(recs[9]["total_actions"], 4, "2 agents × 2 rounds");
+        assert_eq!(recs[11]["event_type"], "simulation_end");
+        assert_eq!(recs[11]["total_rounds"], 2);
+        assert_eq!(recs[11]["total_actions"], 4, "2 agents × 2 rounds (round-0 added 0)");
 
         // Agent ids/names came from the SocialProfile (user_id) + Persona (name).
         let names: Vec<&str> =
-            [&recs[2], &recs[3]].iter().map(|r| r["agent_name"].as_str().unwrap()).collect();
+            [&recs[4], &recs[5]].iter().map(|r| r["agent_name"].as_str().unwrap()).collect();
         assert!(names.contains(&"Alice") && names.contains(&"Bob"));
 
         std::fs::remove_dir_all(&base).ok();
@@ -2339,13 +2413,20 @@ mod producer_tests {
             .expect("run");
 
         let recs = read_jsonl(&log_path);
-        // sim_start + (round_start + round_end) + sim_end = 4; NO action records.
-        assert_eq!(recs.len(), 4, "empty round emits no actions: {recs:?}");
+        // sim_start + round-0 (start+end) + round-1 (start + end, empty) + sim_end = 6;
+        // NO action records (1h/60min = 1 round, nobody active, no initial_posts).
+        assert_eq!(recs.len(), 6, "empty round emits no actions: {recs:?}");
         assert_eq!(recs[1]["event_type"], "round_start");
+        assert_eq!(recs[1]["round"], 0, "round-0 initial-events phase");
         assert_eq!(recs[2]["event_type"], "round_end");
+        assert_eq!(recs[2]["round"], 0);
         assert_eq!(recs[2]["actions_count"], 0);
-        assert_eq!(recs[3]["event_type"], "simulation_end");
-        assert_eq!(recs[3]["total_actions"], 0);
+        assert_eq!(recs[3]["event_type"], "round_start");
+        assert_eq!(recs[3]["round"], 1);
+        assert_eq!(recs[4]["event_type"], "round_end");
+        assert_eq!(recs[4]["actions_count"], 0);
+        assert_eq!(recs[5]["event_type"], "simulation_end");
+        assert_eq!(recs[5]["total_actions"], 0);
         assert!(
             recs.iter()
                 .all(|r| r["event_type"] != Value::Null || r.get("action_type").is_none())
@@ -2495,11 +2576,12 @@ mod producer_tests {
         let tw = read_jsonl(&twitter_path);
         let rd = read_jsonl(&reddit_path);
 
-        // Both files get the fanned-out boundary stream: sim_start + (round_start+round_end)×2 +
-        // sim_end. Twitter additionally has 2 actions/round (2 twitter agents), reddit 1/round.
-        // Twitter: 1 + (1 + 2 + 1)×2 + 1 = 10. Reddit: 1 + (1 + 1 + 1)×2 + 1 = 8.
-        assert_eq!(tw.len(), 10, "twitter stream: {tw:?}");
-        assert_eq!(rd.len(), 8, "reddit stream: {rd:?}");
+        // Both files get the fanned-out boundary stream: sim_start + round-0 (start+end, no
+        // initial_posts) + (round_start+round_end)×2 + sim_end. Twitter additionally has 2
+        // actions/round (2 twitter agents), reddit 1/round.
+        // Twitter: 1 + 2 + (1 + 2 + 1)×2 + 1 = 12. Reddit: 1 + 2 + (1 + 1 + 1)×2 + 1 = 10.
+        assert_eq!(tw.len(), 12, "twitter stream: {tw:?}");
+        assert_eq!(rd.len(), 10, "reddit stream: {rd:?}");
 
         // Every ACTION record in each file belongs to that platform's agents only (routing).
         let tw_action_ids: Vec<i64> = tw
@@ -2520,7 +2602,8 @@ mod producer_tests {
         assert_eq!(tw_action_ids.len(), 4, "2 twitter agents × 2 rounds");
         assert_eq!(rd_action_ids.len(), 2, "1 reddit agent × 2 rounds");
 
-        // Per-platform round_end counts: twitter 2/round, reddit 1/round.
+        // Per-platform round_end counts: round-0 (0) then 2 main rounds — twitter 2/round,
+        // reddit 1/round.
         let tw_round_ends: Vec<i64> = tw
             .iter()
             .filter(|r| r["event_type"] == "round_end")
@@ -2531,8 +2614,8 @@ mod producer_tests {
             .filter(|r| r["event_type"] == "round_end")
             .map(|r| r["actions_count"].as_i64().unwrap())
             .collect();
-        assert_eq!(tw_round_ends, vec![2, 2], "twitter round_end counts");
-        assert_eq!(rd_round_ends, vec![1, 1], "reddit round_end counts");
+        assert_eq!(tw_round_ends, vec![0, 2, 2], "twitter round_end counts (round-0 + 2 rounds)");
+        assert_eq!(rd_round_ends, vec![0, 1, 1], "reddit round_end counts (round-0 + 2 rounds)");
 
         // Per-platform simulation_end totals: twitter 4, reddit 2. Both files terminate on it
         // (drives the monitor dual-gate S-615).
@@ -2549,6 +2632,83 @@ mod producer_tests {
         assert_eq!(tw[0]["platform"], "twitter");
         assert_eq!(rd[0]["event_type"], "simulation_start");
         assert_eq!(rd[0]["platform"], "reddit");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// U-030 round-0 initial_posts (run_parallel_simulation.py:1171-1211): each
+    /// `event_config.initial_posts` entry is emitted as a round-0 CREATE_POST, ROUTED to the poster
+    /// agent's platform logger; an unresolvable `poster_agent_id` is skipped; round-0 counts feed
+    /// each platform's `total_actions`. Verified over a parallel (twitter+reddit) pool.
+    #[tokio::test]
+    async fn run_round0_initial_posts_route_by_platform() {
+        let base = unique_dir("round0");
+        let twitter = Arc::new(PlatformActionLogger::new("twitter", &base).unwrap());
+        let reddit = Arc::new(PlatformActionLogger::new("reddit", &base).unwrap());
+        let twitter_path = twitter.log_path.clone();
+        let reddit_path = reddit.log_path.clone();
+
+        let mut pool = AgentPool::new();
+        pool.add_agent(social_agent_on(10, "Tw", Platform::Twitter));
+        pool.add_agent(social_agent_on(20, "Rd", Platform::Reddit));
+
+        // max_ticks 0 → the main loop body never runs; ONLY round-0 + boundary records are emitted,
+        // isolating round-0. 3 initial_posts: a twitter agent (10), a reddit agent (20), and an
+        // unresolvable id (99 → skipped, Python except:pass).
+        let config = serde_json::json!({
+            "time_config": { "total_simulation_hours": 0, "minutes_per_round": 30 },
+            "event_config": { "initial_posts": [
+                { "poster_agent_id": 10, "content": "tw hello" },
+                { "poster_agent_id": 20, "content": "rd hello" },
+                { "poster_agent_id": 99, "content": "ghost" }
+            ]}
+        });
+        let mut engine = SimEngine::new(SimConfig::from_simulation_config(&config, None, 1));
+        assert_eq!(engine.config().max_ticks, 0, "0h → 0 main rounds (round-0 only)");
+        engine.with_producer(RunProducer {
+            loggers: PlatformLoggerSet::parallel(twitter, reddit),
+            config,
+        });
+        let graph = crate::graph::KnowledgeGraph::new();
+        engine.run(&mut pool, &graph, &FixedLlm("DO_NOTHING")).await.expect("run");
+
+        let tw = read_jsonl(&twitter_path);
+        let rd = read_jsonl(&reddit_path);
+
+        // Each file: sim_start + round_start(0) + 1 routed CREATE_POST + round_end(0,1) + sim_end = 5.
+        assert_eq!(tw.len(), 5, "twitter round-0 stream: {tw:?}");
+        assert_eq!(rd.len(), 5, "reddit round-0 stream: {rd:?}");
+
+        // The twitter post (poster 10) landed in the twitter file ONLY; reddit post (20) in reddit.
+        assert_eq!(tw[1]["event_type"], "round_start");
+        assert_eq!(tw[1]["round"], 0);
+        assert_eq!(tw[2]["action_type"], "CREATE_POST");
+        assert_eq!(tw[2]["round"], 0);
+        assert_eq!(tw[2]["agent_id"], 10);
+        assert_eq!(tw[2]["agent_name"], "Tw");
+        assert_eq!(tw[2]["action_args"], serde_json::json!({ "content": "tw hello" }));
+        assert_eq!(tw[3]["event_type"], "round_end");
+        assert_eq!(tw[3]["round"], 0);
+        assert_eq!(tw[3]["actions_count"], 1, "1 twitter initial post");
+
+        assert_eq!(rd[2]["action_type"], "CREATE_POST");
+        assert_eq!(rd[2]["agent_id"], 20);
+        assert_eq!(rd[2]["action_args"], serde_json::json!({ "content": "rd hello" }));
+        assert_eq!(rd[3]["actions_count"], 1, "1 reddit initial post (ghost id 99 skipped)");
+
+        // No twitter file holds the reddit post and vice-versa (routing); ghost id 99 nowhere.
+        let all_ids: Vec<i64> = tw
+            .iter()
+            .chain(rd.iter())
+            .filter(|r| r.get("action_type").is_some())
+            .map(|r| r["agent_id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(all_ids, vec![10, 20], "only resolvable posters, each in its own file");
+
+        // simulation_end per-platform total_actions counts the round-0 post (1 each).
+        assert_eq!(tw.last().unwrap()["event_type"], "simulation_end");
+        assert_eq!(tw.last().unwrap()["total_actions"], 1);
+        assert_eq!(rd.last().unwrap()["total_actions"], 1);
 
         std::fs::remove_dir_all(&base).ok();
     }
