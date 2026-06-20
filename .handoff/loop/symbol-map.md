@@ -1035,6 +1035,24 @@
       dropped-side-effect (status=Completed save). `[≠] U028-c1-TIMEOUTMSG-NUMFMT` (cosmetic int/float).
   Verifier (parity.md 2026-06-19): PASS both; flipped NO platform S-row (correct — full contracts unproven). -->
 
+<!-- U-028 CYCLE 2 (2026-06-19, parity PASS): `load_agent_pool(sim_dir, platform) -> AgentPool`
+     (services/oasis_profile_export.rs) — the profile-file→AgentPool reader, EXACT INVERSE of the
+     landed save_twitter_csv/save_reddit_json writers. Realizes the `pool` half of
+     GAP-U026-RUNINPUTS-BUILDER (u026-g §0 row-2: "zero code reads a profile file and constructs
+     Agent/Persona into an AgentPool"). twitter CSV (5-col: user_id=row-idx, name, username,
+     user_char→social.persona, description→bio); reddit JSON (always user_id/username/name/bio/
+     persona/karma/created_at/age/gender/mbti/country + conditional profession/interested_topics);
+     parallel = union both (twitter then reddit). Persona{background=bio, traits=[], role="agent"}.
+     VERIFIER read the REAL OASIS lib (backend/.venv/oasis/social_agent/agents_generator.py:614-650
+     generate_twitter_agent_graph) → confirmed OASIS reads only user_char/username/description + range(len)
+     id → twitter round-trip is FAITHFUL recovery; both [≠]U028-CSV-LOSSY (OASIS contract) +
+     [≠]U028-PERSONA-CORE-FROM-PROFILE (dest-superset fill) survive the bar. Error/edge PASS
+     (missing-file/unknown-platform→err not silent-empty; ragged row kept-with-empties no drop).
+     CYCLE-3 WATCH ITEM (verifier): the decision template (agent/mod.rs:1701-1711) injects
+     agent_background(=bio) + agent_traits, NOT social.persona — c3 decision wiring MUST route
+     social.persona into the prompt or the recovered OASIS personality is shadowed by the bio.
+     +4 tests 1502→1506. NO platform S-row flip (run-loop/IPC contract producer-pending in c3). -->
+
 - [ ] S-853 · `unit:U-028` · `type` · `UnicodeFormatter` · logging formatter decoding Unicode escapes · `run_twitter_simulation.py:53`
 - [ ] S-854 · `unit:U-028` · `field` · `UnicodeFormatter.UNICODE_ESCAPE_PATTERN` · `run_twitter_simulation.py:56`
 - [ ] S-855 · `unit:U-028` · `method` · `UnicodeFormatter.format` · `run_twitter_simulation.py:58`

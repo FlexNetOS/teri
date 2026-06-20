@@ -24,7 +24,7 @@
 //! The _final_ `save_reddit_json`/`save_twitter_csv` writers use their own dedicated field
 //! mapping with forced OASIS defaults — faithful to MiroFish's own realtime-vs-save split.
 
-use crate::agent::{Persona, PersonaGenerator, Platform, SocialProfile};
+use crate::agent::{Agent, AgentPool, Persona, PersonaGenerator, Platform, SocialProfile};
 use crate::graph::KnowledgeGraph;
 use crate::llm::LlmClient;
 use crate::services::entity_reader::EntityNode;
@@ -281,6 +281,195 @@ pub(crate) fn save_twitter_csv(
         path.display()
     );
     Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// U-028 (cycle 2): load_agent_pool — profile-file → AgentPool reader.
+//
+// The INVERSE of save_twitter_csv / save_reddit_json above, and the `pool` half of
+// GAP-U026-RUNINPUTS-BUILDER (u026-g §0 row-2: "zero code reads a profile file and constructs
+// Agent/Persona into an AgentPool"). The OASIS subprocess built the agent graph from these same
+// files via `generate_twitter_agent_graph(twitter_profiles.csv)` /
+// `generate_reddit_agent_graph(reddit_profiles.json)` (run_twitter_simulation.py:578-582 /
+// run_reddit_simulation.py); teri reimplements that natively onto its own AgentPool.
+//
+// `[≠] U028-PERSONA-CORE-FROM-PROFILE`: teri's `Persona` core fields `background`/`traits`/`role`
+//   have NO OASIS-profile source (OASIS profiles are bio/persona/demographics only). They are
+//   filled from the available data (`background` = bio, `traits` = [], `role` = "agent") — a
+//   dest-superset fill, not a dropped source behavior. Every field OASIS *does* produce
+//   (user_id, user_name, bio, persona, demographics) IS read.
+// `[≠] U028-CSV-LOSSY`: the twitter CSV has only 5 columns (the writer collapsed bio+persona →
+//   user_char and dropped karma/follower/demographics). A twitter round-trip recovers exactly
+//   what OASIS would feed `generate_twitter_agent_graph` — the lossy collapse is the OASIS
+//   contract, not a teri downgrade. Reddit JSON is lossless for its always-present keys.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Build the `SocialProfile` base with the OASIS-default counters (matches the writer defaults:
+/// karma=1000, friend=100, follower=150, statuses=500), to be overridden by the parsed values.
+fn social_profile_base(user_id: u64, user_name: String, platform: Platform) -> SocialProfile {
+    SocialProfile {
+        user_id,
+        user_name,
+        bio: String::new(),
+        persona: String::new(),
+        platform,
+        karma: 1000,
+        friend_count: 100,
+        follower_count: 150,
+        following_count: 100,
+        statuses_count: 500,
+        age: None,
+        gender: None,
+        mbti: None,
+        country: None,
+        profession: None,
+        interested_topics: Vec::new(),
+        posting_style: None,
+        source_entity_uuid: None,
+        source_entity_type: None,
+        created_at: String::new(),
+    }
+}
+
+/// Wrap a parsed `SocialProfile` + display name into a `Persona` and push it onto the pool.
+fn push_profile_agent(pool: &mut AgentPool, name: String, profile: SocialProfile) {
+    let persona = Persona {
+        name,
+        // [≠] U028-PERSONA-CORE-FROM-PROFILE: no OASIS source for these three.
+        background: profile.bio.clone(),
+        traits: Vec::new(),
+        role: "agent".to_string(),
+        social: Some(profile),
+    };
+    pool.add_agent(Agent::new(persona));
+}
+
+/// Read `twitter_profiles.csv` (OASIS 5-column layout) into the pool — inverse of
+/// [`save_twitter_csv`]. Columns: `user_id, name, username, user_char, description`.
+fn load_twitter_csv_into(path: &Path, pool: &mut AgentPool) -> crate::error::Result<()> {
+    if !path.exists() {
+        return Err(crate::error::TeriError::Sim(format!(
+            "Profile file not found: {}",
+            path.display()
+        )));
+    }
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true) // tolerate ragged rows the same way the writer/reader pair does elsewhere
+        .from_path(path)
+        .map_err(|e| {
+            crate::error::TeriError::Sim(format!("Failed to open {}: {e}", path.display()))
+        })?;
+
+    for record in rdr.records() {
+        let record =
+            record.map_err(|e| crate::error::TeriError::Sim(format!("CSV parse error: {e}")))?;
+        // user_id = 0-based row index column (the writer wrote the enumerate index, not the
+        // profile.user_id). Parse to u64; an unparsable/missing cell falls back to 0.
+        let user_id = record.get(0).and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+        let name = record.get(1).unwrap_or("").to_string();
+        let user_name = record.get(2).unwrap_or("").to_string();
+        // user_char is the LLM-system-prompt personality blob; description is the public bio.
+        let persona = record.get(3).unwrap_or("").to_string();
+        let bio = record.get(4).unwrap_or("").to_string();
+
+        let mut profile = social_profile_base(user_id, user_name, Platform::Twitter);
+        profile.bio = bio;
+        profile.persona = persona;
+        push_profile_agent(pool, name, profile);
+    }
+    Ok(())
+}
+
+/// Read `reddit_profiles.json` (JSON array) into the pool — inverse of [`save_reddit_json`].
+/// Always-present keys: `user_id, username, name, bio, persona, karma, created_at, age, gender,
+/// mbti, country`; conditional: `profession, interested_topics`.
+fn load_reddit_json_into(path: &Path, pool: &mut AgentPool) -> crate::error::Result<()> {
+    if !path.exists() {
+        return Err(crate::error::TeriError::Sim(format!(
+            "Profile file not found: {}",
+            path.display()
+        )));
+    }
+    let content = std::fs::read_to_string(path)?;
+    let arr: Vec<serde_json::Value> = serde_json::from_str(&content)?;
+
+    for obj in arr {
+        let user_id = obj.get("user_id").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let user_name = obj
+            .get("username")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let name = obj.get("name").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+
+        let mut profile = social_profile_base(user_id, user_name, Platform::Reddit);
+        if let Some(s) = obj.get("bio").and_then(serde_json::Value::as_str) {
+            profile.bio = s.to_string();
+        }
+        if let Some(s) = obj.get("persona").and_then(serde_json::Value::as_str) {
+            profile.persona = s.to_string();
+        }
+        if let Some(k) = obj.get("karma").and_then(serde_json::Value::as_i64) {
+            profile.karma = k;
+        }
+        if let Some(s) = obj.get("created_at").and_then(serde_json::Value::as_str) {
+            profile.created_at = s.to_string();
+        }
+        // Demographics: written unconditionally by save_reddit_json (age/gender/mbti/country).
+        if let Some(a) = obj.get("age").and_then(serde_json::Value::as_u64) {
+            profile.age = Some(a as u32);
+        }
+        if let Some(s) = obj.get("gender").and_then(serde_json::Value::as_str) {
+            profile.gender = Some(s.to_string());
+        }
+        if let Some(s) = obj.get("mbti").and_then(serde_json::Value::as_str) {
+            profile.mbti = Some(s.to_string());
+        }
+        if let Some(s) = obj.get("country").and_then(serde_json::Value::as_str) {
+            profile.country = Some(s.to_string());
+        }
+        // Conditional keys (only written when truthy).
+        if let Some(s) = obj.get("profession").and_then(serde_json::Value::as_str) {
+            profile.profession = Some(s.to_string());
+        }
+        if let Some(arr) = obj.get("interested_topics").and_then(serde_json::Value::as_array) {
+            profile.interested_topics =
+                arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+        }
+        push_profile_agent(pool, name, profile);
+    }
+    Ok(())
+}
+
+/// Load an [`AgentPool`] from the prepared profile artifacts in `sim_dir`.
+///
+/// This is the production builder for `RunInputs.pool` (`u026-g` §0 row-2) — the only path in
+/// teri that reads a prepared profile file and constructs an `AgentPool`. It mirrors what the
+/// OASIS subprocess did with `generate_twitter_agent_graph` / `generate_reddit_agent_graph`.
+///
+/// - `"twitter"` → `{sim_dir}/twitter_profiles.csv` (Python `run_twitter_simulation.py:419-421`)
+/// - `"reddit"`  → `{sim_dir}/reddit_profiles.json` (Python `run_reddit_simulation.py`)
+/// - `"parallel"` → BOTH files, unioned (the dual-platform run, U-030 §7 — twitter agents then
+///   reddit agents, in file order). The U-030-specific dual-sink routing lands in cycle 3.
+///
+/// A missing file for the requested platform is an error (the caller must have prepared first).
+pub fn load_agent_pool(sim_dir: &Path, platform: &str) -> crate::error::Result<AgentPool> {
+    let mut pool = AgentPool::new();
+    match platform {
+        "twitter" => load_twitter_csv_into(&sim_dir.join("twitter_profiles.csv"), &mut pool)?,
+        "reddit" => load_reddit_json_into(&sim_dir.join("reddit_profiles.json"), &mut pool)?,
+        "parallel" => {
+            load_twitter_csv_into(&sim_dir.join("twitter_profiles.csv"), &mut pool)?;
+            load_reddit_json_into(&sim_dir.join("reddit_profiles.json"), &mut pool)?;
+        }
+        other => {
+            return Err(crate::error::TeriError::Sim(format!(
+                "Unknown platform for profile load: {other}"
+            )));
+        }
+    }
+    Ok(pool)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1774,5 +1963,186 @@ mod tests {
         assert_eq!(record.get(3).unwrap(), "Alice's bio. Alice's detailed persona.");
         // description = bio
         assert_eq!(record.get(4).unwrap(), "Alice's bio.");
+    }
+
+    // ── U-028 cycle 2: load_agent_pool — round-trip golden (writer → reader) ───────
+
+    #[test]
+    fn load_agent_pool_twitter_roundtrip() {
+        let dir = tempdir().unwrap();
+        // Write a known 2-profile set via the LANDED writer.
+        let p0 = make_profile(
+            0,
+            "alice_w",
+            "Alice bio",
+            "Alice persona",
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            0,
+        );
+        let p1 = make_profile(
+            0,
+            "bob_q",
+            "Bob bio",
+            "Bob persona",
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            0,
+        );
+        let pairs = vec![(p0, "Alice".to_string()), (p1, "Bob".to_string())];
+        save_twitter_csv(&pairs, &dir.path().join("twitter_profiles.csv")).unwrap();
+
+        // Read back via the reader.
+        let pool = load_agent_pool(dir.path(), "twitter").unwrap();
+        assert_eq!(pool.agents.len(), 2);
+
+        // Row 0: user_id is the 0-based CSV row index; name/user_name recovered; user_char→persona,
+        // description→bio. The writer composed user_char = "{bio} {persona}" (they differ).
+        let a0 = &pool.agents[0];
+        assert_eq!(a0.persona.name, "Alice");
+        let s0 = a0.persona.social.as_ref().unwrap();
+        assert_eq!(s0.user_id, 0);
+        assert_eq!(s0.user_name, "alice_w");
+        assert_eq!(s0.platform, Platform::Twitter);
+        assert_eq!(s0.bio, "Alice bio"); // description column
+        assert_eq!(s0.persona, "Alice bio Alice persona"); // user_char column
+        // [≠] U028-PERSONA-CORE-FROM-PROFILE: background = bio, traits empty, role "agent".
+        assert_eq!(a0.persona.background, "Alice bio");
+        assert!(a0.persona.traits.is_empty());
+        assert_eq!(a0.persona.role, "agent");
+
+        // Row 1 has the next CSV index (1).
+        let a1 = &pool.agents[1];
+        assert_eq!(a1.persona.name, "Bob");
+        assert_eq!(a1.persona.social.as_ref().unwrap().user_id, 1);
+    }
+
+    #[test]
+    fn load_agent_pool_reddit_roundtrip_recovers_demographics_and_conditionals() {
+        let dir = tempdir().unwrap();
+        // Profile WITH demographics + conditional keys (profession/topics present).
+        let full = make_profile(
+            7,
+            "carol_r",
+            "Carol bio",
+            "Carol persona",
+            Some(28),
+            Some("female"),
+            Some("INFP"),
+            Some("Canada"),
+            Some("engineer"),
+            vec!["ai", "music"],
+            4200,
+        );
+        // Profile with conditionals ABSENT (profession None, topics empty) → save_reddit_json
+        // still forces age/gender/mbti/country defaults, omits profession/topics.
+        let minimal = make_profile(
+            9,
+            "dave_r",
+            "Dave bio",
+            "Dave persona",
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            0,
+        );
+        let pairs = vec![(full, "Carol".to_string()), (minimal, "Dave".to_string())];
+        save_reddit_json(&pairs, &dir.path().join("reddit_profiles.json")).unwrap();
+
+        let pool = load_agent_pool(dir.path(), "reddit").unwrap();
+        assert_eq!(pool.agents.len(), 2);
+
+        let carol = pool.agents[0].persona.social.as_ref().unwrap();
+        assert_eq!(carol.user_id, 7);
+        assert_eq!(carol.user_name, "carol_r");
+        assert_eq!(carol.platform, Platform::Reddit);
+        assert_eq!(carol.bio, "Carol bio");
+        assert_eq!(carol.persona, "Carol persona");
+        assert_eq!(carol.karma, 4200);
+        assert_eq!(carol.created_at, "2026-01-01");
+        // Demographics recovered (reddit JSON is lossless for these).
+        assert_eq!(carol.age, Some(28));
+        assert_eq!(carol.gender.as_deref(), Some("female"));
+        assert_eq!(carol.mbti.as_deref(), Some("INFP"));
+        assert_eq!(carol.country.as_deref(), Some("Canada"));
+        // Conditionals recovered.
+        assert_eq!(carol.profession.as_deref(), Some("engineer"));
+        assert_eq!(carol.interested_topics, vec!["ai".to_string(), "music".to_string()]);
+
+        // Dave: conditionals absent → reader recovers None/empty; forced demographic defaults present.
+        let dave = pool.agents[1].persona.social.as_ref().unwrap();
+        assert_eq!(dave.user_id, 9);
+        assert_eq!(dave.age, Some(30), "save_reddit_json forced default age=30");
+        assert_eq!(dave.gender.as_deref(), Some("other"));
+        assert_eq!(dave.mbti.as_deref(), Some("ISTJ"));
+        assert_eq!(dave.country.as_deref(), Some("中国"));
+        assert_eq!(dave.profession, None, "profession omitted by writer → None on read");
+        assert!(dave.interested_topics.is_empty());
+        assert_eq!(pool.agents[1].persona.name, "Dave");
+    }
+
+    #[test]
+    fn load_agent_pool_parallel_unions_both_files() {
+        let dir = tempdir().unwrap();
+        let tw = make_profile(
+            0,
+            "tw_user",
+            "tw bio",
+            "tw persona",
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            0,
+        );
+        save_twitter_csv(&[(tw, "TwAgent".to_string())], &dir.path().join("twitter_profiles.csv"))
+            .unwrap();
+        let rd = make_profile(
+            3,
+            "rd_user",
+            "rd bio",
+            "rd persona",
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            0,
+        );
+        save_reddit_json(&[(rd, "RdAgent".to_string())], &dir.path().join("reddit_profiles.json"))
+            .unwrap();
+
+        let pool = load_agent_pool(dir.path(), "parallel").unwrap();
+        // Twitter agents first (file order), then reddit.
+        assert_eq!(pool.agents.len(), 2);
+        assert_eq!(pool.agents[0].persona.name, "TwAgent");
+        assert_eq!(pool.agents[0].persona.social.as_ref().unwrap().platform, Platform::Twitter);
+        assert_eq!(pool.agents[1].persona.name, "RdAgent");
+        assert_eq!(pool.agents[1].persona.social.as_ref().unwrap().platform, Platform::Reddit);
+    }
+
+    #[test]
+    fn load_agent_pool_missing_file_errs() {
+        let dir = tempdir().unwrap();
+        // No profile files written.
+        assert!(load_agent_pool(dir.path(), "twitter").is_err());
+        assert!(load_agent_pool(dir.path(), "reddit").is_err());
+        // Unknown platform.
+        let err = load_agent_pool(dir.path(), "mastodon").unwrap_err();
+        assert!(matches!(err, crate::error::TeriError::Sim(_)));
     }
 }

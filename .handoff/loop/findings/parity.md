@@ -3865,3 +3865,100 @@ symbols S-853..S-879 stay `- [ ]`/`- [~]` (NOT flipped to `- [x]`) — their ful
 **VERDICT:** (a) **PASS** · (b) **PASS** (mappers + IPC production faithful; 2 divergences recorded in
 producer-pending route surface — B-1 a real dropped side effect to fix before cycle 3, B-2 cosmetic).
 Cycle-1 claimed surface is parity-clean. 1502 passed / clippy clean. No cycle-1 blocker.
+
+---
+
+## U-028 Cycle 2 — `load_agent_pool` profile→`AgentPool` reader — PARITY VERDICT (2026-06-19)
+
+**Verifier:** rust-port-parity-verifier (adversarial, default-skeptical, fail-closed).
+**Unit:** U-028 (twitter producer), Cycle 2 deliverable only — the deterministic profile→pool
+round-trip. **Scope guard honored:** activation policy + RunInputs wiring + actions.jsonl producer
+are CYCLE 3 and were NOT verified here (correctly out of scope).
+**Landed:** `src/services/oasis_profile_export.rs` — `pub fn load_agent_pool` + 4 private helpers
+(`load_twitter_csv_into`, `load_reddit_json_into`, `social_profile_base`, `push_profile_agent`) +
+4 round-trip tests. **Build:** `cargo test -p teri` = **1506 passed / 6 ignored**;
+`cargo clippy -p teri --all-targets --all-features` = **clean**.
+
+### Differential method
+Source contract is the **round-trip** (writer→reader recovers what OASIS would feed its agent graph).
+The authoritative source-of-truth is NOT just the MiroFish writer — it is **what the OASIS library's
+`generate_twitter_agent_graph` / `generate_reddit_agent_graph` actually CONSUME** from the files. I
+read the real OASIS library source the subprocess imported
+(`backend/.venv/.../oasis/social_agent/agents_generator.py`) to settle the `[≠]` challenges, ran the 4
+landed round-trip tests, and ran 5 ADVERSARIAL PROBE tests against uncovered edges (header-only CSV,
+ragged row, bad `user_id` cell, empty/malformed reddit JSON, parallel-missing-file) directly through
+`load_agent_pool` (added, run, reverted — suite green after revert).
+
+### Refute target findings
+
+**RT1 — twitter round-trip fidelity (col0=row-index, user_char→persona): CONFIRMED FAITHFUL.**
+The OASIS fn MiroFish calls is `generate_twitter_agent_graph` at `agents_generator.py:614-650` (NOT
+the follow-graph variant at :40). It reads **exactly 3 columns**: `user_char`→`other_info.user_profile`
+(the LLM system-prompt personality), `username`→`UserInfo.name`, `description`→`UserInfo.description`
+(bio). `agent_id` = the `range(len(agent_info))` loop index — it does **NOT** read the CSV `user_id`
+column at all. teri reads col0→`SocialProfile.user_id` = the writer's enumerate row index (proven by
+`load_agent_pool_twitter_roundtrip`: row 0 → user_id 0, row 1 → user_id 1), col3 (`user_char`)→
+`social.persona`, col4 (`description`)→`bio`. The whole `user_char` blob → `social.persona` is the
+faithful recovery of OASIS's `user_profile` system-prompt personality. PASS.
+
+**RT2 — reddit demographics + conditionals: CONFIRMED FAITHFUL.** OASIS reddit
+(`agents_generator.py:567-610`) reads `persona, mbti, gender, age, country` (`other_info`) +
+`username` (name) + `bio` (description). teri recovers all of these PLUS karma/created_at/profession/
+interested_topics. `load_agent_pool_reddit_roundtrip_*` proves: present-conditionals recovered
+(profession="engineer", topics=[ai,music]); ABSENT-conditionals on a minimal profile read back as
+`None`/`[]` (NOT fabricated), while the writer's forced demographic defaults (age=30/gender=other/
+mbti=ISTJ/country=中国) are recovered. PASS.
+
+**RT3 — the two `[≠]` flags: BOTH SURVIVE THE `[≠]` CHALLENGE (legitimate, not disguised skips).**
+- `[≠] U028-CSV-LOSSY` — **legitimate (non-contractual / strict-superset).** The decisive evidence:
+  OASIS's twitter generator consumes only `user_char`/`username`/`description` (3 of the 5 columns);
+  it reads NO karma/demographics from the CSV. The MiroFish writer `_save_twitter_csv`
+  (`oasis_profile_generator.py:1070-1119`) writes exactly those 5 columns and drops karma/demographics
+  — and OASIS never reads them. So the loss is the OASIS contract itself, and teri actually recovers a
+  SUPERSET (all 5 cols + base counters), not a downgrade. (Aside corroborating the "lossy is faithful":
+  the *follow-graph* OASIS variant at :40 DOES read `following_agentid_list`/`previous_tweets`, but the
+  MiroFish CSV never writes those columns either — so that variant is unusable with MiroFish's own
+  files; the actually-called :614 variant is the contract.) NOT a feature skip.
+- `[≠] U028-PERSONA-CORE-FROM-PROFILE` — **legitimate (dest-superset fill).** `Persona.background/
+  traits/role` have no OASIS-profile counterpart (OASIS profiles are bio/persona/demographics only);
+  filled `background=bio, traits=[], role="agent"`. No source behavior dropped; every field OASIS
+  produces is read. NOT a feature skip.
+
+**RT4 — error/edge: PASS, with one Cycle-3 watch item (NOT a Cycle-2 defect).** Empirically probed:
+missing file → `TeriError::Sim` error (not silent empty pool) ✓; unknown platform → error ✓;
+parallel with one file missing → error (no partial pool leaks) ✓; malformed reddit JSON → `Json`
+error (not silent empty) ✓; empty header-only CSV / `[]` reddit → empty pool (correct, not error) ✓.
+Ragged CSV row (`flexible(true)`): the agent is KEPT with missing cells empty + bad `user_id`→0
+fallback (no panic, no corruption, no silent drop). Since the writer always emits well-formed 5-col
+rows, ragged input is not a real-world contract path, and teri's tolerance exceeds OASIS's
+(`pd.read_csv` would NaN/raise). Not a downgrade.
+
+**RT5 — field completeness + base counters: PASS.** `social_profile_base` sets ALL ~19 `SocialProfile`
+fields; the OASIS-default base counters (karma 1000 / friend 100 / follower 150 / following 100 /
+statuses 500) match the writer's `save_reddit_json` defaults and the `SocialProfile::default_*` impls
+(`agent/mod.rs:79-90`). Parsed values override the base where present.
+
+### Cycle-3 WATCH ITEM (informational, not a Cycle-2 gate failure)
+teri's decision template (`agent/mod.rs:1701-1711`) injects `agent_background` (= the reader's
+`bio`-fill) and `agent_traits`, NOT `social.persona`. OASIS feeds `user_char`→`user_profile` as the
+agent's system-prompt personality. The reader correctly STORES `user_char` in `social.persona` (data
+not lost), but Cycle 3's decision wiring must route `social.persona` (the OASIS personality) into the
+prompt — otherwise the recovered personality is shadowed by the bio-fill. Flagged for Cycle 3; the
+Cycle-2 round-trip recovery is faithful and complete.
+
+### Symbol coverage (this cycle's deliverable)
+The Cycle-2 symbols (`load_agent_pool` + 4 helpers) are the substrate mapping of the OASIS
+profile-load step inside `TwitterSimulationRunner.run` (S-877) / `RedditSimulationRunner.run` (S-904),
+via `_get_profile_path` (S-873 twitter / S-900 reddit) → `generate_*_agent_graph` (OASIS-library, no
+S-row). These platform-runner S-rows remain `- [ ]` (their FULL contract — run loop, env.step, IPC —
+is producer-pending in Cycle 3); ONLY the deterministic profile→pool reader landed and is verified.
+Both `[≠]`s are recorded + challenge-passed; no new S-row flips this cycle (correct — same discipline
+as Cycle 1).
+
+**VERDICT: PASS.** The deterministic profile→pool round-trip is parity-clean. Twitter (3-col OASIS
+consume, superset recovery) + reddit (lossless demographics + honest conditional None/empty) +
+parallel union + error/edge paths all verified differentially against the real OASIS library contract.
+Both `[≠]`s are legitimate (non-contractual lossy-collapse / dest-superset fill), NOT disguised
+feature-skips. 1506 passed / clippy clean. No downgrade. The `pool`-field half of
+`GAP-U026-RUNINPUTS-BUILDER` is now satisfied; Cycle 3 (activation + RunInputs + actions.jsonl) may
+proceed, with the one persona-routing watch item above.
