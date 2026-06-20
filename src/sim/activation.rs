@@ -215,6 +215,20 @@ impl TimeActivationPolicy {
     }
 }
 
+/// Wire [`TimeActivationPolicy`] into the engine as the per-tick activation gate (U-028 §4/§5).
+///
+/// `SimEngine::run` calls `active_agent_ids(tick)` each tick; this derives the round's
+/// `simulated_hour` (`simulated_hour(tick)`, the 0-based round number — matching Python's
+/// `get_active_agents_for_round(env, config, simulated_hour, round_num)` call with the main-loop
+/// `round_num`) and returns the stochastically selected agent ids for that hour. The engine maps
+/// those ids onto pool agents by `SocialProfile.user_id`.
+impl crate::sim::ActivationPolicy for TimeActivationPolicy {
+    fn active_agent_ids(&self, tick: u32) -> Vec<i64> {
+        let hour = self.simulated_hour(tick);
+        self.active_agents(hour)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

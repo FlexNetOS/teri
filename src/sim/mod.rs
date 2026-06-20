@@ -98,6 +98,61 @@ impl std::fmt::Display for SocialAction {
     }
 }
 
+impl SocialAction {
+    /// OASIS `action_type` string written to `actions.jsonl` — the values of
+    /// `ACTION_TYPE_MAP` (`run_parallel_simulation.py:614-629`). Deterministic and
+    /// golden-testable: this is the byte-faithful half of the producer contract
+    /// (the DB-internal `action_args` enrichment is the `[≠]U028-OASIS-INTERNALS` half).
+    ///
+    /// `Trend`/`DoNothing` map to their `ACTION_TYPE_MAP` entries (`TREND`/`DO_NOTHING`).
+    pub fn oasis_action_type(&self) -> &'static str {
+        match self {
+            SocialAction::CreatePost { .. } => "CREATE_POST",
+            SocialAction::Like { target_kind: TargetKind::Post, .. } => "LIKE_POST",
+            SocialAction::Like { target_kind: TargetKind::Comment, .. } => "LIKE_COMMENT",
+            SocialAction::Dislike { target_kind: TargetKind::Post, .. } => "DISLIKE_POST",
+            SocialAction::Dislike { target_kind: TargetKind::Comment, .. } => "DISLIKE_COMMENT",
+            SocialAction::Repost { .. } => "REPOST",
+            SocialAction::Quote { .. } => "QUOTE_POST",
+            SocialAction::Follow { .. } => "FOLLOW",
+            SocialAction::Comment { .. } => "CREATE_COMMENT",
+            SocialAction::SearchPosts { .. } => "SEARCH_POSTS",
+            SocialAction::SearchUser { .. } => "SEARCH_USER",
+            SocialAction::Mute { .. } => "MUTE",
+            SocialAction::Trend => "TREND",
+            SocialAction::DoNothing => "DO_NOTHING",
+        }
+    }
+
+    /// `action_args` object for the `actions.jsonl` record — teri's native representation,
+    /// keyed exactly as `Agent::parse_social_action` parses them (so a record round-trips
+    /// through teri's own action parser). teri has no OASIS `trace` DB, so the DB-fetched
+    /// enrichment keys (`post_content`, `author_name`, `quote_content`, …,
+    /// `run_parallel_simulation.py:_enrich_action_context`) are `[≠]U028-OASIS-INTERNALS`;
+    /// the structural fields below ARE emitted faithfully.
+    pub fn oasis_action_args(&self) -> serde_json::Value {
+        match self {
+            SocialAction::CreatePost { content } => serde_json::json!({ "content": content }),
+            SocialAction::Like { target_id, .. } => serde_json::json!({ "target_id": target_id }),
+            SocialAction::Dislike { target_id, .. } => {
+                serde_json::json!({ "target_id": target_id })
+            }
+            SocialAction::Repost { post_id } => serde_json::json!({ "post_id": post_id }),
+            SocialAction::Quote { post_id, content } => {
+                serde_json::json!({ "post_id": post_id, "content": content })
+            }
+            SocialAction::Follow { user_id } => serde_json::json!({ "user_id": user_id }),
+            SocialAction::Comment { post_id, content } => {
+                serde_json::json!({ "post_id": post_id, "content": content })
+            }
+            SocialAction::SearchPosts { query } => serde_json::json!({ "query": query }),
+            SocialAction::SearchUser { query } => serde_json::json!({ "query": query }),
+            SocialAction::Mute { user_id } => serde_json::json!({ "user_id": user_id }),
+            SocialAction::Trend | SocialAction::DoNothing => serde_json::json!({}),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Action {
     // --- Generic simulation actions (pre-existing; must not be altered) ---
@@ -456,6 +511,64 @@ pub struct SimCompletion {
     pub total_ticks: u32,
 }
 
+/// A per-tick agent-activation gate (U-028 §4).
+///
+/// The OASIS subprocess selected a stochastic, time-of-day-weighted subset of agents to
+/// `env.step` each round (`run_twitter_simulation.py:_get_active_agents_for_round`). teri maps
+/// this onto an optional policy consulted by [`SimEngine::run`]: for each tick the engine asks
+/// for the active agent ids; only those agents `prepare_action` that tick, mirroring Python's
+/// `if not active_agents: continue` (an empty set → no agent acts that round).
+///
+/// **Additive, opt-in.** When no policy is installed (every pre-existing caller),
+/// `SimEngine::run` activates *every* agent each tick exactly as before. The concrete
+/// time-based policy is [`crate::sim::activation::TimeActivationPolicy`].
+pub trait ActivationPolicy: Send + Sync {
+    /// The agent ids (OASIS numeric ids — `SocialProfile.user_id`) active for `tick`.
+    /// `SimEngine::run` maps these onto pool agents by `user_id`; agents whose id is absent
+    /// skip `prepare_action` that tick. An empty `Vec` means no agent acts this round.
+    fn active_agent_ids(&self, tick: u32) -> Vec<i64>;
+}
+
+/// The `actions.jsonl` producer wiring for a run (U-028 §5, DECISION-U028-3).
+///
+/// Holds the per-platform [`PlatformActionLogger`] and the run's config (for
+/// `log_simulation_start`'s `total_rounds`/`agents_count` and the `minutes_per_round` used to
+/// derive each round's `simulated_hour`). When installed via [`SimEngine::with_producer`],
+/// `run()` emits the full Python producer stream
+/// (`run_parallel_simulation.py:run_twitter_simulation` structure): one `simulation_start`, then
+/// per tick a `round_start` / N× `log_action` / `round_end`, then one `simulation_end`. The
+/// landed monitor (`spawn_monitor_task`) tails this file and marks the run COMPLETED on the
+/// `simulation_end` record.
+///
+/// **Additive, opt-in.** When no producer is installed, `run()` writes nothing (identical to
+/// pre-existing behavior).
+pub struct RunProducer {
+    /// The per-platform JSONL writer (`{sim_dir}/{platform}/actions.jsonl`).
+    pub logger: Arc<action_logger::PlatformActionLogger>,
+    /// The run config (`simulation_config.json` shape) — read for `log_simulation_start` and
+    /// the `time_config.minutes_per_round` used to compute each round's `simulated_hour`.
+    pub config: serde_json::Value,
+}
+
+impl RunProducer {
+    /// `time_config.minutes_per_round` (default 30 — the script fallback,
+    /// `run_parallel_simulation.py:1216`).
+    fn minutes_per_round(&self) -> i64 {
+        self.config
+            .get("time_config")
+            .and_then(|tc| tc.get("minutes_per_round"))
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(30)
+    }
+}
+
+/// Map an `actions.jsonl` write failure into a `TeriError::Sim`. The producer is part of the
+/// run, so a failed log write aborts it — matching Python's unguarded `action_logger.*` calls
+/// (a write exception there propagates out of the platform coroutine).
+fn log_err(record: &str, e: std::io::Error) -> crate::error::TeriError {
+    crate::error::TeriError::Sim(format!("actions.jsonl {record} write failed: {e}"))
+}
+
 pub struct SimEngine {
     config: SimConfig,
     snapshot_tx: broadcast::Sender<WorldSnapshot>,
@@ -495,6 +608,13 @@ pub struct SimEngine {
     /// Existing callers that never call `with_shutdown` observe identical behavior — this
     /// field is `None` for them and the per-tick check is a no-op.
     shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Optional per-tick agent-activation gate (U-028 §4). `None` → every agent acts each tick
+    /// (pre-existing behavior). `Some` → only `policy.active_agent_ids(tick)` (matched to pool
+    /// agents by `SocialProfile.user_id`) `prepare_action` that tick.
+    activation: Option<Arc<dyn ActivationPolicy>>,
+    /// Optional `actions.jsonl` producer (U-028 §5). `None` → `run()` writes no action log.
+    /// `Some` → `run()` emits the full `simulation_start` / per-round / `simulation_end` stream.
+    producer: Option<RunProducer>,
 }
 
 impl SimEngine {
@@ -515,7 +635,29 @@ impl SimEngine {
             completion_tx,
             _completion_anchor: completion_anchor,
             shutdown: None,
+            activation: None,
+            producer: None,
         }
+    }
+
+    /// Install a per-tick agent-activation gate (U-028 §4, additive, opt-in).
+    ///
+    /// When set, `run()` consults `policy.active_agent_ids(tick)` each tick and only the agents
+    /// whose `SocialProfile.user_id` is in that set `prepare_action`; the rest are skipped
+    /// (mirroring Python's `if not active_agents: continue`). When never called, every agent
+    /// acts each tick — identical to the behavior before this method existed.
+    pub fn with_activation(&mut self, policy: Arc<dyn ActivationPolicy>) {
+        self.activation = Some(policy);
+    }
+
+    /// Install the `actions.jsonl` producer (U-028 §5 / DECISION-U028-3, additive, opt-in).
+    ///
+    /// When set, `run()` emits the full Python producer stream (`simulation_start`, per-round
+    /// `round_start`/`log_action`/`round_end`, `simulation_end`) to
+    /// `{sim_dir}/{platform}/actions.jsonl` so the landed monitor can tail it and mark the run
+    /// COMPLETED. When never called, `run()` writes no action log.
+    pub fn with_producer(&mut self, producer: RunProducer) {
+        self.producer = Some(producer);
     }
 
     /// Install a cooperative-shutdown flag, checked at the top of every tick in `run()`.
@@ -615,7 +757,20 @@ impl SimEngine {
             );
         }
 
-        for _ in 0..self.config.max_ticks {
+        // Producer wiring (U-028 §5): emit the `simulation_start` record before the loop and
+        // accumulate the total action count for `simulation_end`. `minutes_per_round` is read
+        // once for per-round `simulated_hour` (`(tick * mpr / 60) % 24`,
+        // `run_parallel_simulation.py:1235-1236`). No-op when no producer is installed.
+        let mut total_actions: i64 = 0;
+        if let Some(ref producer) = self.producer {
+            producer
+                .logger
+                .log_simulation_start(&producer.config)
+                .map_err(|e| log_err("simulation_start", e))?;
+        }
+        let minutes_per_round = self.producer.as_ref().map(RunProducer::minutes_per_round);
+
+        for tick_idx in 0..self.config.max_ticks {
             // Cooperative-shutdown check (additive, opt-in). When the owner flips the flag,
             // break gracefully BEFORE advancing/executing this tick: history up to the prior
             // tick is preserved, the completion signal below still fires with the partial
@@ -629,9 +784,45 @@ impl SimEngine {
 
             world.advance_tick();
 
-            // Phase 1: prepare actions concurrently (immutable reads + LLM calls).
-            // stream::buffered drives at most `parallelism` futures simultaneously,
-            // giving real throughput gains when agent steps are LLM-bound.
+            // Activation gate (U-028 §4): which agents act this tick. With a policy installed,
+            // map its active agent ids (OASIS numeric ids) onto pool indices by
+            // `SocialProfile.user_id` — agents whose id is absent (or who carry no social
+            // profile) skip this round, mirroring Python's `if not active_agents: continue`
+            // (an empty set → no agent acts). With no policy (every pre-existing caller), all
+            // agents act, in pool order — byte-identical to the prior behavior.
+            let active_indices: Vec<usize> = match &self.activation {
+                Some(policy) => {
+                    let ids: std::collections::HashSet<i64> =
+                        policy.active_agent_ids(tick_idx).into_iter().collect();
+                    pool.agents
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, a)| {
+                            a.persona
+                                .social
+                                .as_ref()
+                                .is_some_and(|s| ids.contains(&(s.user_id as i64)))
+                        })
+                        .map(|(i, _)| i)
+                        .collect()
+                }
+                None => (0..pool.agents.len()).collect(),
+            };
+
+            // Producer: `round_start` is logged EVERY round, even an empty one
+            // (`run_parallel_simulation.py:1244-1245`). Logged round is 1-based (`round_num+1`).
+            let round = tick_idx as i64 + 1;
+            if let (Some(producer), Some(mpr)) = (&self.producer, minutes_per_round) {
+                let simulated_hour = (tick_idx as i64 * mpr / 60) % 24;
+                producer
+                    .logger
+                    .log_round_start(round, simulated_hour)
+                    .map_err(|e| log_err("round_start", e))?;
+            }
+
+            // Phase 1: prepare actions concurrently (immutable reads + LLM calls), for the
+            // ACTIVE agents only. stream::buffered drives at most `parallelism` futures
+            // simultaneously, giving real throughput gains when agent steps are LLM-bound.
             //
             // The per-agent futures are collected into a `Vec<Pin<Box<dyn Future + Send>>>`
             // BEFORE streaming, rather than mapped lazily on the agent iterator. This is
@@ -655,25 +846,63 @@ impl SimEngine {
                                 + '_,
                         >,
                     >,
-                > = pool
-                    .agents
+                > = active_indices
                     .iter()
-                    .map(|agent| {
-                        Box::pin(agent.prepare_action(&world, llm))
+                    .map(|&idx| {
+                        Box::pin(pool.agents[idx].prepare_action(&world, llm))
                             as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send + '_>>
                     })
                     .collect();
                 stream::iter(prepared).buffered(self.config.parallelism).collect().await
             };
 
-            // Phase 2: commit results sequentially (mutable writes + world state).
-            for (agent, action_result) in pool.agents.iter_mut().zip(actions) {
+            // Phase 2: commit results sequentially (mutable writes + world state). Iterate the
+            // active indices zipped with their prepared actions. For each committed
+            // `Action::Social`, emit an `actions.jsonl` record (U-028 §5): round (1-based),
+            // agent_id = `SocialProfile.user_id`, agent_name = `Persona.name`, action_type via
+            // the `ACTION_TYPE_MAP` value, native action_args. Generic (non-social) actions are
+            // not OASIS records and are not logged.
+            let mut round_action_count: i64 = 0;
+            for (&idx, action_result) in active_indices.iter().zip(actions) {
                 let action = action_result?;
-                world.apply(agent.id, action.clone());
-                agent.commit_action(&action);
-                if let Some(snap) = world.agents.get_mut(&agent.id) {
-                    snap.state = format!("{:?}", agent.state);
+                let agent_uuid = pool.agents[idx].id;
+                world.apply(agent_uuid, action.clone());
+                pool.agents[idx].commit_action(&action);
+                if let Some(snap) = world.agents.get_mut(&agent_uuid) {
+                    snap.state = format!("{:?}", pool.agents[idx].state);
                 }
+                if let (Some(producer), Action::Social(sa)) = (&self.producer, &action) {
+                    let agent_id = pool.agents[idx]
+                        .persona
+                        .social
+                        .as_ref()
+                        .map(|s| s.user_id as i64)
+                        .unwrap_or(0);
+                    let args = sa.oasis_action_args();
+                    producer
+                        .logger
+                        .log_action(
+                            round,
+                            agent_id,
+                            &pool.agents[idx].persona.name,
+                            sa.oasis_action_type(),
+                            Some(&args),
+                            None,
+                            true,
+                        )
+                        .map_err(|e| log_err("log_action", e))?;
+                    round_action_count += 1;
+                }
+            }
+            total_actions += round_action_count;
+
+            // Producer: `round_end` with this round's action count
+            // (`run_parallel_simulation.py:1274-1275`).
+            if let Some(ref producer) = self.producer {
+                producer
+                    .logger
+                    .log_round_end(round, round_action_count)
+                    .map_err(|e| log_err("round_end", e))?;
             }
 
             // Apply God's-eye injection if configured
@@ -690,6 +919,17 @@ impl SimEngine {
             }
             // snapshot_history is the single canonical in-memory store (6A)
             self.snapshot_history.lock().push(snapshot);
+        }
+
+        // Producer: the terminal `simulation_end` record (`run_parallel_simulation.py:1284`).
+        // `total_rounds` is the config-derived count (== `max_ticks`), NOT the executed count —
+        // it matches Python even when a cooperative shutdown broke the loop early. This is the
+        // record the landed monitor (`spawn_monitor_task`) detects to mark the run COMPLETED.
+        if let Some(ref producer) = self.producer {
+            producer
+                .logger
+                .log_simulation_end(self.config.max_ticks as i64, total_actions)
+                .map_err(|e| log_err("simulation_end", e))?;
         }
 
         // Clone history from canonical store; avoids a local Vec running in parallel (6A)
@@ -1772,5 +2012,321 @@ mod tests {
         // minutes_per_round=0 would be Python ZeroDivisionError; teri → 0 rounds (no basis).
         let cfg = SimConfig::from_simulation_config(&time_cfg(72, 0), None, 8);
         assert_eq!(cfg.max_ticks, 0);
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// U-028 (c3b-i): activation gate + actions.jsonl producer wiring (SimEngine::run)
+//
+// Differential contract vs `run_parallel_simulation.py:run_twitter_simulation` (the
+// authoritative actions.jsonl producer): one `simulation_start`, then per round a
+// `round_start` (ALWAYS, even empty) / N× `log_action` / `round_end`, then one
+// `simulation_end`. Round numbers are 1-based (`round_num+1`). The `action_type` strings are
+// the `ACTION_TYPE_MAP` values (golden-tested here); the DB-internal `action_args` enrichment is
+// `[≠]U028-OASIS-INTERNALS`. RNG-free here: the gate is exercised with deterministic policies.
+// ───────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod producer_tests {
+    use super::*;
+    use crate::agent::{Agent, AgentPool, Persona, Platform, SocialProfile};
+    use crate::error::Result;
+    use crate::llm::LlmClient;
+    use crate::sim::action_logger::PlatformActionLogger;
+    use async_trait::async_trait;
+    use serde_json::Value;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    /// A test LLM whose `complete` always returns a fixed action string (→ a fixed action).
+    struct FixedLlm(&'static str);
+    #[async_trait]
+    impl LlmClient for FixedLlm {
+        async fn complete(&self, _: &str) -> Result<String> {
+            Ok(self.0.to_string())
+        }
+        async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+            Err(crate::error::TeriError::Llm("not used".into()))
+        }
+        async fn stream(
+            &self,
+            _: &str,
+        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            Err(crate::error::TeriError::Llm("not used".into()))
+        }
+        async fn chat(
+            &self,
+            _: &[crate::llm::ChatMessage],
+            _: &crate::llm::ChatOptions,
+        ) -> Result<String> {
+            Err(crate::error::TeriError::Llm("not used".into()))
+        }
+        async fn chat_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _: &[crate::llm::ChatMessage],
+            _: &crate::llm::ChatOptions,
+        ) -> Result<T> {
+            Err(crate::error::TeriError::Llm("not used".into()))
+        }
+    }
+
+    /// A deterministic activation policy returning a fixed id set every tick (no RNG).
+    struct FixedActivation(Vec<i64>);
+    impl ActivationPolicy for FixedActivation {
+        fn active_agent_ids(&self, _tick: u32) -> Vec<i64> {
+            self.0.clone()
+        }
+    }
+
+    /// Build an agent carrying a `SocialProfile` with the given OASIS `user_id` + display name.
+    fn social_agent(user_id: u64, name: &str) -> Agent {
+        let social = SocialProfile {
+            user_id,
+            user_name: format!("u{user_id}"),
+            bio: String::new(),
+            persona: String::new(),
+            platform: Platform::Twitter,
+            karma: 1000,
+            friend_count: 100,
+            follower_count: 150,
+            following_count: 100,
+            statuses_count: 500,
+            age: None,
+            gender: None,
+            mbti: None,
+            country: None,
+            profession: None,
+            interested_topics: vec![],
+            posting_style: None,
+            source_entity_uuid: None,
+            source_entity_type: None,
+            created_at: String::new(),
+        };
+        Agent::new(Persona {
+            name: name.to_string(),
+            background: String::new(),
+            traits: vec![],
+            role: "agent".into(),
+            social: Some(social),
+        })
+    }
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        let id = uuid::Uuid::new_v4();
+        let dir = std::env::temp_dir().join(format!("teri_producer_{tag}_{id}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Read `{base}/twitter/actions.jsonl` into a Vec of parsed JSON objects.
+    fn read_jsonl(log_path: &std::path::Path) -> Vec<Value> {
+        let content = std::fs::read_to_string(log_path).unwrap();
+        content.lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+    }
+
+    /// 2 agents, no activation (all act every tick), 2 rounds, each emits CREATE_POST.
+    /// Golden-asserts the full producer stream + 1-based rounds + action_type map + sim_end.
+    #[tokio::test]
+    async fn run_emits_full_actions_jsonl_stream() {
+        let base = unique_dir("full_stream");
+        let logger = Arc::new(PlatformActionLogger::new("twitter", &base).unwrap());
+        let log_path = logger.log_path.clone();
+
+        let mut pool = AgentPool::new();
+        pool.add_agent(social_agent(0, "Alice"));
+        pool.add_agent(social_agent(1, "Bob"));
+
+        // total_simulation_hours=1, minutes_per_round=30 → from_simulation_config max_ticks=2.
+        let config = serde_json::json!({
+            "time_config": { "total_simulation_hours": 1, "minutes_per_round": 30 },
+            "agent_configs": [{ "agent_id": 0 }, { "agent_id": 1 }]
+        });
+        let sim_config = SimConfig::from_simulation_config(&config, None, 1);
+        assert_eq!(sim_config.max_ticks, 2, "1h / 30min = 2 rounds");
+
+        let mut engine = SimEngine::new(sim_config);
+        engine.with_producer(RunProducer { logger, config });
+        let graph = crate::graph::KnowledgeGraph::new();
+        engine
+            .run(&mut pool, &graph, &FixedLlm("CREATE_POST(content=hi)"))
+            .await
+            .expect("run");
+
+        let recs = read_jsonl(&log_path);
+        // 1 sim_start + per round (1 round_start + 2 actions + 1 round_end) ×2 + 1 sim_end = 10.
+        assert_eq!(recs.len(), 10, "stream length: {recs:?}");
+
+        // simulation_start first.
+        assert_eq!(recs[0]["event_type"], "simulation_start");
+        assert_eq!(recs[0]["agents_count"], 2);
+        assert_eq!(recs[0]["total_rounds"], 2, "1h*2 = 2 (logger's own formula)");
+
+        // Round 1 (1-based): round_start, 2× CREATE_POST, round_end(count=2).
+        assert_eq!(recs[1]["event_type"], "round_start");
+        assert_eq!(recs[1]["round"], 1, "rounds are 1-based (round_num+1)");
+        assert_eq!(recs[1]["simulated_hour"], 0, "(0*30/60)%24 = 0");
+        assert_eq!(recs[2]["action_type"], "CREATE_POST");
+        assert_eq!(recs[2]["round"], 1);
+        assert_eq!(recs[2]["action_args"], serde_json::json!({ "content": "hi" }));
+        assert_eq!(recs[2]["success"], true);
+        assert_eq!(recs[3]["action_type"], "CREATE_POST");
+        assert_eq!(recs[4]["event_type"], "round_end");
+        assert_eq!(recs[4]["round"], 1);
+        assert_eq!(recs[4]["actions_count"], 2);
+
+        // Round 2.
+        assert_eq!(recs[5]["event_type"], "round_start");
+        assert_eq!(recs[5]["round"], 2);
+        assert_eq!(recs[8]["event_type"], "round_end");
+        assert_eq!(recs[8]["actions_count"], 2);
+
+        // simulation_end last: total_rounds == max_ticks (config-derived), total_actions == 4.
+        assert_eq!(recs[9]["event_type"], "simulation_end");
+        assert_eq!(recs[9]["total_rounds"], 2);
+        assert_eq!(recs[9]["total_actions"], 4, "2 agents × 2 rounds");
+
+        // Agent ids/names came from the SocialProfile (user_id) + Persona (name).
+        let names: Vec<&str> =
+            [&recs[2], &recs[3]].iter().map(|r| r["agent_name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"Alice") && names.contains(&"Bob"));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// An empty activation set → round_start + round_end(0), NO log_action
+    /// (Python `if not active_agents: ... log_round_end(.., 0); continue`).
+    #[tokio::test]
+    async fn run_empty_activation_round_logs_start_end_only() {
+        let base = unique_dir("empty_round");
+        let logger = Arc::new(PlatformActionLogger::new("twitter", &base).unwrap());
+        let log_path = logger.log_path.clone();
+
+        let mut pool = AgentPool::new();
+        pool.add_agent(social_agent(0, "Alice"));
+
+        let config = serde_json::json!({
+            "time_config": { "total_simulation_hours": 1, "minutes_per_round": 60 },
+            "agent_configs": [{ "agent_id": 0 }]
+        });
+        let mut engine = SimEngine::new(SimConfig::from_simulation_config(&config, None, 1));
+        engine.with_activation(Arc::new(FixedActivation(vec![]))); // nobody is active
+        engine.with_producer(RunProducer { logger, config });
+        let graph = crate::graph::KnowledgeGraph::new();
+        engine
+            .run(&mut pool, &graph, &FixedLlm("CREATE_POST(content=x)"))
+            .await
+            .expect("run");
+
+        let recs = read_jsonl(&log_path);
+        // sim_start + (round_start + round_end) + sim_end = 4; NO action records.
+        assert_eq!(recs.len(), 4, "empty round emits no actions: {recs:?}");
+        assert_eq!(recs[1]["event_type"], "round_start");
+        assert_eq!(recs[2]["event_type"], "round_end");
+        assert_eq!(recs[2]["actions_count"], 0);
+        assert_eq!(recs[3]["event_type"], "simulation_end");
+        assert_eq!(recs[3]["total_actions"], 0);
+        assert!(
+            recs.iter()
+                .all(|r| r["event_type"] != Value::Null || r.get("action_type").is_none())
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Activation selects a SUBSET by user_id → only the matched agent acts.
+    #[tokio::test]
+    async fn run_activation_gates_by_user_id() {
+        let base = unique_dir("subset");
+        let logger = Arc::new(PlatformActionLogger::new("twitter", &base).unwrap());
+        let log_path = logger.log_path.clone();
+
+        let mut pool = AgentPool::new();
+        pool.add_agent(social_agent(10, "Ten"));
+        pool.add_agent(social_agent(20, "Twenty"));
+        pool.add_agent(social_agent(30, "Thirty"));
+
+        let config = serde_json::json!({
+            "time_config": { "total_simulation_hours": 1, "minutes_per_round": 60 },
+            "agent_configs": []
+        });
+        let mut engine = SimEngine::new(SimConfig::from_simulation_config(&config, None, 1));
+        engine.with_activation(Arc::new(FixedActivation(vec![20]))); // only user_id 20 active
+        engine.with_producer(RunProducer { logger, config });
+        let graph = crate::graph::KnowledgeGraph::new();
+        engine
+            .run(&mut pool, &graph, &FixedLlm("FOLLOW(user_id=99)"))
+            .await
+            .expect("run");
+
+        let recs = read_jsonl(&log_path);
+        let actions: Vec<&Value> = recs.iter().filter(|r| r.get("action_type").is_some()).collect();
+        assert_eq!(actions.len(), 1, "only the one gated-in agent acts");
+        assert_eq!(actions[0]["agent_id"], 20);
+        assert_eq!(actions[0]["agent_name"], "Twenty");
+        assert_eq!(actions[0]["action_type"], "FOLLOW");
+        assert_eq!(actions[0]["action_args"], serde_json::json!({ "user_id": "99" }));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// No producer installed → run() writes nothing and behaves exactly as before (history len).
+    #[tokio::test]
+    async fn run_without_producer_writes_no_log() {
+        let base = unique_dir("no_producer");
+        let log_path = base.join("twitter").join("actions.jsonl");
+
+        let mut pool = AgentPool::new();
+        pool.add_agent(social_agent(0, "Solo"));
+
+        let engine = SimEngine::new(SimConfig::new(3, 1));
+        let graph = crate::graph::KnowledgeGraph::new();
+        let result = engine.run(&mut pool, &graph, &FixedLlm("Speak(hi)")).await.expect("run");
+
+        assert_eq!(result.history.len(), 3, "all ticks ran (no activation gate)");
+        assert!(!log_path.exists(), "no producer → no actions.jsonl written");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The TimeActivationPolicy wires through the trait: an all-active config + the real policy
+    /// produces a non-empty, monitor-terminating stream (integration of §4 policy into §5 run).
+    #[tokio::test]
+    async fn time_activation_policy_drives_run() {
+        use crate::sim::activation::TimeActivationPolicy;
+        let base = unique_dir("time_policy");
+        let logger = Arc::new(PlatformActionLogger::new("twitter", &base).unwrap());
+        let log_path = logger.log_path.clone();
+
+        let mut pool = AgentPool::new();
+        pool.add_agent(social_agent(0, "A"));
+        pool.add_agent(social_agent(1, "B"));
+
+        // activity_level 1.0 + active all hours + huge agents_per_hour → every agent always acts.
+        let config = serde_json::json!({
+            "time_config": {
+                "total_simulation_hours": 1, "minutes_per_round": 30,
+                "agents_per_hour_min": 100, "agents_per_hour_max": 100,
+                "peak_hours": [], "off_peak_hours": []
+            },
+            "agent_configs": [
+                { "agent_id": 0, "active_hours": (0..24).collect::<Vec<_>>(), "activity_level": 1.0 },
+                { "agent_id": 1, "active_hours": (0..24).collect::<Vec<_>>(), "activity_level": 1.0 }
+            ]
+        });
+        let policy = Arc::new(TimeActivationPolicy::from_config(&config, Some(7)));
+        let mut engine = SimEngine::new(SimConfig::from_simulation_config(&config, None, 1));
+        engine.with_activation(policy);
+        engine.with_producer(RunProducer { logger, config });
+        let graph = crate::graph::KnowledgeGraph::new();
+        engine
+            .run(&mut pool, &graph, &FixedLlm("CREATE_POST(content=z)"))
+            .await
+            .expect("run");
+
+        let recs = read_jsonl(&log_path);
+        assert_eq!(recs.last().unwrap()["event_type"], "simulation_end", "monitor-terminating");
+        let actions = recs.iter().filter(|r| r.get("action_type").is_some()).count();
+        assert!(actions > 0, "all-active config produces real action records");
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }
