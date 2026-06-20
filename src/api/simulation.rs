@@ -77,7 +77,7 @@ use crate::graph::KnowledgeGraph;
 use crate::models::project::python_isoformat_local;
 use crate::services::simulation_ipc::{CommandStatus, IPCResponse};
 use crate::services::simulation_manager::SimulationStatus;
-use crate::services::simulation_runner::{AgentStats, RunnerStatus, TimelineEntry};
+use crate::services::simulation_runner::{AgentStats, RunInputs, RunnerStatus, TimelineEntry};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -2069,10 +2069,103 @@ async fn stop_simulation(
 //      (no fabricated run_state, no MockLlm, no fake success)
 // ---------------------------------------------------------------------------
 
+/// Assemble the [`RunInputs`] for a **single-platform** run (U-028 c3b-ii) — the builder that
+/// closes the engine + pool halves of `GAP-U026-RUNINPUTS-BUILDER`.
+///
+/// - `engine` = [`SimConfig::from_simulation_config`] (c1) → [`SimEngine`], with the time-based
+///   activation policy (c3a) and the `actions.jsonl` producer (c3b-i) attached. The producer is
+///   what the landed monitor (`spawn_monitor_task`) tails to mark the run COMPLETED.
+/// - `pool` = [`load_agent_pool`](crate::services::oasis_profile_export::load_agent_pool) (c2).
+/// - `graph` = the entity-reader graph when memory is enabled, else an empty graph (the engine
+///   does not yet consume it — `SimEngine::run`'s `_graph` is reserved); `graph_for_updater` is
+///   the `Arc<Mutex<_>>` the graph-memory updater writes into (U-021).
+/// - `llm` = [`build_llm`](crate::api::build_llm).
+///
+/// **`platform="parallel"` is NOT handled here** — `[!] U028-PARALLEL-DUALSINK` (deferred to U-030
+/// / c3b-iii): a parallel run needs the per-agent dual-sink (`twitter/` + `reddit/` actions.jsonl)
+/// and the monitor's dual-platform completion gate, which require the multi-logger producer. The
+/// caller rejects `parallel` before calling this. Single-platform `twitter`/`reddit` are fully wired.
+///
+/// **Eager-vs-lazy seam (`[≠]` inherited from U-022 `RunInputs`):** Python's `/start` returns the
+/// running state immediately and the *subprocess* later reads profiles/config; teri assembles the
+/// pool + engine synchronously here, so a missing profile/config surfaces at `/start` rather than
+/// mid-run. Unreachable in practice — the caller only reaches this after the READY-state gate
+/// (`check_simulation_prepared`), which implies `/prepare` already wrote both artifacts.
+async fn build_run_inputs(
+    state: &Arc<ApiState>,
+    simulation_id: &str,
+    platform: &str,
+    max_rounds: Option<i64>,
+    enable_graph_memory_update: bool,
+    graph_id: Option<&str>,
+) -> Result<
+    (
+        RunInputs<crate::llm::OpenAiAdapter>,
+        Option<Arc<tokio::sync::Mutex<KnowledgeGraph>>>,
+    ),
+    ApiError,
+> {
+    use crate::sim::action_logger::PlatformActionLogger;
+    use crate::sim::activation::TimeActivationPolicy;
+    use crate::sim::{RunProducer, SimConfig, SimEngine};
+
+    // sim_dir (creates if absent, mirrors Python `_get_simulation_dir`).
+    let sim_dir = state.sim_manager.get_simulation_dir(simulation_id).map_err(ApiError::server)?;
+
+    // The prepared config artifact (READY ⟹ present). Match the runner's missing-config message
+    // so the (unreachable-here) error path is consistent.
+    let config = state
+        .sim_manager
+        .get_simulation_config(simulation_id)
+        .map_err(ApiError::server)?
+        .ok_or_else(|| {
+            ApiError::client(
+                StatusCode::BAD_REQUEST,
+                "模拟配置不存在，请先调用 /prepare 接口".to_string(),
+            )
+        })?;
+
+    // engine: config→ticks (c1) + activation gate (c3a) + actions.jsonl producer (c3b-i).
+    // parallelism defaults to teri's convention (8); OASIS used a semaphore of 30 (architect §2).
+    let mut engine = SimEngine::new(SimConfig::from_simulation_config(&config, max_rounds, 8));
+    engine.with_activation(Arc::new(TimeActivationPolicy::from_config(&config, None)));
+    let logger = Arc::new(
+        PlatformActionLogger::new(platform, &sim_dir)
+            .map_err(|e| ApiError::server(format!("action logger init failed: {e}")))?,
+    );
+    engine.with_producer(RunProducer { logger, config: config.clone() });
+
+    // pool: profile files → AgentPool (c2).
+    let pool = crate::services::oasis_profile_export::load_agent_pool(&sim_dir, platform)
+        .map_err(ApiError::server)?;
+
+    // llm: always OpenAiAdapter (the concrete monomorphization, DECISION-U025-1).
+    let llm = Arc::new(crate::api::build_llm(&state.config));
+
+    // graph + the updater's shared write-handle. The engine reads `graph` (currently a no-op);
+    // the updater (U-021) writes the `Arc<Mutex<_>>` clone.
+    let (graph, graph_for_updater) = if enable_graph_memory_update {
+        let gid = graph_id.ok_or_else(|| {
+            ApiError::client(
+                StatusCode::BAD_REQUEST,
+                crate::i18n::t("api.graphIdRequiredForMemory"),
+            )
+        })?;
+        let g = load_entity_reader_graph(state, gid).await?;
+        let updater_handle = Arc::new(tokio::sync::Mutex::new(g.clone()));
+        (g, Some(updater_handle))
+    } else {
+        (KnowledgeGraph::new(), None)
+    };
+
+    Ok((RunInputs { engine, pool, graph, llm }, graph_for_updater))
+}
+
 /// Port of MiroFish `start_simulation` (simulation.py:1451-1641).
 ///
-/// Full boundary port with ONE honest 500 at the RunInputs construction gap
-/// (GAP-U026-RUNINPUTS-BUILDER). All validation + state-machine paths are fully ported.
+/// Full boundary port. The `RunInputs` construction gap (GAP-U026-RUNINPUTS-BUILDER) is CLOSED for
+/// single-platform `twitter`/`reddit` via [`build_run_inputs`]; `parallel` remains honestly gapped
+/// (`[!] U028-PARALLEL-DUALSINK`, U-030 / c3b-iii).
 async fn start_simulation(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<Value>>,
@@ -2194,37 +2287,73 @@ async fn start_simulation(
         None
     };
 
-    // Capture locals for the gap comment (prevent unused-variable warnings)
-    let _ = (max_rounds, enable_graph_memory_update, force_restarted, graph_id, platform);
+    // Step 8 (Python :1604-1627): build RunInputs + start the run + assemble the 200.
+    //
+    // GAP-U026-RUNINPUTS-BUILDER CLOSED for single-platform twitter/reddit (U-028 c3b-ii): the
+    // engine (config→ticks + activation + actions.jsonl producer), pool (profile reader), graph,
+    // and llm are all assembled by `build_run_inputs`; the landed monitor tails the producer's
+    // `actions.jsonl` → `simulation_end` → COMPLETED.
+    //
+    // `[!] U028-PARALLEL-DUALSINK` (the default platform — deferred to U-030 / c3b-iii): a parallel
+    // run needs the per-agent dual-sink (twitter/ + reddit/ actions.jsonl) and the monitor's
+    // dual-platform gate, which require the multi-logger producer. Until then `parallel` is an
+    // HONEST gap (no fabrication, no single-sink misroute) — narrowed from the old all-platform 500.
+    if platform == "parallel" {
+        return Err(ApiError::server(format!(
+            "parallel dual-sink simulation not yet wired for '{id}' \
+             (U-030 / U-028 c3b-iii — single-platform twitter/reddit are supported)"
+        )));
+    }
 
-    // === [!] GAP-U026-RUNINPUTS-BUILDER =======================================
-    // Python (:1604-1627): run_state = SimulationRunner.start_simulation(id, platform,
-    //   max_rounds, enable_graph_memory_update, graph_id)
-    //   → state.status = RUNNING + save
-    //   → response = run_state.to_dict() + max_rounds_applied? + graph_memory_update_enabled
-    //                + force_restarted + graph_id?
-    //
-    // teri CANNOT build RunInputs<OpenAiAdapter> { engine, pool, graph, llm }:
-    //   • engine needs SimConfig::from_simulation_config (does not exist)
-    //   • pool needs profile→AgentPool reader (does not exist)
-    // Both are produced by U-028 (twitter) / U-029 (reddit) / U-030 (parallel).
-    //
-    // DO NOT call state.sim_runner.start_simulation with MockLlm / fake RunInputs.
-    // DO NOT fabricate a run_state or a 200 success.
-    //
-    // When U-028/029/030 land: build RunInputs here (SimConfig::from_simulation_config for engine;
-    //   profile reader for pool; load_entity_reader_graph wrapped Arc<Mutex<_>> for graph when
-    //   memory enabled; build_llm for llm), call state.sim_runner.start_simulation(...),
-    //   set sim.status=Running+save, assemble 200 response. ONE localized swap.
-    //
-    // [!] GRAPH-UPDATER-WIRING-PENDING: when memory is enabled and graph_id is resolved,
-    //   `graph_for_updater = Some(Arc::new(tokio::sync::Mutex::new(load_entity_reader_graph(&state, graph_id).await?)))`.
-    //   This wiring is specified but not live until the producer lands.
-    // ==========================================================================
-    Err(ApiError::server(format!(
-        "simulation runtime not available: no RunInputs builder for '{id}' \
-         (blocked on U-028/U-029/U-030 platform producers — GAP-U026-RUNINPUTS-BUILDER)"
-    )))
+    let (inputs, graph_for_updater) = build_run_inputs(
+        &state,
+        id,
+        platform,
+        max_rounds,
+        enable_graph_memory_update,
+        graph_id.as_deref(),
+    )
+    .await?;
+
+    // Drive the run (Python :1604-1610). On error (e.g. already-running ValueError analog) →
+    // map_runner_err (Sim→400), matching Python's `except ValueError → 400`.
+    let run_state = state
+        .sim_runner
+        .start_simulation(
+            id,
+            platform,
+            max_rounds,
+            enable_graph_memory_update,
+            graph_id.as_deref(),
+            inputs,
+            graph_for_updater,
+        )
+        .await
+        .map_err(map_runner_err)?;
+
+    // Mark the simulation RUNNING + save (Python :1613-1614).
+    sim.status = SimulationStatus::Running;
+    state.sim_manager.save_simulation_state(&mut sim).map_err(ApiError::server)?;
+
+    // Assemble the 200 response (Python :1616-1627): run_state.to_dict() + conditional fields.
+    let mut response_data = run_state.to_dict();
+    if let Some(mr) = max_rounds {
+        // Python `if max_rounds:` — truthy; max_rounds here is always Some(>0) (≤0 already 400'd).
+        response_data.insert("max_rounds_applied".to_string(), Value::from(mr));
+    }
+    response_data.insert(
+        "graph_memory_update_enabled".to_string(),
+        Value::from(enable_graph_memory_update),
+    );
+    response_data.insert("force_restarted".to_string(), Value::from(force_restarted));
+    if enable_graph_memory_update && let Some(gid) = &graph_id {
+        response_data.insert("graph_id".to_string(), Value::from(gid.as_str()));
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": Value::Object(response_data)
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -7308,11 +7437,13 @@ mod tests {
         assert!(json.get("traceback").is_none(), "400 must not have traceback");
     }
 
-    /// POST /start — fully prepared, valid request reaches the RunInputs gap → 500 GAP message.
+    /// POST /start — fully prepared `parallel` request reaches the dual-sink gap → 500.
     ///
-    /// This is the KEY parity test for (g2): proves the entire boundary (validation +
-    /// state-machine + status=Ready) runs before the honest error, and that the handler
-    /// emits the structured GAP-U026-RUNINPUTS-BUILDER 500 (not a fabricated 200).
+    /// The default platform is `parallel`, which is honestly gapped (`[!] U028-PARALLEL-DUALSINK`,
+    /// U-030 / c3b-iii). This proves the entire boundary (validation + state-machine + status=Ready)
+    /// runs before the honest error, and that the handler emits the structured parallel-gap 500
+    /// (not a fabricated 200, not a single-sink misroute). The single-platform success path is
+    /// covered by `start_simulation_twitter_prepared_returns_200`.
     #[tokio::test]
     async fn start_simulation_prepared_reaches_gap_500() {
         // Seed a sim with status=ready (passes state-machine without triggering the branch)
@@ -7357,11 +7488,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Must be 500 with the GAP message — NOT a fabricated 200, NOT a 400/404
+        // Default platform=parallel → the dual-sink honest gap (500). NOT a fabricated 200.
         assert_eq!(
             resp.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
-            "prepared sim must reach the gap and return 500"
+            "prepared parallel sim must reach the dual-sink gap and return 500"
         );
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -7369,16 +7500,92 @@ mod tests {
 
         let error = json["error"].as_str().unwrap_or("");
         assert!(
-            error.contains("GAP-U026-RUNINPUTS-BUILDER"),
-            "error must contain GAP marker: {error}"
-        );
-        assert!(
-            error.contains("runtime not available") || error.contains("no RunInputs"),
-            "error must describe the gap: {error}"
+            error.contains("parallel dual-sink") && error.contains("U-030"),
+            "error must describe the parallel dual-sink gap: {error}"
         );
 
         // Must have traceback (server 500 shape)
         assert!(json.get("traceback").is_some(), "server 500 must have traceback key");
+    }
+
+    /// POST /start — a fully prepared **twitter** sim (config + profiles on disk) → **200**.
+    ///
+    /// This is the gap-closure proof for U-028 c3b-ii: `build_run_inputs` assembles the engine
+    /// (config→ticks + activation + actions.jsonl producer) + pool (profile reader) + graph + llm,
+    /// `start_simulation` spawns the run + monitor, and the handler returns 200 with the Python
+    /// response shape (`run_state.to_dict()` + `graph_memory_update_enabled` + `force_restarted`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn start_simulation_twitter_prepared_returns_200() {
+        let (state, _tmp) = test_state();
+        let (project_id, _) = seed_project_with_graph(&state);
+        let sim = state
+            .sim_manager
+            .create_simulation(&project_id, "graph-abc", true, true)
+            .expect("create sim");
+        let sim_id = sim.simulation_id.clone();
+
+        // Prepare the sim on disk: READY state + a real config (1h/30min → 2 rounds) + a twitter
+        // profile so load_agent_pool builds a non-empty pool.
+        let sim_dir =
+            std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join(&sim_id);
+        std::fs::create_dir_all(&sim_dir).unwrap();
+        std::fs::write(
+            sim_dir.join("state.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "ready",
+                "config_generated": true,
+                "entities_count": 0,
+                "entity_types": [],
+                "created_at": "2025-01-01T00:00:00",
+                "updated_at": "2025-01-01T00:00:00"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            sim_dir.join("simulation_config.json"),
+            serde_json::to_string(&serde_json::json!({
+                "time_config": { "total_simulation_hours": 1, "minutes_per_round": 30 }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // twitter_profiles.csv: header + one row (5 cols: user_id,name,username,user_char,description)
+        std::fs::write(
+            sim_dir.join("twitter_profiles.csv"),
+            "user_id,name,username,user_char,description\n0,Alice,alice,curious,a bio\n",
+        )
+        .unwrap();
+        state.sim_manager.evict_cache_for_test(&sim_id);
+
+        let app = crate::server::create_app(state);
+        let body =
+            serde_json::json!({ "simulation_id": sim_id, "platform": "twitter" }).to_string();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/simulation/start")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK, "prepared twitter sim must start → 200");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true);
+        let data = &json["data"];
+        // run_state.to_dict() shape + the conditional fields (Python :1616-1622).
+        assert_eq!(data["simulation_id"], sim_id);
+        assert_eq!(data["total_rounds"], 2, "1h/30min → 2 rounds");
+        assert_eq!(data["graph_memory_update_enabled"], false);
+        assert_eq!(data["force_restarted"], false);
+        // max_rounds absent → no max_rounds_applied; memory disabled → no graph_id.
+        assert!(data.get("max_rounds_applied").is_none());
+        assert!(data.get("graph_id").is_none());
     }
 
     /// POST /generate-profiles — entity_types set-equality: response entity_types is a subset

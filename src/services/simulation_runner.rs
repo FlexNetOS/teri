@@ -2856,6 +2856,33 @@ mod lifecycle_tests {
         }
     }
 
+    /// Like [`run_inputs`] but with the `actions.jsonl` producer (U-028 c3b-i) attached to the
+    /// engine, writing to `{sim_dir}/{platform}/actions.jsonl`. The spawned monitor tails that
+    /// file and marks the run COMPLETED on the producer's `simulation_end` record.
+    fn run_inputs_with_producer(
+        max_ticks: u32,
+        sim_dir: &Path,
+        platform: &str,
+    ) -> RunInputs<MockLlm> {
+        let mut pool = AgentPool::new();
+        pool.add_agent(Agent::new(Persona {
+            name: "A".into(),
+            background: "test".into(),
+            traits: vec![],
+            role: "none".into(),
+            social: None,
+        }));
+        let config = serde_json::json!({
+            "time_config": { "total_simulation_hours": 1, "minutes_per_round": 30 }
+        });
+        let mut engine = SimEngine::new(SimConfig::new(max_ticks, 1));
+        let logger = Arc::new(
+            crate::sim::action_logger::PlatformActionLogger::new(platform, sim_dir).unwrap(),
+        );
+        engine.with_producer(crate::sim::RunProducer { logger, config });
+        RunInputs { engine, pool, graph: KnowledgeGraph::new(), llm: Arc::new(MockLlm) }
+    }
+
     // -----------------------------------------------------------------------
     // start_simulation
     // -----------------------------------------------------------------------
@@ -2873,6 +2900,43 @@ mod lifecycle_tests {
             msg.contains("模拟配置不存在"),
             "error must be the missing-config message: {msg}"
         );
+    }
+
+    /// U-028 c3b-ii gap-closure proof: a producer-attached engine writes `actions.jsonl`, the
+    /// spawned monitor tails it, detects `simulation_end`, and marks the run COMPLETED. This is the
+    /// producer→monitor→COMPLETED composition that closes GAP-U026-RUNINPUTS-BUILDER end-to-end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn producer_run_reaches_completed_via_monitor() {
+        let (runner, dir, _mgr) = make_runner("producer_completed");
+        write_config(&dir, "sim-pc", 1, 30); // 2 rounds
+        let sim_dir = dir.join("sim-pc");
+        let inputs = run_inputs_with_producer(2, &sim_dir, "twitter");
+        let _ = runner
+            .start_simulation("sim-pc", "twitter", None, false, None, inputs, None)
+            .await
+            .expect("start should succeed");
+
+        // The run (MockLlm, 2 ticks) finishes fast and emits `simulation_end`; the monitor's
+        // completion signal wakes it for a final tail pass → COMPLETED. Poll bounded (~5s).
+        let mut completed = false;
+        for _ in 0..50 {
+            if let Some(rs) = runner.get_run_state("sim-pc").await.unwrap()
+                && rs.runner_status == RunnerStatus::Completed
+            {
+                completed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            completed,
+            "producer simulation_end must drive the run to COMPLETED via the monitor"
+        );
+
+        // The actions.jsonl the monitor tailed must contain the terminal record.
+        let log = sim_dir.join("twitter").join("actions.jsonl");
+        let content = std::fs::read_to_string(&log).expect("actions.jsonl written by the producer");
+        assert!(content.contains("simulation_end"), "actions.jsonl must contain simulation_end");
     }
 
     #[tokio::test]
