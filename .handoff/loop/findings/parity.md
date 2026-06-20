@@ -3786,3 +3786,82 @@ Differential re-verification against `report.py:25-272`. Verifier refuted on 8 a
 parity-verified). +12 tests (1481→1493). clippy --all-targets + --all-features clean.
 Y-not-regressed. Atomic gate PASS. create_app S-024 now has all 3 blueprints nested (U-025✓/026✓/
 027✓); only register_cleanup (U-023/U-049) remains before S-024 itself flips.
+
+---
+
+## 2026-06-19 — U-028 Cycle 1 parity verdict (adversarial re-verification)
+
+**Scope:** Two sub-deliverables of U-028 cycle 1. Verified in worktree against
+`MiroFish/backend`. Ran `cargo test -p teri` → **1502 passed / 6 ignored / 0 failed**;
+`cargo clippy -p teri --all-targets --all-features` → **clean** (0 warnings after forced rebuild).
+
+### Deliverable (a) — `SimConfig::from_simulation_config` — **PASS**
+- Internal-consistency claim CONFIRMED: `sim/mod.rs:338-372` is formula-identical to the landed
+  `simulation_runner.rs:1091-1118` (same `((h*60.0)/mpr) as i64` truncate, same `mpr==0→0` guard,
+  same `max_rounds>0` `min`). ONE truncation impl holds.
+- DIFFERENTIAL vs Python: the *script* source (`run_twitter_simulation.py:550`,
+  `run_reddit_simulation.py:539`) is `(h*60)//mpr` (**floor-div**), while the docstring claims
+  `int(h*60/mpr)`. The teri impl matches the *service* primitive form (`simulation_runner.py:353`,
+  `int(.../.)`, truncate-toward-zero), NOT the script's `//`. PROVED these two Python forms are
+  observably IDENTICAL over the entire reachable domain (`total_hours ≥ 0`, `mpr > 0`): 0 mismatches
+  / 200K random non-neg cases; f64 path exact within u32 domain. They diverge ONLY for
+  `total_hours < 0`, which is UNREACHABLE (config_generator constrains 24-168; defaults 72/0; never
+  negative). 5 unit tests cover default(144), floor table incl. 10h/7min=85 + 1h/7min=8 (truncate),
+  max_rounds {50→50, 1000→144, 0→144, -5→144}, missing-keys→72/30, zero-cadence→0. All faithful.
+  NOTE for cartographer: docstring/comment says "matches `int(...)`" referencing the script line that
+  is actually `//`; technically imprecise but observably equivalent — recommend wording fix, not a FAIL.
+
+### Deliverable (b) — `TeriError::Timeout` → HTTP status mapping — **PASS with 2 recorded divergences**
+- `error.rs:21-22` Timeout variant; `simulation_ipc.rs:946-957` elapsed→`Timeout` (was `Sim`);
+  test `send_command_times_out_when_server_not_draining` (ipc:1531) asserts `Timeout`. CONFIRMED.
+- Regression check (Sim→Timeout): the ONLY `send_command` callers are `send_interview`/
+  `send_batch_interview`/`send_close_env` + the test. `stop_simulation` does NOT call send_command
+  (uses `terminate_handle`) → a `Timeout` can never reach `map_runner_err` via stop's `:2034` call
+  site → the new `Timeout→504` arm is inert there. NO regression. CONFIRMED.
+- `map_runner_err` (`:1985`) Timeout→504 raw, BEFORE Sim→400/catch-all→500. `map_interview_err`
+  (`:2001`) Timeout→504 i18n-wrapped, else defers. Three routes use DISTINCT keys
+  `api.interviewTimeout`/`api.batchInterviewTimeout`/`api.globalInterviewTimeout` (`:2826/2909/2951`)
+  matching Python `:2256/2394/2497`. Keys exist in teri en/zh with `{error}` placeholder; `t_args`
+  faithfully mirrors `locale.py` ({name}-replace, zh-fallback, key-passthrough). 4 mapper tests
+  (504 status, success:false, raw vs i18n, per-route EN+ZH keys, non-timeout deferral). FAITHFUL.
+- close-env graceful body BYTE-faithful: route timeout arm (`:3110-3118`) emits
+  `{success:true, data:{success:true, message:"环境关闭命令已发送（等待响应超时，环境可能正在关闭）"}}` —
+  exact CJK literal + exact `{success, data:{...}}` envelope from Python route(`:2698-2701`)×primitive
+  (`simulation_runner.py:1655`). Structural relocation (Python swallows in primitive, teri at route)
+  is observably faithful on body+status.
+
+**DIVERGENCE B-1 (real, unflagged, producer-pending) — status-update side effect on close-env timeout.**
+Python close-env route swallows TimeoutError IN THE PRIMITIVE → route exception NOT raised → route
+*unconditionally* runs the status block: `state.status=COMPLETED; _save_simulation_state` (`simulation.py:2691-2696`).
+teri's `close_env_route` Timeout arm `return`s EARLY (`:3110-3118`) **before** the status-update block
+(`:3122-3128`) → teri does NOT persist status=Completed on the close-env timeout path. Same JSON body
++ 200, but a DIFFERENT persisted side effect. This is NOT an inexpressible/non-contractual/superset
+`[≠]` — it is a dropped side effect. UNREACHABLE today (close-env IPC producer-pending until cycle 3),
+so latent, but the porter MUST fix before cycle 3 makes it reachable: on the timeout arm, set
+status=Completed + save THEN return the graceful 200. Recorded as a porter follow-up, not a cycle-1
+blocker (the directly-claimed surface — mappers + IPC production — is faithful; the route handler is
+explicitly producer-pending honest-gap).
+
+**DIVERGENCE B-2 (cosmetic, in-message) — int-vs-float timeout render in 504 error text.**
+Python interview routes default `data.get('timeout', 60)` → **int 60** → `send_command` →
+`f"等待命令响应超时 ({60}秒)"` → `"60秒"`. teri `parse_timeout(_, 60.0)` → f64 → `{:?}` → `"60.0秒"`.
+So the i18n-wrapped 504 body diverges (`...60秒` vs `...60.0秒`) whenever the timeout is integer-valued
+(default, or a client int). The test `map_interview_err_*` bakes in teri's `60.0秒` rather than catching
+this. Low severity (numeric formatting inside an error string, producer-pending path). Recommend the
+porter coerce integer-valued timeouts to match Python's int repr, or record an explicit `[≠]` cosmetic.
+
+### Honest-gap audit — CONFIRMED not over-claimed
+All timeout paths are UNREACHABLE end-to-end today (no live IPC env until U-028/029/030 cycle 3).
+The cycle correctly claims ONLY: (1) the pure config table; (2) IPC `send_command` elapsed→Timeout
+production; (3) the two mappers. The route-level 504/graceful-200 through a full live handler is
+producer-pending and NOT claimed as tested. The cycle does NOT over-claim.
+
+### Symbol-map rollup
+No whole U-028 symbol is fully exercised by cycle 1 (S-877 `run`, S-865/866 interview handlers,
+S-868 poll-loop remain producer-pending). The cycle delivers the config→tick mapping (a fragment of
+S-877's contract) and the timeout-mapping infra (cross-cutting, not a single U-028 symbol). U-028
+symbols S-853..S-879 stay `- [ ]`/`- [~]` (NOT flipped to `- [x]`) — their full contracts are unproven.
+
+**VERDICT:** (a) **PASS** · (b) **PASS** (mappers + IPC production faithful; 2 divergences recorded in
+producer-pending route surface — B-1 a real dropped side effect to fix before cycle 3, B-2 cosmetic).
+Cycle-1 claimed surface is parity-clean. 1502 passed / clippy clean. No cycle-1 blocker.

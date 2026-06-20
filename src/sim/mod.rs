@@ -313,6 +313,68 @@ impl SimConfig {
         Self { max_ticks, parallelism, inject_fn: None }
     }
 
+    /// Derive a runtime [`SimConfig`] from a prepared `simulation_config.json` artifact
+    /// (U-019 `SimulationParameters::to_dict()` shape).
+    ///
+    /// This is the deterministic config→engine mapping that closes the `u026-g` row-1 gap
+    /// ("the config→total_rounds mapping does not parametrize the engine"): `max_ticks` is the
+    /// simulation's total round count, computed **identically** to
+    /// `SimulationRunner::start_simulation` (`simulation_runner.rs:1091-1118`, the status-field
+    /// `total_rounds`) so the engine and the run-state derive ticks from the same formula.
+    ///
+    /// # Mapping (Python source on the left)
+    /// - `max_ticks` ← `time_config.total_simulation_hours` (default 72) × 60 ÷
+    ///   `time_config.minutes_per_round` (default 30), truncated toward zero. The scripts use
+    ///   floor-division `(total_hours*60)//minutes_per_round` (`run_twitter_simulation.py:550`,
+    ///   `run_reddit_simulation.py:539`); the service primitive uses `int(total_hours*60/mpr)`
+    ///   (`simulation_runner.py:353`). Both are identical over the reachable domain (`hours ≥ 0`,
+    ///   `mpr > 0`) — they diverge only for a negative `total_hours`, which the config generator
+    ///   never produces. teri mirrors the service primitive's float-div-truncate so there is ONE
+    ///   truncation impl. A zero cadence yields 0 rounds (Python would raise `ZeroDivisionError`;
+    ///   teri treats a non-positive cadence as "no truncation basis").
+    /// - `max_rounds` truncation: when `Some(mr)` with `mr > 0`, `max_ticks = min(total, mr)`
+    ///   (`run_twitter_simulation.py:553-557`).
+    /// - `parallelism` is caller-supplied (the run's LLM concurrency; OASIS used `semaphore=30`).
+    /// - `inject_fn` is `None`; the time-based activation policy (U-028 §4) installs it later.
+    ///
+    /// The default fallbacks (72 / 30) match the scripts' `.get(key, default)` — they fire only
+    /// when a key is absent; a real U-019 artifact always carries both keys explicitly.
+    pub fn from_simulation_config(
+        config: &serde_json::Value,
+        max_rounds: Option<i64>,
+        parallelism: usize,
+    ) -> Self {
+        let time_config = config.get("time_config");
+        let total_hours = time_config
+            .and_then(|t| t.get("total_simulation_hours"))
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(72);
+        let minutes_per_round = time_config
+            .and_then(|t| t.get("minutes_per_round"))
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(30);
+
+        // Python `int(total_hours * 60 / minutes_per_round)` — float division then truncate
+        // toward zero. Guard the zero divisor (Python ZeroDivisionError → teri 0-rounds).
+        let mut total_rounds: i64 = if minutes_per_round != 0 {
+            ((total_hours as f64 * 60.0) / minutes_per_round as f64) as i64
+        } else {
+            0
+        };
+
+        // max_rounds truncation (only when positive), mirroring start_simulation.
+        if let Some(mr) = max_rounds
+            && mr > 0
+        {
+            total_rounds = total_rounds.min(mr);
+        }
+
+        // `max_ticks` is u32; Python `range(total_rounds)` with a negative count iterates zero
+        // times. Clamp to the u32 domain (a negative or absurd round count cannot panic).
+        let max_ticks = total_rounds.clamp(0, u32::MAX as i64) as u32;
+        Self { max_ticks, parallelism, inject_fn: None }
+    }
+
     /// Register an injection function to modify world state at each tick.
     ///
     /// The injection function is called by the simulation engine at each tick
@@ -1637,5 +1699,77 @@ mod tests {
         assert_eq!(result.history.len(), 0, "pre-set shutdown breaks before first tick");
         let sc = completion_rx.borrow().clone().expect("completion still fires on graceful stop");
         assert_eq!(sc.total_ticks, 0, "partial total_ticks reflects the truncated run");
+    }
+
+    // -----------------------------------------------------------------------
+    // U-028 (c1): SimConfig::from_simulation_config — the deterministic config→engine mapping.
+    // Differential vs Python `int(total_hours * 60 / minutes_per_round)` + max_rounds `min`.
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a minimal `simulation_config.json`-shaped value with the given time keys.
+    fn time_cfg(hours: i64, mpr: i64) -> serde_json::Value {
+        serde_json::json!({
+            "time_config": { "total_simulation_hours": hours, "minutes_per_round": mpr }
+        })
+    }
+
+    #[test]
+    fn from_simulation_config_default_72h_30min() {
+        // 72*60/30 = 144. Python: int(72*60/30) = 144.
+        let cfg = SimConfig::from_simulation_config(&time_cfg(72, 30), None, 8);
+        assert_eq!(cfg.max_ticks, 144);
+        assert_eq!(cfg.parallelism, 8);
+        assert!(cfg.inject_fn.is_none());
+    }
+
+    #[test]
+    fn from_simulation_config_table_matches_python_floor() {
+        // (hours, mpr) → int(hours*60/mpr). Each row is the Python `//`-equivalent floor.
+        let cases = [
+            (24, 60, 24), // 24*60/60 = 24
+            (1, 30, 2),   // 60/30 = 2
+            (72, 45, 96), // 4320/45 = 96
+            (10, 7, 85),  // 600/7 = 85.71 → 85 (truncate toward zero)
+            (1, 7, 8),    // 60/7 = 8.57 → 8
+            (0, 30, 0),   // 0 rounds
+        ];
+        for (hours, mpr, expected) in cases {
+            let cfg = SimConfig::from_simulation_config(&time_cfg(hours, mpr), None, 4);
+            assert_eq!(cfg.max_ticks, expected, "({hours}h, {mpr}min) → {expected} rounds");
+        }
+    }
+
+    #[test]
+    fn from_simulation_config_max_rounds_truncates_only_when_smaller_and_positive() {
+        // total = 144. max_rounds=50 → min(144,50)=50.
+        let cfg = SimConfig::from_simulation_config(&time_cfg(72, 30), Some(50), 8);
+        assert_eq!(cfg.max_ticks, 50);
+        // max_rounds larger than total → no truncation (min keeps 144).
+        let cfg = SimConfig::from_simulation_config(&time_cfg(72, 30), Some(1000), 8);
+        assert_eq!(cfg.max_ticks, 144);
+        // max_rounds <= 0 → guard skips truncation (Python `if max_rounds and max_rounds > 0`).
+        let cfg = SimConfig::from_simulation_config(&time_cfg(72, 30), Some(0), 8);
+        assert_eq!(cfg.max_ticks, 144);
+        let cfg = SimConfig::from_simulation_config(&time_cfg(72, 30), Some(-5), 8);
+        assert_eq!(cfg.max_ticks, 144);
+    }
+
+    #[test]
+    fn from_simulation_config_missing_keys_use_script_defaults_72_30() {
+        // Absent time_config → defaults total_hours=72, mpr=30 (the scripts' .get fallbacks).
+        let empty = serde_json::json!({});
+        let cfg = SimConfig::from_simulation_config(&empty, None, 8);
+        assert_eq!(cfg.max_ticks, 144);
+        // time_config present but partial: only hours → mpr defaults to 30.
+        let partial = serde_json::json!({ "time_config": { "total_simulation_hours": 24 } });
+        let cfg = SimConfig::from_simulation_config(&partial, None, 8);
+        assert_eq!(cfg.max_ticks, 48); // 24*60/30
+    }
+
+    #[test]
+    fn from_simulation_config_zero_cadence_yields_zero_rounds() {
+        // minutes_per_round=0 would be Python ZeroDivisionError; teri → 0 rounds (no basis).
+        let cfg = SimConfig::from_simulation_config(&time_cfg(72, 0), None, 8);
+        assert_eq!(cfg.max_ticks, 0);
     }
 }

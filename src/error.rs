@@ -14,6 +14,13 @@ pub enum TeriError {
     #[error("Simulation error: {0}")]
     Sim(String),
 
+    /// An awaited operation exceeded its timeout. Distinct from `Sim` so callers can map a
+    /// timeout to the faithful HTTP status (Python `TimeoutError` → 504 for interview routes,
+    /// or the graceful close-env 200) rather than folding it into the generic 400/500 path.
+    /// Produced by the IPC `send_command` elapsed branch (`simulation_ipc.rs`).
+    #[error("Timeout: {0}")]
+    Timeout(String),
+
     #[error("Memory error: {0}")]
     Memory(String),
 

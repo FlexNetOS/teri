@@ -1984,8 +1984,25 @@ pub(crate) fn check_simulation_prepared(
 /// `/start` and `/stop` (simulation.py:1629-1641, :1688-1700).
 fn map_runner_err(err: crate::error::TeriError) -> ApiError {
     match err {
+        // Python `TimeoutError` → HTTP 504. Matched BEFORE the `Sim`/catch-all arms so a
+        // timeout is never folded into a 400/500 (resolves `[≠] U026-k/l-TIMEOUT504`).
+        crate::error::TeriError::Timeout(msg) => ApiError::client(StatusCode::GATEWAY_TIMEOUT, msg),
         crate::error::TeriError::Sim(msg) => ApiError::client(StatusCode::BAD_REQUEST, msg),
         other => ApiError::server(other),
+    }
+}
+
+/// Error mapper for the interview routes — wraps a `TeriError::Timeout` in the route-specific
+/// i18n key (Python `t('api.interviewTimeout', error=str(e))` → 504,
+/// `simulation.py:2256-2260` / `:2394-2398` / `:2497-2501`), deferring every other error class
+/// to [`map_runner_err`].
+fn map_interview_err(err: crate::error::TeriError, timeout_key: &str) -> ApiError {
+    match err {
+        crate::error::TeriError::Timeout(msg) => ApiError::client(
+            StatusCode::GATEWAY_TIMEOUT,
+            crate::i18n::t_args(timeout_key, &[("error", &msg)]),
+        ),
+        other => map_runner_err(other),
     }
 }
 
@@ -2672,12 +2689,13 @@ fn read_comments_response(
 // now.  The interview-call success path (optimize prompt → IPC send → shape result) is ported but
 // only reachable with a live env (code-inspection verified, runtime producer-pending).
 //
-// `[≠] U026-k-TIMEOUT504`: Python maps `TimeoutError` → HTTP 504 (`interviewTimeout` /
-// `batchInterviewTimeout` / `globalInterviewTimeout`).  teri's `TeriError` has NO Timeout variant
-// (an IPC timeout surfaces as a generic Sim/other error), so interview-call errors map via
-// `map_runner_err` (Sim→400 = Python ValueError, else→500 = Python Exception).  The distinct 504
-// is inexpressible without a teri timeout-error variant; flagged, not silently dropped.  This
-// path is producer-pending regardless.
+// `U026-k-TIMEOUT504` — RESOLVED (U-028 cycle 1): Python maps `TimeoutError` → HTTP 504
+// (`interviewTimeout` / `batchInterviewTimeout` / `globalInterviewTimeout`).  teri now has a
+// `TeriError::Timeout` variant — the IPC `send_command` elapsed branch produces it
+// (`simulation_ipc.rs`), and each interview route maps it via `map_interview_err(e, <key>)` →
+// 504 with the route-specific i18n key.  The 504 is now FAITHFUL, not a downgraded 400/500.
+// (End-to-end through a live IPC env remains producer-pending — reachable when U-028/029/030
+// register a run — but the Timeout→504 mapping is unit-verified now.)
 //
 // `/interview/history` is in the `[!] GAP-U026-SOCIALDB` family (same as posts/comments): reads
 // `{platform}_simulation.db` behind `#[cfg(feature="sqlite")]`; no-DB → faithful empty, DB-exists
@@ -2803,7 +2821,7 @@ async fn interview_agent_route(
         .sim_runner
         .interview_agent(simulation_id, agent_id, &optimized, platform, timeout)
         .await
-        .map_err(map_runner_err)?;
+        .map_err(|e| map_interview_err(e, "api.interviewTimeout"))?;
     let result = shape_interview_result(
         &resp,
         vec![("agent_id", serde_json::json!(agent_id)), ("prompt", Value::String(optimized))],
@@ -2886,7 +2904,7 @@ async fn interview_batch_route(
         .sim_runner
         .interview_agents_batch(simulation_id, optimized, platform, timeout)
         .await
-        .map_err(map_runner_err)?;
+        .map_err(|e| map_interview_err(e, "api.batchInterviewTimeout"))?;
     let result =
         shape_interview_result(&resp, vec![("interviews_count", serde_json::json!(count))]);
     let success = result.get("success").and_then(Value::as_bool).unwrap_or(false);
@@ -2928,7 +2946,7 @@ async fn interview_all_route(
         .sim_runner
         .interview_all_agents(simulation_id, &optimized, platform, timeout)
         .await
-        .map_err(map_runner_err)?;
+        .map_err(|e| map_interview_err(e, "api.globalInterviewTimeout"))?;
     // interviews_count = the built-list length the primitive used (agent_configs w/ agent_id).
     let count = count_interview_agents(&state, simulation_id);
     let result =
@@ -3017,15 +3035,13 @@ fn interview_history_response(
 // registered (U-028/029/030).  Validation + the no-env 400 are tested now; the success path
 // (IPC close → shape → status=Completed) is ported, code-inspection-verified, producer-pending.
 //
-// `[≠] U026-l-TIMEOUT` (must-resolve-with-producer): Python's close_simulation_env catches
+// `U026-l-TIMEOUT` — RESOLVED (U-028 cycle 1): Python's close_simulation_env catches
 // `TimeoutError` and returns a GRACEFUL **200** `{success:true, message:"环境关闭命令已发送（等待
 // 响应超时，环境可能正在关闭）"}` (a close-timeout is treated as "probably closing").  teri's IPC
-// `send_command` folds an elapsed timeout into `TeriError::Sim`, so `map_runner_err` maps it to a
-// hard **400** — a status/success/message divergence.  Root cause is shared with
-// `[≠] U026-k-TIMEOUT504` (interview): teri's `TeriError` has NO `Timeout` variant.  Both are
-// UNREACHABLE today (the IPC timeout needs a live env from U-028/029/030), so this is a tracked
-// producer-pending divergence.  RESOLVE both together when the producer lands: add
-// `TeriError::Timeout` and route it → close-env 200-graceful (this CJK literal) / interview 504.
+// `send_command` now produces `TeriError::Timeout` on the elapsed branch, and `close_env_route`
+// catches it BEFORE `map_runner_err` and returns the same 2-key graceful 200 (the CJK literal,
+// verbatim).  The hard-400 divergence is gone.  (End-to-end through a live IPC env remains
+// producer-pending — reachable when U-028/029/030 register a run.)
 // ---------------------------------------------------------------------------
 
 /// Port of MiroFish `get_env_status` route (simulation.py:2585-2647). POST /env-status.
@@ -3083,19 +3099,41 @@ async fn close_env_route(
     let timeout = parse_timeout(&data, 30.0);
 
     // --- IPC-PRODUCER-PENDING: no env → Err(no-run) → map_runner_err → 400 (Python ValueError). ---
-    let resp = state
-        .sim_runner
-        .close_simulation_env(simulation_id, timeout)
-        .await
-        .map_err(map_runner_err)?;
+    // `None` marks the GRACEFUL-TIMEOUT outcome: Python's `close_simulation_env` primitive catches
+    // `TimeoutError` and returns a graceful dict (`simulation_runner.py:1651-1656`), then the ROUTE
+    // continues unconditionally. teri surfaces the timeout as `TeriError::Timeout` at the route and
+    // maps it to `None` here — crucially WITHOUT early-returning, so the status-update block below
+    // still runs (matching Python's unconditional `status=COMPLETED; save` at `:2691-2696`).
+    let resp: Option<IPCResponse> =
+        match state.sim_runner.close_simulation_env(simulation_id, timeout).await {
+            Ok(r) => Some(r),
+            Err(crate::error::TeriError::Timeout(_)) => None,
+            Err(e) => return Err(map_runner_err(e)),
+        };
 
-    // Success path: update the simulation status → Completed + save (Python :2697-2701).
+    // Status update runs for BOTH outcomes (Python `:2691-2696` is unconditional — it executes
+    // whether the primitive returned the normal dict OR swallowed a TimeoutError).
     if let Some(mut sim) =
         state.sim_manager.get_simulation(simulation_id).map_err(ApiError::server)?
     {
         sim.status = SimulationStatus::Completed;
         state.sim_manager.save_simulation_state(&mut sim).map_err(ApiError::server)?;
     }
+
+    // Graceful-timeout body: a distinct 2-key `{success:true, message}` dict (the CJK literal,
+    // verbatim) — NOT the 4-key normal-close shape. Produced after the status update above.
+    let resp = match resp {
+        Some(r) => r,
+        None => {
+            return Ok(Json(serde_json::json!({
+                "success": true,
+                "data": {
+                    "success": true,
+                    "message": "环境关闭命令已发送（等待响应超时，环境可能正在关闭）"
+                }
+            })));
+        }
+    };
 
     // Shape the "close command sent" result dict (Python close_simulation_env tail). The message
     // is a hardcoded CJK literal in the Python primitive (NOT an i18n key) — preserved verbatim.
@@ -7833,5 +7871,73 @@ mod tests {
         // B1 shape carries prepare_info and NO task_id (unlike B3a).
         assert!(json["data"].get("prepare_info").is_some());
         assert!(json["data"].get("task_id").is_none(), "B1 precedes task_id → no task_id field");
+    }
+
+    // -----------------------------------------------------------------------
+    // U-028 (c1): TeriError::Timeout → faithful HTTP status mapping.
+    //   - map_runner_err:  Timeout → 504 (Python TimeoutError → 504) raw msg.
+    //   - map_interview_err: Timeout → 504 wrapped in the route-specific i18n key
+    //     (Python `t('api.interviewTimeout', error=str(e))`).
+    // (ApiError's private fields are visible here: this module is a descendant of `api`.)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn map_runner_err_timeout_maps_to_504() {
+        let err =
+            map_runner_err(crate::error::TeriError::Timeout("等待命令响应超时 (60.0秒)".into()));
+        assert_eq!(err.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(err.body["success"], false);
+        // Raw message preserved (the generic mapper does not i18n-wrap).
+        assert_eq!(err.body["error"], "等待命令响应超时 (60.0秒)");
+    }
+
+    #[test]
+    fn map_runner_err_sim_still_400_timeout_arm_does_not_capture_sim() {
+        let err = map_runner_err(crate::error::TeriError::Sim("bad".into()));
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        // A non-timeout, non-sim error stays a 500 (catch-all).
+        let err = map_runner_err(crate::error::TeriError::Api("boom".into()));
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn map_interview_err_timeout_wraps_in_i18n_key_504() {
+        let inner = "等待命令响应超时 (60.0秒)";
+        // en: "Interview response timed out: {error}"
+        let err = crate::i18n::with_locale("en".to_string(), async {
+            map_interview_err(
+                crate::error::TeriError::Timeout(inner.into()),
+                "api.interviewTimeout",
+            )
+        })
+        .await;
+        assert_eq!(err.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(err.body["error"], format!("Interview response timed out: {inner}"));
+
+        // zh batch key: "等待批量Interview响应超时: {error}"
+        let err = crate::i18n::with_locale("zh".to_string(), async {
+            map_interview_err(
+                crate::error::TeriError::Timeout(inner.into()),
+                "api.batchInterviewTimeout",
+            )
+        })
+        .await;
+        assert_eq!(err.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(err.body["error"], format!("等待批量Interview响应超时: {inner}"));
+    }
+
+    #[tokio::test]
+    async fn map_interview_err_defers_non_timeout_to_map_runner_err() {
+        // A ValueError-class (Sim) error still maps to 400 even through the interview mapper.
+        let err = crate::i18n::with_locale("en".to_string(), async {
+            map_interview_err(
+                crate::error::TeriError::Sim("agent不存在".into()),
+                "api.interviewTimeout",
+            )
+        })
+        .await;
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        // The i18n key is NOT applied to a non-timeout error (raw msg preserved).
+        assert_eq!(err.body["error"], "agent不存在");
     }
 }

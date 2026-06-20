@@ -949,8 +949,15 @@ impl SimulationIPCClient {
                 //   raise TimeoutError(f"等待命令响应超时 ({timeout}秒)")
                 error!("等待IPC响应超时: command_id={}", command_id);
                 // `{:?}` on f64 matches Python's `str(float)` (shortest round-trip with
-                // trailing `.0` for integral values) → "60.0秒", not "60秒".
-                Err(crate::error::TeriError::Sim(format!(
+                // trailing `.0` for integral values) → "60.0秒".  `[≠] U028-c1-TIMEOUTMSG-NUMFMT`:
+                // when the API route passes an INTEGER timeout (`data.get('timeout', 60)`), Python
+                // renders "60秒" while teri renders "60.0秒" (the int/float type is collapsed into
+                // a `Duration` by design — non-recoverable).  Cosmetic, in the 504 `error` string
+                // only, and on the producer-pending path; flagged, not silently dropped.
+                // `TeriError::Timeout` (not `Sim`) so the API layer maps it to the faithful
+                // status: Python raises `TimeoutError` here, which interview routes turn into a
+                // 504 and `close_simulation_env` swallows into a graceful 200.
+                Err(crate::error::TeriError::Timeout(format!(
                     "等待命令响应超时 ({:?}秒)",
                     timeout.as_secs_f64()
                 )))
@@ -1518,10 +1525,12 @@ mod ipc_transport_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test: timeout — command with no server draining → Err(TeriError::Sim)
+    // Test: timeout — command with no server draining → Err(TeriError::Timeout)
     // -----------------------------------------------------------------------
 
-    /// When the server is NOT draining, send_command times out and returns Err.
+    /// When the server is NOT draining, send_command times out and returns
+    /// `TeriError::Timeout` (the variant the API layer maps to 504 / graceful-200,
+    /// matching Python's `TimeoutError`).
     #[tokio::test]
     async fn send_command_times_out_when_server_not_draining() {
         // Create a channel but do NOT spawn a server that drains it.
@@ -1536,14 +1545,14 @@ mod ipc_transport_tests {
 
         assert!(result.is_err(), "send_command must Err on timeout");
         match result {
-            Err(crate::error::TeriError::Sim(msg)) => {
+            Err(crate::error::TeriError::Timeout(msg)) => {
                 // Must mention the timeout duration in the error message
                 assert!(
                     msg.contains("秒") || msg.contains("timeout") || msg.contains("超时"),
                     "error message should mention timeout, got: {msg}"
                 );
             }
-            other => panic!("expected TeriError::Sim, got {:?}", other),
+            other => panic!("expected TeriError::Timeout, got {:?}", other),
         }
     }
 
