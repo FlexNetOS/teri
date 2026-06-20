@@ -523,6 +523,37 @@ impl ReportManager {
             .collect()
     }
 
+    /// U-027 (c) GAP-A: read the on-disk `full_report.md` content if it exists.
+    ///
+    /// The `/<report_id>/download` route (`report.py:414-433`) serves the on-disk
+    /// markdown file when present, else a temp file written from `report.markdown_content`.
+    /// This pub wrapper exposes the on-disk read (the private `get_report_markdown_path`
+    /// stays internal); `None` → the route falls back to `report.markdown_content`. Both
+    /// branches yield the same `.md` attachment bytes (save_report writes
+    /// `full_report.md` = `markdown_content`).
+    pub fn read_report_markdown(&self, report_id: &str) -> Option<String> {
+        let path = self.get_report_markdown_path(report_id);
+        if path.exists() { fs::read_to_string(&path).ok() } else { None }
+    }
+
+    /// U-027 (c) GAP-B: read a single section's `(filename, content)` if it exists.
+    ///
+    /// Port of `get_single_section`'s file read (`report.py:676-694`): reads
+    /// `section_{NN:02}.md` from the report folder. `None` → the route returns 404
+    /// `sectionNotFound`. The private `get_section_path` stays internal.
+    pub fn get_single_section(
+        &self,
+        report_id: &str,
+        section_index: usize,
+    ) -> Option<(String, String)> {
+        let path = self.get_section_path(report_id, section_index);
+        if !path.exists() {
+            return None;
+        }
+        let content = fs::read_to_string(&path).ok()?;
+        Some((format!("section_{:02}.md", section_index), content))
+    }
+
     // ── Full report assembly ─────────────────────────────────────────────────
 
     /// Assemble the full report from saved section files.

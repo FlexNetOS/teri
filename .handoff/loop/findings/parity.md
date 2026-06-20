@@ -3566,3 +3566,101 @@ to_simple_dict(reuse) — all exercised.
 No `[≠]` rows are claimed for the 4 sub-cycle (b) symbols themselves — all 4 are full `- [x]` behavioral matches. The two inherited markers above are unit-level: `U027-SSE-SEAM-DORMANT` survives as "genuinely no source SSE route exists" (not a portable feature being skipped); `U025-TRACEBACK` survives as "identical shape, non-contractual value." Neither is a disguised feature-skip.
 
 **Conclusion:** All 4 contract behaviors match source; all 4 symbols `- [x]`; refutation target (hidden SSE) actively REFUTED. Sub-cycle (b) is parity-clean. (The U-027 UNIT ledger row stays `- [ ]` — sub-cycles c–f remain unported; only (b) is gated here.)
+
+---
+
+## PARITY VERDICT — U-027 sub-cycle (c): sections + download routes + GAP-A/B wrappers — 2026-06-19 (opus)
+
+**Verdict: PASS** · symbols 5/5 verified (3 routes + 2 ReportManager pub wrappers)
+**Tests:** `cargo test -p teri --lib api::report` → 29 passed, 0 failed (8 new sub-cycle (c) tests:
+download_not_found_404, download_found_serves_markdown_attachment, sections_empty_no_files,
+sections_with_files_and_is_complete, sections_generating_report_not_complete, single_section_found,
+single_section_not_found_404, single_section_non_integer_404).
+**Build precondition:** `cargo build -p teri --lib` clean (tests compile+run).
+
+### Differential shape diff (MiroFish report.py vs teri src/api/report.rs + manager.rs)
+
+| Behavior | Source (report.py) | teri | Result |
+|---|---|---|---|
+| download 404 | get_report None → 404 `{success:false, error:reportNotFound{id}}` (L408-412) | report.rs:334-340 same | MATCH |
+| download 200 | send_file(full_report.md OR temp from markdown_content) as_attachment, download_name=`{id}.md` (L414-433) | report.rs:344-358 reads on-disk md (GAP-A) `.unwrap_or(markdown_content)`; CD=`attachment; filename="{id}.md"`; body=content bytes | MATCH (bytes+filename); CT adjudicated below |
+| download bytes-equality | both branches same bytes (save_report writes full_report.md = markdown_content, report_agent.py:2441 + temp branch writes report.markdown_content) | teri save_report manager.rs:755-760 writes full_report.md = markdown_content; fallback uses report.markdown_content | SAME BYTES on both branches, both repos |
+| sections | get_generated_sections(id) + is_complete=report&&COMPLETED → `{report_id, sections, total_sections:len, is_complete}` (L636-649) | report.rs:370-385 same 4-key data | MATCH |
+| section valid+present | `{filename:section_{NN:02}.md, section_index, content}` (L687-693) | report.rs:426-433 same 3-key | MATCH |
+| section valid+missing | os.path.exists False → 404 sectionNotFound index=`{n:02d}` (L678-682) | report.rs:417-424 → 404 sectionNotFound idx2=`{n:02}` | MATCH (test: "05" for idx 5) |
+| section non-integer | Flask `<int:section_index>` no-match → Werkzeug default 404 (STATUS) | report.rs:407-414 String-capture + manual parse → 404 | STATUS MATCH (`[≠]` on body, adjudicated below) |
+
+### GAP-A/B wrapper audit (manager.rs:526-555) — thin, correct, private helpers UNCHANGED
+- `git diff --stat HEAD src/report/manager.rs` = **+31 insertions, 0 deletions** → the two new pub
+  wrappers ONLY; the private `get_report_markdown_path` (manager.rs:86-88) and `get_section_path`
+  (manager.rs:101-104) are byte-unchanged.
+- `read_report_markdown` (GAP-A, L534-537): `path = get_report_markdown_path(id); if exists → Some(read), else None`.
+  Wraps the private helper, returns on-disk full_report.md content or None → route falls back to
+  `report.markdown_content`. Both branches yield identical `.md` bytes. CORRECT, thin.
+- `get_single_section` (GAP-B, L544-555): `path = get_section_path(id, idx); !exists → None; else Some((format!("section_{:02}.md",idx), read))`.
+  Mirrors Python report.py:676-694 (path → exists-check → read → filename `{idx:02d}.md`). CORRECT, thin.
+
+### THE ADJUDICATION — `[≠] U027-c-SECTIONIDX-404BODY` is the RIGHT classification (survives challenge)
+1. **STATUS correction is faithful & sound.** Flask `<int:section_index>` is a route *converter*: a
+   non-integer segment does NOT match the route, so Werkzeug raises a default 404 (no JSON 404
+   errorhandler — CONFIRMED: `grep errorhandler\|404 app/__init__.py` → 0 hits). The architect's
+   original design claim ("axum Path<usize> would 404 like <int:>") is WRONG and the porter correctly
+   refuted it: axum has NO type-matching route converter (context7/axum routing docs, verbatim: *"It is
+   not possible to create segments that only match some types like numbers or regular expression. You
+   must handle that manually in your handlers."*). A typed `Path<usize>` that fails to deserialize
+   returns a `PathRejection` → **400**, a STATUS divergence from Flask's 404. The porter captured the
+   segment as `Path<(String,String)>` and parses manually (report.rs:404-415) → non-integer now yields
+   **404**, restoring STATUS parity. Test `single_section_non_integer_404` (`/section/abc` → 404)
+   proves it. The correction is SOUND.
+2. **The body divergence is genuinely non-contractual** (the `[≠]` survives the challenge):
+   - It is NOT inexpressible (teri *can* return a body) — so not `[!]`.
+   - It is NON-CONTRACTUAL: Flask emits its **framework-default HTML 404 error page** (there is no JSON
+     404 handler); teri emits its JSON `{success:false, error:sectionNotFound...}`. Neither body is a
+     designed/observed API contract — it is a malformed-URL artifact. The frontend constructs
+     `/section/{int}` (S-1057 streaming contract uses integer section indices), so a non-integer segment
+     is **never sent** by any real consumer. No consumer parses the 404 body of a malformed URL.
+   - This is NOT a portable-feature-skip: there is no source *feature* (export format, file sink, CLI
+     flag, distinct render path) being dropped — only a framework-default error *page* on an
+     impossible-in-practice URL. The contractual surface (404 STATUS) IS ported faithfully.
+   - ∴ `[≠] U027-c-SECTIONIDX-404BODY` is correct, NOT `[~]`. (A `[~]` would imply the STATUS itself is
+     unproven; it is proven 404-faithful. Only the non-contractual body shape differs, which is exactly
+     what `[≠]` records.)
+
+### Content-Type adjudication (download) — non-divergent in contract
+- teri sets `text/markdown; charset=utf-8` explicitly (report.rs:351). Flask `send_file(download_name="x.md")`
+  infers `text/markdown` from the `.md` extension. Even if charset suffix differs trivially, the
+  **download contract is**: attachment (Content-Disposition: attachment; filename="{id}.md") + the
+  markdown bytes. Both are byte-identical (test `download_found_serves_markdown_attachment` asserts
+  CT starts_with "text/markdown", CD == `attachment; filename="report_dl.md"`, body == markdown_content).
+  Content-Type for a file *attachment* is non-contractual (the browser saves by filename, not MIME).
+  No divergence of substance.
+
+### i18n (en+zh, both with interpolation) — CONFIRMED byte-identical to source
+- teri `src/i18n/locales/{en,zh}.json:371,375` == MiroFish `locales/{en,zh}.json:371,375` (byte-for-byte,
+  same line numbers): `reportNotFound:"...{id}"` / `"...报告不存在: {id}"`;
+  `sectionNotFound:"Section not found: section_{index}.md"` / `"章节不存在: section_{index}.md"`. Both keys
+  present in BOTH locales; `sectionNotFound` carries `{index}` interpolation, `reportNotFound` `{id}`.
+  `t_args` interpolates placeholders (existing passing tests t_args_interpolation_*; here proven by
+  single_section_not_found_404 asserting the rendered error contains "05" for index 5).
+
+### Inherited markers
+- `[≠] U025-TRACEBACK` — inherited; 500 envelope shape `{success:false,error,traceback}` matches source,
+  only the opaque traceback VALUE differs (non-contractual debug text). Valid `[≠]`, not a feature-skip.
+  (In sub-cycle (c) the throwing paths are: download HeaderValue build error / fs read errors →
+  ApiError::server → 3-key shape if hit; effectively unreachable for well-formed reports.)
+- `[!] U027-ROUTE-ORDER` — /download, /sections, /section/:idx registered under the /:report_id capture
+  after seg-0 statics; distinct full-path tails resolve correctly (existing routing tests + the 8 new
+  tests address real paths without collision).
+
+### `[≠]` challenge summary
+- `U027-c-SECTIONIDX-404BODY`: CHALLENGED → SURVIVES as non-contractual framework-default-error-page on
+  a URL no consumer sends. NOT a disguised portable-feature-skip (no export/sink/flag/render dropped;
+  the 404 STATUS is ported faithfully). Classification CONFIRMED.
+- `U025-TRACEBACK`: inherited precedent, identical shape / non-contractual value. Not a skip.
+
+**Conclusion:** All sub-cycle (c) contract behaviors match source; download serves the identical
+markdown bytes as a `.md` attachment with the correct filename; sections/section data shapes are
+key-for-key; the section-index 404 STATUS correction is faithful and sound (axum has no `<int:>`
+converter — verified); GAP-A/B wrappers are thin/correct and leave the private helpers byte-unchanged;
+i18n is byte-identical en+zh with interpolation. 5/5 symbols `- [x]`/`- [≠]`. Sub-cycle (c) parity-clean.
+(The U-027 UNIT ledger row stays open — sub-cycles d–f remain unported; only (c) is gated here.)

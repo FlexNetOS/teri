@@ -30,9 +30,10 @@ use std::sync::Arc;
 
 use axum::{
     Router,
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::Json,
+    http::{HeaderValue, StatusCode, header},
+    response::{Json, Response},
     routing::get,
 };
 use serde_json::Value;
@@ -63,6 +64,11 @@ pub fn report_router(state: Arc<ApiState>) -> Router {
         .route("/:report_id/agent-log/stream", get(get_agent_log_stream_route))
         .route("/:report_id/console-log", get(get_console_log_route))
         .route("/:report_id/console-log/stream", get(get_console_log_stream_route))
+        // ── Sub-cycle (c): sections + download ──
+        .route("/:report_id/download", get(download_report_route))
+        .route("/:report_id/sections", get(get_sections_route))
+        // /section/:idx — :section_index parsed as usize (axum 404s non-integer = Flask <int:>).
+        .route("/:report_id/section/:section_index", get(get_single_section_route))
         .with_state(state)
 }
 
@@ -307,9 +313,131 @@ async fn get_console_log_stream_route(
     })))
 }
 
-// Sub-cycles (c)–(f) append their routes + handlers in their own commits:
-//   (c) download/sections/section/:idx; (d) tools/search+statistics;
-//   (e) chat; (f) generate+generate/status.
+// ===========================================================================
+// Sub-cycle (c) — sections + download
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// GET /:report_id/download  (report.py:398-441)
+//   get_report None → 404 reportNotFound; else serve the markdown as a
+//   `text/markdown` attachment (download_name={report_id}.md).
+//   Source serves the on-disk full_report.md if present, else a temp file from
+//   report.markdown_content — both yield the SAME bytes (save_report writes
+//   full_report.md = markdown_content). teri reads the on-disk md (GAP-A) and
+//   falls back to markdown_content. This handler returns `Response`, NOT `Json`.
+// ---------------------------------------------------------------------------
+async fn download_report_route(
+    State(state): State<Arc<ApiState>>,
+    Path(report_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let mgr = report_manager(&state);
+    let report = match mgr.get_report(&report_id) {
+        None => {
+            return Err(ApiError::client(
+                StatusCode::NOT_FOUND,
+                crate::i18n::t_args("api.reportNotFound", &[("id", &report_id)]),
+            ));
+        }
+        Some(r) => r,
+    };
+
+    // On-disk full_report.md if present (Python md_path branch), else markdown_content
+    // (Python temp-file branch). Same bytes either way.
+    let content = mgr.read_report_markdown(&report_id).unwrap_or(report.markdown_content);
+
+    let disposition = format!("attachment; filename=\"{report_id}.md\"");
+    let resp = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, HeaderValue::from_static("text/markdown; charset=utf-8"))
+        .header(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_str(&disposition).map_err(ApiError::server)?,
+        )
+        .body(axum::body::Body::from(Bytes::from(content.into_bytes())))
+        .map_err(ApiError::server)?;
+    Ok(resp)
+}
+
+// ---------------------------------------------------------------------------
+// GET /:report_id/sections  (report.py:610-650)
+//   get_generated_sections(id) + get_report (is_complete = report && Completed)
+//   → 200 {success, data:{report_id, sections, total_sections, is_complete}}
+// ---------------------------------------------------------------------------
+async fn get_sections_route(
+    State(state): State<Arc<ApiState>>,
+    Path(report_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let mgr = report_manager(&state);
+    let sections = mgr.get_generated_sections(&report_id);
+    let total_sections = sections.len();
+    let is_complete = mgr
+        .get_report(&report_id)
+        .map(|r| r.status == ReportStatus::Completed)
+        .unwrap_or(false);
+
+    let sections_arr: Vec<Value> = sections.into_iter().map(Value::Object).collect();
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": {
+            "report_id": report_id,
+            "sections": sections_arr,
+            "total_sections": total_sections,
+            "is_complete": is_complete
+        }
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// GET /:report_id/section/:section_index  (report.py:661-702)
+//   Flask `<int:section_index>`: a NON-integer segment doesn't match the route →
+//   Werkzeug default 404. axum's typed `Path<usize>` would instead 400 (parse
+//   failure), a STATUS divergence. So we capture the segment as a String and
+//   parse it manually → non-integer yields a faithful 404 (matching Flask's
+//   <int:> no-match status). `[≠] U027-c-SECTIONIDX-404BODY`: Flask returns its
+//   default HTML 404 (no JSON errorhandler in __init__.py); teri returns the JSON
+//   sectionNotFound 404 — the STATUS (404) is contract-faithful, the body shape is
+//   a framework-default-error-page artifact (non-contractual; a non-integer index
+//   is never sent by the frontend, which constructs `/section/{int}`).
+//   Valid-but-missing index → 404 sectionNotFound{index:02d}; present →
+//   200 {success, data:{filename, section_index, content}}.
+// ---------------------------------------------------------------------------
+async fn get_single_section_route(
+    State(state): State<Arc<ApiState>>,
+    Path((report_id, section_index_raw)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    // Flask <int:> non-match → 404 (route doesn't match).
+    let section_index: usize = match section_index_raw.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            return Err(ApiError::client(
+                StatusCode::NOT_FOUND,
+                crate::i18n::t_args("api.sectionNotFound", &[("index", &section_index_raw)]),
+            ));
+        }
+    };
+
+    match report_manager(&state).get_single_section(&report_id, section_index) {
+        None => {
+            // Python: t('api.sectionNotFound', index=f"{section_index:02d}")
+            let idx2 = format!("{section_index:02}");
+            Err(ApiError::client(
+                StatusCode::NOT_FOUND,
+                crate::i18n::t_args("api.sectionNotFound", &[("index", &idx2)]),
+            ))
+        }
+        Some((filename, content)) => Ok(Json(serde_json::json!({
+            "success": true,
+            "data": {
+                "filename": filename,
+                "section_index": section_index,
+                "content": content
+            }
+        }))),
+    }
+}
+
+// Sub-cycles (d)–(f) append their routes + handlers in their own commits:
+//   (d) tools/search+statistics; (e) chat; (f) generate+generate/status.
 
 #[cfg(test)]
 mod tests {
@@ -673,5 +801,145 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["data"]["count"], 3);
         assert_eq!(json["data"]["logs"].as_array().unwrap().len(), 3);
+    }
+
+    // =======================================================================
+    // Sub-cycle (c) — sections + download
+    // =======================================================================
+
+    fn seed_section(state: &Arc<ApiState>, report_id: &str, idx: usize, content: &str) {
+        let folder = report_manager(state).ensure_report_folder(report_id).expect("folder");
+        std::fs::write(folder.join(format!("section_{idx:02}.md")), content).unwrap();
+    }
+
+    // ---- download (Response, not Json) -------------------------------------
+
+    #[tokio::test]
+    async fn download_not_found_404() {
+        let (state, _t) = test_state();
+        let app = crate::server::create_app(state);
+        let (status, json) = req(app, "GET", "/api/report/report_none/download").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["success"], false);
+    }
+
+    #[tokio::test]
+    async fn download_found_serves_markdown_attachment() {
+        let (state, _t) = test_state();
+        seed(&state, &make_report("report_dl", "sim1", ReportStatus::Completed));
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/report/report_dl/download")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap().to_string();
+        let cd = resp.headers().get("content-disposition").unwrap().to_str().unwrap().to_string();
+        assert!(ct.starts_with("text/markdown"), "content-type: {ct}");
+        assert_eq!(cd, "attachment; filename=\"report_dl.md\"");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        // markdown_content of make_report is "# T\n\nBody."
+        assert_eq!(body, "# T\n\nBody.");
+    }
+
+    // ---- sections -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn sections_empty_no_files() {
+        let (state, _t) = test_state();
+        let app = crate::server::create_app(state);
+        let (status, json) = req(app, "GET", "/api/report/report_x/sections").await;
+        assert_eq!(status, StatusCode::OK);
+        let d = &json["data"];
+        assert_eq!(d["report_id"], "report_x");
+        assert_eq!(d["total_sections"], 0);
+        assert!(d["sections"].as_array().unwrap().is_empty());
+        assert_eq!(d["is_complete"], false, "no report → not complete");
+    }
+
+    #[tokio::test]
+    async fn sections_with_files_and_is_complete() {
+        let (state, _t) = test_state();
+        seed(&state, &make_report("report_sec", "sim1", ReportStatus::Completed));
+        seed_section(&state, "report_sec", 1, "## Sec1\n\nA");
+        seed_section(&state, "report_sec", 2, "## Sec2\n\nB");
+        let app = crate::server::create_app(state);
+        let (status, json) = req(app, "GET", "/api/report/report_sec/sections").await;
+        assert_eq!(status, StatusCode::OK);
+        let d = &json["data"];
+        assert_eq!(d["total_sections"], 2);
+        let secs = d["sections"].as_array().unwrap();
+        assert_eq!(secs.len(), 2);
+        // sorted by filename → section_01 first
+        assert_eq!(secs[0]["filename"], "section_01.md");
+        assert_eq!(secs[0]["section_index"], 1);
+        assert_eq!(secs[0]["content"], "## Sec1\n\nA");
+        assert_eq!(d["is_complete"], true, "Completed report → is_complete");
+    }
+
+    #[tokio::test]
+    async fn sections_generating_report_not_complete() {
+        let (state, _t) = test_state();
+        seed(&state, &make_report("report_gen", "sim1", ReportStatus::Generating));
+        seed_section(&state, "report_gen", 1, "x");
+        let app = crate::server::create_app(state);
+        let (_s, json) = req(app, "GET", "/api/report/report_gen/sections").await;
+        assert_eq!(json["data"]["total_sections"], 1);
+        assert_eq!(json["data"]["is_complete"], false);
+    }
+
+    // ---- single section -----------------------------------------------------
+
+    #[tokio::test]
+    async fn single_section_found() {
+        let (state, _t) = test_state();
+        seed_section(&state, "report_ss", 1, "## Exec Summary\n\nBody");
+        let app = crate::server::create_app(state);
+        let (status, json) = req(app, "GET", "/api/report/report_ss/section/1").await;
+        assert_eq!(status, StatusCode::OK);
+        let d = &json["data"];
+        assert_eq!(d["filename"], "section_01.md");
+        assert_eq!(d["section_index"], 1);
+        assert_eq!(d["content"], "## Exec Summary\n\nBody");
+    }
+
+    #[tokio::test]
+    async fn single_section_not_found_404() {
+        let (state, _t) = test_state();
+        let app = crate::server::create_app(state);
+        let (status, json) = req(app, "GET", "/api/report/report_x/section/5").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["success"], false);
+        // sectionNotFound carries the 2-digit zero-padded index "05".
+        assert!(json["error"].as_str().unwrap().contains("05"), "error: {}", json["error"]);
+    }
+
+    /// Flask `<int:section_index>` — a non-integer segment must 404 (axum usize parse).
+    #[tokio::test]
+    async fn single_section_non_integer_404() {
+        let (state, _t) = test_state();
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/report/report_x/section/abc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "non-integer section index must 404 (Flask <int:>)"
+        );
     }
 }
