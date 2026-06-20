@@ -34,13 +34,15 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderValue, StatusCode, header},
     response::{Json, Response},
-    routing::get,
+    routing::{get, post},
 };
 use serde_json::Value;
 
+use crate::api::simulation::load_entity_reader_graph;
 use crate::api::{ApiError, ApiState};
 use crate::report::ReportStatus;
 use crate::report::manager::ReportManager;
+use crate::services::zep_tools::ReportTools;
 
 /// Build the `/report` sub-router. Mirrors `simulation_router` (DECISION-U026-1 state).
 ///
@@ -67,8 +69,13 @@ pub fn report_router(state: Arc<ApiState>) -> Router {
         // ── Sub-cycle (c): sections + download ──
         .route("/:report_id/download", get(download_report_route))
         .route("/:report_id/sections", get(get_sections_route))
-        // /section/:idx — :section_index parsed as usize (axum 404s non-integer = Flask <int:>).
+        // /section/:idx — captured as String + parsed manually so a non-integer 404s
+        // (Flask <int:> no-match status), not 400 (axum typed-path parse failure).
         .route("/:report_id/section/:section_index", get(get_single_section_route))
+        // ── Sub-cycle (d): tools debug routes (POST, body graph_id) ──
+        // seg-0 static "tools" — distinct from the `/:report_id` capture by full path.
+        .route("/tools/search", post(tools_search_route))
+        .route("/tools/statistics", post(tools_statistics_route))
         .with_state(state)
 }
 
@@ -436,8 +443,113 @@ async fn get_single_section_route(
     }
 }
 
-// Sub-cycles (d)–(f) append their routes + handlers in their own commits:
-//   (d) tools/search+statistics; (e) chat; (f) generate+generate/status.
+// ===========================================================================
+// Sub-cycle (d) — tools debug routes  (report.py:935-1020)
+//
+// Both POST. Body-supplied `graph_id` → `load_entity_reader_graph` (ZEP guard +
+// task→graph, REUSED from simulation.rs, not duplicated) → `ReportTools::new(&graph,
+// &llm)` → `search_graph`/`get_graph_statistics` → `to_dict`. First handlers to
+// exercise the `ReportTools` borrow-facade + `build_llm`. The graph resolves to an
+// OWNED `KnowledgeGraph` (after the only `.await`), then `ReportTools` borrows it +
+// the per-request `llm` and the sync search/stats calls return owned Maps — NO borrow
+// is held across an await, so the handler futures stay `Send`.
+//
+// Flags:
+//   `[≠] U026-ZEPKEY` (inherited via load_entity_reader_graph): ZEP guard KEPT —
+//      empty config.zep_api_key → 500 zepApiKeyMissing (matches source + U-025/026).
+//   `[!] U027-GRAPHREQ`: a RESOLVED-but-empty graph returns an EMPTY result set
+//      (facts/edges/nodes []), faithful to source on an empty graph — the data is
+//      producer-supplied (a built graph_build task). Runs end-to-end today.
+//   `[≠] U026-R2-ABSENTGRAPH` (inherited from sub-cycle b entities): an UNRESOLVABLE
+//      graph_id (no graph_build task) → 500 (teri cannot build a reader over a
+//      nonexistent LOCAL graph) vs Python's blanket-except → empty. STATUS differs
+//      ONLY for the secondary absent-graph case; the PRIMARY contract (resolved graph
+//      → result.to_dict) is faithful. Same substrate-forced input-domain narrowing
+//      already adjudicated for the entities routes (DECISION-U026 R2).
+//   `[≠] U025-TRACEBACK`: 500 body carries a Rust backtrace string, not a Python stack.
+// ===========================================================================
+
+/// Tolerate absent/empty body like Python's `request.get_json() or {}`.
+fn parse_tools_body(body: Option<Json<Value>>) -> Value {
+    body.map(|j| j.0).unwrap_or_else(|| serde_json::json!({}))
+}
+
+// ---------------------------------------------------------------------------
+// POST /tools/search  (report.py:935-980)
+//   data = get_json() or {}; graph_id = data.graph_id; query = data.query;
+//   limit = data.get('limit', 10).
+//   not graph_id or not query → 400 api.requireGraphIdAndQuery.
+//   else ZepToolsService().search_graph(graph_id, query, limit) → {success, data:to_dict}.
+//
+// teri MAP: ZepToolsService() → load_entity_reader_graph + ReportTools::new(&graph,&llm).
+// Source omits `scope` → Python default "edges"; teri passes Some("edges") to match.
+// ---------------------------------------------------------------------------
+async fn tools_search_route(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, ApiError> {
+    let data = parse_tools_body(body);
+    let graph_id = data.get("graph_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let query = data.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    // Python `data.get('limit', 10)`: absent/non-int → 10.
+    let limit = data.get("limit").and_then(|v| v.as_i64()).unwrap_or(10);
+
+    // Python `not graph_id or not query` — empty string / absent are both falsy → 400.
+    if graph_id.is_empty() || query.is_empty() {
+        return Err(ApiError::client(
+            StatusCode::BAD_REQUEST,
+            crate::i18n::t("api.requireGraphIdAndQuery"),
+        ));
+    }
+
+    // ZEP guard + graph resolution (REUSED helper). Only await; yields an owned graph.
+    let graph = load_entity_reader_graph(&state, &graph_id).await?;
+    let llm = crate::api::build_llm(&state.config);
+    let tools = ReportTools::new(&graph, &llm);
+    // scope omitted in source → Python default "edges".
+    let result = tools.search_graph(&graph_id, &query, limit, Some("edges"));
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": Value::Object(result.to_dict())
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// POST /tools/statistics  (report.py:983-1020)
+//   data = get_json() or {}; graph_id = data.graph_id.
+//   not graph_id → 400 api.requireGraphId.
+//   else ZepToolsService().get_graph_statistics(graph_id) → {success, data:result}.
+//   (result is already a plain dict — {graph_id,total_nodes,total_edges,entity_types,
+//   relation_types} — so data is the Map directly, NOT a .to_dict() wrapper.)
+// ---------------------------------------------------------------------------
+async fn tools_statistics_route(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, ApiError> {
+    let data = parse_tools_body(body);
+    let graph_id = data.get("graph_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    if graph_id.is_empty() {
+        return Err(ApiError::client(
+            StatusCode::BAD_REQUEST,
+            crate::i18n::t("api.requireGraphId"),
+        ));
+    }
+
+    let graph = load_entity_reader_graph(&state, &graph_id).await?;
+    let llm = crate::api::build_llm(&state.config);
+    let tools = ReportTools::new(&graph, &llm);
+    let stats = tools.get_graph_statistics(&graph_id);
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": Value::Object(stats)
+    })))
+}
+
+// Sub-cycles (e)–(f) append their routes + handlers in their own commits:
+//   (e) chat; (f) generate+generate/status.
 
 #[cfg(test)]
 mod tests {
@@ -941,5 +1053,181 @@ mod tests {
             StatusCode::NOT_FOUND,
             "non-integer section index must 404 (Flask <int:>)"
         );
+    }
+
+    // =======================================================================
+    // Sub-cycle (d) — tools debug routes (POST, body graph_id)
+    // =======================================================================
+
+    /// POST a JSON body and decode the (status, json) response.
+    async fn post_json(
+        app: axum::Router,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (status, json)
+    }
+
+    /// Seed a completed `graph_build` task whose result embeds a real KnowledgeGraph
+    /// (2 entities Alice/Bob + 1 edge). The task_id IS the graph_id. Mirrors the
+    /// simulation.rs entities-route test fixture.
+    fn seed_graph_task() -> String {
+        use crate::graph::{Entity, EntityKind, KnowledgeGraph, Relation, RelationKind};
+
+        let alice_id = uuid::Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        let bob_id = uuid::Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap();
+
+        let mut graph = KnowledgeGraph::new();
+        let alice = Entity { id: alice_id, name: "Alice".to_string(), kind: EntityKind::Person };
+        let bob = Entity { id: bob_id, name: "Bob".to_string(), kind: EntityKind::Person };
+        let alice_idx = graph.add_entity(alice).expect("add alice");
+        let bob_idx = graph.add_entity(bob).expect("add bob");
+        graph.add_relation(
+            alice_idx,
+            bob_idx,
+            Relation::new(RelationKind::RelatedTo, 0.8).expect("rel"),
+        );
+
+        let graph_json_str = graph.serialize_to_json().expect("serialize graph");
+        let graph_json: serde_json::Value =
+            serde_json::from_str(&graph_json_str).expect("parse graph json");
+        let result = serde_json::json!({
+            "graph_name":       "ReportToolsTestGraph",
+            "graph_info":       {"node_count": 2, "edge_count": 1, "entity_types": []},
+            "chunks_processed": 1,
+            "graph":            graph_json
+        });
+
+        let tm = crate::task::TaskManager::global();
+        let task_id = tm.create_task("graph_build", None);
+        tm.complete_task(&task_id, result);
+        task_id
+    }
+
+    /// Build an app whose `zep_api_key` is None so the inherited ZEP guard fires.
+    fn test_app_no_zep() -> (axum::Router, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let mut config = crate::Config::build_test();
+        config.upload_folder = tmp.path().to_string_lossy().to_string();
+        config.zep_api_key = None;
+        (crate::server::create_app(Arc::new(ApiState::new(config))), tmp)
+    }
+
+    // ---- /tools/search ------------------------------------------------------
+
+    #[tokio::test]
+    async fn tools_search_missing_graph_id_400() {
+        let (state, _t) = test_state();
+        let app = crate::server::create_app(state);
+        let (status, json) =
+            post_json(app, "/api/report/tools/search", serde_json::json!({"query": "x"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["success"], false);
+    }
+
+    #[tokio::test]
+    async fn tools_search_missing_query_400() {
+        let (state, _t) = test_state();
+        let app = crate::server::create_app(state);
+        let (status, json) =
+            post_json(app, "/api/report/tools/search", serde_json::json!({"graph_id": "g"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["success"], false);
+    }
+
+    #[tokio::test]
+    async fn tools_search_resolved_graph_200_shape() {
+        let (state, _t) = test_state();
+        let graph_id = seed_graph_task();
+        let app = crate::server::create_app(state);
+        let (status, json) = post_json(
+            app,
+            "/api/report/tools/search",
+            serde_json::json!({"graph_id": graph_id, "query": "Alice", "limit": 5}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["success"], true);
+        let d = &json["data"];
+        // SearchResult::to_dict 5-key contract.
+        assert!(d["facts"].is_array());
+        assert!(d["edges"].is_array());
+        assert!(d["nodes"].is_array());
+        assert_eq!(d["query"], "Alice");
+        assert!(d["total_count"].is_number());
+    }
+
+    /// `[≠] U026-ZEPKEY` inherited: empty zep_api_key → 500 zepApiKeyMissing (validation
+    /// passes first since both graph_id+query are present, THEN the ZEP guard fires).
+    #[tokio::test]
+    async fn tools_search_zep_guard_500() {
+        let (app, _t) = test_app_no_zep();
+        let (status, json) = post_json(
+            app,
+            "/api/report/tools/search",
+            serde_json::json!({"graph_id": "g", "query": "q"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(json["success"], false);
+    }
+
+    // ---- /tools/statistics --------------------------------------------------
+
+    #[tokio::test]
+    async fn tools_statistics_missing_graph_id_400() {
+        let (state, _t) = test_state();
+        let app = crate::server::create_app(state);
+        let (status, json) =
+            post_json(app, "/api/report/tools/statistics", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["success"], false);
+    }
+
+    #[tokio::test]
+    async fn tools_statistics_resolved_graph_200_shape() {
+        let (state, _t) = test_state();
+        let graph_id = seed_graph_task();
+        let app = crate::server::create_app(state);
+        let (status, json) = post_json(
+            app,
+            "/api/report/tools/statistics",
+            serde_json::json!({"graph_id": graph_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["success"], true);
+        let d = &json["data"];
+        // get_graph_statistics 5-key contract; graph_id echoed; 2 nodes / 1 edge.
+        assert_eq!(d["graph_id"], graph_id);
+        assert_eq!(d["total_nodes"], 2);
+        assert_eq!(d["total_edges"], 1);
+        assert!(d["entity_types"].is_object());
+        assert!(d["relation_types"].is_object());
+    }
+
+    /// `[≠] U026-ZEPKEY` inherited: statistics ZEP guard → 500.
+    #[tokio::test]
+    async fn tools_statistics_zep_guard_500() {
+        let (app, _t) = test_app_no_zep();
+        let (status, json) =
+            post_json(app, "/api/report/tools/statistics", serde_json::json!({"graph_id": "g"}))
+                .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(json["success"], false);
     }
 }

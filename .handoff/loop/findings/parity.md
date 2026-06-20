@@ -3664,3 +3664,41 @@ key-for-key; the section-index 404 STATUS correction is faithful and sound (axum
 converter — verified); GAP-A/B wrappers are thin/correct and leave the private helpers byte-unchanged;
 i18n is byte-identical en+zh with interpolation. 5/5 symbols `- [x]`/`- [≠]`. Sub-cycle (c) parity-clean.
 (The U-027 UNIT ledger row stays open — sub-cycles d–f remain unported; only (c) is gated here.)
+
+---
+
+## U-027 sub-cycle (d) — tools debug routes (POST /tools/search, /tools/statistics) — PASS
+
+**Gate verdict: PASS (2026-06-19, 26th resume). 2/2 symbols `- [x]` (S-852f, S-852g).**
+
+Differential re-verification in teri's context against `report.py:935-1020` + `zep_tools.py`.
+Tried to REFUTE on 7 axes; all hold:
+
+1. **Validation + order** — `not graph_id or not query` (search) / `not graph_id` (statistics) →
+   400 with the right i18n key, BEFORE the ZEP guard. teri `unwrap_or("")` + `is_empty()` reproduces
+   Python falsy (absent ≡ empty-string → 400). The 400 returns before the single `.await`.
+2. **Success envelope / data shape** — search `data` = SearchResult::to_dict 5-key
+   {facts,edges,nodes,query,total_count}; statistics `data` = the 5-key dict DIRECTLY (Python result is
+   already a plain dict, NOT double-wrapped via to_dict). `query`/`graph_id` echoed. preserve_order →
+   byte-faithful key order.
+3. **scope/limit defaults** — source omits scope (Python default "edges") → teri `Some("edges")`;
+   `data.get('limit', 10)` → `as_i64().unwrap_or(10)`.
+4. **`[≠] U026-ZEPKEY`** — guard KEPT (empty zep_api_key → 500 zepApiKeyMissing), consistent with
+   U-025/026; proven to fire AFTER validation. Preserved behavior, not a skip. LEGITIMATE.
+5. **`[≠] U026-R2-ABSENTGRAPH`** — unresolvable graph_id (no graph_build task) → teri 500 vs Python
+   blanket-except → empty. Substrate-forced input-domain narrowing (teri can't synthesize a reader over
+   a graph with no local task); the PRIMARY resolved-graph→to_dict contract is faithful and is the live
+   path. SAME divergence already accepted for the entities routes (sim sub-cycle b). LEGITIMATE.
+6. **Send-safety** — only `.await` (load_entity_reader_graph) yields an owned KnowledgeGraph; build_llm
+   + ReportTools::new + search_graph/get_graph_statistics are sync on owned values → no borrow across
+   await → handler futures Send (compiles as axum post handler).
+7. **`[!] U027-GRAPHREQ`** — resolved-but-empty graph → empty result set, faithful to source on an empty
+   graph. Data is producer-supplied. Runs end-to-end today.
+
+**Structural reuse:** `load_entity_reader_graph` (sim:205) promoted `async fn` → `pub(crate) async fn`
+so report.rs reuses the ONE graph-resolution path / ONE ZEP guard rather than duplicating it
+(no-downgrade: reuse-not-duplicate; blast-radius = visibility only). `[≠] U025-TRACEBACK` inherited.
+
+**Conclusion:** Sub-cycle (d) parity-clean. +7 tests (1465→1472 broader / lib 1450→1457). clippy
+--all-targets + --all-features clean. Y-not-regressed. Atomic gate PASS. (U-027 UNIT row stays open —
+sub-cycles e,f remain.)

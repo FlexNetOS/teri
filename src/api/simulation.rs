@@ -201,8 +201,11 @@ pub fn simulation_router(state: Arc<ApiState>) -> Router {
 /// Resolve a `graph_id` to an owned `KnowledgeGraph`, applying the ZEP guard and all
 /// task-resolution failure modes as 500 ApiErrors.
 ///
-/// Used by: `get_graph_entities`, `get_entity_detail`, `get_entities_by_type`.
-async fn load_entity_reader_graph(
+/// Used by: `get_graph_entities`, `get_entity_detail`, `get_entities_by_type`,
+/// and (U-027 reuse) `crate::api::report`'s tools/chat/generate handlers.
+/// `pub(crate)` so report.rs reuses this exact helper rather than duplicating it
+/// (no-downgrade: one graph-resolution path, one ZEP guard).
+pub(crate) async fn load_entity_reader_graph(
     state: &ApiState,
     graph_id: &str,
 ) -> Result<KnowledgeGraph, ApiError> {
