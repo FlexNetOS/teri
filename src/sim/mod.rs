@@ -1,6 +1,7 @@
 pub mod action_logger;
 pub mod activation;
 
+use crate::agent::Platform;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -529,22 +530,103 @@ pub trait ActivationPolicy: Send + Sync {
     fn active_agent_ids(&self, tick: u32) -> Vec<i64>;
 }
 
-/// The `actions.jsonl` producer wiring for a run (U-028 §5, DECISION-U028-3).
+/// The set of per-platform action loggers a [`RunProducer`] fans records out to (U-030 §1,
+/// DECISION-U030-1).
 ///
-/// Holds the per-platform [`PlatformActionLogger`] and the run's config (for
+/// - **Single-platform** (the U-028 case): exactly one entry (twitter-only OR reddit-only). The
+///   unified loop routes every record to it — byte-identical to the pre-U030 single-`logger` field.
+/// - **Parallel** (U-030): two entries (twitter + reddit). Boundary records (`simulation_start` /
+///   `round_start` / `round_end` / `simulation_end`) fan out to ALL loggers; each `log_action`
+///   routes to the committing agent's platform logger (so reddit actions land in
+///   `reddit/actions.jsonl`, not twitter's — the misroute that forced U-028 to defer parallel).
+///
+/// Backed by a `Vec` (not a `HashMap`) because there are at most 2 platforms: a linear scan over
+/// ≤2 entries is trivial and keeps insertion order (twitter-before-reddit) deterministic.
+pub struct PlatformLoggerSet {
+    /// Invariant: 1 entry (single-platform) or 2 (parallel); never empty.
+    loggers: Vec<(Platform, Arc<action_logger::PlatformActionLogger>)>,
+}
+
+impl PlatformLoggerSet {
+    /// Single-platform set (the U-028 case). `platform` is the producer's one platform.
+    pub fn single(platform: Platform, logger: Arc<action_logger::PlatformActionLogger>) -> Self {
+        Self { loggers: vec![(platform, logger)] }
+    }
+
+    /// Parallel dual set (twitter + reddit), insertion order twitter-before-reddit.
+    pub fn parallel(
+        twitter: Arc<action_logger::PlatformActionLogger>,
+        reddit: Arc<action_logger::PlatformActionLogger>,
+    ) -> Self {
+        Self { loggers: vec![(Platform::Twitter, twitter), (Platform::Reddit, reddit)] }
+    }
+
+    /// All `(platform, logger)` pairs, for boundary-record fan-out.
+    fn iter(&self) -> impl Iterator<Item = &(Platform, Arc<action_logger::PlatformActionLogger>)> {
+        self.loggers.iter()
+    }
+
+    /// The logger for `platform`, if installed (used to route a `log_action`).
+    fn get(&self, platform: Platform) -> Option<&Arc<action_logger::PlatformActionLogger>> {
+        self.loggers.iter().find(|(p, _)| *p == platform).map(|(_, l)| l)
+    }
+
+    /// The platforms present in this set (used to seed [`PerPlatform`] accumulators).
+    fn platforms(&self) -> impl Iterator<Item = Platform> + '_ {
+        self.loggers.iter().map(|(p, _)| *p)
+    }
+}
+
+/// A tiny fixed-size (≤2 platform) accumulator keyed by [`Platform`] (U-030 §2,
+/// DECISION-U030-2). Seeded from a [`PlatformLoggerSet`] so a single-platform run holds exactly one
+/// slot. Used for per-platform round and total action counts in `round_end` / `simulation_end`.
+struct PerPlatform<T> {
+    slots: Vec<(Platform, T)>,
+}
+
+impl<T: Copy + Default + std::ops::AddAssign> PerPlatform<T> {
+    /// One zeroed slot per platform installed in `set`.
+    fn zeroed(set: &PlatformLoggerSet) -> Self {
+        Self { slots: set.platforms().map(|p| (p, T::default())).collect() }
+    }
+
+    /// Add `delta` to `platform`'s slot (no-op if the platform is not installed — unreachable under
+    /// the §3 routing invariant, but a safe fail-closed default).
+    fn add(&mut self, platform: Platform, delta: T) {
+        if let Some(slot) = self.slots.iter_mut().find(|(p, _)| *p == platform) {
+            slot.1 += delta;
+        }
+    }
+
+    /// The accumulated value for `platform` (`T::default()` if not installed).
+    fn get(&self, platform: Platform) -> T {
+        self.slots
+            .iter()
+            .find(|(p, _)| *p == platform)
+            .map(|(_, v)| *v)
+            .unwrap_or_default()
+    }
+}
+
+/// The `actions.jsonl` producer wiring for a run (U-028 §5 / U-030 §1, DECISION-U028-3 /
+/// DECISION-U030-1).
+///
+/// Holds the per-platform logger set ([`PlatformLoggerSet`]) and the run's config (for
 /// `log_simulation_start`'s `total_rounds`/`agents_count` and the `minutes_per_round` used to
 /// derive each round's `simulated_hour`). When installed via [`SimEngine::with_producer`],
 /// `run()` emits the full Python producer stream
 /// (`run_parallel_simulation.py:run_twitter_simulation` structure): one `simulation_start`, then
-/// per tick a `round_start` / N× `log_action` / `round_end`, then one `simulation_end`. The
-/// landed monitor (`spawn_monitor_task`) tails this file and marks the run COMPLETED on the
-/// `simulation_end` record.
+/// per tick a `round_start` / N× `log_action` / `round_end`, then one `simulation_end`. For a
+/// parallel run both platforms' streams are emitted (boundary records fanned out, actions routed).
+/// The landed monitor (`spawn_monitor_task`) tails each platform file and marks the run COMPLETED
+/// once every enabled platform's `simulation_end` record is seen.
 ///
 /// **Additive, opt-in.** When no producer is installed, `run()` writes nothing (identical to
 /// pre-existing behavior).
 pub struct RunProducer {
-    /// The per-platform JSONL writer (`{sim_dir}/{platform}/actions.jsonl`).
-    pub logger: Arc<action_logger::PlatformActionLogger>,
+    /// The per-platform JSONL writers (`{sim_dir}/{platform}/actions.jsonl`). One for
+    /// single-platform, two for parallel.
+    pub loggers: PlatformLoggerSet,
     /// The run config (`simulation_config.json` shape) — read for `log_simulation_start` and
     /// the `time_config.minutes_per_round` used to compute each round's `simulated_hour`.
     pub config: serde_json::Value,
@@ -757,17 +839,24 @@ impl SimEngine {
             );
         }
 
-        // Producer wiring (U-028 §5): emit the `simulation_start` record before the loop and
-        // accumulate the total action count for `simulation_end`. `minutes_per_round` is read
-        // once for per-round `simulated_hour` (`(tick * mpr / 60) % 24`,
-        // `run_parallel_simulation.py:1235-1236`). No-op when no producer is installed.
-        let mut total_actions: i64 = 0;
-        if let Some(ref producer) = self.producer {
-            producer
-                .logger
-                .log_simulation_start(&producer.config)
-                .map_err(|e| log_err("simulation_start", e))?;
-        }
+        // Producer wiring (U-028 §5 / U-030 §2): emit the `simulation_start` record before the
+        // loop (fanned out to ALL installed loggers) and accumulate a PER-PLATFORM total action
+        // count for `simulation_end`. `minutes_per_round` is read once for per-round
+        // `simulated_hour` (`(tick * mpr / 60) % 24`, `run_parallel_simulation.py:1235-1236`).
+        // No-op when no producer is installed. For a single-platform producer the logger set has
+        // one entry, so every fan-out/accumulator below resolves to that one logger — byte-identical
+        // to the pre-U030 single-`logger` behavior.
+        let mut total_actions: PerPlatform<i64> = match &self.producer {
+            Some(producer) => {
+                for (_, logger) in producer.loggers.iter() {
+                    logger
+                        .log_simulation_start(&producer.config)
+                        .map_err(|e| log_err("simulation_start", e))?;
+                }
+                PerPlatform::zeroed(&producer.loggers)
+            }
+            None => PerPlatform { slots: Vec::new() },
+        };
         let minutes_per_round = self.producer.as_ref().map(RunProducer::minutes_per_round);
 
         for tick_idx in 0..self.config.max_ticks {
@@ -810,14 +899,17 @@ impl SimEngine {
             };
 
             // Producer: `round_start` is logged EVERY round, even an empty one
-            // (`run_parallel_simulation.py:1244-1245`). Logged round is 1-based (`round_num+1`).
+            // (`run_parallel_simulation.py:1244-1245`), fanned out to ALL installed loggers
+            // (U-030 §2 — each platform's coroutine logs round_start every round). Logged round is
+            // 1-based (`round_num+1`); `simulated_hour` is identical across platforms.
             let round = tick_idx as i64 + 1;
             if let (Some(producer), Some(mpr)) = (&self.producer, minutes_per_round) {
                 let simulated_hour = (tick_idx as i64 * mpr / 60) % 24;
-                producer
-                    .logger
-                    .log_round_start(round, simulated_hour)
-                    .map_err(|e| log_err("round_start", e))?;
+                for (_, logger) in producer.loggers.iter() {
+                    logger
+                        .log_round_start(round, simulated_hour)
+                        .map_err(|e| log_err("round_start", e))?;
+                }
             }
 
             // Phase 1: prepare actions concurrently (immutable reads + LLM calls), for the
@@ -861,8 +953,14 @@ impl SimEngine {
             // `Action::Social`, emit an `actions.jsonl` record (U-028 §5): round (1-based),
             // agent_id = `SocialProfile.user_id`, agent_name = `Persona.name`, action_type via
             // the `ACTION_TYPE_MAP` value, native action_args. Generic (non-social) actions are
-            // not OASIS records and are not logged.
-            let mut round_action_count: i64 = 0;
+            // not OASIS records and are not logged. The record routes to the committing agent's
+            // PLATFORM logger (U-030 §3): in a parallel run a reddit agent's action lands in
+            // `reddit/actions.jsonl`, a twitter agent's in `twitter/actions.jsonl`. Counts are
+            // accumulated per platform for the per-platform `round_end` / `simulation_end`.
+            let mut round_counts: PerPlatform<i64> = match &self.producer {
+                Some(producer) => PerPlatform::zeroed(&producer.loggers),
+                None => PerPlatform { slots: Vec::new() },
+            };
             for (&idx, action_result) in active_indices.iter().zip(actions) {
                 let action = action_result?;
                 let agent_uuid = pool.agents[idx].id;
@@ -872,37 +970,45 @@ impl SimEngine {
                     snap.state = format!("{:?}", pool.agents[idx].state);
                 }
                 if let (Some(producer), Action::Social(sa)) = (&self.producer, &action) {
-                    let agent_id = pool.agents[idx]
-                        .persona
-                        .social
-                        .as_ref()
-                        .map(|s| s.user_id as i64)
-                        .unwrap_or(0);
-                    let args = sa.oasis_action_args();
-                    producer
-                        .logger
-                        .log_action(
-                            round,
-                            agent_id,
-                            &pool.agents[idx].persona.name,
-                            sa.oasis_action_type(),
-                            Some(&args),
-                            None,
-                            true,
-                        )
-                        .map_err(|e| log_err("log_action", e))?;
-                    round_action_count += 1;
+                    // Route by the committing agent's platform. `social` is always present for a
+                    // producer-run pool agent (`load_agent_pool` sets it); a route-miss (no social
+                    // profile, or a platform with no logger installed) is a no-op that does NOT
+                    // count — never misroute into the wrong file. Under the §3 invariant
+                    // (`PlatformLoggerSet` holds a logger for every platform present in the pool)
+                    // this is unreachable; it is the fail-closed guard.
+                    let social = pool.agents[idx].persona.social.as_ref();
+                    if let Some((platform, logger)) = social
+                        .and_then(|s| producer.loggers.get(s.platform).map(|l| (s.platform, l)))
+                    {
+                        let agent_id = social.map(|s| s.user_id as i64).unwrap_or(0);
+                        let args = sa.oasis_action_args();
+                        logger
+                            .log_action(
+                                round,
+                                agent_id,
+                                &pool.agents[idx].persona.name,
+                                sa.oasis_action_type(),
+                                Some(&args),
+                                None,
+                                true,
+                            )
+                            .map_err(|e| log_err("log_action", e))?;
+                        round_counts.add(platform, 1);
+                    }
                 }
             }
-            total_actions += round_action_count;
 
-            // Producer: `round_end` with this round's action count
-            // (`run_parallel_simulation.py:1274-1275`).
+            // Producer: `round_end` with THIS round's per-platform action count, fanned out to ALL
+            // loggers (`run_parallel_simulation.py:1274-1275` per coroutine). A platform with no
+            // actions this round logs `round_end(round, 0)` — matching Python's
+            // `if not active_agents: log_round_end(+1, 0)` and its zero-action branch. Each
+            // platform's running total advances by its own round count.
             if let Some(ref producer) = self.producer {
-                producer
-                    .logger
-                    .log_round_end(round, round_action_count)
-                    .map_err(|e| log_err("round_end", e))?;
+                for (platform, logger) in producer.loggers.iter() {
+                    let count = round_counts.get(*platform);
+                    logger.log_round_end(round, count).map_err(|e| log_err("round_end", e))?;
+                    total_actions.add(*platform, count);
+                }
             }
 
             // Apply God's-eye injection if configured
@@ -921,15 +1027,19 @@ impl SimEngine {
             self.snapshot_history.lock().push(snapshot);
         }
 
-        // Producer: the terminal `simulation_end` record (`run_parallel_simulation.py:1284`).
+        // Producer: the terminal `simulation_end` record (`run_parallel_simulation.py:1284`),
+        // fanned out to ALL loggers with each platform's OWN running `total_actions` (U-030 §2).
         // `total_rounds` is the config-derived count (== `max_ticks`), NOT the executed count —
-        // it matches Python even when a cooperative shutdown broke the loop early. This is the
-        // record the landed monitor (`spawn_monitor_task`) detects to mark the run COMPLETED.
+        // it matches Python even when a cooperative shutdown broke the loop early (both coroutines
+        // share the same `total_rounds`). This is the record the landed monitor
+        // (`spawn_monitor_task`) detects per platform; for a parallel run BOTH platforms'
+        // `simulation_end` records drive the dual-platform completion gate (S-615).
         if let Some(ref producer) = self.producer {
-            producer
-                .logger
-                .log_simulation_end(self.config.max_ticks as i64, total_actions)
-                .map_err(|e| log_err("simulation_end", e))?;
+            for (platform, logger) in producer.loggers.iter() {
+                logger
+                    .log_simulation_end(self.config.max_ticks as i64, total_actions.get(*platform))
+                    .map_err(|e| log_err("simulation_end", e))?;
+            }
         }
 
         // Clone history from canonical store; avoids a local Vec running in parallel (6A)
@@ -2077,14 +2187,20 @@ mod producer_tests {
         }
     }
 
-    /// Build an agent carrying a `SocialProfile` with the given OASIS `user_id` + display name.
+    /// Build an agent carrying a `SocialProfile` with the given OASIS `user_id` + display name
+    /// (Twitter platform).
     fn social_agent(user_id: u64, name: &str) -> Agent {
+        social_agent_on(user_id, name, Platform::Twitter)
+    }
+
+    /// Like [`social_agent`] but on an explicit platform (for the U-030 parallel dual-sink test).
+    fn social_agent_on(user_id: u64, name: &str, platform: Platform) -> Agent {
         let social = SocialProfile {
             user_id,
             user_name: format!("u{user_id}"),
             bio: String::new(),
             persona: String::new(),
-            platform: Platform::Twitter,
+            platform,
             karma: 1000,
             friend_count: 100,
             follower_count: 150,
@@ -2144,7 +2260,10 @@ mod producer_tests {
         assert_eq!(sim_config.max_ticks, 2, "1h / 30min = 2 rounds");
 
         let mut engine = SimEngine::new(sim_config);
-        engine.with_producer(RunProducer { logger, config });
+        engine.with_producer(RunProducer {
+            loggers: PlatformLoggerSet::single(Platform::Twitter, logger),
+            config,
+        });
         let graph = crate::graph::KnowledgeGraph::new();
         engine
             .run(&mut pool, &graph, &FixedLlm("CREATE_POST(content=hi)"))
@@ -2209,7 +2328,10 @@ mod producer_tests {
         });
         let mut engine = SimEngine::new(SimConfig::from_simulation_config(&config, None, 1));
         engine.with_activation(Arc::new(FixedActivation(vec![]))); // nobody is active
-        engine.with_producer(RunProducer { logger, config });
+        engine.with_producer(RunProducer {
+            loggers: PlatformLoggerSet::single(Platform::Twitter, logger),
+            config,
+        });
         let graph = crate::graph::KnowledgeGraph::new();
         engine
             .run(&mut pool, &graph, &FixedLlm("CREATE_POST(content=x)"))
@@ -2250,7 +2372,10 @@ mod producer_tests {
         });
         let mut engine = SimEngine::new(SimConfig::from_simulation_config(&config, None, 1));
         engine.with_activation(Arc::new(FixedActivation(vec![20]))); // only user_id 20 active
-        engine.with_producer(RunProducer { logger, config });
+        engine.with_producer(RunProducer {
+            loggers: PlatformLoggerSet::single(Platform::Twitter, logger),
+            config,
+        });
         let graph = crate::graph::KnowledgeGraph::new();
         engine
             .run(&mut pool, &graph, &FixedLlm("FOLLOW(user_id=99)"))
@@ -2315,7 +2440,10 @@ mod producer_tests {
         let policy = Arc::new(TimeActivationPolicy::from_config(&config, Some(7)));
         let mut engine = SimEngine::new(SimConfig::from_simulation_config(&config, None, 1));
         engine.with_activation(policy);
-        engine.with_producer(RunProducer { logger, config });
+        engine.with_producer(RunProducer {
+            loggers: PlatformLoggerSet::single(Platform::Twitter, logger),
+            config,
+        });
         let graph = crate::graph::KnowledgeGraph::new();
         engine
             .run(&mut pool, &graph, &FixedLlm("CREATE_POST(content=z)"))
@@ -2326,6 +2454,101 @@ mod producer_tests {
         assert_eq!(recs.last().unwrap()["event_type"], "simulation_end", "monitor-terminating");
         let actions = recs.iter().filter(|r| r.get("action_type").is_some()).count();
         assert!(actions > 0, "all-active config produces real action records");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// U-030 parallel dual-sink: a `PlatformLoggerSet::parallel` over a mixed twitter+reddit pool
+    /// fans boundary records to BOTH loggers and ROUTES each `log_action` to the committing agent's
+    /// platform file — twitter agents' actions land in `twitter/actions.jsonl`, reddit agents' in
+    /// `reddit/actions.jsonl`, with correct PER-PLATFORM `round_end`/`simulation_end` counts.
+    #[tokio::test]
+    async fn run_parallel_routes_actions_to_platform_loggers() {
+        let base = unique_dir("parallel");
+        let twitter = Arc::new(PlatformActionLogger::new("twitter", &base).unwrap());
+        let reddit = Arc::new(PlatformActionLogger::new("reddit", &base).unwrap());
+        let twitter_path = twitter.log_path.clone();
+        let reddit_path = reddit.log_path.clone();
+
+        // 2 twitter agents + 1 reddit agent, distinct user_ids.
+        let mut pool = AgentPool::new();
+        pool.add_agent(social_agent_on(10, "Tw1", Platform::Twitter));
+        pool.add_agent(social_agent_on(11, "Tw2", Platform::Twitter));
+        pool.add_agent(social_agent_on(20, "Rd1", Platform::Reddit));
+
+        // 1h / 30min → 2 rounds; no activation gate → all act every tick.
+        let config = serde_json::json!({
+            "time_config": { "total_simulation_hours": 1, "minutes_per_round": 30 },
+            "agent_configs": [{ "agent_id": 10 }, { "agent_id": 11 }, { "agent_id": 20 }]
+        });
+        let mut engine = SimEngine::new(SimConfig::from_simulation_config(&config, None, 1));
+        engine.with_producer(RunProducer {
+            loggers: PlatformLoggerSet::parallel(twitter, reddit),
+            config,
+        });
+        let graph = crate::graph::KnowledgeGraph::new();
+        engine
+            .run(&mut pool, &graph, &FixedLlm("CREATE_POST(content=hi)"))
+            .await
+            .expect("run");
+
+        let tw = read_jsonl(&twitter_path);
+        let rd = read_jsonl(&reddit_path);
+
+        // Both files get the fanned-out boundary stream: sim_start + (round_start+round_end)×2 +
+        // sim_end. Twitter additionally has 2 actions/round (2 twitter agents), reddit 1/round.
+        // Twitter: 1 + (1 + 2 + 1)×2 + 1 = 10. Reddit: 1 + (1 + 1 + 1)×2 + 1 = 8.
+        assert_eq!(tw.len(), 10, "twitter stream: {tw:?}");
+        assert_eq!(rd.len(), 8, "reddit stream: {rd:?}");
+
+        // Every ACTION record in each file belongs to that platform's agents only (routing).
+        let tw_action_ids: Vec<i64> = tw
+            .iter()
+            .filter(|r| r.get("action_type").is_some())
+            .map(|r| r["agent_id"].as_i64().unwrap())
+            .collect();
+        let rd_action_ids: Vec<i64> = rd
+            .iter()
+            .filter(|r| r.get("action_type").is_some())
+            .map(|r| r["agent_id"].as_i64().unwrap())
+            .collect();
+        assert!(
+            tw_action_ids.iter().all(|id| *id == 10 || *id == 11),
+            "twitter ids: {tw_action_ids:?}"
+        );
+        assert!(rd_action_ids.iter().all(|id| *id == 20), "reddit ids: {rd_action_ids:?}");
+        assert_eq!(tw_action_ids.len(), 4, "2 twitter agents × 2 rounds");
+        assert_eq!(rd_action_ids.len(), 2, "1 reddit agent × 2 rounds");
+
+        // Per-platform round_end counts: twitter 2/round, reddit 1/round.
+        let tw_round_ends: Vec<i64> = tw
+            .iter()
+            .filter(|r| r["event_type"] == "round_end")
+            .map(|r| r["actions_count"].as_i64().unwrap())
+            .collect();
+        let rd_round_ends: Vec<i64> = rd
+            .iter()
+            .filter(|r| r["event_type"] == "round_end")
+            .map(|r| r["actions_count"].as_i64().unwrap())
+            .collect();
+        assert_eq!(tw_round_ends, vec![2, 2], "twitter round_end counts");
+        assert_eq!(rd_round_ends, vec![1, 1], "reddit round_end counts");
+
+        // Per-platform simulation_end totals: twitter 4, reddit 2. Both files terminate on it
+        // (drives the monitor dual-gate S-615).
+        assert_eq!(tw.last().unwrap()["event_type"], "simulation_end");
+        assert_eq!(rd.last().unwrap()["event_type"], "simulation_end");
+        assert_eq!(tw.last().unwrap()["total_actions"], 4);
+        assert_eq!(rd.last().unwrap()["total_actions"], 2);
+        // Both share the same config-derived total_rounds (== max_ticks).
+        assert_eq!(tw.last().unwrap()["total_rounds"], 2);
+        assert_eq!(rd.last().unwrap()["total_rounds"], 2);
+
+        // simulation_start fanned to both, each stamped with its own platform.
+        assert_eq!(tw[0]["event_type"], "simulation_start");
+        assert_eq!(tw[0]["platform"], "twitter");
+        assert_eq!(rd[0]["event_type"], "simulation_start");
+        assert_eq!(rd[0]["platform"], "reddit");
 
         std::fs::remove_dir_all(&base).ok();
     }

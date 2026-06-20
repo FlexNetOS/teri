@@ -2879,7 +2879,15 @@ mod lifecycle_tests {
         let logger = Arc::new(
             crate::sim::action_logger::PlatformActionLogger::new(platform, sim_dir).unwrap(),
         );
-        engine.with_producer(crate::sim::RunProducer { logger, config });
+        let platform_enum = if platform == "reddit" {
+            crate::agent::Platform::Reddit
+        } else {
+            crate::agent::Platform::Twitter
+        };
+        engine.with_producer(crate::sim::RunProducer {
+            loggers: crate::sim::PlatformLoggerSet::single(platform_enum, logger),
+            config,
+        });
         RunInputs { engine, pool, graph: KnowledgeGraph::new(), llm: Arc::new(MockLlm) }
     }
 

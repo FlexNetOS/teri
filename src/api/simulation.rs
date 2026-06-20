@@ -2105,9 +2105,10 @@ async fn build_run_inputs(
     ),
     ApiError,
 > {
+    use crate::agent::Platform;
     use crate::sim::action_logger::PlatformActionLogger;
     use crate::sim::activation::TimeActivationPolicy;
-    use crate::sim::{RunProducer, SimConfig, SimEngine};
+    use crate::sim::{PlatformLoggerSet, RunProducer, SimConfig, SimEngine};
 
     // sim_dir (creates if absent, mirrors Python `_get_simulation_dir`).
     let sim_dir = state.sim_manager.get_simulation_dir(simulation_id).map_err(ApiError::server)?;
@@ -2129,11 +2130,19 @@ async fn build_run_inputs(
     // parallelism defaults to teri's convention (8); OASIS used a semaphore of 30 (architect §2).
     let mut engine = SimEngine::new(SimConfig::from_simulation_config(&config, max_rounds, 8));
     engine.with_activation(Arc::new(TimeActivationPolicy::from_config(&config, None)));
+    // Single-platform producer: one logger keyed by this run's platform. "parallel" is rejected by
+    // the caller before reaching here (the honest-500 at the /start handler — U-028); the
+    // dual-logger parallel path lands in U-030 cycle B. Map the &str platform to the enum for
+    // routing; "twitter"/"reddit" are the only single-platform values.
+    let platform_enum = if platform == "reddit" { Platform::Reddit } else { Platform::Twitter };
     let logger = Arc::new(
         PlatformActionLogger::new(platform, &sim_dir)
             .map_err(|e| ApiError::server(format!("action logger init failed: {e}")))?,
     );
-    engine.with_producer(RunProducer { logger, config: config.clone() });
+    engine.with_producer(RunProducer {
+        loggers: PlatformLoggerSet::single(platform_enum, logger),
+        config: config.clone(),
+    });
 
     // pool: profile files → AgentPool (c2).
     let pool = crate::services::oasis_profile_export::load_agent_pool(&sim_dir, platform)
