@@ -1,4 +1,5 @@
 pub mod action_logger;
+pub mod activation;
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};

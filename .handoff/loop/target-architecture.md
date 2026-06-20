@@ -238,6 +238,7 @@ frontend/                   (keep-Vue, re-point: U-031..U-044, SWEEP-1)
 | openai SDK | teri `OpenAiAdapter` (reqwest) | present |
 | zep_cloud | petgraph + redb | native (Decision-1) |
 | camel-oasis / camel-ai | native `SimEngine` | reimplement (Decision-2) |
+| python `random` | `rand` (StdRng) | U-028 c3a, DECISION-U028-2 — seedable for tests; Python unseeded (`[≠]U028-RNG-SEQUENCE`) |
 | pydantic | serde / serde_json | present |
 | python-dotenv | std env + teri config | present (no .env files; envctl) |
 | PyMuPDF (fitz) | pdfium_render | present in seed |

@@ -1053,6 +1053,22 @@
      social.persona into the prompt or the recovered OASIS personality is shadowed by the bio.
      +4 tests 1502→1506. NO platform S-row flip (run-loop/IPC contract producer-pending in c3). -->
 
+<!-- U-028 CYCLE 3a (2026-06-19, parity PASS — S-876 FLIPPED [x]): `TimeActivationPolicy`
+     (src/sim/activation.rs, new pub mod) = faithful port of `_get_active_agents_for_round`
+     (run_twitter_simulation.py:462-529; reddit :469-521 VERIFIER-CONFIRMED structurally identical →
+     single port covers BOTH twitter+reddit, reddit mirror S-903 flips when U-029 cycle lands).
+     simulated_hour((round*mpr//60)%24) + select_multiplier(peak/off-peak/1.0, peak precedence) +
+     active_agents(hour): target=int(uniform(min,max)*mult), per-agent active_hours gating +
+     activity_level coin-flip, sample(candidates, min(target,len)). DECISION-U028-2: NEW `rand`=0.8
+     dep (already in lockfile) — seedable StdRng (entropy prod / fixed-seed test); Python is UNSEEDED
+     so exact selected multiset is non-reproducible IN PYTHON ITSELF → `[≠]U028-RNG-SEQUENCE` (only
+     STRUCTURE differential-tested: gating, multiplier, count-cap, no-dup, membership). VERIFIER:
+     uniform=min+(max-min)*gen (byte-exact, min==max no-panic), int()=as-i64 truncate, 500-seed fuzz
+     0 dup/0 out-of-set, reddit≡twitter diffed. SCOPE 3a ONLY — NOT yet wired into SimEngine::run (no
+     SimConfig.activation seam, 0 run-loop refs; id→agent resolution Python :520-529 deferred to 3b).
+     Dep table: `python random` → `rand` crate (DECISION-U028-2). +9 tests 1506→1515. >>> BUDGET REACHED
+     (3rd cycle of 27th resume). 3b carries to next session = the HIGH-RISK integration. -->
+
 - [ ] S-853 · `unit:U-028` · `type` · `UnicodeFormatter` · logging formatter decoding Unicode escapes · `run_twitter_simulation.py:53`
 - [ ] S-854 · `unit:U-028` · `field` · `UnicodeFormatter.UNICODE_ESCAPE_PATTERN` · `run_twitter_simulation.py:56`
 - [ ] S-855 · `unit:U-028` · `method` · `UnicodeFormatter.format` · `run_twitter_simulation.py:58`
@@ -1076,7 +1092,7 @@
 - [ ] S-873 · `unit:U-028` · `method` · `TwitterSimulationRunner._get_profile_path` · `run_twitter_simulation.py:419`
 - [ ] S-874 · `unit:U-028` · `method` · `TwitterSimulationRunner._get_db_path` · `run_twitter_simulation.py:423`
 - [ ] S-875 · `unit:U-028` · `method` · `TwitterSimulationRunner._create_model` · configures OASIS LLM model · `run_twitter_simulation.py:427`
-- [ ] S-876 · `unit:U-028` · `method` · `TwitterSimulationRunner._get_active_agents_for_round` · filters by activity schedule · `run_twitter_simulation.py:462`
+- [x] S-876 · `unit:U-028` · `method` · `TwitterSimulationRunner._get_active_agents_for_round` · filters by activity schedule · `run_twitter_simulation.py:462` · PARITY 2026-06-19 (Cycle 3a): ported to `src/sim/activation.rs` `TimeActivationPolicy::{simulated_hour,active_agents}`+`select_multiplier`; differential MATCH on all §1A rows; `[≠]U028-RNG-SEQUENCE` survives bar (unseeded Python, non-contractual sequence). 500-seed fuzz clean. 1515 passed/clippy clean.
 - [ ] S-877 · `unit:U-028` · `method` · `TwitterSimulationRunner.run` · async main loop; wait-for-commands mode after rounds · `run_twitter_simulation.py:531`
 - [ ] S-878 · `unit:U-028` · `fn` · `main` · entry-point; sets up asyncio loop · `run_twitter_simulation.py:707`
 - [ ] S-879 · `unit:U-028` · `fn` · `setup_signal_handlers` · SIGTERM/SIGINT/SIGHUP → graceful shutdown · `run_twitter_simulation.py:749`

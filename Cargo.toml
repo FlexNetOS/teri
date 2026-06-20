@@ -44,6 +44,11 @@ petgraph = "0.6"
 # Parallel computation (agent simulation)
 rayon = "1"
 
+# Seedable RNG for the time-based agent activation policy (U-028). Python's OASIS scripts use the
+# unseeded `random` module; teri uses a seedable `StdRng` (entropy in production, fixed-seed in
+# tests) so the stochastic-but-structured activation is reproducible for the parity gate.
+rand = "0.8"
+
 # Fast non-poisoning mutex for short critical sections in async code
 parking_lot = "0.12"
 

@@ -3962,3 +3962,43 @@ Both `[≠]`s are legitimate (non-contractual lossy-collapse / dest-superset fil
 feature-skips. 1506 passed / clippy clean. No downgrade. The `pool`-field half of
 `GAP-U026-RUNINPUTS-BUILDER` is now satisfied; Cycle 3 (activation + RunInputs + actions.jsonl) may
 proceed, with the one persona-routing watch item above.
+
+---
+
+## 2026-06-19 — U-028 Cycle 3a · `TimeActivationPolicy` (port of `_get_active_agents_for_round`) — VERDICT: **PASS**
+
+**Verifier:** rust-port-parity-verifier (adversarial, fail-closed).
+**Unit/symbol:** U-028 · **S-876** `TwitterSimulationRunner._get_active_agents_for_round` (`run_twitter_simulation.py:462-529`) + round→hour math (`:635-636`). Contributes to U-029 **S-903** (reddit mirror, byte-identical — see below).
+**Rust:** `src/sim/activation.rs` — `TimeActivationPolicy::{from_config, simulated_hour, active_agents}`, `select_multiplier`, `AgentActivation`. `pub mod activation;` in `src/sim/mod.rs:2`. Dep `rand = "0.8"` (`Cargo.toml:50`; `Cargo.lock` rand 0.8.6).
+**Gates:** `cargo test -p teri` = **1515 passed / 6 ignored** (baseline held); `cargo clippy -p teri --all-targets --all-features` = **clean**. 9 module tests + 3 gate-added adversarial tests (500-seed fuzz, min==max, truncation) all PASS, adversarial tests reverted (clean `git diff`).
+
+### Differential parity — source (Python) vs Rust, line-by-line
+| Behavior | Python (twitter) | Rust | Verdict |
+|---|---|---|---|
+| `simulated_hour = (round*mpr//60)%24` | `:635-636` | `simulated_hour` `:165-168` | MATCH (table test: r0→0, r2→1, r48→0 day-wrap, r50→1) |
+| multiplier select: peak→`peak_mult` `elif` off-peak→`off_mult` else `1.0`; peak precedence | `:490-495` | `select_multiplier` `:76-90` | MATCH (incl. hour-in-both → peak wins, the `if`/`elif` order) |
+| `target_count = int(random.uniform(min,max)*mult)` | `:497` | `min+(max-min)*gen::<f64>()` then `*mult as i64` `:189-191` | MATCH. `uniform(a,b)=a+(b-a)*random()` byte-equiv; `as i64` truncates toward zero = `int()` (5.9→5 verified); `min==max` returns `a`, no panic (`gen_range(a..a)` WOULD panic — manual form avoids it, 500-seed fuzz confirms) |
+| active_hours gating: `hour ∉ active_hours → skip` | `:507-508` | `:196-198` | MATCH (deterministic regardless of seed — verified over 20 seeds) |
+| activity threshold `random.random()<activity_level` (0.0 never, 1.0 always) | `:511-512` | `gen::<f64>()<activity_level` `:199-201` | MATCH (boundary tests both directions) |
+| sample cap `random.sample(cands, min(target,len))` without replacement | `:515-518` | `choose_multiple(rng, clamp(0,len))` `:211-214` | MATCH. `choose_multiple` = without-replacement (uniqueness verified 500 seeds, 0 dups, 0 out-of-candidate); `clamp` lower-0 guards only unreachable negative k (target is structurally ≥0) — faithful guard, not a behavior change |
+| `if candidates else []` | `:518` | `candidates.is_empty() → Vec::new()` `:205-207` | MATCH |
+| id→agent resolution (`env.agent_graph.get_agent`) | `:520-529` | DEFERRED to 3b run loop (per scope) | correctly out of scope |
+
+### `.get` default fidelity (the key parity subtlety) — CONFIRMED byte-correct
+`from_config` (`:110-141`) mirrors the SCRIPT's `.get` defaults exactly, NOT the U-019 dataclass:
+`peak_hours [9,10,11,14,15,20,21,22]` (`:113` vs Py `:487`), `off_peak_hours [0,1,2,3,4,5]` (`:114` vs `:488`), `peak_mult 1.5` (`:115` vs `:491`), `off_peak_mult 0.3` (`:116` vs `:493`) — NOT the dataclass `0.05`, agents_per_hour min/max `5`/`20` (`:111-112` vs `:483-484`), per-agent `active_hours range(8,23)` = `(8..23)` (`:119` vs `:503`), `activity_level 0.5` (`:137` vs `:504`), `agent_id 0` (`:126` vs `:502`), `minutes_per_round 30` (`:110`). Mirroring the script (not the dataclass) is CORRECT: `_get_active_agents_for_round` IS the ported function; it reads the raw dict with its own fallbacks. In practice the generator always writes the keys so the defaults never fire — but for byte-parity on a key-absent artifact the literals must match the script, and they do.
+
+### reddit "structurally identical" claim — VERIFIED
+`run_reddit_simulation.py:469-521` (`_get_active_agents_for_round`, S-903) diffed against twitter `:462-529`: SAME defaults (`:481-485,488,490,498-500`), SAME formula (`:494` `int(uniform*mult)`), SAME gating (`:502-505`), SAME sample cap (`:508-511`), SAME round→hour (`:627-628`). No divergence. The single port covers both; reddit is not a separate algorithm.
+
+### `[≠]` challenge
+- **`[≠] U028-RNG-SEQUENCE`** (exact selected multiset): SURVIVES the bar. Python is **unseeded** (verified: no `random.seed` in either script) → the exact sequence is non-reproducible **in Python itself**, so there is no stable source sequence to match — genuinely NON-CONTRACTUAL. teri preserves the verifiable STRUCTURE (gating, multiplier, count cap, uniqueness, candidate membership); only the draw order differs. NOT a disguised feature-skip — there is no observable export, format, or branch being dropped. Legal non-contractual-sequence `[≠]`.
+- The seedable `StdRng` itself is `[≠]`-neutral: a strict testability superset (Python had no seed); production path uses `from_entropy` matching Python's run-to-run non-determinism.
+
+### Scope (3a only) — CONFIRMED
+NOT wired into `SimEngine::run`: no `SimConfig.activation` field (`mod.rs:339` is only a forward-looking comment), no run-loop consult (0 refs to the policy in `mod.rs`), no production caller of `active_agents` (only the module's own tests). Integration (`build_run_inputs` + actions.jsonl producer + `/start` 200) correctly deferred to 3b. The id→agent resolution (Py `:520-529`) is correctly deferred to 3b's run loop.
+
+### Test honesty — CONFIRMED non-tautological
+The 9 tests exercise the contract, not the happy path: seed-independent gating (20-seed loops), activity 0.0/1.0 boundaries, target_count cap + no-duplicate, reproducibility under fixed seed, peak-precedence, simulated_hour day-wrap, empty-config. Gate-added adversarial fuzz (500 seeds: selected ⊆ candidates ∧ unique ∧ |selected| ≤ |candidates|), min==max no-panic, and truncation-toward-zero all PASS — none cherry-picked, all reverted.
+
+**VERDICT: PASS.** Symbols verified 1/1 for this cycle (S-876; reddit S-903 confirmed identical, marked when U-029 cycle lands). No downgrade. The one `[≠]` is legal (non-contractual unseeded sequence). Mark S-876 `- [x]`.
