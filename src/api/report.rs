@@ -40,6 +40,7 @@ use serde_json::Value;
 
 use crate::api::simulation::load_entity_reader_graph;
 use crate::api::{ApiError, ApiState};
+use crate::llm::ChatMessage;
 use crate::report::ReportStatus;
 use crate::report::manager::ReportManager;
 use crate::services::zep_tools::ReportTools;
@@ -76,6 +77,8 @@ pub fn report_router(state: Arc<ApiState>) -> Router {
         // seg-0 static "tools" — distinct from the `/:report_id` capture by full path.
         .route("/tools/search", post(tools_search_route))
         .route("/tools/statistics", post(tools_statistics_route))
+        // ── Sub-cycle (e): chat (POST, seg-0 static) ──
+        .route("/chat", post(chat_route))
         .with_state(state)
 }
 
@@ -548,8 +551,159 @@ async fn tools_statistics_route(
     })))
 }
 
-// Sub-cycles (e)–(f) append their routes + handlers in their own commits:
-//   (e) chat; (f) generate+generate/status.
+// ===========================================================================
+// Sub-cycle (e) — chat route  (report.py:472-564)
+//
+// The heaviest non-async-background handler: a full resolution chain ending in a
+// ReACT LLM conversation. `ReportAgent::chat` is a PLAIN `async fn` (NO RefCell held
+// across an await — unlike `generate_report`), so it ports as an ordinary Send axum
+// handler (no OS-thread needed). It borrows `&tools`/`&llm`/`&manager` across its LLM
+// awaits, all shared refs over Sync types → the handler future stays Send.
+//
+// Resolution chain (report.py:518-551):
+//   sim_manager.get_simulation(simulation_id) → None → 404 simulationNotFound{id}
+//   ProjectManager.get_project(state.project_id) → None → 404 projectNotFound{id}
+//   graph_id = state.graph_id or project.graph_id → empty → 400 missingGraphId
+//   simulation_requirement = project.simulation_requirement or ""
+//   ReportAgent::new_react(graph_id, simulation_id, requirement)
+//   agent.chat(&tools, &llm, &manager, message, &history) → ChatResponse::to_dict
+//
+// Flags:
+//   `[≠] U026-ZEPKEY` (inherited via load_entity_reader_graph): empty zep key → 500.
+//   `[!] U027-GRAPHREQ` / `[!] U027-e-LLM-GATED`: the 200 success path drives the LLM
+//      (ReACT loop) over a resolved graph — it runs end-to-end with a live LLM (chat
+//      gracefully handles an empty report via the "（暂无报告）" placeholder, mod:2172).
+//      The chat SUBSTRATE is already U-024 parity-verified with mock adapters; this
+//      handler only WIRES the verified `ReportAgent::chat`. The tests below exercise the
+//      ENTIRE pre-LLM contract surface (both 400s, both 404s, the graph_id fallback both
+//      ways, and the ZEP-guard 500); the LLM round-trip itself is not unit-tested here
+//      (no live/mock HTTP LLM in these route tests — same producer-gating convention as
+//      the (g)/(k) success paths).
+//   `[~] U027-e-CHATROLE-NARROW`: see `parse_chat_history`.
+//   `[≠] U025-TRACEBACK`: 500 body carries a Rust backtrace string.
+// ===========================================================================
+
+/// Parse the optional `chat_history` JSON array into `Vec<ChatMessage>`.
+///
+/// Python appends each `{role, content}` dict to the LLM messages verbatim
+/// (`report_agent.py:1808` `for h in chat_history[-10:]: messages.append(h)`); teri's
+/// `ReportAgent::chat` does the SAME `[-10:]` windowing internally over typed
+/// `ChatMessage`s, so the handler parses the FULL array here and lets `chat` window it.
+///
+/// `[~] U027-e-CHATROLE-NARROW`: Python passes arbitrary role strings straight to the
+/// LLM API; teri's `ChatRole` is a closed enum {system,user,assistant}. We map
+/// "system"/"assistant" to their roles and EVERYTHING ELSE (incl "user", absent,
+/// unknown) to `user`. The frontend only ever sends user/assistant (the documented
+/// contract, report.py:484-485), so the narrowing is non-contractual. A non-array
+/// `chat_history` (never sent) → empty history (Python would iterate a string char-wise;
+/// unreachable under the contract).
+fn parse_chat_history(raw: Option<&Value>) -> Vec<ChatMessage> {
+    let Some(Value::Array(arr)) = raw else {
+        return Vec::new();
+    };
+    arr.iter()
+        .map(|entry| {
+            let role = entry.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            let content = entry.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            match role {
+                "system" => ChatMessage::system(content),
+                "assistant" => ChatMessage::assistant(content),
+                _ => ChatMessage::user(content),
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// POST /chat  (report.py:472-564)
+// ---------------------------------------------------------------------------
+async fn chat_route(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, ApiError> {
+    let data = parse_tools_body(body);
+
+    // Step 1-2: required fields (report.py:502-516) — Python falsy: absent/"" → 400.
+    let simulation_id =
+        data.get("simulation_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if simulation_id.is_empty() {
+        return Err(ApiError::client(
+            StatusCode::BAD_REQUEST,
+            crate::i18n::t("api.requireSimulationId"),
+        ));
+    }
+    let message = data.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if message.is_empty() {
+        return Err(ApiError::client(
+            StatusCode::BAD_REQUEST,
+            crate::i18n::t("api.requireMessage"),
+        ));
+    }
+
+    // Step 3: optional chat_history (report.py:504).
+    let chat_history = parse_chat_history(data.get("chat_history"));
+
+    // Step 4: resolve simulation (report.py:519-526).
+    let sim_state = state.sim_manager.get_simulation(&simulation_id).map_err(ApiError::server)?;
+    let sim_state = match sim_state {
+        None => {
+            return Err(ApiError::client(
+                StatusCode::NOT_FOUND,
+                crate::i18n::t_args("api.simulationNotFound", &[("id", &simulation_id)]),
+            ));
+        }
+        Some(s) => s,
+    };
+
+    // Step 5: resolve project (report.py:528-533).
+    let pm = crate::models::project::ProjectManager::from_config(&state.config);
+    let project = pm.get_project(&sim_state.project_id).map_err(ApiError::server)?;
+    let project = match project {
+        None => {
+            return Err(ApiError::client(
+                StatusCode::NOT_FOUND,
+                crate::i18n::t_args("api.projectNotFound", &[("id", &sim_state.project_id)]),
+            ));
+        }
+        Some(p) => p,
+    };
+
+    // Step 6: graph_id = state.graph_id or project.graph_id (report.py:535-540).
+    // Python `a or b`: state.graph_id (non-empty) wins, else project.graph_id, else 400.
+    let graph_id = if !sim_state.graph_id.is_empty() {
+        sim_state.graph_id.clone()
+    } else {
+        project.graph_id.clone().unwrap_or_default()
+    };
+    if graph_id.is_empty() {
+        return Err(ApiError::client(
+            StatusCode::BAD_REQUEST,
+            crate::i18n::t("api.missingGraphId"),
+        ));
+    }
+
+    // Python `project.simulation_requirement or ""` (report.py:542). None/Some("") → "".
+    let simulation_requirement = project.simulation_requirement.clone().unwrap_or_default();
+
+    // Step 7: build agent + tools + llm + manager, run the ReACT chat (report.py:545-551).
+    // load_entity_reader_graph applies the ZEP guard (inherited [≠] U026-ZEPKEY).
+    let graph = load_entity_reader_graph(&state, &graph_id).await?;
+    let llm = crate::api::build_llm(&state.config);
+    let tools = ReportTools::new(&graph, &llm);
+    let manager = report_manager(&state);
+    let agent =
+        crate::report::ReportAgent::new_react(&graph_id, &simulation_id, &simulation_requirement);
+
+    let result = agent.chat(&tools, &llm, &manager, &message, &chat_history).await;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": Value::Object(result.to_dict())
+    })))
+}
+
+// Sub-cycle (f) appends its routes + handlers in its own commit:
+//   (f) generate + generate/status (async keystone).
 
 #[cfg(test)]
 mod tests {
@@ -1228,6 +1382,183 @@ mod tests {
             post_json(app, "/api/report/tools/statistics", serde_json::json!({"graph_id": "g"}))
                 .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(json["success"], false);
+    }
+
+    // =======================================================================
+    // Sub-cycle (e) — chat route (POST /chat)
+    //
+    // The 200 success path drives a live LLM (ReACT loop) and is not unit-tested
+    // here (`[!] U027-e-LLM-GATED`); these tests cover the ENTIRE pre-LLM contract:
+    // both 400s, both 404s, the graph_id fallback (state vs project), and the ZEP
+    // guard 500 (which fires only AFTER sim+project+graph_id all resolve, so it
+    // doubles as proof the full resolution chain succeeded).
+    // =======================================================================
+
+    /// `parse_chat_history` role mapping — direct unit test (no LLM).
+    #[test]
+    fn chat_history_role_narrowing() {
+        let raw = serde_json::json!([
+            {"role": "user", "content": "u"},
+            {"role": "assistant", "content": "a"},
+            {"role": "system", "content": "s"},
+            {"role": "weird", "content": "w"},   // unknown → user
+            {"content": "no-role"}               // absent → user
+        ]);
+        let msgs = parse_chat_history(Some(&raw));
+        assert_eq!(msgs.len(), 5);
+        use crate::llm::ChatRole;
+        assert!(matches!(msgs[0].role, ChatRole::User));
+        assert!(matches!(msgs[1].role, ChatRole::Assistant));
+        assert!(matches!(msgs[2].role, ChatRole::System));
+        assert!(matches!(msgs[3].role, ChatRole::User), "unknown role → user");
+        assert!(matches!(msgs[4].role, ChatRole::User), "absent role → user");
+        assert_eq!(msgs[3].content, "w");
+    }
+
+    #[test]
+    fn chat_history_absent_or_non_array_is_empty() {
+        assert!(parse_chat_history(None).is_empty());
+        assert!(parse_chat_history(Some(&serde_json::json!("not-an-array"))).is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_missing_simulation_id_400() {
+        let (state, _t) = test_state();
+        let app = crate::server::create_app(state);
+        let (status, json) =
+            post_json(app, "/api/report/chat", serde_json::json!({"message": "hi"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["success"], false);
+    }
+
+    #[tokio::test]
+    async fn chat_missing_message_400() {
+        let (state, _t) = test_state();
+        let app = crate::server::create_app(state);
+        let (status, json) =
+            post_json(app, "/api/report/chat", serde_json::json!({"simulation_id": "sim_x"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["success"], false);
+    }
+
+    #[tokio::test]
+    async fn chat_simulation_not_found_404() {
+        let (state, _t) = test_state();
+        let app = crate::server::create_app(state);
+        let (status, json) = post_json(
+            app,
+            "/api/report/chat",
+            serde_json::json!({"simulation_id": "sim_ghost", "message": "hi"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["success"], false);
+    }
+
+    #[tokio::test]
+    async fn chat_project_not_found_404() {
+        let (state, _t) = test_state();
+        // Sim references a project that does not exist → projectNotFound.
+        let sim = state
+            .sim_manager
+            .create_simulation("ghost_project", "g1", true, true)
+            .expect("create sim");
+        let app = crate::server::create_app(state);
+        let (status, json) = post_json(
+            app,
+            "/api/report/chat",
+            serde_json::json!({"simulation_id": sim.simulation_id, "message": "hi"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["success"], false);
+    }
+
+    #[tokio::test]
+    async fn chat_missing_graph_id_400() {
+        let (state, _t) = test_state();
+        // Project WITHOUT a graph_id; sim WITHOUT a graph_id → 400 missingGraphId.
+        let pm = crate::models::project::ProjectManager::from_config(&state.config);
+        let mut p = pm.create_project("NoGraph").expect("project");
+        p.graph_id = None;
+        pm.save_project(&mut p).expect("save");
+        let sim = state
+            .sim_manager
+            .create_simulation(&p.project_id, "", true, true)
+            .expect("create sim");
+        let app = crate::server::create_app(state);
+        let (status, json) = post_json(
+            app,
+            "/api/report/chat",
+            serde_json::json!({"simulation_id": sim.simulation_id, "message": "hi"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["success"], false);
+    }
+
+    /// graph_id fallback via state.graph_id → resolution succeeds → ZEP guard 500
+    /// (proves the full sim+project+graph_id chain resolved before the graph load).
+    #[tokio::test]
+    async fn chat_resolves_via_state_graph_id_then_zep_guard_500() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let mut config = crate::Config::build_test();
+        config.upload_folder = tmp.path().to_string_lossy().to_string();
+        config.oasis_simulation_data_dir = tmp.path().join("sims").to_string_lossy().to_string();
+        config.zep_api_key = None; // ZEP guard fires after resolution
+        let state = Arc::new(ApiState::new(config));
+
+        let pm = crate::models::project::ProjectManager::from_config(&state.config);
+        let mut p = pm.create_project("WithGraph").expect("project");
+        p.graph_id = Some("proj_graph".to_string());
+        pm.save_project(&mut p).expect("save");
+        // sim carries its OWN graph_id "state_graph" → takes precedence over project's.
+        let sim = state
+            .sim_manager
+            .create_simulation(&p.project_id, "state_graph", true, true)
+            .expect("create sim");
+
+        let app = crate::server::create_app(state);
+        let (status, json) = post_json(
+            app,
+            "/api/report/chat",
+            serde_json::json!({"simulation_id": sim.simulation_id, "message": "hi"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "ZEP guard fires post-resolution");
+        assert_eq!(json["success"], false);
+    }
+
+    /// graph_id fallback via PROJECT graph_id (sim has none) → resolution succeeds →
+    /// ZEP guard 500. Proves the `state.graph_id or project.graph_id` fallback branch.
+    #[tokio::test]
+    async fn chat_resolves_via_project_graph_id_then_zep_guard_500() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let mut config = crate::Config::build_test();
+        config.upload_folder = tmp.path().to_string_lossy().to_string();
+        config.oasis_simulation_data_dir = tmp.path().join("sims").to_string_lossy().to_string();
+        config.zep_api_key = None;
+        let state = Arc::new(ApiState::new(config));
+
+        let pm = crate::models::project::ProjectManager::from_config(&state.config);
+        let mut p = pm.create_project("WithGraph").expect("project");
+        p.graph_id = Some("proj_graph".to_string());
+        pm.save_project(&mut p).expect("save");
+        // sim graph_id EMPTY → falls back to project.graph_id.
+        let sim = state
+            .sim_manager
+            .create_simulation(&p.project_id, "", true, true)
+            .expect("create sim");
+
+        let app = crate::server::create_app(state);
+        let (status, json) = post_json(
+            app,
+            "/api/report/chat",
+            serde_json::json!({"simulation_id": sim.simulation_id, "message": "hi"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "fallback resolves, then ZEP 500");
         assert_eq!(json["success"], false);
     }
 }

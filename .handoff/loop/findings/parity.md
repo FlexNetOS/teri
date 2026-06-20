@@ -3702,3 +3702,44 @@ so report.rs reuses the ONE graph-resolution path / ONE ZEP guard rather than du
 **Conclusion:** Sub-cycle (d) parity-clean. +7 tests (1465→1472 broader / lib 1450→1457). clippy
 --all-targets + --all-features clean. Y-not-regressed. Atomic gate PASS. (U-027 UNIT row stays open —
 sub-cycles e,f remain.)
+
+---
+
+## U-027 sub-cycle (e) — chat route (POST /chat) — PASS
+
+**Gate verdict: PASS (2026-06-19, 26th resume). 2/2 symbols `- [x]` (S-852h chat_route, S-852i parse_chat_history).**
+
+Differential re-verification against `report.py:472-564` + `report_agent.py:1766-1881`.
+Tried to REFUTE on 9 axes; all hold:
+
+1. **Validation + order** — simulation_id 400 (requireSimulationId) BEFORE message 400
+   (requireMessage), both before resolution. Python falsy via unwrap_or("")+is_empty().
+2. **Resolution order + 404s** — sim THEN project; simulationNotFound{id} then
+   projectNotFound{**project_id**} (interpolates the PROJECT id, faithful to report.py:532).
+3. **graph_id fallback** — `state.graph_id or project.graph_id` reproduced by
+   `if !sim.graph_id.is_empty() {sim} else {project.graph_id.unwrap_or_default()}`; both
+   branches + the both-empty 400 missingGraphId tested.
+4. **simulation_requirement** — `.unwrap_or_default()` == Python `or ""` (Some("")/None→"").
+5. **`[~] U027-e-CHATROLE-NARROW`** — Python appends role-dicts verbatim (arbitrary roles);
+   teri narrows to closed ChatRole (system/assistant mapped, else→user). Frontend only sends
+   user/assistant (docstring contract) → non-contractual narrowing, NOT a downgrade. Verifier
+   confirmed NO double-windowing: handler passes the FULL array, `chat` does `[-10:]` internally
+   (mod.rs:2190). LEGITIMATE `[~]`.
+6. **Success envelope** — `{success:true, data: result.to_dict()}`; BOTH Python return paths
+   (report_agent.py:1841 early + 1877 post-loop) emit exactly {response,tool_calls,sources} —
+   matches ChatResponse::to_dict 3-key set + order.
+7. **`[≠] U026-ZEPKEY`** — empty zep key → 500, fires only AFTER full resolution. The two
+   ZEP-500 tests double as full-resolution proof. LEGITIMATE inherited.
+8. **Send-safety / no OS-thread** — `ReportAgent::chat` is a PLAIN async fn (NO RefCell across
+   await, unlike generate_report); graph owned after the only await, &tools/&llm/&manager are
+   shared refs over Sync types → future Send. Compiled as `post(chat_route)` (axum rejects
+   non-Send). The (f) keystone — NOT (e) — needs the OS-thread.
+9. **`[!] U027-e-LLM-GATED`** — the 200 path drives a live LLM; ALL pre-LLM paths are tested
+   (2×400, 2×404, graph_id fallback both branches, ZEP-500); success wiring correct by
+   inspection (new_react/chat arg order, to_dict). The chat substrate is already U-024
+   parity-verified with mock adapters. No coverage hole — same producer-gating convention as
+   the (g)/(k) success paths.
+
+**Conclusion:** Sub-cycle (e) parity-clean. +9 tests (1472→1481). clippy --all-targets +
+--all-features clean. Y-not-regressed. Atomic gate PASS. (U-027 UNIT row stays open — only the
+(f) async-generate keystone remains; after (f), create_app S-024 flips [x].)
