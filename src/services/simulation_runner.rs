@@ -2891,6 +2891,31 @@ mod lifecycle_tests {
         RunInputs { engine, pool, graph: KnowledgeGraph::new(), llm: Arc::new(MockLlm) }
     }
 
+    /// Like [`run_inputs_with_producer`] but with a DUAL-logger (twitter + reddit) producer (U-030
+    /// cycle B), writing BOTH `{sim_dir}/twitter/actions.jsonl` and `{sim_dir}/reddit/actions.jsonl`.
+    /// The monitor's dual-platform gate (S-615) requires BOTH to hit `simulation_end` before the run
+    /// is marked COMPLETED. The boundary records (simulation_start/round_start/round_end/
+    /// simulation_end) fan out to both loggers, so both files are created and terminate even if the
+    /// pool produces no social actions.
+    fn run_inputs_with_parallel_producer(max_ticks: u32, sim_dir: &Path) -> RunInputs<MockLlm> {
+        let pool = AgentPool::new();
+        let config = serde_json::json!({
+            "time_config": { "total_simulation_hours": 1, "minutes_per_round": 30 }
+        });
+        let mut engine = SimEngine::new(SimConfig::new(max_ticks, 1));
+        let twitter = Arc::new(
+            crate::sim::action_logger::PlatformActionLogger::new("twitter", sim_dir).unwrap(),
+        );
+        let reddit = Arc::new(
+            crate::sim::action_logger::PlatformActionLogger::new("reddit", sim_dir).unwrap(),
+        );
+        engine.with_producer(crate::sim::RunProducer {
+            loggers: crate::sim::PlatformLoggerSet::parallel(twitter, reddit),
+            config,
+        });
+        RunInputs { engine, pool, graph: KnowledgeGraph::new(), llm: Arc::new(MockLlm) }
+    }
+
     // -----------------------------------------------------------------------
     // start_simulation
     // -----------------------------------------------------------------------
@@ -2945,6 +2970,49 @@ mod lifecycle_tests {
         let log = sim_dir.join("twitter").join("actions.jsonl");
         let content = std::fs::read_to_string(&log).expect("actions.jsonl written by the producer");
         assert!(content.contains("simulation_end"), "actions.jsonl must contain simulation_end");
+    }
+
+    /// U-030 cycle B end-to-end: a PARALLEL run with a dual-logger producer writes BOTH
+    /// `twitter/actions.jsonl` and `reddit/actions.jsonl`, each terminating on `simulation_end`, and
+    /// the monitor's dual-platform completion gate (S-615) requires BOTH before transitioning the run
+    /// to COMPLETED. This is the gap-closure proof that parallel now reaches COMPLETED.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parallel_producer_run_reaches_completed() {
+        let (runner, dir, _mgr) = make_runner("parallel_completed");
+        write_config(&dir, "sim-par", 1, 30); // 2 rounds
+        let sim_dir = dir.join("sim-par");
+        let inputs = run_inputs_with_parallel_producer(2, &sim_dir);
+        let _ = runner
+            .start_simulation("sim-par", "parallel", None, false, None, inputs, None)
+            .await
+            .expect("start should succeed");
+
+        // Poll bounded (~5s) for COMPLETED — only fires once BOTH platforms' simulation_end are seen.
+        let mut completed = false;
+        for _ in 0..50 {
+            if let Some(rs) = runner.get_run_state("sim-par").await.unwrap()
+                && rs.runner_status == RunnerStatus::Completed
+            {
+                completed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            completed,
+            "parallel run must reach COMPLETED only after BOTH platforms' simulation_end (dual-gate)"
+        );
+
+        // BOTH platform files exist and each terminates on simulation_end.
+        for platform in ["twitter", "reddit"] {
+            let log = sim_dir.join(platform).join("actions.jsonl");
+            let content = std::fs::read_to_string(&log)
+                .unwrap_or_else(|_| panic!("{platform}/actions.jsonl must be written"));
+            assert!(
+                content.contains("simulation_end"),
+                "{platform}/actions.jsonl must contain simulation_end"
+            );
+        }
     }
 
     #[tokio::test]

@@ -4119,3 +4119,37 @@ The 200 test asserts the conditional-field truthiness exactly (memory off ⟹ NO
 (4) **route-miss fail-closed**, not silent-drop — unreachable under the pool/logger-set invariant; single-platform no regression vs U-028's unconditional log; only prevents the parallel misroute.
 
 **Test:** +1 `run_parallel_routes_actions_to_platform_loggers` (2 twitter + 1 reddit, 2 rounds → twitter file len 10 / reddit len 8, routed agent_ids, per-platform round_end `[2,2]`/`[1,1]`, sim_end totals 4/2, platform-stamped sim_start). 1509→1510 lib pass. clippy `--all-targets` + `--all-features` clean. Y-not-regressed (develop=7c354a5). No downgrade.
+
+---
+
+## U-030 cycle B — `build_run_inputs` parallel dual-logger + `/start` honest-500→200 swap — PARITY PASS (2026-06-20, opus)
+
+**Verdict: PASS.** Parallel `/start` is faithfully wired (real 200, not fabricated); the 200 envelope matches Python's platform-agnostic shape; the monitor's dual-gate genuinely requires BOTH platforms; no orphaned honest-500 reference, no misroute. **S-820 flips `- [x]`.**
+
+**Scope:** UNCOMMITTED worktree `port/mirofish` on top of cycle A `8f1df6e`. `git diff` = cycle B only (162 lines `api/simulation.rs`, 68 lines `services/simulation_runner.rs`).
+
+### Claim 1 — `build_run_inputs` parallel branch (PASS)
+- (a) **Single-platform path BYTE-IDENTICAL** to cycle A: `PlatformLoggerSet::single(platform_enum, make_logger(platform)?)` over the same sim_dir; the only change is the logger ctor extracted into a `make_logger` closure (`api/simulation.rs:2136-2152`). Same enum keying (`reddit→Reddit` else `Twitter`).
+- (b) **Parallel path** builds TWO loggers over the SAME sim_dir (`make_logger("twitter")?` + `make_logger("reddit")?`) → `PlatformLoggerSet::parallel(...)`; pool = `load_agent_pool(&sim_dir,"parallel")` which unions twitter CSV (`Platform::Twitter`) + reddit JSON (`Platform::Reddit`) (`oasis_profile_export.rs:462-465`), each agent carrying its own `social.platform`. Routing at `sim/mod.rs:980-981` (`producer.loggers.get(s.platform)`) sends each action to its platform file; route-miss = fail-closed no-op (unreachable under the §3 invariant).
+- (c) **Activation policy UNCHANGED**: `engine.with_activation(TimeActivationPolicy::from_config(&config,None))` at `api/simulation.rs:2133` (pre-existing line, untouched); gates the unioned pool by `social.user_id` (`sim/mod.rs:882-897`).
+
+### Claim 2 — honest-500 GONE, real 200 (PASS, no fabrication)
+- The `if platform=="parallel" { return Err(ApiError::server(...)) }` block at `/start` is DELETED. `grep` for `U028-PARALLEL-DUALSINK` / `dual-sink simulation not yet` / `reaches_gap` over `src/` → ZERO hits (only an unrelated `c3b-iii` comment in `agent/mod.rs:2440` about persona recovery). Doc-comments on `build_run_inputs` (2181-2186) + `start_simulation` updated; the old in-handler gap comment replaced by the all-platforms-closed comment.
+- The 200 is a REAL run: `start_simulation` calls `build_run_inputs` → `state.sim_runner.start_simulation(...inputs...)` (spawns run + monitor) → builds response from the spawned `run_state.to_dict()` + conditionals (`api/simulation.rs:2348-2365`). Envelope is **platform-agnostic and identical to Python :1616-1627** (`run_state.to_dict()` + `max_rounds_applied` only-when-truthy + `graph_memory_update_enabled`/`force_restarted` always + `graph_id` only-when-memory). Parallel produces NO different shape from twitter/reddit (same proven path U-028 c3b-ii verified).
+- `start_simulation_parallel_prepared_returns_200`: seeds READY state + config (1h/30min) + BOTH `twitter_profiles.csv` AND `reddit_profiles.json`, posts `platform:"parallel"`, asserts 200 + `success:true`, no traceback, simulation_id, `total_rounds==2`, `graph_memory_update_enabled:false`, `force_restarted:false`, no `max_rounds_applied`, no `graph_id`. Shape matches Python. PASS.
+
+### Claim 3 — e2e dual-gate fires (PASS, gap-closure proof)
+- (a) **Genuinely requires BOTH.** `apply_log_record` simulation_end branch (`simulation_runner.rs:1881-1906`) sets `twitter_completed`/`reddit_completed` STRICTLY keyed by the file's platform; monitor reads twitter file as "twitter" / reddit as "reddit" (`1711`/`1715`). `check_all_platforms_completed` (`2014-2033`, faithful port of Python L709-718): if both files exist, `reddit_enabled && !reddit_completed → false`. A one-file completion CANNOT set both flags. Load-bearing & non-vacuous — directly proven by `check_completed_dual_requires_both` ("one platform done must NOT complete") + `simulation_end_dual_one_platform_not_completed`.
+- (b) **Empty-pool completion is legitimate.** All boundary records fan out over `producer.loggers.iter()` independent of pool/actions: `simulation_start` (`sim/mod.rs:851`), `round_start` (`908`), `round_end` (`1007`), `simulation_end` (`1037-1042`). With an empty pool both twitter + reddit files still get the full `simulation_start→round_start/round_end×2→simulation_end` stream → both `*_completed` → gate fires. Matches Python's coroutines (cite `run_parallel_simulation.py:1244-1245`/1284) which emit the full boundary stream regardless of actions. `parallel_producer_run_reaches_completed` polls COMPLETED (only after both sim_end) and asserts both files contain `simulation_end`. PASS.
+
+### Python differential
+- `run_parallel_simulation.py:1583-1589` else-branch = `asyncio.gather(run_twitter_simulation(...,twitter_logger,...), run_reddit_simulation(...,reddit_logger,...))` — both platforms concurrent, each own logger over same simulation_dir. Rust models the OBSERVABLE output (both platform files, full boundary streams, per-platform routing) via one unified engine over a unioned pool. Output parity holds; structural mechanism (unified engine vs 2 coroutines) is a faithful `[≠]`-class idiom already accepted in cycle A.
+- `simulation.py:1604-1627` `/start` response = `run_state.to_dict()` + conditionals — platform-agnostic; Rust matches key-for-key.
+
+### Tests
+`cargo test -p teri --lib` → **1511 passed** (expected). `parallel` filter → 5 passed (incl. both new tests). `prepared_returns_200` → 2 passed (parallel + twitter). Old `start_simulation_prepared_reaches_gap_500` cleanly removed.
+
+### S-820 decision — FLIP `- [x]`
+S-820's `[~]` reason was exactly ONE residual: `[!] U028-PARALLEL-DUALSINK` (parallel honest-500), per the row's own "flips `[x]` when U-030 lands parallel." Cycle B closes it. The eager-vs-lazy `[≠]` seam is a recorded non-contractual substrate boundary, unreachable past the READY gate (survives the `[≠]` bar — genuinely inexpressible eager/lazy timing, already accepted). The round-0 `initial_posts` item lives on **S-877** (U-028 `TwitterSimulationRunner.run`) and concerns actions.jsonl STREAM CONTENT during an LLM run — ORTHOGONAL to `/start`'s response/run-spawn contract; it does NOT gate S-820. Full S-820 contract (validation + state-machine + check_prepared + cleanup + graph_id + RunInputs-builder-for-ALL-platforms + real-200 + ValueError→400) now holds → **`- [x]`**.
+
+**Symbols verified this cycle: S-820 (1/1 for the unit's `/start` contract).** No downgrade. Y-not-regressed (no merge in scope; this is a port-only cycle in `port/mirofish`).

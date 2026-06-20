@@ -2081,10 +2081,11 @@ async fn stop_simulation(
 ///   the `Arc<Mutex<_>>` the graph-memory updater writes into (U-021).
 /// - `llm` = [`build_llm`](crate::api::build_llm).
 ///
-/// **`platform="parallel"` is NOT handled here** — `[!] U028-PARALLEL-DUALSINK` (deferred to U-030
-/// / c3b-iii): a parallel run needs the per-agent dual-sink (`twitter/` + `reddit/` actions.jsonl)
-/// and the monitor's dual-platform completion gate, which require the multi-logger producer. The
-/// caller rejects `parallel` before calling this. Single-platform `twitter`/`reddit` are fully wired.
+/// **`platform="parallel"` (U-030 cycle B):** attaches a DUAL-logger producer
+/// ([`PlatformLoggerSet::parallel`]) over the unioned twitter+reddit pool, so the unified
+/// `SimEngine::run` fans boundary records to both loggers and routes each action to its platform
+/// file — emitting `twitter/` AND `reddit/actions.jsonl` and satisfying the monitor's dual-platform
+/// completion gate (S-615). Single-platform `twitter`/`reddit` attach a one-entry set (U-028 c3b-ii).
 ///
 /// **Eager-vs-lazy seam (`[≠]` inherited from U-022 `RunInputs`):** Python's `/start` returns the
 /// running state immediately and the *subprocess* later reads profiles/config; teri assembles the
@@ -2130,19 +2131,26 @@ async fn build_run_inputs(
     // parallelism defaults to teri's convention (8); OASIS used a semaphore of 30 (architect §2).
     let mut engine = SimEngine::new(SimConfig::from_simulation_config(&config, max_rounds, 8));
     engine.with_activation(Arc::new(TimeActivationPolicy::from_config(&config, None)));
-    // Single-platform producer: one logger keyed by this run's platform. "parallel" is rejected by
-    // the caller before reaching here (the honest-500 at the /start handler — U-028); the
-    // dual-logger parallel path lands in U-030 cycle B. Map the &str platform to the enum for
-    // routing; "twitter"/"reddit" are the only single-platform values.
-    let platform_enum = if platform == "reddit" { Platform::Reddit } else { Platform::Twitter };
-    let logger = Arc::new(
-        PlatformActionLogger::new(platform, &sim_dir)
-            .map_err(|e| ApiError::server(format!("action logger init failed: {e}")))?,
-    );
-    engine.with_producer(RunProducer {
-        loggers: PlatformLoggerSet::single(platform_enum, logger),
-        config: config.clone(),
-    });
+    // The actions.jsonl producer (U-028 c3b-i / U-030). `make_logger` builds a per-platform
+    // `PlatformActionLogger` writing `{sim_dir}/{platform}/actions.jsonl`.
+    let make_logger = |p: &str| -> Result<Arc<PlatformActionLogger>, ApiError> {
+        Ok(Arc::new(
+            PlatformActionLogger::new(p, &sim_dir)
+                .map_err(|e| ApiError::server(format!("action logger init failed: {e}")))?,
+        ))
+    };
+    // - "parallel" (U-030 cycle B): a DUAL-logger set (twitter + reddit). The unioned pool's agents
+    //   carry their own `social.platform`, so `SimEngine::run` fans boundary records to both loggers
+    //   and routes each action to its platform file — emitting twitter/ AND reddit/actions.jsonl, so
+    //   the monitor's dual-platform completion gate (S-615) can fire.
+    // - "twitter"/"reddit" (U-028 c3b-ii): a single-platform logger set — byte-identical to before.
+    let loggers = if platform == "parallel" {
+        PlatformLoggerSet::parallel(make_logger("twitter")?, make_logger("reddit")?)
+    } else {
+        let platform_enum = if platform == "reddit" { Platform::Reddit } else { Platform::Twitter };
+        PlatformLoggerSet::single(platform_enum, make_logger(platform)?)
+    };
+    engine.with_producer(RunProducer { loggers, config: config.clone() });
 
     // pool: profile files → AgentPool (c2).
     let pool = crate::services::oasis_profile_export::load_agent_pool(&sim_dir, platform)
@@ -2173,8 +2181,9 @@ async fn build_run_inputs(
 /// Port of MiroFish `start_simulation` (simulation.py:1451-1641).
 ///
 /// Full boundary port. The `RunInputs` construction gap (GAP-U026-RUNINPUTS-BUILDER) is CLOSED for
-/// single-platform `twitter`/`reddit` via [`build_run_inputs`]; `parallel` remains honestly gapped
-/// (`[!] U028-PARALLEL-DUALSINK`, U-030 / c3b-iii).
+/// ALL platforms via [`build_run_inputs`]: single-platform `twitter`/`reddit` (U-028 c3b-ii) and
+/// `parallel` dual-sink (U-030 cycle B — dual-logger producer over the unioned pool, monitor
+/// dual-platform gate S-615).
 async fn start_simulation(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<Value>>,
@@ -2298,22 +2307,13 @@ async fn start_simulation(
 
     // Step 8 (Python :1604-1627): build RunInputs + start the run + assemble the 200.
     //
-    // GAP-U026-RUNINPUTS-BUILDER CLOSED for single-platform twitter/reddit (U-028 c3b-ii): the
-    // engine (config→ticks + activation + actions.jsonl producer), pool (profile reader), graph,
-    // and llm are all assembled by `build_run_inputs`; the landed monitor tails the producer's
-    // `actions.jsonl` → `simulation_end` → COMPLETED.
-    //
-    // `[!] U028-PARALLEL-DUALSINK` (the default platform — deferred to U-030 / c3b-iii): a parallel
-    // run needs the per-agent dual-sink (twitter/ + reddit/ actions.jsonl) and the monitor's
-    // dual-platform gate, which require the multi-logger producer. Until then `parallel` is an
-    // HONEST gap (no fabrication, no single-sink misroute) — narrowed from the old all-platform 500.
-    if platform == "parallel" {
-        return Err(ApiError::server(format!(
-            "parallel dual-sink simulation not yet wired for '{id}' \
-             (U-030 / U-028 c3b-iii — single-platform twitter/reddit are supported)"
-        )));
-    }
-
+    // GAP-U026-RUNINPUTS-BUILDER CLOSED for ALL platforms: single-platform twitter/reddit (U-028
+    // c3b-ii) and parallel dual-sink (U-030 cycle B). `build_run_inputs` assembles the engine
+    // (config→ticks + activation + per-platform actions.jsonl producer), pool (profile reader),
+    // graph, and llm; for "parallel" it attaches a dual-logger producer over the unioned pool so the
+    // unified run emits twitter/ AND reddit/actions.jsonl. The landed monitor tails the producer's
+    // `actions.jsonl` per platform → `simulation_end` → (for parallel, BOTH platforms via the
+    // dual-platform gate S-615) → COMPLETED.
     let (inputs, graph_for_updater) = build_run_inputs(
         &state,
         id,
@@ -7446,16 +7446,16 @@ mod tests {
         assert!(json.get("traceback").is_none(), "400 must not have traceback");
     }
 
-    /// POST /start — fully prepared `parallel` request reaches the dual-sink gap → 500.
+    /// POST /start — a fully prepared **parallel** sim (config + BOTH profile files) → **200**.
     ///
-    /// The default platform is `parallel`, which is honestly gapped (`[!] U028-PARALLEL-DUALSINK`,
-    /// U-030 / c3b-iii). This proves the entire boundary (validation + state-machine + status=Ready)
-    /// runs before the honest error, and that the handler emits the structured parallel-gap 500
-    /// (not a fabricated 200, not a single-sink misroute). The single-platform success path is
-    /// covered by `start_simulation_twitter_prepared_returns_200`.
-    #[tokio::test]
-    async fn start_simulation_prepared_reaches_gap_500() {
-        // Seed a sim with status=ready (passes state-machine without triggering the branch)
+    /// The gap-closure proof for U-030 cycle B: `platform="parallel"` (the default) is no longer an
+    /// honest-500. `build_run_inputs` attaches a DUAL-logger producer over the unioned twitter+reddit
+    /// pool; `start_simulation` spawns the run + monitor and returns 200 with the Python response
+    /// shape. (The runner-level e2e — both `twitter/`+`reddit/actions.jsonl` written → monitor
+    /// dual-gate S-615 → COMPLETED — is proven by `parallel_producer_run_reaches_completed` in
+    /// `services::simulation_runner`.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn start_simulation_parallel_prepared_returns_200() {
         let (state, _tmp) = test_state();
         let (project_id, _) = seed_project_with_graph(&state);
         let sim = state
@@ -7464,27 +7464,52 @@ mod tests {
             .expect("create sim");
         let sim_id = sim.simulation_id.clone();
 
-        // Patch the sim to status=Ready in the manager cache + state.json
+        // Prepare on disk: READY state + config + BOTH profile files (load_agent_pool("parallel")
+        // requires twitter_profiles.csv AND reddit_profiles.json).
         let sim_dir =
             std::path::PathBuf::from(&state.config.oasis_simulation_data_dir).join(&sim_id);
         std::fs::create_dir_all(&sim_dir).unwrap();
-        let state_json = serde_json::json!({
-            "status": "ready",
-            "config_generated": true,
-            "entities_count": 0,
-            "entity_types": [],
-            "created_at": "2025-01-01T00:00:00",
-            "updated_at": "2025-01-01T00:00:00"
-        });
         std::fs::write(
             sim_dir.join("state.json"),
-            serde_json::to_string_pretty(&state_json).unwrap(),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "ready",
+                "config_generated": true,
+                "entities_count": 0,
+                "entity_types": [],
+                "created_at": "2025-01-01T00:00:00",
+                "updated_at": "2025-01-01T00:00:00"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            sim_dir.join("simulation_config.json"),
+            serde_json::to_string(&serde_json::json!({
+                "time_config": { "total_simulation_hours": 1, "minutes_per_round": 30 }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            sim_dir.join("twitter_profiles.csv"),
+            "user_id,name,username,user_char,description\n0,Alice,alice,curious,a bio\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sim_dir.join("reddit_profiles.json"),
+            serde_json::to_string(&serde_json::json!([{
+                "user_id": 1, "username": "bob", "name": "Bob", "bio": "b bio",
+                "persona": "grumpy", "karma": 1000, "created_at": "2025-01-01"
+            }]))
+            .unwrap(),
         )
         .unwrap();
         state.sim_manager.evict_cache_for_test(&sim_id);
 
         let app = crate::server::create_app(state);
-        let body = serde_json::json!({"simulation_id": sim_id}).to_string();
+        // Default platform is "parallel"; pass it explicitly for clarity.
+        let body =
+            serde_json::json!({ "simulation_id": sim_id, "platform": "parallel" }).to_string();
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
@@ -7497,24 +7522,19 @@ mod tests {
             .await
             .unwrap();
 
-        // Default platform=parallel → the dual-sink honest gap (500). NOT a fabricated 200.
-        assert_eq!(
-            resp.status(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "prepared parallel sim must reach the dual-sink gap and return 500"
-        );
+        // Parallel is now wired → 200 (NOT the old honest-500).
+        assert_eq!(resp.status(), StatusCode::OK, "prepared parallel sim must start → 200");
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["success"], false, "gap 500 must have success=false");
-
-        let error = json["error"].as_str().unwrap_or("");
-        assert!(
-            error.contains("parallel dual-sink") && error.contains("U-030"),
-            "error must describe the parallel dual-sink gap: {error}"
-        );
-
-        // Must have traceback (server 500 shape)
-        assert!(json.get("traceback").is_some(), "server 500 must have traceback key");
+        assert_eq!(json["success"], true);
+        assert!(json.get("traceback").is_none(), "200 must not carry a traceback");
+        let data = &json["data"];
+        assert_eq!(data["simulation_id"], sim_id);
+        assert_eq!(data["total_rounds"], 2, "1h/30min → 2 rounds");
+        assert_eq!(data["graph_memory_update_enabled"], false);
+        assert_eq!(data["force_restarted"], false);
+        assert!(data.get("max_rounds_applied").is_none());
+        assert!(data.get("graph_id").is_none());
     }
 
     /// POST /start — a fully prepared **twitter** sim (config + profiles on disk) → **200**.
