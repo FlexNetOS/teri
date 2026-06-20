@@ -197,6 +197,8 @@ pub fn create_app(state: std::sync::Arc<ApiState>) -> Router {
         .nest("/graph", crate::api::graph::graph_router(state.clone()))
         // U-026 (a): simulation blueprint — skeleton nested here; routes land in sub-cycles b–m.
         .nest("/simulation", crate::api::simulation::simulation_router(state.clone()))
+        // U-027 (a): report blueprint — report.py /api/report routes.
+        .nest("/report", crate::api::report::report_router(state.clone()))
         // CORS scoped to /api/* (applied to api_router, not the top-level app)
         .layer(cors);
 
