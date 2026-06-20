@@ -995,29 +995,12 @@
 - [x] S-845 · `unit:U-027` · `route` · `GET /:report_id/progress` · get_report_progress · `report.py:569` · **(a) parity PASS**: get_progress None→404 reportProgressNotAvail / Some→200 {success,data:raw-Map}. `src/api/report.rs::get_progress_route`.
 - [x] S-846 · `unit:U-027` · `route` · `GET /check/:sim` · check_report_status · `report.py:707` · **(a) parity PASS**: ALWAYS 200; 5-key data {simulation_id,has_report,report_status(lowercase value|null),report_id(|null),interview_unlocked=has_report&&Completed}; key order preserved. Generating→has_report:true but interview_unlocked:false. `src/api/report.rs::check_report_status_route`.
 - [x] S-847 · `unit:U-027` · `fn` · `report_router` + nest wiring · report_bp blueprint · `report.py` · **(a) parity PASS**: report_router(Arc<ApiState>)→Router factory (GROWS per sub-cycle, incremental like simulation_router); pub mod report in api/mod.rs; .nest("/report", report_router(state)) in server.rs (CORS-scoped /api/*). VERIFIER: ROUTE-ORDER /list≠/:report_id, seg-0 statics by-simulation/check no collision, GET+DELETE share /:report_id, reachable at /api/report/*. +14 tests (1436→1450). `src/api/report.rs::report_router`.
+- [x] S-848 · `unit:U-027` · `route` · `GET /:report_id/agent-log` · get_agent_log · `report.py:758` · **(b) parity PASS (2026-06-19)**: ?from_line type=int default 0 (usize-parse) → get_agent_log(id,from_line) → {success,data:Map{logs,total_lines,from_line,has_more}} key-for-key passthrough. `src/api/report.rs::get_agent_log_route`.
+- [x] S-849 · `unit:U-027` · `route` · `GET /:report_id/agent-log/stream` · stream_agent_log · `report.py:817` · **(b) parity PASS**: get_agent_log_stream(id) → {success,data:{logs,count}} ONE-SHOT JSON. VERIFIER REFUTED SSE concern: source report.py:817-848 is bare jsonify (0 text/event-stream/stream_with_context/Response()), JSON port FAITHFUL not downgrade-from-SSE. `src/api/report.rs::get_agent_log_stream_route`.
+- [x] S-850 · `unit:U-027` · `route` · `GET /:report_id/console-log` · get_console_log · `report.py:853` · **(b) parity PASS**: ?from_line → get_console_log(id,from_line) → {success,data:Map} same shape as S-848. `src/api/report.rs::get_console_log_route`.
+- [x] S-851 · `unit:U-027` · `route` · `GET /:report_id/console-log/stream` · stream_console_log · `report.py:899` · **(b) parity PASS**: get_console_log_stream(id) → {success,data:{logs,count}} one-shot JSON, source not SSE. `[~] U027-SSE-SEAM-DORMANT` (no source live-SSE route → U-024 sink.rs SseSink seam stays reserved, no dropped behavior). +7 tests (1450→1457). `src/api/report.rs::get_console_log_stream_route`.
 
----
-
-## U-027 — `backend/app/api/report.py` (Blueprint: `/api/report`)
-
-- [ ] S-835 · `unit:U-027` · `route` · `POST /generate` · generate_report async; pre-generates report_id · `report.py:26`
-- [ ] S-836 · `unit:U-027` · `route` · `POST /generate/status` · get_generate_status · `report.py:204`
-- [ ] S-837 · `unit:U-027` · `route` · `GET /<report_id>` · get_report · `report.py:278`
-- [ ] S-838 · `unit:U-027` · `route` · `GET /by-simulation/<simulation_id>` · get_report_by_simulation · `report.py:320`
-- [ ] S-839 · `unit:U-027` · `route` · `GET /list` · list_reports · `report.py:359`
-- [ ] S-840 · `unit:U-027` · `route` · `GET /<report_id>/download` · download_report · `report.py:399`
-- [ ] S-841 · `unit:U-027` · `route` · `DELETE /<report_id>` · delete_report · `report.py:445`
-- [ ] S-842 · `unit:U-027` · `route` · `POST /chat` · chat_with_report_agent · `report.py:473`
-- [ ] S-843 · `unit:U-027` · `route` · `GET /<report_id>/progress` · get_report_progress · `report.py:570`
-- [ ] S-844 · `unit:U-027` · `route` · `GET /<report_id>/sections` · get_report_sections · `report.py:611`
-- [ ] S-845 · `unit:U-027` · `route` · `GET /<report_id>/section/<int:section_index>` · get_single_section · `report.py:662`
-- [ ] S-846 · `unit:U-027` · `route` · `GET /check/<simulation_id>` · check_report_status · `report.py:708`
-- [ ] S-847 · `unit:U-027` · `route` · `GET /<report_id>/agent-log` · get_agent_log; from_line incremental · `report.py:759`
-- [ ] S-848 · `unit:U-027` · `route` · `GET /<report_id>/agent-log/stream` · stream_agent_log · `report.py:818`
-- [ ] S-849 · `unit:U-027` · `route` · `GET /<report_id>/console-log` · get_console_log; from_line incremental · `report.py:854`
-- [ ] S-850 · `unit:U-027` · `route` · `GET /<report_id>/console-log/stream` · stream_console_log · `report.py:900`
-- [ ] S-851 · `unit:U-027` · `route` · `POST /tools/search` · search_graph_tool · `report.py:936`
-- [ ] S-852 · `unit:U-027` · `route` · `POST /tools/statistics` · get_graph_statistics_tool · `report.py:984`
+> `[!] U027-LEDGER-DRIFT` RESOLVED: the stale DISCOVER U-027 placeholder block (S-835–852, numbers colliding with U-026 prepare S-835-840 + U-027(a) S-841-847) was removed; the authoritative per-symbol U-027 entries are the live S-841… entries above. Remaining unported U-027 routes (generate/generate-status/chat/sections/section/download/tools×2) are tracked in merge-ledger U-027 row + findings/u027-architecture.md §1.
 
 ---
 

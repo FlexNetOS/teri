@@ -57,6 +57,12 @@ pub fn report_router(state: Arc<ApiState>) -> Router {
         // capture root: /:report_id GET + DELETE (same path, two methods).
         .route("/:report_id", get(get_report_route).delete(delete_report_route))
         .route("/:report_id/progress", get(get_progress_route))
+        // ── Sub-cycle (b): log-read routes (one-shot JSON, NOT SSE — source IS JSON) ──
+        // 2-seg /agent-log vs 3-seg /agent-log/stream: distinct static tails, full-path match.
+        .route("/:report_id/agent-log", get(get_agent_log_route))
+        .route("/:report_id/agent-log/stream", get(get_agent_log_stream_route))
+        .route("/:report_id/console-log", get(get_console_log_route))
+        .route("/:report_id/console-log/stream", get(get_console_log_stream_route))
         .with_state(state)
 }
 
@@ -223,9 +229,87 @@ async fn check_report_status_route(
     })))
 }
 
-// Sub-cycles (b)–(f) append their routes + handlers in their own commits:
-//   (b) agent-log/console-log[/stream]; (c) download/sections/section/:idx;
-//   (d) tools/search+statistics; (e) chat; (f) generate+generate/status.
+// ===========================================================================
+// Sub-cycle (b) — log read routes
+//
+// Decision (ii) (findings/u027-architecture.md §3.ii): the `/stream` routes are
+// NOT SSE — the source (report.py:817-852, 899-934) returns a one-shot JSON
+// `{logs, count}` full-dump. The "stream" name means "get the whole stream at
+// once"; incremental tailing is the `from_line` param on the NON-`/stream` routes.
+// So all four port as ordinary JSON handlers. `[~] U027-SSE-SEAM-DORMANT`: the
+// U-024 sink.rs SseSink seam stays reserved (no source route maps to live SSE).
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// GET /:report_id/agent-log  (report.py:758-814)
+//   ?from_line (type=int default 0) → get_agent_log(id, from_line) → {success, data:map}
+//   where map = {logs, total_lines, from_line, has_more}.
+// ---------------------------------------------------------------------------
+async fn get_agent_log_route(
+    State(state): State<Arc<ApiState>>,
+    Path(report_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    let from_line = params.get("from_line").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+    let log_data = report_manager(&state).get_agent_log(&report_id, from_line);
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": Value::Object(log_data)
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// GET /:report_id/agent-log/stream  (report.py:817-848)
+//   get_agent_log_stream(id) → {success, data:{logs, count}}  (one-shot full dump)
+// ---------------------------------------------------------------------------
+async fn get_agent_log_stream_route(
+    State(state): State<Arc<ApiState>>,
+    Path(report_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let logs = report_manager(&state).get_agent_log_stream(&report_id);
+    let count = logs.len();
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": { "logs": logs, "count": count }
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// GET /:report_id/console-log  (report.py:853-896)
+//   ?from_line → get_console_log(id, from_line) → {success, data:map}
+// ---------------------------------------------------------------------------
+async fn get_console_log_route(
+    State(state): State<Arc<ApiState>>,
+    Path(report_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    let from_line = params.get("from_line").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+    let log_data = report_manager(&state).get_console_log(&report_id, from_line);
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": Value::Object(log_data)
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// GET /:report_id/console-log/stream  (report.py:899-930)
+//   get_console_log_stream(id) → {success, data:{logs, count}}
+// ---------------------------------------------------------------------------
+async fn get_console_log_stream_route(
+    State(state): State<Arc<ApiState>>,
+    Path(report_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let logs = report_manager(&state).get_console_log_stream(&report_id);
+    let count = logs.len();
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": { "logs": logs, "count": count }
+    })))
+}
+
+// Sub-cycles (c)–(f) append their routes + handlers in their own commits:
+//   (c) download/sections/section/:idx; (d) tools/search+statistics;
+//   (e) chat; (f) generate+generate/status.
 
 #[cfg(test)]
 mod tests {
@@ -457,5 +541,137 @@ mod tests {
         assert_eq!(d["has_report"], true);
         assert_eq!(d["report_status"], "generating");
         assert_eq!(d["interview_unlocked"], false, "non-completed must NOT unlock interview");
+    }
+
+    // =======================================================================
+    // Sub-cycle (b) — log read routes
+    // =======================================================================
+
+    fn seed_agent_log(state: &Arc<ApiState>, report_id: &str, lines: &[serde_json::Value]) {
+        let folder = report_manager(state).ensure_report_folder(report_id).expect("folder");
+        let body: String =
+            lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n") + "\n";
+        std::fs::write(folder.join("agent_log.jsonl"), body).unwrap();
+    }
+
+    fn seed_console_log(state: &Arc<ApiState>, report_id: &str, lines: &[&str]) {
+        let folder = report_manager(state).ensure_report_folder(report_id).expect("folder");
+        std::fs::write(folder.join("console_log.txt"), lines.join("\n") + "\n").unwrap();
+    }
+
+    // ---- agent-log ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn agent_log_missing_file_empty_shape() {
+        let (state, _t) = test_state();
+        let app = crate::server::create_app(state);
+        let (status, json) = req(app, "GET", "/api/report/report_x/agent-log").await;
+        assert_eq!(status, StatusCode::OK);
+        let d = &json["data"];
+        assert_eq!(d["logs"].as_array().unwrap().len(), 0);
+        assert_eq!(d["total_lines"], 0);
+        assert_eq!(d["from_line"], 0);
+        assert_eq!(d["has_more"], false);
+    }
+
+    #[tokio::test]
+    async fn agent_log_with_entries_and_from_line() {
+        let (state, _t) = test_state();
+        seed_agent_log(
+            &state,
+            "report_al",
+            &[
+                serde_json::json!({"action": "report_start", "section_index": 0}),
+                serde_json::json!({"action": "tool_call", "section_index": 1}),
+                serde_json::json!({"action": "report_complete", "section_index": 2}),
+            ],
+        );
+        let app = crate::server::create_app(state.clone());
+        let (status, json) = req(app, "GET", "/api/report/report_al/agent-log").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["data"]["total_lines"], 3);
+        assert_eq!(json["data"]["logs"].as_array().unwrap().len(), 3);
+        assert_eq!(json["data"]["logs"][0]["action"], "report_start");
+
+        // from_line=1 → skip the first line.
+        let app2 = crate::server::create_app(state);
+        let (_s, j2) = req(app2, "GET", "/api/report/report_al/agent-log?from_line=1").await;
+        assert_eq!(j2["data"]["from_line"], 1);
+        assert_eq!(j2["data"]["logs"].as_array().unwrap().len(), 2);
+        assert_eq!(j2["data"]["logs"][0]["action"], "tool_call");
+    }
+
+    #[tokio::test]
+    async fn agent_log_stream_logs_and_count() {
+        let (state, _t) = test_state();
+        seed_agent_log(
+            &state,
+            "report_als",
+            &[serde_json::json!({"action": "a"}), serde_json::json!({"action": "b"})],
+        );
+        let app = crate::server::create_app(state);
+        let (status, json) = req(app, "GET", "/api/report/report_als/agent-log/stream").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["data"]["count"], 2);
+        assert_eq!(json["data"]["logs"].as_array().unwrap().len(), 2);
+    }
+
+    /// ROUTE-ORDER: /agent-log (2-seg) vs /agent-log/stream (3-seg) resolve distinctly.
+    #[tokio::test]
+    async fn agent_log_stream_vs_nonstream_distinct() {
+        let (state, _t) = test_state();
+        seed_agent_log(&state, "report_d", &[serde_json::json!({"x": 1})]);
+        // /agent-log returns the {logs,total_lines,from_line,has_more} shape...
+        let app = crate::server::create_app(state.clone());
+        let (_s, j1) = req(app, "GET", "/api/report/report_d/agent-log").await;
+        assert!(j1["data"].get("total_lines").is_some(), "non-stream has total_lines");
+        // ...while /agent-log/stream returns {logs,count}.
+        let app2 = crate::server::create_app(state);
+        let (_s, j2) = req(app2, "GET", "/api/report/report_d/agent-log/stream").await;
+        assert!(j2["data"].get("count").is_some(), "stream has count");
+        assert!(j2["data"].get("total_lines").is_none(), "stream has NO total_lines");
+    }
+
+    // ---- console-log --------------------------------------------------------
+
+    #[tokio::test]
+    async fn console_log_missing_file_empty_shape() {
+        let (state, _t) = test_state();
+        let app = crate::server::create_app(state);
+        let (status, json) = req(app, "GET", "/api/report/report_x/console-log").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["data"]["logs"].as_array().unwrap().len(), 0);
+        assert_eq!(json["data"]["total_lines"], 0);
+    }
+
+    #[tokio::test]
+    async fn console_log_with_lines_and_from_line() {
+        let (state, _t) = test_state();
+        seed_console_log(
+            &state,
+            "report_cl",
+            &["[19:46:14] INFO: a", "[19:46:15] INFO: b", "[19:46:16] WARNING: c"],
+        );
+        let app = crate::server::create_app(state.clone());
+        let (status, json) = req(app, "GET", "/api/report/report_cl/console-log").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["data"]["total_lines"], 3);
+        assert_eq!(json["data"]["logs"].as_array().unwrap().len(), 3);
+
+        let app2 = crate::server::create_app(state);
+        let (_s, j2) = req(app2, "GET", "/api/report/report_cl/console-log?from_line=2").await;
+        assert_eq!(j2["data"]["from_line"], 2);
+        assert_eq!(j2["data"]["logs"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn console_log_stream_logs_and_count() {
+        let (state, _t) = test_state();
+        seed_console_log(&state, "report_cls", &["line1", "line2", "line3"]);
+        let app = crate::server::create_app(state);
+        let (status, json) = req(app, "GET", "/api/report/report_cls/console-log/stream").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["data"]["count"], 3);
+        assert_eq!(json["data"]["logs"].as_array().unwrap().len(), 3);
     }
 }

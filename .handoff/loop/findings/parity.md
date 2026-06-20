@@ -3529,3 +3529,40 @@ VERDICT: PASS — all contract behaviors match; std::thread spawn is a faithful,
 U-023 surface untouched (blast radius 0). Symbols verified: prepare_simulation_route,
 prepare_status_route, spawn_prepare_simulation, prepare_worker, prepare_progress_update,
 to_simple_dict(reuse) — all exercised.
+
+---
+
+## PARITY VERDICT — U-027 sub-cycle (b): report log-read routes — 2026-06-19 (opus)
+
+**Verdict: PASS** · symbols 4/4 verified (S-847, S-848, S-849, S-850 → `- [x]`)
+**Tests:** `cargo test -p teri --lib api::report` → 21 passed, 0 failed (7 new sub-cycle (b) tests).
+
+### Differential shape diff (MiroFish report.py jsonify  vs  teri serde_json::json!)
+
+| Route | Source (report.py) | teri (src/api/report.rs) | Result |
+|---|---|---|---|
+| `GET /:id/agent-log` (758-814) | `{success:True, data: get_agent_log(id, from_line)}` = `data:{logs,total_lines,from_line,has_more}` | `:248` `{success:true, data: Map{logs,total_lines,from_line,has_more}}` straight passthrough | key-for-key MATCH |
+| `GET /:id/agent-log/stream` (817-848) | `{success:True, data:{logs, count:len(logs)}}` plain `jsonify` | `:265` `{success:true, data:{logs, count:logs.len()}}` plain JSON | MATCH; NOT SSE on either side |
+| `GET /:id/console-log` (853-896) | `{success:True, data: get_console_log(id, from_line)}` | `:281` `{success:true, data: Map{...}}` passthrough | MATCH |
+| `GET /:id/console-log/stream` (899-930) | `{success:True, data:{logs, count:len(logs)}}` | `:298` `{success:true, data:{logs, count}}` | MATCH |
+
+### REFUTATION TARGET (critical): is any source `/stream` route actually SSE? — REFUTED, port is faithful
+- `grep -nE 'text/event-stream|stream_with_context|EventSource|Response\(' report.py` → **0 hits**. Both `/stream` handlers (report.py:817-848, 899-930) are bare `return jsonify({...})` one-shot full-dumps. The "stream" name means "fetch the whole stream at once"; incremental tailing is the `from_line` param on the NON-`/stream` routes. No frontend `EventSource` consumes them either.
+- The lone "SSE log streams" phrase in symbol-map S-1057 (U-048 frontend contract) is a loose label for the polling mechanism, NOT a backend `text/event-stream` route. It does not contradict the source: backend behavior is JSON.
+- ∴ teri's JSON `/stream` handlers MATCH the source. **NOT a downgrade-from-SSE.** Decision (ii) confirmed.
+
+### Contract details verified
+- **`from_line` parse**: source `request.args.get('from_line',0,type=int)` (Flask `type=int` → default 0 on non-coercible); teri `parse::<usize>().ok().unwrap_or(0)` (non-numeric/neg → 0). Faithful. Behavioral evidence: `?from_line=1` skips line 0 (agent_log); `?from_line=2` leaves 1 line (console_log).
+- **passthrough**: agent-log/console-log re-wrap the manager's `Map{logs,total_lines,from_line,has_more}` verbatim under `data` — no re-ordering, no re-keying.
+- **count**: `count == logs.len()` on both `/stream` routes.
+- **routing**: 2-seg `/agent-log` vs 3-seg `/agent-log/stream` resolve distinctly (test `agent_log_stream_vs_nonstream_distinct`: non-stream has `total_lines`, stream has `count` + NO `total_lines`); same for console-log; both under `/:report_id` capture, registered after seg-0 statics (`[!] U027-ROUTE-ORDER`).
+- **substrate (reuse-Y, U-024)**: `get_agent_log_route` calls `ReportManager::get_agent_log`; `_stream_route` calls `get_agent_log_stream`; console pair calls `get_console_log`/`get_console_log_stream`. Correct CALLs confirmed against manager.rs:146/200/222/278 (internals already U-024-verified; the Python managers at report_agent.py:1958/2005/2019/2067 return matching `{logs,total_lines,from_line,has_more}` / `List` shapes).
+
+### Markers
+- **`[~] U027-SSE-SEAM-DORMANT`** — CORRECT to leave dormant. There is NO live-SSE report route in the SOURCE (refutation above), so not building one drops zero source behavior. S-763 h4 note confirms `NullSink covers parity`, SseSink adapter is "optional polish". Leaving the U-024 sink.rs SseSink seam reserved is faithful, NOT a downgrade.
+- **`[≠] U025-TRACEBACK`** — inherited correctly. 500 envelope `ApiError::server` → `{success:false,error,traceback}` (3-key shape == source `jsonify({success:False,error,traceback:format_exc()})`); only the traceback VALUE differs (Rust backtrace string vs Python format_exc), which is opaque non-contractual debug text. Valid `[≠]`, not a feature-skip. (Note: these 4 log routes have no throwing path in practice — missing/malformed files yield empty/skipped lines, not 500 — so the 500 envelope is effectively unreachable here but shape-correct if hit.)
+
+### `[≠]` challenge
+No `[≠]` rows are claimed for the 4 sub-cycle (b) symbols themselves — all 4 are full `- [x]` behavioral matches. The two inherited markers above are unit-level: `U027-SSE-SEAM-DORMANT` survives as "genuinely no source SSE route exists" (not a portable feature being skipped); `U025-TRACEBACK` survives as "identical shape, non-contractual value." Neither is a disguised feature-skip.
+
+**Conclusion:** All 4 contract behaviors match source; all 4 symbols `- [x]`; refutation target (hidden SSE) actively REFUTED. Sub-cycle (b) is parity-clean. (The U-027 UNIT ledger row stays `- [ ]` — sub-cycles c–f remain unported; only (b) is gated here.)
