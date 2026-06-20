@@ -4198,3 +4198,34 @@ Record-by-record, both sides:
 **Recommendation:** Commit cycle C (round-0 producer sub-contract PASS). Do NOT flip S-877 / U-028 unit to `- [x]`. What remains to close the U-028 unit: port the run-loop's wait-for-commands/IPC + env.step execution + signal shutdown (S-938/S-939 main-loop + S-913–S-924 IPC + S-941) — these are the U-030 verify/port-forward items. Round-0 is the last of S-877's c3b-deferred producer items; the residual is the orchestration/IPC layer (U-030), not the producer.
 
 **Tests:** `cargo test -p teri --lib` → 1512 passed (expected). `round0` filter → 1 passed. `producer_tests` → 7 passed. No downgrade. Y-not-regressed (port-only cycle in `port/mirofish`, no merge in scope).
+
+---
+
+## CYCLE 55 (2026-06-20, 30th resume) — SCOPE + VERIFY-ONLY FLIPS (S-903, S-935)
+
+**Scoping (rust-port-cartographer → findings/u030-orchestration-residual.md):** classified all 89
+`[ ]`/`[~]` orchestration symbols across U-028/029/030 → 17 `[x]`-substrate-satisfied / ~50
+`[≠]`-substrate-gap (NEW tags U028-LOGGING, U028-SUBPROCESS-IPC, U028-SUBPROCESS-RUNNER + existing
+U028-OASIS-INTERNALS) / ~10 `[ ]`-genuinely-unported + S-934 dual-LLM (bucket-3 to-port). The ~10
+genuinely-unported all collapse to ONE ROOT GATE: `run_sim_body` (simulation_runner.rs:1542) lacks
+the post-sim IPC command-service loop (poll_commands/send_response exist but are never driven inside
+the sim task) — also why the U-026 interview/env surface is still `[!] IPC-PRODUCER-PENDING`.
+
+**VERIFY-ONLY FLIPS (rust-port-parity-verifier, 2/2 PASS):**
+- **S-903** (`RedditSimulationRunner._get_active_agents_for_round`, run_reddit_simulation.py:469-521)
+  → `[x]`. Byte-structurally identical to the already-`[x]` S-876 (same 9 time_config keys+defaults,
+  same uniform×multiplier→int target_count, same peak/off/1.0 multiplier precedence, same
+  active_hours+activity_level per-agent gating, same random.sample(min(target,len)) cap). Fully
+  covered by the landed `TimeActivationPolicy` (src/sim/activation.rs). `[≠]U028-RNG-SEQUENCE`
+  carries unchanged; NO new divergence.
+- **S-935** (`get_active_agents_for_round` free fn, run_parallel_simulation.py:1040-1090) → `[x]`.
+  Byte-identical body; SOLE material diff = `config` direct param vs `self.config`, observably
+  equivalent (`from_config(&Value,…)` already consumes config as a plain arg). Same coverage + same
+  `[≠]`.
+
+Verifier adversarial checks (extra/different config key? different branch order/rounding/sampling
+cap? per-agent field not modeled? free-fn observable change? platform-specific leak?) ALL came back
+clean. No fresh port — pure mirrors of S-876. 9 `sim::activation` tests pass; 1512 lib unchanged
+(verify-only, no code change). Y-not-regressed (develop=7c354a5).
+
+**Units STAY `[ ]`** — the IPC command-service loop gate (CYCLE 56 keystone) is unported; no over-flip.

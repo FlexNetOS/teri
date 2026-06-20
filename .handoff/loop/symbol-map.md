@@ -1124,7 +1124,7 @@
 - [ ] S-900 · `unit:U-029` · `method` · `RedditSimulationRunner._get_profile_path` · `run_reddit_simulation.py:426`
 - [ ] S-901 · `unit:U-029` · `method` · `RedditSimulationRunner._get_db_path` · `run_reddit_simulation.py:430`
 - [ ] S-902 · `unit:U-029` · `method` · `RedditSimulationRunner._create_model` · `run_reddit_simulation.py:434`
-- [ ] S-903 · `unit:U-029` · `method` · `RedditSimulationRunner._get_active_agents_for_round` · `run_reddit_simulation.py:469`
+- [x] S-903 · `unit:U-029` · `method` · `RedditSimulationRunner._get_active_agents_for_round` · `run_reddit_simulation.py:469` · **VERIFY-ONLY FLIP 2026-06-20 (Cycle 55, parity PASS)**: reddit≡twitter byte-identical body (run_reddit_simulation.py:469-521 diffed vs run_twitter_simulation.py:462-529 — same 9 time_config keys+defaults, same uniform×multiplier→int target_count, same peak/off/1.0 multiplier precedence, same active_hours+activity_level per-agent gating, same random.sample(min(target,len)) cap); fully covered by the landed `TimeActivationPolicy` (src/sim/activation.rs, S-876 port). `[≠]U028-RNG-SEQUENCE` carries unchanged (Python unseeded RNG → structure-only differential, no NEW divergence). No fresh port — verify-only mirror of S-876. 9 activation tests pass.
 - [ ] S-904 · `unit:U-029` · `method` · `RedditSimulationRunner.run` · `run_reddit_simulation.py:523`
 - [ ] S-905 · `unit:U-029` · `fn` · `main` · `run_reddit_simulation.py:695`
 - [ ] S-906 · `unit:U-029` · `fn` · `setup_signal_handlers` · `run_reddit_simulation.py:737`
@@ -1161,7 +1161,7 @@
 - [ ] S-932 · `unit:U-030` · `fn` · `_get_user_name` · `run_parallel_simulation.py:903`
 - [ ] S-933 · `unit:U-030` · `fn` · `_get_comment_info` · `run_parallel_simulation.py:938`
 - [ ] S-934 · `unit:U-030` · `fn` · `create_model` · configures OASIS model · `run_parallel_simulation.py:984`
-- [ ] S-935 · `unit:U-030` · `fn` · `get_active_agents_for_round` · `run_parallel_simulation.py:1040`
+- [x] S-935 · `unit:U-030` · `fn` · `get_active_agents_for_round` · `run_parallel_simulation.py:1040` · **VERIFY-ONLY FLIP 2026-06-20 (Cycle 55, parity PASS)**: parallel≡twitter byte-identical body (run_parallel_simulation.py:1040-1090; SOLE material diff = `config` direct param vs `self.config`, observably equivalent — `from_config(&Value,…)` already consumes config as a plain arg, no self/param distinction); fully covered by the landed `TimeActivationPolicy` (src/sim/activation.rs, S-876 port). `[≠]U028-RNG-SEQUENCE` carries unchanged, no NEW divergence. Verify-only mirror of S-876. 9 activation tests pass.
 - [ ] S-936 · `unit:U-030` · `type` · `PlatformSimulation` · dataclass: env + runner per platform · `run_parallel_simulation.py:1093`
 - [ ] S-937 · `unit:U-030` · `method` · `PlatformSimulation.__init__` · `run_parallel_simulation.py:1095`
 - [ ] S-938 · `unit:U-030` · `fn` · `run_twitter_simulation` · coroutine for asyncio.gather · `run_parallel_simulation.py:1101`
