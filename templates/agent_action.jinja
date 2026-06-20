@@ -6,6 +6,9 @@ Agent Role: {{ agent_role }}
 Agent State: {{ agent_state }}
 Background: {{ agent_background }}
 Traits: {{ agent_traits|join(", ") }}
+{% if agent_persona %}
+Persona: {{ agent_persona }}
+{% endif %}
 
 ## World Context
 World Tick: {{ world_tick }}

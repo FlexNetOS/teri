@@ -1698,12 +1698,21 @@ impl ActionGenerator {
         // Convert HashMap to Vec of tuples for MiniJinja iteration
         let world_variables_seq: Vec<(String, f32)> = world_variables.into_iter().collect();
 
+        // Route the recovered OASIS personality (`SocialProfile.persona`, the `user_char` blob a
+        // profile reader recovers in U-028 c2) into the decision prompt. Without this, an agent
+        // loaded from a profile would decide purely from `background`(=bio)+`traits` and its OASIS
+        // personality would be SHADOWED (the c2 verifier watch-item). Generic agents (no social
+        // profile) yield "" → the template's `{% if agent_persona %}` skips the section → their
+        // prompt is byte-identical to before (no regression).
+        let agent_persona = agent.persona.social.as_ref().map(|s| s.persona.as_str()).unwrap_or("");
+
         let template_context = context! {
             agent_name => &agent.persona.name,
             agent_role => &agent.persona.role,
             agent_state => format!("{:?}", agent.state),
             agent_background => &agent.persona.background,
             agent_traits => &agent.persona.traits,
+            agent_persona => agent_persona,
             world_tick => world_tick,
             recent_events => recent_events,
             relevant_memories => relevant_memories,
@@ -2426,6 +2435,68 @@ mod tests {
         assert!(prompt.contains("creative"));
         // World variables parsed from context and rendered
         assert!(prompt.contains("temperature"));
+    }
+
+    /// U-028 c3b-iii / c2 watch-item: the recovered OASIS personality (`SocialProfile.persona`)
+    /// MUST reach the decision prompt, or an agent loaded from a profile decides without its
+    /// OASIS personality (shadowed by bio+traits only).
+    #[test]
+    fn test_generate_prompt_includes_social_persona() {
+        let generator = ActionGenerator::new();
+        let social = SocialProfile {
+            user_id: 7,
+            user_name: "skeptic7".to_string(),
+            bio: "a researcher".to_string(),
+            persona: "A relentless skeptic who questions every claim and loves debate.".to_string(),
+            platform: Platform::Twitter,
+            karma: 1000,
+            friend_count: 100,
+            follower_count: 150,
+            following_count: 100,
+            statuses_count: 500,
+            age: None,
+            gender: None,
+            mbti: None,
+            country: None,
+            profession: None,
+            interested_topics: vec![],
+            posting_style: None,
+            source_entity_uuid: None,
+            source_entity_type: None,
+            created_at: String::new(),
+        };
+        let agent = Agent::new(Persona {
+            name: "Sam".to_string(),
+            background: "a researcher".to_string(),
+            traits: vec!["curious".to_string()],
+            role: "agent".to_string(),
+            social: Some(social),
+        });
+        let prompt = generator.generate_prompt(&agent, "World Tick: 1\n\n").unwrap();
+        assert!(prompt.contains("Persona:"), "prompt must render the Persona section");
+        assert!(
+            prompt.contains("A relentless skeptic who questions every claim"),
+            "the recovered OASIS persona text must appear in the decision prompt: {prompt}"
+        );
+    }
+
+    /// A generic agent (no social profile) must produce a prompt with NO Persona section — the
+    /// `{% if agent_persona %}` skips it on the empty string, so non-social agents are unaffected.
+    #[test]
+    fn test_generate_prompt_omits_persona_when_no_social() {
+        let generator = ActionGenerator::new();
+        let agent = Agent::new(Persona {
+            name: "Gen".to_string(),
+            background: "generic".to_string(),
+            traits: vec![],
+            role: "agent".to_string(),
+            social: None,
+        });
+        let prompt = generator.generate_prompt(&agent, "World Tick: 1\n\n").unwrap();
+        assert!(
+            !prompt.contains("Persona:"),
+            "no social profile → no Persona section (no regression): {prompt}"
+        );
     }
 
     #[test]
