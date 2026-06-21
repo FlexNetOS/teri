@@ -1394,14 +1394,14 @@
 
 ## SWEEP-1 — Frontend Components (8 Vue SFCs)
 
-- [ ] S-1060 · `unit:SWEEP-1` · `component` · `GraphPanel` · D3 force-graph; props: graphData, isSimulating, viewMode; emits: refresh, toggle-maximize; ~100 reactive symbols including renderGraph, entityTypes computed, drag handlers, self-loop expansion · `components/GraphPanel.vue:1`
-- [ ] S-1061 · `unit:SWEEP-1` · `component` · `HistoryDatabase` · project history panel; animated card fan; ~75 reactive symbols including getCardStyle, containerStyle, loadProjects, deleteProject · `components/HistoryDatabase.vue:1`
-- [ ] S-1062 · `unit:SWEEP-1` · `component` · `LanguageSwitcher` · dropdown for locale; 7 symbols: open, switcherRef, currentLabel, toggleDropdown, switchLocale, onClickOutside · `components/LanguageSwitcher.vue:1`
-- [ ] S-1063 · `unit:SWEEP-1` · `component` · `Step1GraphBuild` · ontology/graph viewer; props: graphData, projectData; ~14 symbols including handleEnterEnvSetup, selectOntologyItem, graphStats · `components/Step1GraphBuild.vue:1`
-- [ ] S-1064 · `unit:SWEEP-1` · `component` · `Step2EnvSetup` · profile generation + config; props: simulationId; emits: go-back, next-step; ~65 symbols including startPrepareSimulation, startPolling, profile display · `components/Step2EnvSetup.vue:1`
-- [ ] S-1065 · `unit:SWEEP-1` · `component` · `Step3Simulation` · simulation run control; props: simulationId, maxRounds, minutesPerRound; emits: go-back, next-step; ~60 symbols including doStartSimulation, fetchRunStatus, actionFeed · `components/Step3Simulation.vue:1`
-- [ ] S-1066 · `unit:SWEEP-1` · `component` · `Step4Report` · report progress + viewer; props: reportId; emits: add-log, update-status; ~252 symbols including section rendering, SSE polling, parseInsightForge, markdown render · `components/Step4Report.vue:1`
-- [ ] S-1067 · `unit:SWEEP-1` · `component` · `Step5Interaction` · chat + batch survey; props: reportId; emits: add-log, update-status; ~90 symbols including selectChatTarget, sendMessage, surveyAgents, renderMarkdown · `components/Step5Interaction.vue:1`
+- [≠] S-1060 · `unit:SWEEP-1` · `component` · `GraphPanel` · D3 force-graph; props: graphData, isSimulating, viewMode; emits: refresh, toggle-maximize; ~100 reactive symbols including renderGraph, entityTypes computed, drag handlers, self-loop expansion · `components/GraphPanel.vue:1`
+- [≠] S-1061 · `unit:SWEEP-1` · `component` · `HistoryDatabase` · project history panel; animated card fan; ~75 reactive symbols including getCardStyle, containerStyle, loadProjects, deleteProject · `components/HistoryDatabase.vue:1`
+- [≠] S-1062 · `unit:SWEEP-1` · `component` · `LanguageSwitcher` · dropdown for locale; 7 symbols: open, switcherRef, currentLabel, toggleDropdown, switchLocale, onClickOutside · `components/LanguageSwitcher.vue:1`
+- [≠] S-1063 · `unit:SWEEP-1` · `component` · `Step1GraphBuild` · ontology/graph viewer; props: graphData, projectData; ~14 symbols including handleEnterEnvSetup, selectOntologyItem, graphStats · `components/Step1GraphBuild.vue:1`
+- [≠] S-1064 · `unit:SWEEP-1` · `component` · `Step2EnvSetup` · profile generation + config; props: simulationId; emits: go-back, next-step; ~65 symbols including startPrepareSimulation, startPolling, profile display · `components/Step2EnvSetup.vue:1`
+- [≠] S-1065 · `unit:SWEEP-1` · `component` · `Step3Simulation` · simulation run control; props: simulationId, maxRounds, minutesPerRound; emits: go-back, next-step; ~60 symbols including doStartSimulation, fetchRunStatus, actionFeed · `components/Step3Simulation.vue:1`
+- [≠] S-1066 · `unit:SWEEP-1` · `component` · `Step4Report` · report progress + viewer; props: reportId; emits: add-log, update-status; ~252 symbols including section rendering, SSE polling, parseInsightForge, markdown render · `components/Step4Report.vue:1`
+- [≠] S-1067 · `unit:SWEEP-1` · `component` · `Step5Interaction` · chat + batch survey; props: reportId; emits: add-log, update-status; ~90 symbols including selectChatTarget, sendMessage, surveyAgents, renderMarkdown · `components/Step5Interaction.vue:1`
 
 ---
 
@@ -1436,7 +1436,7 @@
 
 ## SWEEP-4 — `backend/scripts/test_profile_format.py`
 
-- [ ] S-1087 · `unit:SWEEP-4` · `fn` · `test_profile_format` · DEFERRED — test utility only; not part of production surface · `backend/scripts/test_profile_format.py:1`
+- [≠] S-1087 · `unit:SWEEP-4` · `fn` · `test_profile_format` · DEFERRED — test utility only; not part of production surface · `backend/scripts/test_profile_format.py:1`
 
 
 ---

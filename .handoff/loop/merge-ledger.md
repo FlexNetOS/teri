@@ -77,10 +77,10 @@ Status legend: `pending` (not started).
 - [ ] U-050 · port-fresh · `LOCALE task-local` · new src/i18n (task-local) · -> teri::i18n::LOCALE · refs: U-005, spawn sites · pending
 
 ## Sweep items
-- [ ] SWEEP-1 · reuse-Y · — · keep-Vue · -> 6 step components · refs: re-pointed clients · pending · verify-only vs X (skip fresh port)
+- [≠] SWEEP-1 · reuse-Y · — · keep-Vue · -> 6 step components · refs: re-pointed clients · pending · verify-only vs X (skip fresh port) · **[≠]FRONTEND-SPA (cycle71)** — 8 Vue components (GraphPanel/HistoryDatabase/LanguageSwitcher/Step1-5); keep-Vue, out-of-substrate for a Rust backend. Backend contract VERIFIED: 0 raw fetch/axios/EventSource calls — all backend access via the cycle-70-verified api/report (x3) + api/simulation (x5) clients.
 - [x] SWEEP-2 · port-fresh · `locales` · src/i18n/locales + keep-Vue · -> zh/en keys · refs: U-005, U-036 · pending · **[x] cycle70** — backend locale table fully ported: 629/629 keys + 0 value-mismatches (en & zh) vs MiroFish/locales; languages.json byte-identical (7 langs). 18 section-symbols verified.
 - [ ] SWEEP-3 · map-onto-substrate · `SimEngine` · map-onto `src/sim::SimEngine` · -> native SimEngine · refs: U-022/U-028/U-029/U-030 · pending · verify-only vs X (RECLASSIFIED: reimplement OASIS natively, was "Python subprocess")
-- [ ] SWEEP-4 · — · — · (drop, non-prod) · -> — · refs: — · `- [≠]` intentional-divergence: utility test script, not production surface
+- [≠] SWEEP-4 · — · — · (drop, non-prod) · -> — · refs: — · `- [≠]` intentional-divergence: utility test script, not production surface · **[≠] (cycle71)** intentional-divergence executed — test utility test_profile_format (backend/scripts), not production surface; symbol S-1087 rolled up to match the documented drop.
 
 ---
 

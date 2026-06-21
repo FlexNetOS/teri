@@ -5039,3 +5039,9 @@ Orchestrator applied both fixes; re-verified the delta only.
 - SWEEP-2 locale table → `[x]`: 629/629 keys + 0 value-mismatches (en & zh) vs MiroFish/locales; languages.json byte-identical (7 langs). 18 section-symbols verified.
 
 **Build health:** cargo check ✓, clippy --lib `No issues found` ✓, fmt ✓, 1552 lib tests pass (Y-not-regressed; only change is doc-comment text). DONE-progress 80%→92%.
+
+## Cycle 71 (35th resume) — SWEEP-1 [≠]FRONTEND-SPA + SWEEP-4 [≠] drop
+- SWEEP-1 (8 Vue components: GraphPanel/HistoryDatabase/LanguageSwitcher/Step1-5) → [≠]FRONTEND-SPA. Verified the components make ZERO raw backend calls (grep fetch/axios/EventSource/WebSocket = 0); all backend access routes through the cycle-70-verified api/report (x3) + api/simulation (x5) clients. Out-of-substrate (Vue, not Rust-backend-portable); contract holds transitively.
+- SWEEP-4 (test_profile_format, backend/scripts) → [≠]: executed the documented intentional-divergence drop (test utility, non-production). Symbol S-1087 rolled up to match the merge-ledger row's decision.
+- No Rust code changed (pure ledger adjudication) — build state unchanged-green from cycle 70.
+- DONE-progress 92%→93%. 5 [ ] symbols remain (U-045/046/049/050 + SWEEP-3 runtime contracts) for cycle 72.
