@@ -4298,3 +4298,37 @@ verify-only, no code change):
 to flip units: the rest of the [≠]/[x] adjudication sweep (logging/subprocess-IPC/subprocess-runner/OASIS-DB
 → [≠] with tags) + PORT parallel ParallelIPCHandler S-920-924 (architect-first, unified-pool [≠]) + PORT
 S-934 dual-LLM + flip S-877/904/938/939 run-coroutines + then the units.
+
+## Cycle 58 — [≠]/[x] ADJUDICATION SWEEP (PART 2, verify-only, no code)
+
+Converted the cycle-55 cartographer classification (findings/u030-orchestration-residual.md) into honest
+ledger marks: **60 orchestration symbols FLIPPED [ ]→[≠]** with substrate-gap tags. No code changed (1519
+lib unchanged, Y-not-regressed develop=7c354a5). Tag buckets:
+- **U028-LOGGING** (16): S-853-858 / S-880-885 / S-907-910 — OASIS Python `logging` plumbing
+  (UnicodeFormatter / MaxTokensWarningFilter / setup·disable·init OASIS loggers). teri uses `tracing`; no
+  OASIS loggers exist → inexpressible.
+- **U028-SUBPROCESS-IPC** (16): S-860-864 / S-887-891 / S-914-919 — filesystem IPC transport (ipc_commands/
+  scan + ipc_responses/{id}.json + env_status.json) exists only across the OS subprocess boundary; teri runs
+  in-process (`SimulationIPCServer` mpsc+oneshot + AtomicBool liveness). Observable covered, transport [≠].
+- **U028-SUBPROCESS-RUNNER** (18): S-869-873/875 / S-878 / S-896-900/902 / S-905 / S-911/912 / S-936/937 —
+  subprocess-runner artifacts (runner class / AVAILABLE_ACTIONS / _load_config / _get_profile_path /
+  _create_model / main entrypoint / PlatformSimulation). teri's in-process lifecycle covers the observable.
+- **U028-OASIS-INTERNALS** (10): S-867 / S-874 / S-894 / S-901 / S-923 / S-929-933 — OASIS SQLite
+  trace/post/user/comment DB readers + enrichment. teri has no relational world (`WorldState` = events Vec
+  + snapshots, sim/mod.rs:198-204) and no env.step world-mutation → records produced directly from
+  prepare/commit (sim/mod.rs:1029-1064), interview results inline from LLM (Cycle 56). Enrichment keys are
+  the established [≠]U028-OASIS-INTERNALS divergence.
+
+**VERIFIER SPOT-CHECK (rust-port-parity-verifier, 6/6 [≠]-CONFIRMED, no over-flip):** adversarially refuted
+the 6 highest-risk flips (could a [≠] hide a skipped feature?). ALL confirmed genuine substrate gaps:
+S-875 _create_model (env-var LLM config covered by config.rs:129/191/198 same 3 vars + gpt-4o-mini fallback;
+dual-LLM=S-934 separate); S-929 fetch_new_actions_from_db (teri emits same record shape directly, no DB);
+**S-930 _enrich_action_context (load-bearing — teri has NO post/comment/user/follow tables to read, post_id
+are LLM strings referring to nothing stored → unreproducible, not skipped)**; S-862/864 update_status/
+send_response (env_status.json timestamp never read back; oneshot covers reply); S-858 setup_oasis_logging
+(no teri consumer reads OASIS logger files — consumers stream teri's own simulation/stdout/stderr logs,
+api/report.rs:69-71); S-919 _get_env_and_graph (env-selection collapses to per-agent SocialProfile.platform
+filter, routing preserved). Conservative under-marking retained: S-904/938/939/940 STAY [ ] (composite
+coroutines, producer-proven, full contract pending cycle D); S-920/921/922/924 STAY [ ] (parallel handler,
+cycle B); S-934 STAY [ ] (dual-LLM, bucket-3 TO-PORT cycle C); S-877 STAYS [~]. U-028/U-029/U-030 units
+STAY [ ]. No over-flip.
