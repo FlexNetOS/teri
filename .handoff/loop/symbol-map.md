@@ -1355,13 +1355,13 @@
 
 ## U-045 — Runtime: Subprocess Isolation Contract
 
-- [ ] S-1054 · `unit:U-045` · `const` · `SUBPROCESS_ISOLATION_CONTRACT` · each simulation runs as a separate OS process group (pgid); killed via os.killpg(pgid, SIGTERM)→SIGKILL after 5 s; fully isolated from Flask process · `simulation_runner.py:390`
+- [≠] S-1054 · `unit:U-045` · `const` · `SUBPROCESS_ISOLATION_CONTRACT` · each simulation runs as a separate OS process group (pgid); killed via os.killpg(pgid, SIGTERM)→SIGKILL after 5 s; fully isolated from Flask process · `simulation_runner.py:390` · **[≠]SUBSTRATE (cycle72)** SUBPROCESS_ISOLATION realized via in-process tokio tasks (no OS subprocess): terminate=cooperative AtomicBool→tokio timeout→abort; grace windows 10s/5s match X. Only residual = no OS exit-code (non-observable). Parity-verifier REALIZED.
 
 ---
 
 ## U-046 — Runtime: IPC Polling Contract
 
-- [ ] S-1055 · `unit:U-046` · `const` · `IPC_POLLING_CONTRACT` · filesystem-based IPC: parent writes JSON command files to ipc_commands/; subprocess polls 0.5 s interval; subprocess writes response + status JSON; no sockets, no pipes · `run_twitter_simulation.py:170`
+- [≠] S-1055 · `unit:U-046` · `const` · `IPC_POLLING_CONTRACT` · filesystem-based IPC: parent writes JSON command files to ipc_commands/; subprocess polls 0.5 s interval; subprocess writes response + status JSON; no sockets, no pipes · `run_twitter_simulation.py:170` · **[≠]SUBSTRATE (cycle72)** IPC_POLLING realized via in-process mpsc + per-command oneshot (no filesystem command files): command/response/status shapes, ordering, timeouts preserved. Parity-verifier REALIZED.
 
 ---
 
@@ -1382,13 +1382,13 @@
 
 ## U-049 — Runtime: Background Thread Concurrency Contract
 
-- [ ] S-1058 · `unit:U-049` · `const` · `BACKGROUND_THREAD_CONTRACT` · SimulationRunner runs status-monitor daemon thread (non-blocking); SimulationManager runs prepare tasks via ThreadPoolExecutor; report generation runs via separate thread; Flask threads access shared state under threading.Lock · `simulation_manager.py:89`
+- [≠] S-1058 · `unit:U-049` · `const` · `BACKGROUND_THREAD_CONTRACT` · SimulationRunner runs status-monitor daemon thread (non-blocking); SimulationManager runs prepare tasks via ThreadPoolExecutor; report generation runs via separate thread; Flask threads access shared state under threading.Lock · `simulation_manager.py:89` · **[≠]SUBSTRATE (cycle72)** BACKGROUND_THREAD realized via tokio: monitor task (spawn+abort), Arc<Mutex>/RwLock shared state, spawn_blocking/std::thread for !Send futures, buffer_unordered for the pool. No lost concurrency path. Parity-verifier REALIZED.
 
 ---
 
 ## U-050 — Runtime: Signal Handling Contract
 
-- [ ] S-1059 · `unit:U-050` · `const` · `SIGNAL_CONTRACT` · SIGTERM/SIGINT/SIGHUP all routed to graceful shutdown; subprocess runners register signal handlers before asyncio.run(); Flask SIGTERM propagates kill to child pgid then exits · `run_twitter_simulation.py:749`
+- [x] S-1059 · `unit:U-050` · `const` · `SIGNAL_CONTRACT` · SIGTERM/SIGINT/SIGHUP all routed to graceful shutdown; subprocess runners register signal handlers before asyncio.run(); Flask SIGTERM propagates kill to child pgid then exits · `run_twitter_simulation.py:749` → REALIZED cycle-73: `server.rs:307-353` installs SIGTERM+SIGHUP (unix) + SIGINT handlers, all selecting into the graceful-shutdown future that calls `cleanup_all().await` (rs:339); post-serve atexit-net `cleanup_all()` (rs:349) on the non-signal exit path; idempotent via shared `cleanup_done` compare-exchange (`simulation_runner.rs:1366-1373`). X `register_cleanup` original-handler chaining (py:1326-1340) is non-observable plumbing-to-exit (`[≠]`: tokio future-completion → process exit is structurally automatic; no distinct exit code owed).
 
 ---
 
@@ -1430,7 +1430,7 @@
 
 ## SWEEP-3 — OASIS Library Contract (external dependency)
 
-- [ ] S-1086 · `unit:SWEEP-3` · `const` · `OASIS_CONTRACT` · OASIS TwitterChannel/RedditChannel env: step_env(active_agents), interview_agent(agent_id, query), close(); ActionType enum with 6 Twitter + 13 Reddit variants; model constructed via create_model(model_type, model_config_dict). Teri port must provide a compatible abstraction layer; do NOT vendor OASIS internals · `backend/scripts/run_twitter_simulation.py:1`
+- [≠] S-1086 · `unit:SWEEP-3` · `const` · `OASIS_CONTRACT` · OASIS TwitterChannel/RedditChannel env: step_env(active_agents), interview_agent(agent_id, query), close(); ActionType enum with 6 Twitter + 13 Reddit variants; model constructed via create_model(model_type, model_config_dict). Teri port must provide a compatible abstraction layer; do NOT vendor OASIS internals · `backend/scripts/run_twitter_simulation.py:1` · **[≠]SUBSTRATE (cycle72)** OASIS realized via native src/sim::SimEngine: 14 recordable ActionTypes (Twitter-6 + Reddit-13 subsets; REFRESH correctly filtered), channel ops step_env/interview_agent/create_model/close mapped; OASIS internals NOT vendored (contract-required). Parity-verifier REALIZED.
 
 ---
 

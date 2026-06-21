@@ -11,14 +11,14 @@
 //! | S-005 `JSON_AS_ASCII=False` (roll)| serde_json raw UTF-8 (structural)    | ported     |
 //! | S-040 `get_locale` req-ctx branch | `accept_language_middleware`         | ported     |
 //!
-//! # Pending dependencies (recorded honestly; do NOT pretend complete)
+//! # Wired subsystems (all landed)
 //!
-//! - **Blueprint: graph_bp → /api/graph** (pending U-025 `graph.py` routes)
-//! - **Blueprint: simulation_bp → /api/simulation** (pending U-026 `simulation.py` routes)
-//! - **Blueprint: report_bp → /api/report** (pending U-027 `report.py` routes)
-//! - **register_cleanup / graceful sim-process teardown** (pending U-023 SimulationRunner,
-//!   U-049 graceful shutdown). A structural `with_graceful_shutdown(ctrl_c)` is wired now;
-//!   the sim-process cleanup hooks will be composed in when U-023/U-049 land.
+//! - **Blueprint: graph_bp → /api/graph** (U-025 `graph.py` routes — nested in `create_app`)
+//! - **Blueprint: simulation_bp → /api/simulation** (U-026 `simulation.py` routes — nested)
+//! - **Blueprint: report_bp → /api/report** (U-027 `report.py` routes — nested)
+//! - **register_cleanup / graceful sim-process teardown** (U-050 SIGNAL_CONTRACT): `serve`
+//!   installs SIGTERM/SIGINT/SIGHUP handlers that run `SimulationRunner::cleanup_all`
+//!   (terminate running sims, persist STOPPED) before axum stops.
 //!
 //! # `[≠]` intentional divergences
 //!
@@ -227,7 +227,7 @@ pub fn create_app(state: std::sync::Arc<ApiState>) -> Router {
 //   2. create_app() — build the Router.
 //   3. Bind address: --addr superset + FLASK_HOST/FLASK_PORT env contract.
 //   4. debug / threaded — [≠] (see module doc above).
-//   5. Graceful shutdown — structural ctrl_c/SIGTERM; sim-process cleanup pending U-023/U-049.
+//   5. Graceful shutdown (U-050 SIGNAL_CONTRACT) — SIGTERM/SIGINT/SIGHUP → SimulationRunner::cleanup_all.
 // ---------------------------------------------------------------------------
 
 /// Resolve the bind address from CLI override or MiroFish env contract.
@@ -254,8 +254,8 @@ pub fn resolve_bind_addr(cli_addr: Option<&str>) -> String {
 ///   1. Config validate_collect() → if errors, surface them and return Err.
 ///   2. Build the Router via create_app().
 ///   3. Bind the resolved address.
-///   4. Serve with graceful shutdown (ctrl_c / SIGTERM).
-///      NOTE: sim-process cleanup (register_cleanup equivalent) is PENDING U-023/U-049.
+///   4. Serve with graceful shutdown (U-050 SIGNAL_CONTRACT): SIGTERM/SIGINT/SIGHUP route to
+///      SimulationRunner::cleanup_all (terminate running sims, persist STOPPED) before exit.
 ///
 /// # Errors
 /// Returns `TeriError::Config` on config validation failure.
@@ -275,6 +275,13 @@ pub async fn serve(config: Config, cli_addr: Option<&str>) -> crate::error::Resu
 
     let state = std::sync::Arc::new(ApiState::new(config.clone()));
 
+    // U-050 SIGNAL_CONTRACT — clone the sim_runner Arc for the graceful-shutdown handler
+    // BEFORE `state` is moved into create_app, so on SIGTERM/SIGINT/SIGHUP we can run
+    // SimulationRunner::cleanup_all() (terminate running sims, persist STOPPED) before exit.
+    // A second clone backs the atexit-style net below (cleanup on the non-signal exit path).
+    let sim_runner = state.sim_runner.clone();
+    let shutdown_runner = sim_runner.clone();
+
     // S-023 element 2 — create app
     let app = create_app(state);
 
@@ -284,20 +291,64 @@ pub async fn serve(config: Config, cli_addr: Option<&str>) -> crate::error::Resu
 
     let listener = TcpListener::bind(&addr).map_err(TeriError::Io)?;
 
-    // S-023 element 4 / S-024 element 6 — graceful shutdown
-    // Structural: ctrl_c signal causes clean axum shutdown.
-    // PENDING U-023/U-049: SimulationRunner.register_cleanup() equivalent
-    // (atexit/SIGTERM handlers to kill simulation subprocesses) will compose in here
-    // when U-023 (SimulationRunner) and U-049 (graceful shutdown) are ported.
-    // MiroFish source: app/__init__.py:46-47, run.py:44 (threaded shutdown semantics).
-    axum::serve(tokio::net::TcpListener::from_std(listener).map_err(TeriError::Io)?, app)
-        .with_graceful_shutdown(async {
-            tokio::signal::ctrl_c().await.expect("Failed to install CTRL+C handler");
-            tracing::info!("Received shutdown signal, stopping server...");
-            // PENDING U-023/U-049: call SimulationRunner::cleanup() here
-        })
-        .await
-        .map_err(TeriError::Io)?;
+    // S-023 element 4 / S-024 element 6 / U-050 SIGNAL_CONTRACT — graceful shutdown.
+    //
+    // Port of MiroFish `register_cleanup` (simulation_runner.py:1319-1357 /
+    // run_twitter_simulation.py:749): SIGTERM, SIGINT, and SIGHUP all route to graceful
+    // shutdown, and each runs `cleanup_all_simulations()` before the process exits. teri
+    // installs tokio handlers for all three (SIGTERM/SIGHUP are unix-only; on non-unix only
+    // SIGINT/Ctrl-C exists), then calls `SimulationRunner::cleanup_all()` — which terminates
+    // each still-running sim (cooperative-then-abort, grace window) and persists STOPPED state
+    // — before axum stops accepting connections.
+    //
+    // SIGTERM is the critical one: `kill`, containers, and systemd send SIGTERM by default, so
+    // handling only Ctrl-C (SIGINT) would let production shutdowns hard-kill running sims
+    // without recording STOPPED state.
+    let serve_result =
+        axum::serve(tokio::net::TcpListener::from_std(listener).map_err(TeriError::Io)?, app)
+            .with_graceful_shutdown(async move {
+                let ctrl_c = async {
+                    tokio::signal::ctrl_c()
+                        .await
+                        .expect("Failed to install SIGINT (Ctrl-C) handler");
+                };
+
+                #[cfg(unix)]
+                let terminate = async {
+                    use tokio::signal::unix::{SignalKind, signal};
+                    let mut sigterm =
+                        signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
+                    let mut sighup =
+                        signal(SignalKind::hangup()).expect("Failed to install SIGHUP handler");
+                    tokio::select! {
+                        _ = sigterm.recv() => {}
+                        _ = sighup.recv() => {}
+                    }
+                };
+
+                // Non-unix (e.g. Windows) has no SIGTERM/SIGHUP — only Ctrl-C fires.
+                #[cfg(not(unix))]
+                let terminate = std::future::pending::<()>();
+
+                tokio::select! {
+                    _ = ctrl_c => tracing::info!("Received SIGINT, stopping server..."),
+                    _ = terminate => tracing::info!("Received SIGTERM/SIGHUP, stopping server..."),
+                }
+
+                // U-050: graceful sim cleanup (terminate running sims, persist STOPPED) before exit.
+                shutdown_runner.cleanup_all().await;
+            })
+            .await;
+
+    // U-050 atexit backup (port of `atexit.register(cleanup_all_simulations)`,
+    // simulation_runner.py:1343): also run cleanup on the NON-signal exit path — when
+    // `axum::serve(...)` returns (Ok or Err) without a signal having fired (e.g. a serve
+    // error). `cleanup_all` is idempotent (`cleanup_done` compare-exchange), so if a signal
+    // already cleaned up this is a no-op. Without this, a serve error would leave a running
+    // sim un-terminated with stale on-disk RUNNING state.
+    sim_runner.cleanup_all().await;
+
+    serve_result.map_err(TeriError::Io)?;
 
     Ok(())
 }
