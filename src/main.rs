@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use teri::{Config, Result, TeriError};
+use teri::{Config, Result, TeriError, init_logging};
 
 #[derive(Parser)]
 #[command(name = "teri", version, about = "Swarm Intelligence Prediction Engine")]
@@ -21,8 +21,10 @@ enum Commands {
     },
     /// Start the REST API server
     Serve {
-        #[arg(short, long, default_value = "0.0.0.0:8080")]
-        addr: String,
+        /// Bind address (e.g. "0.0.0.0:8080"). When not set, FLASK_HOST (default "0.0.0.0")
+        /// and FLASK_PORT (default 5001) are used — faithful to MiroFish's env contract.
+        #[arg(short, long)]
+        addr: Option<String>,
     },
 }
 
@@ -59,9 +61,9 @@ async fn run_cmd() -> Result<()> {
     };
 
     // FIX-1.3: GGUF/stub backend guard — preflight before sim run.
-    let is_stub = teri::preflight_check_backend(&config.llm).await.map_err(|e| {
-        TeriError::Config(format!("Backend probe failed: {e}"))
-    })?;
+    let is_stub = teri::preflight_check_backend(&config.llm)
+        .await
+        .map_err(|e| TeriError::Config(format!("Backend probe failed: {e}")))?;
     if is_stub {
         return Err(TeriError::Config(
             "GGUF/stub backend detected — simulation would produce canned text, not intelligence.\n\
@@ -70,7 +72,7 @@ async fn run_cmd() -> Result<()> {
         ));
     }
 
-    tracing_subscriber::fmt().with_env_filter(&config.logging.level).init();
+    init_logging(&config.logging.level)?;
 
     // Create data directories for persistence layer
     let memory_dir = std::path::Path::new(&config.persistence.memory_db_path)
@@ -83,9 +85,7 @@ async fn run_cmd() -> Result<()> {
     std::fs::create_dir_all(graph_dir)
         .map_err(|e| TeriError::Config(format!("Failed to create graph dir: {e}")))?;
 
-    tracing::info!(
-        "Starting simulation: seed={seed}, agents={agents}, query={query}"
-    );
+    tracing::info!("Starting simulation: seed={seed}, agents={agents}, query={query}");
     tracing::info!("Query: {query}");
     tracing::info!("Configuration loaded successfully");
     Err(TeriError::Unknown("Pipeline not yet implemented".to_string()))
@@ -95,14 +95,24 @@ async fn serve_cmd() -> Result<()> {
     let cli = Cli::parse();
     let Commands::Serve { addr } = cli.command else { unreachable!() };
 
-    let config = Config::load().map_err(|e| {
-        TeriError::Config(format!("Configuration error: {e}"))
-    })?;
+    // FIX-1.2 style: friendly guidance toward envctl when config is missing.
+    let config = match Config::load() {
+        Ok(c) => c,
+        Err(e) if e.config_missing() => {
+            eprintln!(
+                "teri: configuration unavailable — key may not be set.\n\
+                 If using envctl: `envctl run -- teri serve`\n\
+                 Otherwise set LLM_API_KEY or create a teri config file.\n\nError: {e}"
+            );
+            return Err(e);
+        }
+        Err(e) => return Err(e),
+    };
 
-    tracing_subscriber::fmt()
-        .with_env_filter(&config.logging.level)
-        .init();
+    // init_logging once — process-global (faithful to create_app calling setup_logger
+    // once at app-factory time; teri does it in the entrypoint instead).
+    init_logging(&config.logging.level)?;
 
-    tracing::info!("Starting API server on {addr}");
-    Err(TeriError::Unknown("API server not yet implemented".to_string()))
+    // Delegate to teri::server::serve which carries the full U-002/U-003 logic.
+    teri::server::serve(config, addr.as_deref()).await
 }

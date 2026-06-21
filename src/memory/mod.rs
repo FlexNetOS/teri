@@ -291,13 +291,151 @@ impl MemoryStore {
         .map_err(|e| TeriError::Memory(format!("Task join error: {e}")))?
     }
 
+    /// Searches stored vector entries for the agent by cosine similarity against `query_embedding`,
+    /// returning up to `top_k` results sorted by descending similarity score.
+    ///
+    /// # Dimension mismatch policy
+    /// If a stored entry's embedding length differs from the query length, that entry is **skipped
+    /// gracefully** (not an error). This mirrors Zep/MiroFish's tolerance for mixed-dimension
+    /// stores. If ALL stored entries are dimension-mismatched (or if the store is empty), returns
+    /// `Ok(vec![])`.
+    ///
+    /// # Zero-norm policy
+    /// Stored entries or query vectors with L2-norm == 0.0 are skipped (avoiding div-by-zero).
+    ///
+    /// # Embedding generation
+    /// This method takes a **precomputed** `query_embedding`. To search by raw text, use
+    /// [`semantic_recall`](Self::semantic_recall), which embeds the text via the
+    /// [`EmbeddingClient`](crate::embedding::EmbeddingClient) (OpenAI-compatible `/v1/embeddings`)
+    /// and feeds the result here — closing GAP-OQ3-EMBED. This precomputed-vector entry point
+    /// stays for callers that already hold a query vector.
     pub async fn query_vec_similarity(
         &self,
-        _agent_id: Uuid,
-        _query_embedding: &[f32],
-        _top_k: usize,
+        agent_id: Uuid,
+        query_embedding: &[f32],
+        top_k: usize,
     ) -> Result<Vec<VectorEntry>> {
-        Err(TeriError::Memory("vector similarity search not yet implemented".to_string()))
+        if top_k == 0 {
+            return Ok(vec![]);
+        }
+
+        let query_len = query_embedding.len();
+
+        // Compute query L2-norm; if zero, no comparison is meaningful.
+        let query_norm: f32 = query_embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if query_norm == 0.0 {
+            return Ok(vec![]);
+        }
+
+        // Clone the embedding for the blocking task (Vec<f32> is Send + 'static).
+        let query_embedding: Vec<f32> = query_embedding.to_vec();
+
+        let prefix = format!("agent:{agent_id}:vec:");
+        let db = self.db.clone();
+
+        let scored_result: Result<Vec<(f32, VectorEntry)>> =
+            tokio::task::spawn_blocking(move || {
+                let read_txn =
+                    db.begin_read().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
+                let table = read_txn
+                    .open_table(KV_TABLE)
+                    .map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
+
+                let mut results: Vec<(f32, VectorEntry)> = Vec::new();
+
+                let iter = table
+                    .range(prefix.as_str()..)
+                    .map_err(|e| TeriError::Memory(format!("Iterator error: {e}")))?;
+
+                for item in iter {
+                    let (k, v) =
+                        item.map_err(|e| TeriError::Memory(format!("Iterator item error: {e}")))?;
+                    if !k.value().starts_with(&prefix) {
+                        break;
+                    }
+                    let entry: VectorEntry = serde_json::from_slice(v.value())
+                        .map_err(|e| TeriError::Memory(format!("Deserialization error: {e}")))?;
+
+                    // Skip dimension-mismatched entries.
+                    if entry.embedding.len() != query_len {
+                        continue;
+                    }
+
+                    // Compute entry L2-norm; skip zero-norm.
+                    let entry_norm: f32 = entry.embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    if entry_norm == 0.0 {
+                        continue;
+                    }
+
+                    // Cosine similarity = dot(q, e) / (|q| * |e|).
+                    let dot: f32 = query_embedding
+                        .iter()
+                        .zip(entry.embedding.iter())
+                        .map(|(a, b)| a * b)
+                        .sum();
+                    let similarity = dot / (query_norm * entry_norm);
+
+                    results.push((similarity, entry));
+                }
+
+                Ok(results)
+            })
+            .await
+            .map_err(|e| TeriError::Memory(format!("Task join error: {e}")))?;
+
+        let mut scored = scored_result?;
+
+        // Sort descending by similarity score.
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Return at most top_k results, discarding scores.
+        let results = scored.into_iter().take(top_k).map(|(_, entry)| entry).collect();
+        Ok(results)
+    }
+
+    /// Embed `content` via the [`EmbeddingClient`] and persist it as a [`VectorEntry`].
+    ///
+    /// This is the **generation→storage** half of GAP-OQ3-EMBED: it joins the embedding
+    /// backend (`src/embedding.rs`, text→vector over an OpenAI-compatible `/v1/embeddings`
+    /// endpoint) to the vector store. Previously `write_vec` required a *precomputed*
+    /// embedding and there was no in-repo path that produced one; this method closes that.
+    ///
+    /// The vector dimensionality is whatever the configured embedding model returns; the
+    /// cosine search ([`query_vec_similarity`](Self::query_vec_similarity)) tolerates mixed
+    /// dimensions by skipping mismatches, so callers do not have to pin a dimension here.
+    pub async fn write_vec_text(
+        &self,
+        agent_id: Uuid,
+        embedder: &crate::embedding::EmbeddingClient,
+        content: &str,
+        importance: f32,
+    ) -> Result<()> {
+        let embedding = embedder.embed(content).await?;
+        let entry = VectorEntry {
+            timestamp: chrono::Utc::now(),
+            content: content.to_string(),
+            embedding,
+            importance,
+        };
+        self.write_vec(agent_id, &entry).await
+    }
+
+    /// Semantic recall: embed `query_text` via the [`EmbeddingClient`], then return the
+    /// `top_k` stored entries most cosine-similar to it.
+    ///
+    /// This is the **generation→search** half of GAP-OQ3-EMBED — the live feed that
+    /// `query_vec_similarity` was written to consume. It is the text-in/entries-out surface
+    /// a feature (e.g. semantic agent-memory recall) calls; `query_vec_similarity` remains
+    /// available for callers that already hold a precomputed query vector.
+    pub async fn semantic_recall(
+        &self,
+        agent_id: Uuid,
+        embedder: &crate::embedding::EmbeddingClient,
+        query_text: &str,
+        top_k: usize,
+    ) -> Result<Vec<VectorEntry>> {
+        let query_embedding = embedder.embed(query_text).await?;
+        self.query_vec_similarity(agent_id, &query_embedding, top_k).await
     }
 }
 
@@ -534,22 +672,272 @@ mod tests {
         assert_eq!(entries[0].importance, 0.9);
     }
 
+    // ===== query_vec_similarity tests =====
+
     #[tokio::test]
-    async fn test_query_vec_similarity_returns_not_implemented() {
+    async fn test_query_vec_similarity_empty_store_returns_empty() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let db_path = temp_dir.path().join("test.redb");
         let store = MemoryStore::new(&db_path).expect("Failed to create memory store");
 
         let agent_id = Uuid::new_v4();
         let query_embedding = vec![0.1, 0.2, 0.3];
-        let result = store.query_vec_similarity(agent_id, &query_embedding, 5).await;
+        let result = store
+            .query_vec_similarity(agent_id, &query_embedding, 5)
+            .await
+            .expect("empty store must succeed, not error");
+        assert!(result.is_empty(), "empty store must return empty vec");
+    }
 
-        assert!(result.is_err());
-        match result {
-            Err(TeriError::Memory(msg)) => {
-                assert!(msg.contains("not yet implemented"));
-            }
-            _ => panic!("Expected Memory error with 'not yet implemented' message"),
+    #[tokio::test]
+    async fn test_query_vec_similarity_ranking() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let db_path = temp_dir.path().join("test.redb");
+        let store = MemoryStore::new(&db_path).expect("Failed to create memory store");
+        let agent_id = Uuid::new_v4();
+        let base_time = chrono::Utc::now();
+
+        // Three vectors:
+        //   A = [1, 0, 0] — orthogonal to query [0, 1, 0] → similarity = 0
+        //   B = [0, 1, 0] — identical to query → similarity = 1.0 (closest)
+        //   C = [0.6, 0.8, 0.0] — partial overlap → similarity = 0.8
+        let entries = vec![
+            VectorEntry {
+                timestamp: base_time,
+                content: "A: orthogonal".to_string(),
+                embedding: vec![1.0, 0.0, 0.0],
+                importance: 0.5,
+            },
+            VectorEntry {
+                timestamp: base_time + chrono::Duration::milliseconds(1),
+                content: "B: identical".to_string(),
+                embedding: vec![0.0, 1.0, 0.0],
+                importance: 0.5,
+            },
+            VectorEntry {
+                timestamp: base_time + chrono::Duration::milliseconds(2),
+                content: "C: partial".to_string(),
+                embedding: vec![0.6, 0.8, 0.0],
+                importance: 0.5,
+            },
+        ];
+
+        for e in &entries {
+            store.write_vec(agent_id, e).await.expect("write vec");
         }
+
+        let query = vec![0.0, 1.0, 0.0];
+        let results = store
+            .query_vec_similarity(agent_id, &query, 3)
+            .await
+            .expect("query must succeed");
+
+        assert_eq!(results.len(), 3);
+        // B must rank first (similarity ≈ 1.0)
+        assert!(
+            results[0].content.contains("B"),
+            "B must rank first; got: {}",
+            results[0].content
+        );
+        // C must rank second (similarity = 0.8)
+        assert!(
+            results[1].content.contains("C"),
+            "C must rank second; got: {}",
+            results[1].content
+        );
+        // A must rank last (similarity = 0.0)
+        assert!(
+            results[2].content.contains("A"),
+            "A must rank last; got: {}",
+            results[2].content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_query_vec_similarity_top_k_limiting() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let db_path = temp_dir.path().join("test.redb");
+        let store = MemoryStore::new(&db_path).expect("Failed to create memory store");
+        let agent_id = Uuid::new_v4();
+        let base_time = chrono::Utc::now();
+
+        // Store 5 vectors with non-zero embeddings and well-separated timestamps.
+        // i+1 avoids [0.0, 0.0, 0.0] which would be skipped (zero norm).
+        for i in 0i64..5 {
+            let entry = VectorEntry {
+                timestamp: base_time + chrono::Duration::milliseconds(i * 100),
+                content: format!("entry {i}"),
+                embedding: vec![(i + 1) as f32, 0.0, 0.0],
+                importance: 0.5,
+            };
+            store.write_vec(agent_id, &entry).await.expect("write");
+        }
+
+        // Request only 2
+        let query = vec![1.0, 0.0, 0.0];
+        let results = store
+            .query_vec_similarity(agent_id, &query, 2)
+            .await
+            .expect("query must succeed");
+        assert_eq!(results.len(), 2, "must return at most top_k=2");
+    }
+
+    #[tokio::test]
+    async fn test_query_vec_similarity_top_k_ge_available_returns_all() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let db_path = temp_dir.path().join("test.redb");
+        let store = MemoryStore::new(&db_path).expect("Failed to create memory store");
+        let agent_id = Uuid::new_v4();
+        // Use a fixed base so timestamps are well-separated (100ms apart) to avoid key collision.
+        let base_time =
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp");
+
+        // Store 3 vectors with non-zero embeddings and well-separated timestamps (100ms apart).
+        // i+1 avoids the [0.0, 0.0] zero-norm case that would be silently skipped.
+        for i in 0u32..3 {
+            let entry = VectorEntry {
+                timestamp: base_time + chrono::Duration::milliseconds(i64::from(i) * 100),
+                content: format!("entry {i}"),
+                embedding: vec![(i + 1) as f32, 0.0],
+                importance: 0.5,
+            };
+            store.write_vec(agent_id, &entry).await.expect("write");
+        }
+
+        // Request more than available
+        let query = vec![1.0, 0.0];
+        let results = store
+            .query_vec_similarity(agent_id, &query, 100)
+            .await
+            .expect("query must succeed");
+        assert_eq!(results.len(), 3, "when top_k >= available, must return all");
+    }
+
+    #[tokio::test]
+    async fn test_query_vec_similarity_dimension_mismatch_skipped() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let db_path = temp_dir.path().join("test.redb");
+        let store = MemoryStore::new(&db_path).expect("Failed to create memory store");
+        let agent_id = Uuid::new_v4();
+        let base_time = chrono::Utc::now();
+
+        // Store a 3-dim entry
+        let entry_3d = VectorEntry {
+            timestamp: base_time,
+            content: "3-dim".to_string(),
+            embedding: vec![1.0, 0.0, 0.0],
+            importance: 0.5,
+        };
+        store.write_vec(agent_id, &entry_3d).await.expect("write 3d");
+
+        // Store a 2-dim entry (correct dimension)
+        let entry_2d = VectorEntry {
+            timestamp: base_time + chrono::Duration::milliseconds(1),
+            content: "2-dim".to_string(),
+            embedding: vec![1.0, 0.0],
+            importance: 0.5,
+        };
+        store.write_vec(agent_id, &entry_2d).await.expect("write 2d");
+
+        // Query with 2-dim → 3-dim entry is skipped, 2-dim entry is returned
+        let query = vec![1.0, 0.0];
+        let results = store
+            .query_vec_similarity(agent_id, &query, 10)
+            .await
+            .expect("dimension mismatch must not error");
+        assert_eq!(results.len(), 1, "3-dim entry must be skipped; only 2-dim returned");
+        assert!(results[0].content.contains("2-dim"));
+    }
+
+    #[tokio::test]
+    async fn test_query_vec_similarity_identical_vector_similarity_near_one() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let db_path = temp_dir.path().join("test.redb");
+        let store = MemoryStore::new(&db_path).expect("Failed to create memory store");
+        let agent_id = Uuid::new_v4();
+
+        let vec = vec![0.6, 0.8]; // already unit-normed: |v|=1.0
+        let entry = VectorEntry {
+            timestamp: chrono::Utc::now(),
+            content: "identical".to_string(),
+            embedding: vec.clone(),
+            importance: 1.0,
+        };
+        store.write_vec(agent_id, &entry).await.expect("write");
+
+        let results =
+            store.query_vec_similarity(agent_id, &vec, 1).await.expect("query must succeed");
+        assert_eq!(results.len(), 1);
+        // We can't directly read the score but the identical vector must rank first (and only).
+        assert_eq!(results[0].content, "identical");
+    }
+
+    // ===== GAP-OQ3-EMBED end-to-end: EmbeddingClient -> write_vec_text/semantic_recall =====
+
+    /// Full text→vector→cosine path through the REAL embedding client (mocked HTTP, never a
+    /// fake embedder): store two texts via `write_vec_text`, then `semantic_recall` a query and
+    /// assert the semantically-aligned entry ranks first. The mock serves distinct unit vectors
+    /// keyed by the request body, so ranking is determined by the generated embeddings — proving
+    /// the generation half is wired to the search half.
+    #[tokio::test]
+    async fn test_semantic_recall_end_to_end_via_embedding_client() {
+        use crate::config::LlmConfig;
+        use crate::embedding::EmbeddingClient;
+        use httpmock::prelude::*;
+
+        let server = MockServer::start();
+        // "fruit-red-apple" -> e1 = [1,0]
+        server.mock(|when, then| {
+            when.method(POST).path("/embeddings").body_contains("fruit-red-apple");
+            then.status(200).header("Content-Type", "application/json").body(
+                r#"{"object":"list","data":[{"object":"embedding","embedding":[1.0,0.0],"index":0}]}"#,
+            );
+        });
+        // "fast-red-car" -> e2 = [0,1]
+        server.mock(|when, then| {
+            when.method(POST).path("/embeddings").body_contains("fast-red-car");
+            then.status(200).header("Content-Type", "application/json").body(
+                r#"{"object":"list","data":[{"object":"embedding","embedding":[0.0,1.0],"index":0}]}"#,
+            );
+        });
+        // query "apple-query" -> aligned with the apple entry = [1,0]
+        server.mock(|when, then| {
+            when.method(POST).path("/embeddings").body_contains("apple-query");
+            then.status(200).header("Content-Type", "application/json").body(
+                r#"{"object":"list","data":[{"object":"embedding","embedding":[1.0,0.0],"index":0}]}"#,
+            );
+        });
+
+        let cfg = LlmConfig {
+            base_url: server.base_url(),
+            api_key: String::new(),
+            model: "unused".to_string(),
+            embed_model: "all-MiniLM-L6-v2".to_string(),
+            timeout_secs: 5,
+            max_retries: 0,
+        };
+        let embedder = EmbeddingClient::new(&cfg);
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let store = MemoryStore::new(temp_dir.path()).expect("store");
+        let agent_id = Uuid::new_v4();
+
+        store
+            .write_vec_text(agent_id, &embedder, "fruit-red-apple", 0.9)
+            .await
+            .expect("store apple via embedding");
+        store
+            .write_vec_text(agent_id, &embedder, "fast-red-car", 0.5)
+            .await
+            .expect("store car via embedding");
+
+        let hits = store
+            .semantic_recall(agent_id, &embedder, "apple-query", 2)
+            .await
+            .expect("semantic recall");
+
+        assert_eq!(hits.len(), 2, "both stored entries returned");
+        assert_eq!(hits[0].content, "fruit-red-apple", "apple must rank first for an apple query");
+        assert_eq!(hits[1].content, "fast-red-car");
     }
 }

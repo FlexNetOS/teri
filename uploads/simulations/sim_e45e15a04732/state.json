@@ -1,0 +1,19 @@
+{
+  "simulation_id": "sim_e45e15a04732",
+  "project_id": "proj_8008777edf33",
+  "graph_id": "",
+  "enable_twitter": true,
+  "enable_reddit": true,
+  "status": "created",
+  "entities_count": 0,
+  "profiles_count": 0,
+  "entity_types": [],
+  "config_generated": false,
+  "config_reasoning": "",
+  "current_round": 0,
+  "twitter_status": "not_started",
+  "reddit_status": "not_started",
+  "created_at": "2026-06-19T20:31:28.680103",
+  "updated_at": "2026-06-19T20:31:28.680114",
+  "error": null
+}

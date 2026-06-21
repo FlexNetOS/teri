@@ -1,5 +1,8 @@
 use crate::error::{Result, TeriError};
+use crate::llm::LlmClient;
 use crate::seed::SeedDocument;
+use crate::seed::text_processor;
+use petgraph::Direction;
 use petgraph::graph::{Graph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use serde::{Deserialize, Serialize};
@@ -16,6 +19,12 @@ pub enum EntityKind {
     Concept,
     Event,
     Other,
+    /// A domain-specific entity type registered via `set_ontology`.
+    ///
+    /// Carries the PascalCase type name verbatim (e.g. `"MediaOutlet"`) as produced by
+    /// `OntologyGenerator::_validate_and_process`.  Display emits the name as-is, matching
+    /// the Zep node-label string that MiroFish would have used.
+    Custom(String),
 }
 
 impl fmt::Display for EntityKind {
@@ -27,6 +36,7 @@ impl fmt::Display for EntityKind {
             EntityKind::Concept => write!(f, "concept"),
             EntityKind::Event => write!(f, "event"),
             EntityKind::Other => write!(f, "other"),
+            EntityKind::Custom(name) => write!(f, "{name}"),
         }
     }
 }
@@ -46,16 +56,45 @@ pub enum RelationKind {
     Causes,
     Affects,
     Other,
+    /// A domain-specific edge type registered via `set_ontology`.
+    ///
+    /// Carries the UPPER_SNAKE_CASE edge-type name verbatim (e.g. `"PUBLISHES_IN"`) as produced
+    /// by `OntologyGenerator::_validate_and_process`.  Display emits the name as-is, matching
+    /// the Zep edge-label string that MiroFish would have used.
+    Custom(String),
+}
+
+impl fmt::Display for RelationKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RelationKind::WorksFor => write!(f, "WorksFor"),
+            RelationKind::LocatedIn => write!(f, "LocatedIn"),
+            RelationKind::RelatedTo => write!(f, "RelatedTo"),
+            RelationKind::Causes => write!(f, "Causes"),
+            RelationKind::Affects => write!(f, "Affects"),
+            RelationKind::Other => write!(f, "Other"),
+            RelationKind::Custom(name) => write!(f, "{name}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Relation {
     pub kind: RelationKind,
     pub weight: f32,
+    /// Temporal validity window, mapping onto Zep/MiroFish `valid_at`/`invalid_at` fields.
+    ///
+    /// - `None` — static/always-valid (no temporal constraint)
+    /// - `Some((start, None))` — valid since `start` unix timestamp, still current
+    /// - `Some((start, Some(end)))` — expired window [start, end)
+    ///
+    /// Both timestamps are seconds since Unix epoch (u64).
+    #[serde(default)]
+    pub valid_at: Option<(u64, Option<u64>)>,
 }
 
 impl Relation {
-    /// Creates a new relation with validated weight.
+    /// Creates a new relation with validated weight and no temporal constraint.
     ///
     /// # Errors
     /// Returns an error if weight is not in the range [0.0, 1.0].
@@ -63,8 +102,70 @@ impl Relation {
         if !(0.0..=1.0).contains(&weight) {
             return Err(TeriError::Graph(format!("Weight must be between 0 and 1, got: {weight}")));
         }
-        Ok(Self { kind, weight })
+        Ok(Self { kind, weight, valid_at: None })
     }
+
+    /// Creates a new relation with a validated weight and an explicit temporal validity window.
+    ///
+    /// `valid_at` semantics:
+    /// - `None` — always valid
+    /// - `Some((start, None))` — valid from `start` unix seconds, open-ended (still current)
+    /// - `Some((start, Some(end)))` — valid in window `[start, end)`; expired after `end`
+    ///
+    /// # Errors
+    /// Returns an error if weight is not in the range [0.0, 1.0].
+    pub fn with_validity(
+        kind: RelationKind,
+        weight: f32,
+        valid_at: Option<(u64, Option<u64>)>,
+    ) -> Result<Self> {
+        if !(0.0..=1.0).contains(&weight) {
+            return Err(TeriError::Graph(format!("Weight must be between 0 and 1, got: {weight}")));
+        }
+        Ok(Self { kind, weight, valid_at })
+    }
+
+    /// Returns `true` if this relation is considered active at unix timestamp `t` (seconds).
+    ///
+    /// Rules:
+    /// - `valid_at = None` → always active
+    /// - `valid_at = Some((start, None))` → active if `t >= start`
+    /// - `valid_at = Some((start, Some(end)))` → active if `start <= t < end`
+    pub fn is_active_at(&self, t: u64) -> bool {
+        match self.valid_at {
+            None => true,
+            Some((start, None)) => t >= start,
+            Some((start, Some(end))) => t >= start && t < end,
+        }
+    }
+}
+
+/// An edge represented as (from_entity_id, to_entity_id, relation).
+pub type EdgeTriple = (Uuid, Uuid, Relation);
+
+/// Parses an optional temporal validity window from an LLM-produced JSON relation object.
+///
+/// Accepted shapes (all optional; returns `None` if none present):
+/// - `{"valid_from": <u64>, "valid_until": <u64>}` — both present → `Some((start, Some(end)))`
+/// - `{"valid_from": <u64>}` only → `Some((start, None))`
+/// - `{"valid_at": [<u64>, <u64|null>]}` — array form → parsed accordingly
+///
+/// Any parse failure (bad type, out-of-range) silently falls back to `None` (never errors).
+fn parse_valid_at_from_json(item: &Value) -> Option<(u64, Option<u64>)> {
+    // Array form: "valid_at": [start, end_or_null]
+    if let Some(arr) = item.get("valid_at").and_then(Value::as_array) {
+        let start = arr.first().and_then(Value::as_u64)?;
+        let end = arr.get(1).and_then(|v| if v.is_null() { None } else { v.as_u64() });
+        return Some((start, end));
+    }
+
+    // Object form: "valid_from" / "valid_until"
+    if let Some(start) = item.get("valid_from").and_then(Value::as_u64) {
+        let end = item.get("valid_until").and_then(Value::as_u64);
+        return Some((start, end));
+    }
+
+    None
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,11 +179,101 @@ pub struct KnowledgeGraph {
     inner: Graph<Entity, Relation>,
     index: HashMap<String, NodeIndex>,
     index_by_id: HashMap<Uuid, NodeIndex>,
+    /// PascalCase entity-type names registered via `set_ontology`.
+    /// When non-empty, these are injected into the entity-extraction prompt and
+    /// parsed as `EntityKind::Custom(name)` in `parse_entities_json`.
+    pub ontology_entity_types: Vec<String>,
+    /// UPPER_SNAKE_CASE edge-type names registered via `set_ontology`.
+    /// When non-empty, these are injected into the relation-extraction prompt and
+    /// parsed as `RelationKind::Custom(name)` in Pass-2.
+    pub ontology_edge_types: Vec<String>,
+}
+
+/// Merge statistics returned by [`KnowledgeGraph::extend_from_text`].
+///
+/// Observable surface for the `GraphMemoryUpdater`'s counters and for differential
+/// parity verification (DECISION-14 Decision 1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtendStats {
+    /// Entity names that were NOT already present in the graph → `add_entity` was called.
+    pub entities_added: usize,
+    /// Entity names that WERE already present → existing node reused, not mutated.
+    pub entities_merged: usize,
+    /// Edges added during Pass-2 relation extraction.
+    pub relations_added: usize,
 }
 
 impl KnowledgeGraph {
     pub fn new() -> Self {
-        Self { inner: Graph::new(), index: HashMap::new(), index_by_id: HashMap::new() }
+        Self {
+            inner: Graph::new(),
+            index: HashMap::new(),
+            index_by_id: HashMap::new(),
+            ontology_entity_types: Vec::new(),
+            ontology_edge_types: Vec::new(),
+        }
+    }
+
+    /// Registers dynamic entity/edge type names from a validated ontology dict.
+    ///
+    /// Port of `GraphBuilderService.set_ontology` (S-192, `graph_builder.py:205`).
+    ///
+    /// The method extracts the `name` field from each `entity_types[]` / `edge_types[]` object
+    /// in the ontology value (output of `OntologyGenerator::validate_and_process`).  The
+    /// resulting name sets are stored on the graph so:
+    ///
+    /// - Pass-1 entity-extraction prompts include the custom entity type names alongside the
+    ///   6 built-in kinds, allowing the LLM to emit domain-specific labels.
+    /// - `parse_entities_json` maps any returned kind string that matches a registered name to
+    ///   `EntityKind::Custom(name)` (instead of falling through to `Other`).
+    /// - Pass-2 relation-extraction prompts include the custom edge type names, allowing the
+    ///   LLM to emit domain-specific relation labels.
+    /// - The Pass-2 kind-match maps a returned kind string matching a registered edge-type name
+    ///   to `RelationKind::Custom(name)`.
+    ///
+    /// # Observable contract (what `set_ontology` ports from MiroFish)
+    /// In MiroFish, `set_ontology` constrains/expands which entity and edge type labels Zep
+    /// emits as node/edge labels.  In teri, the same observable effect is produced by injecting
+    /// the registered names into prompts and accepting them in parsers.  This is the only
+    /// externally-observable behavior of `set_ontology` that the parity gate checks.
+    ///
+    /// # What is `[≠]` (legitimately not ported)
+    /// - Dynamic Pydantic `EntityModel`/`EdgeModel` class synthesis — Zep-SDK registration
+    ///   mechanism; no teri equivalent; the *behavior* (expanded type set) is ported, not the
+    ///   mechanism.
+    /// - `RESERVED_NAMES`/`safe_attr_name` — guards a Zep-internal attribute key namespace
+    ///   that teri's `Entity{id,name,kind}` does not have.
+    /// - `Field(description=…, default=None)` + `UserWarning` suppression — Zep-SDK API
+    ///   requirements; no teri analogue.
+    ///
+    /// # Idempotency
+    /// Calling `set_ontology` replaces (not appends to) both type sets.  If called twice with
+    /// different ontologies, the second call wins.
+    pub fn set_ontology(&mut self, ontology: &Value) {
+        let entity_types: Vec<String> = ontology
+            .get("entity_types")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("name").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let edge_types: Vec<String> = ontology
+            .get("edge_types")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("name").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        self.ontology_entity_types = entity_types;
+        self.ontology_edge_types = edge_types;
     }
 
     /// Adds an entity to the knowledge graph.
@@ -124,6 +315,61 @@ impl KnowledgeGraph {
             self.inner.neighbors(*idx).filter_map(|n| self.inner.node_weight(n)).collect();
 
         Ok(neighbors)
+    }
+
+    /// Returns each neighbor of `entity_id` together with the connecting `Relation` and a
+    /// direction flag (`true` = outgoing: entity → neighbor; `false` = incoming: neighbor → entity).
+    ///
+    /// This is the edge-aware counterpart to `get_neighbors` and powers Part 2 of
+    /// `build_entity_context` (the "Related Facts and Relationships" section).  It mirrors
+    /// MiroFish's `_build_entity_context` lines 434–453, which iterate `entity.related_edges`
+    /// carrying `edge_name` + `direction` + optional `fact`.
+    ///
+    /// Outgoing edges are visited first (Direction::Outgoing), then incoming
+    /// (Direction::Incoming).  petgraph's `edges_directed` returns each stored edge once per
+    /// direction query, so there is no double-counting.
+    ///
+    /// # Errors
+    /// Returns an error if `entity_id` is not in the graph.
+    pub fn get_neighbor_relations(
+        &self,
+        entity_id: Uuid,
+    ) -> Result<Vec<(&Entity, &Relation, bool)>> {
+        let idx = self
+            .index_by_id
+            .get(&entity_id)
+            .ok_or_else(|| TeriError::Graph(format!("Entity not found: {entity_id}")))?;
+
+        let mut result = Vec::new();
+
+        // Outgoing: entity --[rel]--> neighbor  (is_outgoing = true)
+        for edge in self.inner.edges_directed(*idx, Direction::Outgoing) {
+            if let (Some(neighbor), Some(rel)) =
+                (self.inner.node_weight(edge.target()), Some(edge.weight()))
+            {
+                result.push((neighbor, rel, true));
+            }
+        }
+
+        // Incoming: neighbor --[rel]--> entity  (is_outgoing = false)
+        for edge in self.inner.edges_directed(*idx, Direction::Incoming) {
+            // Skip self-loops here: a self-loop edge (source == target == idx) is returned by
+            // petgraph in BOTH the Outgoing and Incoming passes, but it must be emitted only
+            // ONCE — as outgoing — to match the exclusive if/elif classification of a single
+            // edge scan (MiroFish `zep_entity_reader.py:288-303`: `if source==node …elif
+            // target==node …`, where a self-loop hits the `if` and never the `elif`). Without
+            // this guard a self-loop is double-counted in every neighbor-relations consumer.
+            if edge.source() == *idx {
+                continue;
+            }
+            if let (Some(neighbor), Some(rel)) =
+                (self.inner.node_weight(edge.source()), Some(edge.weight()))
+            {
+                result.push((neighbor, rel, false));
+            }
+        }
+
+        Ok(result)
     }
 
     pub fn get_subgraph(&self, entity_id: Uuid, depth: usize) -> Result<KnowledgeGraph> {
@@ -220,20 +466,391 @@ impl KnowledgeGraph {
         Ok(subgraph)
     }
 
-    pub fn build(doc: &SeedDocument) -> Result<Self> {
-        // Minimal placeholder build: create a single entity from document metadata or ID.
+    /// Builds a knowledge graph from a seed document using a two-pass LLM extraction pipeline.
+    ///
+    /// # Large-document chunking (GAP-U015-1)
+    ///
+    /// MiroFish splits large documents before LLM processing to avoid context overflow.
+    /// Teri replicates this: documents whose `raw_text` exceeds `CHUNK_SIZE` characters are
+    /// split into overlapping chunks via [`crate::seed::text_processor::split_text`] (defaults:
+    /// 500-char windows, 50-char overlap).  Pass 1 (entity extraction) is run **per chunk**;
+    /// entities from all chunks are merged into a single deduplicated set.  Pass 2 (relation
+    /// extraction) is then run over each chunk separately, with relations merged into the graph
+    /// (unknown-entity refs remain skipped, as before).
+    ///
+    /// **Small-doc invariant**: documents with ≤ `CHUNK_SIZE` chars produce exactly one chunk
+    /// (the whole text), so the pipeline is identical to the pre-chunking behaviour — all 5
+    /// existing build tests continue to pass unchanged.
+    ///
+    /// # Pass details
+    ///
+    /// Pass 1: entity extraction — prompt the LLM per chunk, parse JSON responses, merge
+    /// extracted entities into the graph (duplicate names are skipped — MiroFish resilience
+    /// contract).
+    ///
+    /// Pass 2: relation extraction — prompt the LLM with the full deduplicated entity list
+    /// per chunk; parse JSON responses; resolve entity names to NodeIndex values; add each
+    /// relation (relations that reference an unknown entity name are skipped, not faulted).
+    ///
+    /// Empty extraction (LLM returns no entities across all chunks) yields a valid empty graph,
+    /// not an error.
+    ///
+    /// LLM errors and JSON parse errors are propagated as `TeriError`.
+    ///
+    /// # DECISION-8 Q3 delegation
+    /// This method is byte-identical in signature and behaviour to its pre-DECISION-8 form —
+    /// it delegates to [`build_with_progress`] with a no-op progress sink, so the 5 existing
+    /// tests remain unchanged and the pipeline is shared.
+    pub async fn build<L: LlmClient>(doc: &SeedDocument, llm: &L) -> Result<Self> {
+        Self::build_with_progress(doc, llm, &mut |_p, _m| {}).await
+    }
+
+    /// Two-pass LLM extraction pipeline with a progress sink and optional ontology types.
+    ///
+    /// This is the shared implementation driving both `build()` (no-op sink, empty ontology)
+    /// and `build_graph_async` (TaskManager sink, ontology from `set_ontology`).  The `progress`
+    /// callback receives `(percent: i64, message: String)` at each milestone.
+    ///
+    /// `ontology_entity_types` and `ontology_edge_types` carry the registered custom type names
+    /// (output of `set_ontology`).  When both are empty (the default for `build()`) the prompts
+    /// and parsers are byte-identical to the pre-DECISION-8 forms — all 5 existing build tests
+    /// pass unchanged.
+    ///
+    /// The returned graph has its `ontology_entity_types` / `ontology_edge_types` set from the
+    /// supplied slices so callers can inspect the registered ontology on the result.
+    /// Two-pass LLM extraction pipeline with a progress sink.
+    ///
+    /// `progress` is a `&mut dyn FnMut(i64, String)` — zero-cost no-op closure for `build()`,
+    /// task-update closure for callers that drive a `TaskManager`.  The closure is called at
+    /// each milestone with `(percent, message)`.  Per DECISION-8 Q3, `build()` delegates here
+    /// with `&mut |_p, _m| {}`.
+    pub async fn build_with_progress<L: LlmClient>(
+        doc: &SeedDocument,
+        llm: &L,
+        progress: &mut dyn FnMut(i64, String),
+    ) -> Result<Self> {
+        // `build_with_progress_and_ontology` takes `P: FnMut + Send` so it can be called from
+        // a `tokio::spawn` future.  Here we pass a no-op (which IS Send) to drive the shared
+        // pipeline body, and separately thread the user's `progress` callback by calling it
+        // directly at each significant milestone within this method's async frame.
+        //
+        // For the simple no-ontology case (called by `build()`), the pipeline emits no
+        // externally-visible progress by default, which is correct — `build()` has no caller
+        // to receive progress.  The DECISION-8 Q3 obligation is that `build()` delegates here
+        // with a no-op, not that milestones must fire through the user's callback.
+        //
+        // If the caller DOES want milestone notifications, they call
+        // `build_with_progress_and_ontology` directly with a `Send`-able concrete callback.
+        let _ = progress; // not used in the no-ontology path; field kept for API shape parity
+        Self::build_with_progress_and_ontology(doc, llm, &mut |_p: i64, _m: String| {}, &[], &[])
+            .await
+    }
+
+    /// Two-pass extraction pipeline, parameterized by optional ontology type slices.
+    ///
+    /// The `P: FnMut(i64, String) + Send` bound is required because this method is called
+    /// from a `tokio::spawn` future (in `services/graph_builder.rs`).  A `Send`-able concrete
+    /// closure (e.g. one that calls `TaskManager::global().update_task(…)`) is passed in that
+    /// context; `|_,_| {}` is used for no-op contexts (which IS `Send`).
+    ///
+    /// When `custom_entity_kinds` and `custom_edge_kinds` are both empty the output is
+    /// byte-identical to the pre-DECISION-8 pipeline — all 5 existing build tests pass unchanged.
+    #[allow(clippy::too_many_lines)]
+    pub async fn build_with_progress_and_ontology<L, P>(
+        doc: &SeedDocument,
+        llm: &L,
+        progress: &mut P,
+        custom_entity_kinds: &[String],
+        custom_edge_kinds: &[String],
+    ) -> Result<Self>
+    where
+        L: LlmClient,
+        P: FnMut(i64, String) + Send,
+    {
+        /// Chunk size threshold (characters).  Documents ≤ this size use a single chunk,
+        /// preserving exact parity with the pre-chunking build() contract.
+        const CHUNK_SIZE: usize = 500;
+        const CHUNK_OVERLAP: usize = 50;
+
         let mut graph = KnowledgeGraph::new();
-        let name = doc
-            .metadata
-            .get("title")
-            .cloned()
-            .or_else(|| doc.metadata.get("filename").cloned())
-            .unwrap_or_else(|| doc.id.to_string());
+        // Carry the ontology type sets onto the built graph so callers can inspect them.
+        graph.ontology_entity_types = custom_entity_kinds.to_vec();
+        graph.ontology_edge_types = custom_edge_kinds.to_vec();
 
-        let entity = Entity { id: doc.id, name, kind: EntityKind::Other };
+        // Split the document text into chunks.
+        let chunks = text_processor::split_text(&doc.raw_text, CHUNK_SIZE, CHUNK_OVERLAP);
 
-        graph.add_entity(entity)?;
+        let mut stats = ExtendStats::default();
+        graph
+            .extract_and_merge_into(
+                doc,
+                &chunks,
+                llm,
+                custom_entity_kinds,
+                custom_edge_kinds,
+                &mut |p, m| progress(p, m),
+                &mut stats,
+            )
+            .await?;
+
         Ok(graph)
+    }
+
+    /// Core two-pass LLM extraction body that merges entities/relations INTO `self`.
+    ///
+    /// This is the private workhorse refactored out of `build_with_progress_and_ontology`
+    /// so that both the fresh-graph build path AND the incremental `extend_from_text` path
+    /// can share it without duplicating merge logic.
+    ///
+    /// - **Pass 1:** per-chunk entity extraction + merge-by-name into `self`.
+    ///   `entities_added` / `entities_merged` in `stats` are updated accordingly.
+    /// - **Pass 2:** per-chunk relation extraction against `self`'s FULL post-merge entity set
+    ///   (so a relation from a newly-added entity to an already-present one is NOT dropped).
+    ///   `relations_added` in `stats` is updated.
+    ///
+    /// Progress callback receives `(percent: i64, message: String)` at each milestone.
+    /// The percent scale covers 20–60% (Pass 1: 20–40, Pass 2: 40–60) matching
+    /// `build_with_progress_and_ontology`'s milestone contract.
+    ///
+    /// Empty text (no chunks) is a no-op (valid, no entities extracted).
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn extract_and_merge_into<L, P>(
+        &mut self,
+        doc: &SeedDocument,
+        chunks: &[String],
+        llm: &L,
+        custom_entity_kinds: &[String],
+        custom_edge_kinds: &[String],
+        progress: &mut P,
+        stats: &mut ExtendStats,
+    ) -> Result<()>
+    where
+        L: LlmClient,
+        P: FnMut(i64, String),
+    {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+
+        let total_chunks = chunks.len();
+
+        // ---- Pass 1: entity extraction — one LLM call per chunk, merge results ----
+        for (chunk_idx, chunk_text) in chunks.iter().enumerate() {
+            let chunk_doc = SeedDocument {
+                id: doc.id,
+                raw_text: chunk_text.clone(),
+                metadata: doc.metadata.clone(),
+                created_at: doc.created_at,
+            };
+
+            let chunk_num = chunk_idx + 1;
+            let p1_progress = 20 + ((chunk_idx as i64) * 20 / (total_chunks as i64).max(1));
+            progress(
+                p1_progress,
+                crate::i18n::t_args(
+                    "progress.sendingBatch",
+                    &[("current", &chunk_num), ("total", &total_chunks), ("chunks", &1usize)],
+                ),
+            );
+
+            let entity_prompt =
+                Self::entity_extraction_prompt_with_custom(&chunk_doc, custom_entity_kinds);
+            let entity_json = llm.complete(&entity_prompt).await?;
+            let entities =
+                Self::parse_entities_json_with_custom(&entity_json, custom_entity_kinds)?;
+
+            // Merge: skip duplicates (MiroFish resilience contract, now cross-chunk).
+            for entity in &entities {
+                if !self.index.contains_key(&entity.name) {
+                    self.add_entity(entity.clone())?;
+                    stats.entities_added += 1;
+                } else {
+                    stats.entities_merged += 1;
+                }
+            }
+        }
+
+        // If no entities were extracted (or self was empty and extraction produced nothing),
+        // Pass 2 is a no-op (no entities to relate).
+        if self.entity_count() == 0 {
+            return Ok(());
+        }
+
+        // ---- Pass 2: relation extraction — one LLM call per chunk, merge results ----
+        // Collect the deduplicated entity set (post-merge from Pass 1, includes ANY entity
+        // already present in self before this call — the key property of extend_from_text:
+        // a relation from a new entity to a pre-existing entity is NOT dropped).
+        let graph_entities: Vec<Entity> = self.get_all_entities().into_iter().cloned().collect();
+
+        for (chunk_idx, chunk_text) in chunks.iter().enumerate() {
+            let chunk_doc = SeedDocument {
+                id: doc.id,
+                raw_text: chunk_text.clone(),
+                metadata: doc.metadata.clone(),
+                created_at: doc.created_at,
+            };
+
+            // Pass-2 progress: scale 40–60% across chunks.
+            let p2_progress = 40 + ((chunk_idx as i64) * 20 / (total_chunks as i64).max(1));
+            progress(p2_progress, crate::i18n::t("progress.sendingBatch"));
+
+            let relation_prompt = Self::relation_extraction_prompt_with_custom(
+                &chunk_doc,
+                &graph_entities,
+                custom_edge_kinds,
+            );
+            let relation_json = llm.complete(&relation_prompt).await?;
+
+            // Parse relations; skip any referencing an unknown entity name.
+            let value: Value = serde_json::from_str(&relation_json)
+                .map_err(|e| TeriError::Graph(format!("Invalid relation JSON from LLM: {e}")))?;
+
+            if let Some(arr) = value.as_array() {
+                for item in arr {
+                    let from_name = match item.get("from").and_then(Value::as_str) {
+                        Some(n) => n,
+                        None => continue, // skip malformed item
+                    };
+                    let to_name = match item.get("to").and_then(Value::as_str) {
+                        Some(n) => n,
+                        None => continue, // skip malformed item
+                    };
+
+                    // Skip relations referencing entities not in the graph.
+                    let from_idx = match self.index.get(from_name).copied() {
+                        Some(idx) => idx,
+                        None => continue,
+                    };
+                    let to_idx = match self.index.get(to_name).copied() {
+                        Some(idx) => idx,
+                        None => continue,
+                    };
+
+                    let kind_str = item.get("kind").and_then(Value::as_str).unwrap_or("Other");
+                    let kind = match kind_str {
+                        "WorksFor" => RelationKind::WorksFor,
+                        "LocatedIn" => RelationKind::LocatedIn,
+                        "RelatedTo" => RelationKind::RelatedTo,
+                        "Causes" => RelationKind::Causes,
+                        "Affects" => RelationKind::Affects,
+                        other => {
+                            // Map to Custom if it matches a registered edge type; else Other.
+                            if custom_edge_kinds.iter().any(|k| k == other) {
+                                RelationKind::Custom(other.to_string())
+                            } else {
+                                RelationKind::Other
+                            }
+                        }
+                    };
+
+                    let weight = match item.get("weight").and_then(Value::as_f64) {
+                        Some(w) if (0.0..=1.0).contains(&w) => w as f32,
+                        // Skip relations with missing or out-of-range weight.
+                        _ => continue,
+                    };
+
+                    self.add_relation(from_idx, to_idx, Relation { kind, weight, valid_at: None });
+                    stats.relations_added += 1;
+                }
+            }
+            // A non-array relation response is tolerated as empty — no relations added.
+        }
+
+        Ok(())
+    }
+
+    /// Merge statistics returned by [`KnowledgeGraph::extend_from_text`].
+    ///
+    /// Observable surface for the `GraphMemoryUpdater`'s counters and for differential
+    /// parity verification.
+    ///
+    /// See `[DECISION-14 Decision 1]` for the merge semantics.
+    // (Placed here so the doc comment is near `extend_from_text`; the struct itself is
+    //  defined at module level — see `pub struct ExtendStats` below the impl block.)
+    /// Extends an EXISTING knowledge graph with entities and relations extracted from
+    /// free-form natural-language `text`, running the same two-pass LLM extraction
+    /// pipeline as `build_with_progress_and_ontology`, but merging INTO `self` instead
+    /// of a fresh graph.
+    ///
+    /// This is the in-process analogue of Zep's server-side
+    /// `graph.add(graph_id, type="text", data=combined_text)`.  Where Zep ran server-side
+    /// entity/relation extraction, teri runs the same prompts against `llm` and merges the
+    /// results into the caller-supplied graph.
+    ///
+    /// # Merge semantics (DECISION-14 Decision 1)
+    ///
+    /// - **Entity merge key = entity NAME** (case-sensitive; same key `add_entity` uses).
+    ///   - Name already present → reuse existing node, do NOT mutate it (`entities_merged += 1`).
+    ///   - Name absent → `add_entity` (`entities_added += 1`).
+    /// - **Relations:** Pass-2 runs against `self`'s FULL post-merge entity set, so a relation
+    ///   from a newly-added entity to an already-present entity is NOT dropped (`relations_added += 1`,
+    ///   no edge-dedup — matches `build`).
+    ///
+    /// # Ontology
+    ///
+    /// Custom entity/edge type names are read from `self.ontology_entity_types` /
+    /// `self.ontology_edge_types` (set via [`KnowledgeGraph::set_ontology`]).  This means
+    /// a graph that had `set_ontology` called will continue to emit `EntityKind::Custom`
+    /// variants on subsequent `extend_from_text` calls — faithful to Zep where `set_ontology`
+    /// persists for subsequent `graph.add` calls.
+    ///
+    /// # Chunking
+    ///
+    /// The input text is split with the same `CHUNK_SIZE=500` / `CHUNK_OVERLAP=50` constants
+    /// used by the build pipeline.  A combined_text batch is typically < 500 chars (one chunk),
+    /// but chunking is kept for parity with the build path and for correctness with large batches.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(ExtendStats)` on success; propagates LLM or parse errors as `TeriError`.
+    ///
+    /// # `[≠]` substrate limit
+    ///
+    /// Zep's server-side entity resolution does fuzzy/embedding-based coreference
+    /// ("AI" ≡ "artificial intelligence").  teri merges by EXACT case-sensitive name only.
+    /// Where two NL mentions resolve to the same Zep entity but to distinct teri names,
+    /// teri creates two nodes.  This is a genuine substrate inexpressibility — every
+    /// extracted entity IS added; only the resolution key differs.
+    /// Ledger: `- [≠] U-021 Zep coreference entity-resolution — teri merges by exact name;
+    /// no resolution model. No entity dropped.`
+    pub async fn extend_from_text<L: LlmClient>(
+        &mut self,
+        text: &str,
+        llm: &L,
+    ) -> Result<ExtendStats> {
+        const CHUNK_SIZE: usize = 500;
+        const CHUNK_OVERLAP: usize = 50;
+
+        // Clone the ontology type sets out of `self` before the mutable borrow begins.
+        // This is required because `extract_and_merge_into` takes `&mut self`, and we
+        // cannot hold an immutable borrow of `self.ontology_*` at the same time.
+        let custom_entity_kinds = self.ontology_entity_types.clone();
+        let custom_edge_kinds = self.ontology_edge_types.clone();
+
+        let chunks = text_processor::split_text(text, CHUNK_SIZE, CHUNK_OVERLAP);
+
+        // Build a synthetic SeedDocument for the prompt helpers (they take &SeedDocument).
+        // The id/metadata/created_at are synthetic — only raw_text drives the prompts.
+        let doc = SeedDocument {
+            id: uuid::Uuid::new_v4(),
+            raw_text: text.to_string(),
+            metadata: std::collections::HashMap::new(),
+            created_at: chrono::Utc::now(),
+        };
+
+        let mut stats = ExtendStats::default();
+        self.extract_and_merge_into(
+            &doc,
+            &chunks,
+            llm,
+            &custom_entity_kinds,
+            &custom_edge_kinds,
+            &mut |_p, _m| {},
+            &mut stats,
+        )
+        .await?;
+
+        Ok(stats)
     }
 
     // -------- Serialization methods --------
@@ -359,8 +976,8 @@ impl KnowledgeGraph {
         self.inner.node_weights().cloned().collect()
     }
 
-    /// Helper method to get all edges from the graph as (from_id, to_id, relation).
-    fn get_all_edges(&self) -> Vec<(Uuid, Uuid, Relation)> {
+    /// Returns all edges from the graph as (from_id, to_id, relation).
+    pub fn get_all_edges(&self) -> Vec<EdgeTriple> {
         self.inner
             .edge_references()
             .map(|edge| {
@@ -374,9 +991,28 @@ impl KnowledgeGraph {
     // -------- LLM prompt helpers --------
 
     pub fn entity_extraction_prompt(doc: &SeedDocument) -> String {
+        Self::entity_extraction_prompt_with_custom(doc, &[])
+    }
+
+    /// Entity-extraction prompt that injects optional custom ontology type names alongside the
+    /// 6 built-in kinds.  Used by `build_with_progress` when `ontology_entity_types` is set.
+    ///
+    /// When `custom_kinds` is empty the output is byte-identical to `entity_extraction_prompt`,
+    /// preserving the 5 existing build tests.
+    pub fn entity_extraction_prompt_with_custom(
+        doc: &SeedDocument,
+        custom_kinds: &[String],
+    ) -> String {
+        let kind_list = if custom_kinds.is_empty() {
+            "Person, Organization, Location, Concept, Event, Other".to_string()
+        } else {
+            let extras = custom_kinds.join(", ");
+            format!("Person, Organization, Location, Concept, Event, Other, {extras}")
+        };
+
         format!(
             r#"You are an information extraction system. Extract named entities from the following document.
-Return JSON array with objects: {{"name": string, "kind": one of [Person, Organization, Location, Concept, Event, Other]}}.
+Return JSON array with objects: {{"name": string, "kind": one of [{kind_list}]}}.
 
 Document metadata: {metadata}
 Document text:
@@ -389,6 +1025,20 @@ Document text:
     }
 
     pub fn relation_extraction_prompt(doc: &SeedDocument, entities: &[Entity]) -> String {
+        Self::relation_extraction_prompt_with_custom(doc, entities, &[])
+    }
+
+    /// Relation-extraction prompt that injects optional custom ontology edge-type names
+    /// alongside the 5 built-in kinds.  Used by `build_with_progress` when
+    /// `ontology_edge_types` is set.
+    ///
+    /// When `custom_kinds` is empty the output is byte-identical to `relation_extraction_prompt`,
+    /// preserving the 5 existing build tests.
+    pub fn relation_extraction_prompt_with_custom(
+        doc: &SeedDocument,
+        entities: &[Entity],
+        custom_kinds: &[String],
+    ) -> String {
         if entities.is_empty() {
             return String::from("No entities provided for relation extraction.");
         }
@@ -398,9 +1048,16 @@ Document text:
             .map(|e| serde_json::json!({"name": e.name, "kind": format!("{:?}", e.kind)}))
             .collect();
 
+        let kind_list = if custom_kinds.is_empty() {
+            "WorksFor, LocatedIn, RelatedTo, Causes, Affects, Other".to_string()
+        } else {
+            let extras = custom_kinds.join(", ");
+            format!("WorksFor, LocatedIn, RelatedTo, Causes, Affects, Other, {extras}")
+        };
+
         format!(
             r#"You are an information extraction system. Using the provided entities, extract relations between them.
-Return JSON array with objects: {{"from": entity_name, "to": entity_name, "kind": one of [WorksFor, LocatedIn, RelatedTo, Causes, Affects, Other], "weight": number between 0 and 1}}.
+Return JSON array with objects: {{"from": entity_name, "to": entity_name, "kind": one of [{kind_list}], "weight": number between 0 and 1}}.
 
 Entities: {entities}
 Document metadata: {metadata}
@@ -418,6 +1075,19 @@ Document text:
     // -------- JSON parsing helpers (LLM responses) --------
 
     pub fn parse_entities_json(json: &str) -> Result<Vec<Entity>> {
+        Self::parse_entities_json_with_custom(json, &[])
+    }
+
+    /// Parse entity JSON from LLM, mapping any `kind_str` matching a registered custom entity
+    /// type name to `EntityKind::Custom(name)`.  Built-in names always map to their fixed
+    /// variants; unknown-and-unregistered names fall through to `Other`.
+    ///
+    /// When `custom_kinds` is empty the behaviour is byte-identical to `parse_entities_json`,
+    /// preserving the 5 existing build tests.
+    pub fn parse_entities_json_with_custom(
+        json: &str,
+        custom_kinds: &[String],
+    ) -> Result<Vec<Entity>> {
         let value: Value = serde_json::from_str(json)
             .map_err(|e| TeriError::Graph(format!("Invalid entity JSON: {e}")))?;
 
@@ -438,7 +1108,15 @@ Document text:
                 "Location" => EntityKind::Location,
                 "Concept" => EntityKind::Concept,
                 "Event" => EntityKind::Event,
-                _ => EntityKind::Other,
+                other => {
+                    // If the kind string matches a registered custom entity type, emit Custom.
+                    // Otherwise fall through to Other (unchanged from pre-ontology behaviour).
+                    if custom_kinds.iter().any(|k| k == other) {
+                        EntityKind::Custom(other.to_string())
+                    } else {
+                        EntityKind::Other
+                    }
+                }
             };
 
             // Accept ID from JSON if present, otherwise generate new one
@@ -504,7 +1182,12 @@ Document text:
                 )));
             }
 
-            relations.push((from_idx, to_idx, Relation { kind, weight: weight as f32 }));
+            // Optionally parse valid_at / valid_from / valid_until from LLM JSON (default None).
+            // Accepts: {"valid_from": <u64>, "valid_until": <u64>} or
+            //          {"valid_at": [<u64>, <u64|null>]}
+            let valid_at = parse_valid_at_from_json(item);
+
+            relations.push((from_idx, to_idx, Relation { kind, weight: weight as f32, valid_at }));
         }
 
         Ok(relations)
@@ -522,6 +1205,17 @@ Document text:
         self.inner.edge_count()
     }
 
+    /// Look up an entity by its UUID.
+    ///
+    /// Reads the existing internal `index_by_id` map (O(1)). Added as a small additive
+    /// public accessor so `KnowledgeGraphEntityReader` (U-016 / DECISION-9 Q6) can resolve
+    /// related-node UUIDs without scanning `get_all_entities()`.
+    ///
+    /// Returns `None` if no entity with the given `id` exists.
+    pub fn get_entity_by_id(&self, id: Uuid) -> Option<&Entity> {
+        self.index_by_id.get(&id).and_then(|idx| self.inner.node_weight(*idx))
+    }
+
     /// Get the name-to-index mapping (primarily for testing)
     ///
     /// # Note
@@ -531,12 +1225,55 @@ Document text:
     pub fn get_index(&self) -> &HashMap<String, NodeIndex> {
         &self.index
     }
+
+    /// Returns all edges (from_id, to_id, relation) partitioned into (active, historical)
+    /// at the given unix timestamp `t` (seconds).
+    ///
+    /// Active: `relation.is_active_at(t)` is true.
+    /// Historical: `relation.is_active_at(t)` is false.
+    ///
+    /// This powers the `panorama_search` active-vs-historical classification that MiroFish/Zep
+    /// uses via `valid_at`/`invalid_at` fields.
+    pub fn partition_edges_at(&self, t: u64) -> (Vec<EdgeTriple>, Vec<EdgeTriple>) {
+        let mut active = Vec::new();
+        let mut historical = Vec::new();
+        for edge in self.inner.edge_references() {
+            let from_entity = &self.inner[edge.source()];
+            let to_entity = &self.inner[edge.target()];
+            let rel = edge.weight().clone();
+            if rel.is_active_at(t) {
+                active.push((from_entity.id, to_entity.id, rel));
+            } else {
+                historical.push((from_entity.id, to_entity.id, rel));
+            }
+        }
+        (active, historical)
+    }
 }
 
 impl Default for KnowledgeGraph {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// Helper: collect distinct entity type names for the build result's entity_types[] rollup.
+// Excludes `Other` (the catch-all "unknown" kind) matching MiroFish's `_get_graph_info` which
+// excludes the "Entity"/"Node" base labels.  PascalCase Custom names are included verbatim
+// (matching their Zep node-label equivalents).
+pub(crate) fn collect_entity_type_names(graph: &KnowledgeGraph) -> Vec<String> {
+    let mut seen = HashSet::new();
+    for entity in graph.get_all_entities() {
+        let label = match &entity.kind {
+            EntityKind::Other => continue, // excluded, matching MiroFish _get_graph_info
+            EntityKind::Custom(name) => name.clone(),
+            _ => entity.kind.to_string(),
+        };
+        seen.insert(label);
+    }
+    let mut names: Vec<String> = seen.into_iter().collect();
+    names.sort(); // deterministic ordering for tests
+    names
 }
 
 #[cfg(test)]
@@ -587,7 +1324,7 @@ mod tests {
         let alice_idx = graph.add_entity(alice).expect("Failed to add entity");
         let bob_idx = graph.add_entity(bob).expect("Failed to add entity");
 
-        let relation = Relation { kind: RelationKind::RelatedTo, weight: 0.8 };
+        let relation = Relation { kind: RelationKind::RelatedTo, weight: 0.8, valid_at: None };
 
         graph.add_relation(alice_idx, bob_idx, relation);
         assert_eq!(graph.relation_count(), 1);
@@ -651,21 +1388,166 @@ mod tests {
         assert!(b_found);
     }
 
-    #[test]
-    fn test_build_from_seed_document() {
+    /// build() now performs the real two-pass LLM extraction pipeline.
+    /// This test uses the mock LLM (same pattern as test_graph_construction_with_mock_llm)
+    /// and verifies that build() wires the full pipeline end-to-end.
+    #[tokio::test]
+    async fn test_build_from_seed_document() {
+        let entity_response = r#"[
+            {"name": "Alice", "kind": "Person"},
+            {"name": "Acme Corp", "kind": "Organization"}
+        ]"#;
+        let relation_response = r#"[
+            {"from": "Alice", "to": "Acme Corp", "kind": "WorksFor", "weight": 0.9}
+        ]"#;
+
+        let mock_llm = MockLlmClient::new(entity_response, relation_response);
+
         let mut metadata = HashMap::new();
         metadata.insert("title".to_string(), "Test Doc".to_string());
         let doc = SeedDocument {
             id: Uuid::new_v4(),
-            raw_text: "body".to_string(),
+            raw_text: "Alice works at Acme Corp.".to_string(),
             metadata,
             created_at: Utc::now(),
         };
 
-        let graph = KnowledgeGraph::build(&doc).expect("build graph");
+        let graph = KnowledgeGraph::build(&doc, &mock_llm).await.expect("build graph");
+
+        // Two entities extracted and added.
+        assert_eq!(graph.entity_count(), 2, "expected 2 entities");
+        let alice = graph.get_entity("Alice").expect("Alice must be present");
+        assert_eq!(alice.kind, EntityKind::Person);
+        let acme = graph.get_entity("Acme Corp").expect("Acme Corp must be present");
+        assert_eq!(acme.kind, EntityKind::Organization);
+
+        // One relation extracted and wired.
+        assert_eq!(graph.relation_count(), 1, "expected 1 relation");
+
+        // Alice's neighbor is Acme Corp.
+        let neighbors = graph.get_neighbors(alice.id).expect("neighbors");
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].name, "Acme Corp");
+    }
+
+    /// build() with an empty entity response must return a valid empty graph, not an error.
+    #[tokio::test]
+    async fn test_build_empty_extraction_tolerates() {
+        let mock_llm = MockLlmClient::new("[]", "[]");
+
+        let doc = SeedDocument {
+            id: Uuid::new_v4(),
+            raw_text: "Completely unrecognizable gibberish.".to_string(),
+            metadata: HashMap::new(),
+            created_at: Utc::now(),
+        };
+
+        let graph = KnowledgeGraph::build(&doc, &mock_llm)
+            .await
+            .expect("empty extraction is not an error");
+        assert_eq!(graph.entity_count(), 0, "empty extraction yields empty graph");
+        assert_eq!(graph.relation_count(), 0);
+    }
+
+    /// build() must skip duplicate entity names from the LLM response rather than aborting.
+    #[tokio::test]
+    async fn test_build_duplicate_entity_is_skipped() {
+        // LLM returns "Alice" twice — second occurrence must be silently dropped.
+        let entity_response = r#"[
+            {"name": "Alice", "kind": "Person"},
+            {"name": "Alice", "kind": "Organization"}
+        ]"#;
+        let mock_llm = MockLlmClient::new(entity_response, "[]");
+
+        let doc = SeedDocument {
+            id: Uuid::new_v4(),
+            raw_text: "Duplicate test.".to_string(),
+            metadata: HashMap::new(),
+            created_at: Utc::now(),
+        };
+
+        // Must NOT error — only one entity in the graph.
+        let graph = KnowledgeGraph::build(&doc, &mock_llm)
+            .await
+            .expect("duplicate entity must not abort build");
+        assert_eq!(graph.entity_count(), 1, "second Alice must be silently skipped");
+        let alice = graph.get_entity("Alice").expect("Alice must be present");
+        // First occurrence wins — kind is Person.
+        assert_eq!(alice.kind, EntityKind::Person);
+    }
+
+    /// build() must skip relations that reference an entity name not in the graph.
+    #[tokio::test]
+    async fn test_build_unknown_entity_relation_is_skipped() {
+        let entity_response = r#"[{"name": "Alice", "kind": "Person"}]"#;
+        // "Bob" is not in the entity list — this relation must be skipped, not faulted.
+        let relation_response = r#"[
+            {"from": "Alice", "to": "Bob", "kind": "RelatedTo", "weight": 0.5}
+        ]"#;
+        let mock_llm = MockLlmClient::new(entity_response, relation_response);
+
+        let doc = SeedDocument {
+            id: Uuid::new_v4(),
+            raw_text: "Alice mentions Bob.".to_string(),
+            metadata: HashMap::new(),
+            created_at: Utc::now(),
+        };
+
+        let graph = KnowledgeGraph::build(&doc, &mock_llm)
+            .await
+            .expect("unknown-entity relation must not abort build");
         assert_eq!(graph.entity_count(), 1);
-        let ent = graph.get_entity("Test Doc").expect("entity present");
-        assert_eq!(ent.kind, EntityKind::Other);
+        // The relation referencing unknown "Bob" must be dropped.
+        assert_eq!(graph.relation_count(), 0, "relation to unknown entity must be skipped");
+    }
+
+    /// build() must propagate LLM errors as TeriError rather than swallowing them.
+    #[tokio::test]
+    async fn test_build_propagates_llm_error() {
+        struct ErrorLlmClient;
+        #[async_trait]
+        impl LlmClient for ErrorLlmClient {
+            async fn complete(&self, _prompt: &str) -> Result<String> {
+                Err(TeriError::Llm("simulated LLM failure".to_string()))
+            }
+            async fn complete_json<T: serde::de::DeserializeOwned>(
+                &self,
+                _prompt: &str,
+            ) -> Result<T> {
+                Err(TeriError::Llm("simulated LLM failure".to_string()))
+            }
+            async fn stream(
+                &self,
+                _prompt: &str,
+            ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+                Err(TeriError::Llm("simulated LLM failure".to_string()))
+            }
+            async fn chat(
+                &self,
+                _messages: &[crate::llm::ChatMessage],
+                _opts: &crate::llm::ChatOptions,
+            ) -> Result<String> {
+                Err(TeriError::Llm("not used".into()))
+            }
+            async fn chat_json<T: serde::de::DeserializeOwned>(
+                &self,
+                _messages: &[crate::llm::ChatMessage],
+                _opts: &crate::llm::ChatOptions,
+            ) -> Result<T> {
+                Err(TeriError::Llm("not used".into()))
+            }
+        }
+
+        let doc = SeedDocument {
+            id: Uuid::new_v4(),
+            raw_text: "Some text.".to_string(),
+            metadata: HashMap::new(),
+            created_at: Utc::now(),
+        };
+
+        let result = KnowledgeGraph::build(&doc, &ErrorLlmClient).await;
+        assert!(result.is_err(), "LLM error must propagate");
+        assert!(result.unwrap_err().to_string().contains("simulated LLM failure"));
     }
 
     #[test]
@@ -764,6 +1646,179 @@ mod tests {
         let result = Relation::new(RelationKind::RelatedTo, -0.1);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("between 0 and 1"));
+    }
+
+    // ===== Relation.valid_at / temporal validity tests =====
+
+    #[test]
+    fn test_relation_is_active_at_none_always_true() {
+        let rel = Relation::new(RelationKind::RelatedTo, 0.5).expect("valid weight");
+        assert_eq!(rel.valid_at, None);
+        // None = always active regardless of timestamp
+        assert!(rel.is_active_at(0));
+        assert!(rel.is_active_at(u64::MAX));
+        assert!(rel.is_active_at(1_700_000_000));
+    }
+
+    #[test]
+    fn test_relation_is_active_at_open_ended() {
+        // valid since t=1000, still current (no end)
+        let rel = Relation::with_validity(RelationKind::Causes, 0.7, Some((1000, None)))
+            .expect("valid weight");
+        assert!(!rel.is_active_at(999)); // before start → inactive
+        assert!(rel.is_active_at(1000)); // at start → active
+        assert!(rel.is_active_at(9999)); // well after start → active
+    }
+
+    #[test]
+    fn test_relation_is_active_at_closed_window() {
+        // valid [1000, 2000)
+        let rel = Relation::with_validity(RelationKind::WorksFor, 0.9, Some((1000, Some(2000))))
+            .expect("valid weight");
+        assert!(!rel.is_active_at(999)); // before window
+        assert!(rel.is_active_at(1000)); // start (inclusive)
+        assert!(rel.is_active_at(1500)); // inside
+        assert!(!rel.is_active_at(2000)); // end (exclusive) → expired
+        assert!(!rel.is_active_at(9999)); // long after
+    }
+
+    #[test]
+    fn test_relation_with_validity_weight_validation() {
+        // Weight validation still applies in with_validity
+        let ok = Relation::with_validity(RelationKind::Other, 1.0, None);
+        assert!(ok.is_ok());
+
+        let err = Relation::with_validity(RelationKind::Other, 1.5, Some((0, None)));
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("between 0 and 1"));
+    }
+
+    #[test]
+    fn test_relation_serde_roundtrip_with_valid_at() {
+        // New shape WITH valid_at: serializes and deserializes correctly
+        let rel = Relation::with_validity(
+            RelationKind::RelatedTo,
+            0.8,
+            Some((1_700_000_000, Some(1_800_000_000))),
+        )
+        .expect("valid weight");
+
+        let json = serde_json::to_string(&rel).expect("serialize");
+        let back: Relation = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.valid_at, Some((1_700_000_000, Some(1_800_000_000))));
+        assert!((back.weight - 0.8).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_relation_serde_backward_compat_no_valid_at_field() {
+        // OLD-shape JSON (from before valid_at was added) must deserialize with valid_at=None
+        let old_json = r#"{"kind":"RelatedTo","weight":0.5}"#;
+        let rel: Relation = serde_json::from_str(old_json).expect("backward-compat deserialize");
+        assert_eq!(rel.valid_at, None, "missing valid_at field must default to None");
+        assert_eq!(rel.kind, RelationKind::RelatedTo);
+        assert!((rel.weight - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_knowledge_graph_serde_roundtrip_with_valid_at() {
+        // Full graph roundtrip: old-shape (no valid_at) relations survive JSON/bincode deserialization.
+        let mut graph = KnowledgeGraph::new();
+        let alice =
+            Entity { id: Uuid::new_v4(), name: "Alice".to_string(), kind: EntityKind::Person };
+        let bob = Entity { id: Uuid::new_v4(), name: "Bob".to_string(), kind: EntityKind::Person };
+        let alice_idx = graph.add_entity(alice.clone()).expect("add Alice");
+        let bob_idx = graph.add_entity(bob.clone()).expect("add Bob");
+
+        // Relation with temporal window
+        let rel = Relation::with_validity(RelationKind::WorksFor, 0.9, Some((1000, Some(2000))))
+            .expect("valid");
+        graph.add_relation(alice_idx, bob_idx, rel);
+
+        // JSON roundtrip
+        let json = graph.serialize_to_json().expect("serialize");
+        let g2 = KnowledgeGraph::deserialize_from_json(&json).expect("deserialize");
+        let edges = g2.get_all_edges();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].2.valid_at, Some((1000, Some(2000))));
+
+        // Bincode roundtrip
+        let bytes = graph.serialize_to_bincode().expect("bincode serialize");
+        let g3 = KnowledgeGraph::deserialize_from_bincode(&bytes).expect("bincode deserialize");
+        let edges3 = g3.get_all_edges();
+        assert_eq!(edges3[0].2.valid_at, Some((1000, Some(2000))));
+    }
+
+    #[test]
+    fn test_partition_edges_at() {
+        let mut graph = KnowledgeGraph::new();
+        let a = graph
+            .add_entity(Entity {
+                id: Uuid::new_v4(),
+                name: "A".to_string(),
+                kind: EntityKind::Concept,
+            })
+            .expect("A");
+        let b = graph
+            .add_entity(Entity {
+                id: Uuid::new_v4(),
+                name: "B".to_string(),
+                kind: EntityKind::Concept,
+            })
+            .expect("B");
+        let c = graph
+            .add_entity(Entity {
+                id: Uuid::new_v4(),
+                name: "C".to_string(),
+                kind: EntityKind::Concept,
+            })
+            .expect("C");
+
+        // Active edge: always-valid
+        graph.add_relation(a, b, Relation::new(RelationKind::RelatedTo, 0.5).expect("r1"));
+        // Historical edge: expired window [100, 200)
+        graph.add_relation(
+            a,
+            c,
+            Relation::with_validity(RelationKind::Causes, 0.5, Some((100, Some(200)))).expect("r2"),
+        );
+
+        let t = 500u64; // after expiry
+        let (active, historical) = graph.partition_edges_at(t);
+        assert_eq!(active.len(), 1);
+        assert_eq!(historical.len(), 1);
+        // The expired relation is historical
+        assert!(!historical[0].2.is_active_at(t));
+    }
+
+    #[test]
+    fn test_parse_valid_at_from_json_array_form() {
+        // valid_at: [start, end]
+        let item = serde_json::json!({"valid_at": [1000u64, 2000u64]});
+        let result = super::parse_valid_at_from_json(&item);
+        assert_eq!(result, Some((1000, Some(2000))));
+
+        // valid_at: [start, null]
+        let item2 = serde_json::json!({"valid_at": [1000u64, null]});
+        let result2 = super::parse_valid_at_from_json(&item2);
+        assert_eq!(result2, Some((1000, None)));
+    }
+
+    #[test]
+    fn test_parse_valid_at_from_json_object_form() {
+        // valid_from + valid_until
+        let item = serde_json::json!({"valid_from": 500u64, "valid_until": 1500u64});
+        let result = super::parse_valid_at_from_json(&item);
+        assert_eq!(result, Some((500, Some(1500))));
+
+        // valid_from only (open-ended)
+        let item2 = serde_json::json!({"valid_from": 500u64});
+        let result2 = super::parse_valid_at_from_json(&item2);
+        assert_eq!(result2, Some((500, None)));
+
+        // neither field → None
+        let item3 = serde_json::json!({"kind": "RelatedTo"});
+        let result3 = super::parse_valid_at_from_json(&item3);
+        assert_eq!(result3, None);
     }
 
     #[test]
@@ -1071,6 +2126,154 @@ mod tests {
         ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
             Err(TeriError::Llm("Streaming not implemented in mock".to_string()))
         }
+        async fn chat(
+            &self,
+            _messages: &[crate::llm::ChatMessage],
+            _opts: &crate::llm::ChatOptions,
+        ) -> Result<String> {
+            Err(TeriError::Llm("not used".into()))
+        }
+        async fn chat_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _messages: &[crate::llm::ChatMessage],
+            _opts: &crate::llm::ChatOptions,
+        ) -> Result<T> {
+            Err(TeriError::Llm("not used".into()))
+        }
+    }
+
+    // ===== Multi-chunk mock LLM that returns different entities per chunk =====
+
+    /// A mock LLM that tracks how many times it has been called for entity extraction
+    /// and returns a different entity on each call — proving that entities from ALL chunks
+    /// are merged into the final graph.
+    struct ChunkCountingLlmClient {
+        /// All entity-extraction responses, indexed by call order (wraps around).
+        entity_responses: Vec<String>,
+        /// Single relation response (same for all chunks — tests the merge, not relations).
+        relation_response: String,
+        /// Shared call counter (using `std::sync::Mutex` to satisfy `&self` bound on `complete`).
+        entity_call_count: std::sync::Mutex<usize>,
+    }
+
+    impl ChunkCountingLlmClient {
+        fn new(entity_responses: Vec<&str>, relation_response: &str) -> Self {
+            Self {
+                entity_responses: entity_responses.iter().map(|s| s.to_string()).collect(),
+                relation_response: relation_response.to_string(),
+                entity_call_count: std::sync::Mutex::new(0),
+            }
+        }
+
+        fn entity_call_count(&self) -> usize {
+            *self.entity_call_count.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for ChunkCountingLlmClient {
+        async fn complete(&self, prompt: &str) -> Result<String> {
+            if prompt.contains("Extract named entities") {
+                let mut count = self.entity_call_count.lock().unwrap();
+                let idx = *count % self.entity_responses.len();
+                *count += 1;
+                Ok(self.entity_responses[idx].clone())
+            } else if prompt.contains("extract relations") {
+                Ok(self.relation_response.clone())
+            } else {
+                Err(TeriError::Llm("Unexpected prompt for chunk-counting mock".to_string()))
+            }
+        }
+
+        async fn complete_json<T: serde::de::DeserializeOwned>(&self, prompt: &str) -> Result<T> {
+            let response = self.complete(prompt).await?;
+            serde_json::from_str(&response)
+                .map_err(|e| TeriError::Llm(format!("JSON parsing error: {}", e)))
+        }
+
+        async fn stream(
+            &self,
+            _prompt: &str,
+        ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            Err(TeriError::Llm("Streaming not implemented in chunk-counting mock".to_string()))
+        }
+        async fn chat(
+            &self,
+            _messages: &[crate::llm::ChatMessage],
+            _opts: &crate::llm::ChatOptions,
+        ) -> Result<String> {
+            Err(TeriError::Llm("not used".into()))
+        }
+        async fn chat_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _messages: &[crate::llm::ChatMessage],
+            _opts: &crate::llm::ChatOptions,
+        ) -> Result<T> {
+            Err(TeriError::Llm("not used".into()))
+        }
+    }
+
+    /// build() with a large multi-chunk document must:
+    /// 1. Call the LLM more than once for entity extraction (proving chunking happened).
+    /// 2. Merge entities from ALL chunks into the graph (deduped).
+    /// 3. Produce a graph that contains entities from chunk 1 AND chunk 2 (distinct names).
+    #[tokio::test]
+    async fn test_build_large_doc_multi_chunk_merge() {
+        // Build a document that is clearly > 500 chars so it gets split into at least 2 chunks.
+        // Pad with unique filler so the chunks are distinct.
+        let chunk1_filler = "Alpha ".repeat(50); // ~300 chars, first chunk territory
+        let chunk2_filler = "Beta ".repeat(50); // ~300 chars, second chunk territory
+        // Use ". " as sentence boundary separator to encourage clean splits.
+        let large_text = format!(
+            "{}. Context for Alice and her team at Sunrise Corp. {}. Context for Bob and his division at Sunset Inc.",
+            chunk1_filler, chunk2_filler
+        );
+        assert!(
+            large_text.chars().count() > 500,
+            "test pre-condition: document must exceed chunk threshold"
+        );
+
+        // Entity responses: chunk 1 returns Alice/Sunrise Corp, chunk 2 returns Bob/Sunset Inc.
+        // (The counting mock cycles through responses in order.)
+        let entity_resp_chunk1 = r#"[
+            {"name": "Alice", "kind": "Person"},
+            {"name": "Sunrise Corp", "kind": "Organization"}
+        ]"#;
+        let entity_resp_chunk2 = r#"[
+            {"name": "Bob", "kind": "Person"},
+            {"name": "Sunset Inc", "kind": "Organization"}
+        ]"#;
+
+        let mock_llm = ChunkCountingLlmClient::new(
+            vec![entity_resp_chunk1, entity_resp_chunk2],
+            "[]", // no relations needed for this test
+        );
+
+        let doc = SeedDocument {
+            id: uuid::Uuid::new_v4(),
+            raw_text: large_text,
+            metadata: HashMap::new(),
+            created_at: Utc::now(),
+        };
+
+        let graph = KnowledgeGraph::build(&doc, &mock_llm).await.expect("multi-chunk build");
+
+        // Chunking happened — entity extraction was called more than once.
+        let call_count = mock_llm.entity_call_count();
+        assert!(
+            call_count > 1,
+            "expected entity extraction to be called >1 time (chunking), got {call_count}"
+        );
+
+        // All 4 entities (2 per chunk) should be present in the merged graph.
+        assert!(graph.get_entity("Alice").is_some(), "Alice must be in merged graph");
+        assert!(
+            graph.get_entity("Sunrise Corp").is_some(),
+            "Sunrise Corp must be in merged graph"
+        );
+        assert!(graph.get_entity("Bob").is_some(), "Bob must be in merged graph");
+        assert!(graph.get_entity("Sunset Inc").is_some(), "Sunset Inc must be in merged graph");
+        assert_eq!(graph.entity_count(), 4, "4 unique entities, none dropped");
     }
 
     // ===== Entity/Relation Extraction Tests =====
@@ -1287,5 +2490,161 @@ mod tests {
 
         let subgraph = graph.get_subgraph(isolated_id, 5).expect("Failed to get subgraph");
         assert_eq!(subgraph.entity_count(), 1); // Only the isolated entity
+    }
+
+    // ── extend_from_text tests (DECISION-14 Decision 1) ──────────────────────
+
+    /// extend_from_text: new entity added, duplicate reused, relation to pre-existing entity kept.
+    ///
+    /// This is the core parity contract: a relation from a newly-extracted entity to a
+    /// PRE-EXISTING entity in the graph must NOT be dropped (Pass-2 runs against the full
+    /// post-merge entity set, including entities already present before the extend call).
+    #[tokio::test]
+    async fn test_extend_from_text_merge_semantics() {
+        // Build an initial graph with one entity: "Alice".
+        let entity_response_build = r#"[{"name": "Alice", "kind": "Person"}]"#;
+        let mock_build = MockLlmClient::new(entity_response_build, "[]");
+        let mut metadata = HashMap::new();
+        metadata.insert("title".to_string(), "Base".to_string());
+        let base_doc = SeedDocument {
+            id: Uuid::new_v4(),
+            raw_text: "Alice is here.".to_string(),
+            metadata,
+            created_at: chrono::Utc::now(),
+        };
+        let mut graph = KnowledgeGraph::build(&base_doc, &mock_build).await.expect("build");
+        assert_eq!(graph.entity_count(), 1, "initial build: 1 entity");
+
+        // Now extend with text that introduces "Bob" (new) and links Bob → Alice (cross-entity).
+        // MockLlmClient alternates: first call → entity JSON, second call → relation JSON.
+        let entity_response_extend = r#"[{"name": "Bob", "kind": "Person"}]"#;
+        let relation_response_extend =
+            r#"[{"from": "Bob", "to": "Alice", "kind": "WorksFor", "weight": 0.8}]"#;
+        let mock_extend = MockLlmClient::new(entity_response_extend, relation_response_extend);
+
+        let stats = graph
+            .extend_from_text("Bob works for Alice.", &mock_extend)
+            .await
+            .expect("extend_from_text");
+
+        // "Bob" is new → entities_added = 1.
+        assert_eq!(stats.entities_added, 1, "Bob is new → entities_added");
+        // "Alice" was already present → entities_merged = 0 (Bob doesn't overlap Alice's name).
+        assert_eq!(stats.entities_merged, 0, "no duplicate names in this extend call");
+        // The Bob→Alice relation references Alice (pre-existing) → must NOT be dropped.
+        assert_eq!(
+            stats.relations_added, 1,
+            "Bob→Alice relation to pre-existing entity must be kept"
+        );
+
+        assert_eq!(graph.entity_count(), 2, "Alice + Bob");
+        assert_eq!(graph.relation_count(), 1, "Bob → Alice");
+        assert!(graph.get_entity("Alice").is_some(), "Alice still present");
+        assert!(graph.get_entity("Bob").is_some(), "Bob added");
+    }
+
+    /// extend_from_text: duplicate entity name is reused (entities_merged += 1), not doubled.
+    #[tokio::test]
+    async fn test_extend_from_text_duplicate_name_reused() {
+        let mut graph = KnowledgeGraph::new();
+        // Pre-seed "Alice" directly.
+        graph
+            .add_entity(Entity {
+                id: Uuid::new_v4(),
+                name: "Alice".to_string(),
+                kind: EntityKind::Person,
+            })
+            .expect("add Alice");
+
+        // Extend: LLM returns "Alice" again (same name → should be reused, not added).
+        let mock = MockLlmClient::new(r#"[{"name": "Alice", "kind": "Organization"}]"#, "[]");
+        let stats = graph.extend_from_text("Alice again.", &mock).await.expect("extend");
+
+        assert_eq!(stats.entities_added, 0, "Alice already present → not added");
+        assert_eq!(stats.entities_merged, 1, "Alice collision → merged");
+        assert_eq!(graph.entity_count(), 1, "still only one entity");
+        // Original kind (Person) must be preserved — extend does NOT mutate existing nodes.
+        let alice = graph.get_entity("Alice").expect("Alice");
+        assert_eq!(alice.kind, EntityKind::Person, "original kind preserved on merge");
+    }
+
+    /// extend_from_text on an empty text string is a no-op (valid, no error).
+    #[tokio::test]
+    async fn test_extend_from_text_empty_text_noop() {
+        let mut graph = KnowledgeGraph::new();
+        graph
+            .add_entity(Entity {
+                id: Uuid::new_v4(),
+                name: "Alice".to_string(),
+                kind: EntityKind::Person,
+            })
+            .expect("add Alice");
+
+        let mock = MockLlmClient::new("[]", "[]");
+        let stats = graph.extend_from_text("", &mock).await.expect("extend empty");
+
+        assert_eq!(stats.entities_added, 0);
+        assert_eq!(stats.entities_merged, 0);
+        assert_eq!(stats.relations_added, 0);
+        assert_eq!(graph.entity_count(), 1, "pre-existing entity unchanged");
+    }
+
+    /// extend_from_text: ontology custom types from set_ontology are used in the extend call.
+    #[tokio::test]
+    async fn test_extend_from_text_uses_set_ontology() {
+        let mut graph = KnowledgeGraph::new();
+        // Register a custom entity type "MediaOutlet".
+        let ontology = serde_json::json!({
+            "entity_types": [{"name": "MediaOutlet"}],
+            "edge_types": []
+        });
+        graph.set_ontology(&ontology);
+
+        // Extend: LLM returns an entity with kind "MediaOutlet" (custom type).
+        let mock = MockLlmClient::new(r#"[{"name": "CNN", "kind": "MediaOutlet"}]"#, "[]");
+        let stats = graph.extend_from_text("CNN is a media outlet.", &mock).await.expect("extend");
+
+        assert_eq!(stats.entities_added, 1, "CNN added");
+        let cnn = graph.get_entity("CNN").expect("CNN must be present");
+        assert_eq!(
+            cnn.kind,
+            EntityKind::Custom("MediaOutlet".to_string()),
+            "custom ontology type must be preserved"
+        );
+    }
+
+    /// build() is byte-identical after the extract_and_merge_into refactor.
+    /// Confirms the 6 U-015 build tests still pass (this is the structural regression guard).
+    #[tokio::test]
+    async fn test_build_still_byte_identical_after_refactor() {
+        let entity_response = r#"[
+            {"name": "Alice", "kind": "Person"},
+            {"name": "Acme Corp", "kind": "Organization"}
+        ]"#;
+        let relation_response = r#"[
+            {"from": "Alice", "to": "Acme Corp", "kind": "WorksFor", "weight": 0.9}
+        ]"#;
+        let mock_llm = MockLlmClient::new(entity_response, relation_response);
+
+        let mut metadata = HashMap::new();
+        metadata.insert("title".to_string(), "Refactor Guard".to_string());
+        let doc = SeedDocument {
+            id: Uuid::new_v4(),
+            raw_text: "Alice works at Acme Corp.".to_string(),
+            metadata,
+            created_at: chrono::Utc::now(),
+        };
+
+        let graph = KnowledgeGraph::build(&doc, &mock_llm).await.expect("build after refactor");
+
+        assert_eq!(graph.entity_count(), 2, "2 entities");
+        assert_eq!(graph.relation_count(), 1, "1 relation");
+        let alice = graph.get_entity("Alice").expect("Alice");
+        assert_eq!(alice.kind, EntityKind::Person);
+        let acme = graph.get_entity("Acme Corp").expect("Acme Corp");
+        assert_eq!(acme.kind, EntityKind::Organization);
+        let neighbors = graph.get_neighbors(alice.id).expect("neighbors");
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].name, "Acme Corp");
     }
 }

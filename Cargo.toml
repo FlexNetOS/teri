@@ -23,8 +23,8 @@ redb = "2"
 tokio = { version = "1", features = ["full"] }
 
 # HTTP server (API layer)
-axum = { version = "0.7", features = ["macros"] }
-tower = "0.4"
+axum = { version = "0.7", features = ["macros", "multipart"] }
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 
 # HTTP client (LLM API calls)
@@ -32,7 +32,7 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 bincode = "1"
 
 # CLI
@@ -43,6 +43,11 @@ petgraph = "0.6"
 
 # Parallel computation (agent simulation)
 rayon = "1"
+
+# Seedable RNG for the time-based agent activation policy (U-028). Python's OASIS scripts use the
+# unseeded `random` module; teri uses a seedable `StdRng` (entropy in production, fixed-seed in
+# tests) so the stochastic-but-structured activation is reproducible for the parity gate.
+rand = "0.8"
 
 # Fast non-poisoning mutex for short critical sections in async code
 parking_lot = "0.12"
@@ -61,6 +66,8 @@ async-trait = "0.1"
 # Logging & tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Size-based rotating file appender (10 MB x 5 backups — matches MiroFish RotatingFileHandler)
+file-rotate = "0.8"
 
 # Config & env
 dotenvy = "0.15"
@@ -71,7 +78,7 @@ anyhow = "1"
 thiserror = "1"
 
 # UUID for agent/world IDs
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -79,9 +86,18 @@ chrono = { version = "0.4", features = ["serde"] }
 # Templating (persona/prompt templates)
 minijinja = "1"
 
+# Regex (used by OntologyGenerator._to_pascal_case — S-173)
+regex = "1"
+
+# CSV writing (OASIS twitter_profiles.csv export — S-370)
+csv = "1"
+
+# SQLite for interview history storage (optional, feature-gated for security)
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 # File format support
 pdfium-render = "0.8"
 scraper = "0.19"
+encoding_rs = "0.8"
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -93,3 +109,9 @@ httpmock = "0.7"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+[features]
+default = []
+sqlite = ["rusqlite"]
+
+[workspace]
