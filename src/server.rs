@@ -290,6 +290,10 @@ pub async fn serve(config: Config, cli_addr: Option<&str>) -> crate::error::Resu
     tracing::info!("Starting API server on {addr}");
 
     let listener = TcpListener::bind(&addr).map_err(TeriError::Io)?;
+    // `std::net::TcpListener::bind` returns a BLOCKING socket; current tokio refuses
+    // `TcpListener::from_std` on a blocking fd ("Registering a blocking socket with the tokio
+    // runtime is unsupported", tokio #7172) and panics. Mark it non-blocking before handoff.
+    listener.set_nonblocking(true).map_err(TeriError::Io)?;
 
     // S-023 element 4 / S-024 element 6 / U-050 SIGNAL_CONTRACT — graceful shutdown.
     //

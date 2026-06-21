@@ -5113,3 +5113,8 @@ The 4 claims independently confirmed against `server.rs` (serve fn, lines read 2
 - Stale-comment cleanup (server.rs module doc): "Pending dependencies" block claimed graph/sim/report blueprints + register_cleanup pending — all landed; corrected.
 - **MILESTONE: symbol-map.md [ ]=0 (port symbol-complete).** DONE-progress 93%→94%.
 - **FINDING for cycle 73:** merge-ledger (27 [ ]) + parity-ledger (30 [ ]) are stale rollup-lag vs the now-complete symbol-map — reconcile per-unit (roll up units whose symbols are all terminal; keep only the cycle-E producers U-028/029/030 + 2 [!] + 3 [~] non-terminal).
+
+## Cycle 72 follow-up (/verify) — `teri serve` startup-panic FIX (runtime-observed)
+- Running `teri serve` (not just tests) revealed a PRE-EXISTING crash: `axum::serve(tokio::net::TcpListener::from_std(listener)…)` panicked at startup — "Registering a blocking socket with the tokio runtime is unsupported" (tokio #7172). `std::net::TcpListener::bind` returns a BLOCKING socket; current tokio refuses `from_std` on it. Never caught by the 1552 tests because none call `serve()` (it binds a real socket + runs forever).
+- FIX (server.rs): `listener.set_nonblocking(true)?` before `from_std`. Now `teri serve` binds and serves.
+- RUNTIME-VERIFIED (live, /verify): server up (GET /health → 200 `{"status":"ok","service":"teri"}`); SIGTERM → "Received SIGTERM/SIGHUP, stopping server..." → exit 0; SIGINT → "Received SIGINT…" → exit 0; SIGHUP → "Received SIGTERM/SIGHUP…" → exit 0 (the U-050 SIGNAL_CONTRACT fix, now observable). i18n Accept-Language live: en→"Project not found", zh→"项目不存在", absent→zh, unsupported fr→zh (U-036 contract confirmed live).
