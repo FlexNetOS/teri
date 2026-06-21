@@ -1190,7 +1190,11 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
         // the run finishes before the monitor first polls, the monitor still observes `Some(..)`.
         let completion_rx = engine.subscribe_completion();
 
-        let task = spawn_sim_task(engine, pool, graph, llm, ipc_server, Arc::clone(&shutdown));
+        // Parallel run ⇒ dual-platform interview dispatch (ParallelIPCHandler analog). Anything
+        // other than "twitter"/"reddit" is parallel — same predicate as the (6) platform flags.
+        let parallel = !matches!(platform, "twitter" | "reddit");
+        let task =
+            spawn_sim_task(engine, pool, graph, llm, ipc_server, Arc::clone(&shutdown), parallel);
 
         // process_pid stays None ([≠] value-only — no OS pid). runner_status → Running.
         state.runner_status = RunnerStatus::Running;
@@ -1525,6 +1529,7 @@ fn spawn_sim_task<L: LlmClient + Send + Sync + 'static>(
     llm: Arc<L>,
     ipc_server: SimulationIPCServer,
     shutdown: Arc<AtomicBool>,
+    parallel: bool,
 ) -> JoinHandle<()> {
     // Box+coerce the future to an explicit `Pin<Box<dyn Future + Send>>`. This sidesteps
     // rustc's higher-ranked-lifetime inference failure ("implementation of `FnOnce` is not
@@ -1532,7 +1537,7 @@ fn spawn_sim_task<L: LlmClient + Send + Sync + 'static>(
     // is handed to `tokio::spawn`. The explicit type annotation pins the lifetime so the
     // closure's `for<'a> FnMut(&'a Agent)` bound resolves. Behavior is unchanged.
     let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
-        Box::pin(run_sim_body(engine, pool, graph, llm, ipc_server, shutdown));
+        Box::pin(run_sim_body(engine, pool, graph, llm, ipc_server, shutdown, parallel));
     tokio::spawn(fut)
 }
 
@@ -1557,6 +1562,7 @@ async fn run_sim_body<L: LlmClient + Send + Sync + 'static>(
     llm: Arc<L>,
     mut ipc_server: SimulationIPCServer,
     shutdown: Arc<AtomicBool>,
+    parallel: bool,
 ) {
     // Mark the env alive while the run is in progress (DECISION-16: `check_env_alive`
     // reads this flag; interview commands are serviced by the wait-for-commands loop below).
@@ -1587,7 +1593,7 @@ async fn run_sim_body<L: LlmClient + Send + Sync + 'static>(
         match ipc_server.try_poll() {
             CommandPoll::Command(env) => {
                 // `dispatch_command` returns `false` only for `close_env` → exit the wait loop.
-                if !dispatch_command(env, &pool, &*llm).await {
+                if !dispatch_command(env, &pool, &*llm, parallel).await {
                     break;
                 }
             }
@@ -1609,10 +1615,16 @@ async fn run_sim_body<L: LlmClient + Send + Sync + 'static>(
 /// `CommandType` has exactly three variants, so the match is exhaustive — Python's `else:
 /// "unknown command"` branch is unreachable here because `IPCCommand::from_dict` already rejects
 /// any unrecognised `command_type` string at deserialization time.
+/// `parallel` selects the dispatch variant — teri's analog of Python launching
+/// `ParallelIPCHandler` (parallel run) vs `IPCHandler` (single-platform run). `true` →
+/// dual-platform interview ([`execute_interview_parallel`]/[`execute_batch_interview_parallel`],
+/// honoring the optional `platform` arg); `false` → the single-env path unchanged
+/// ([`execute_interview`]/[`execute_batch_interview`], S-865/866/868).
 async fn dispatch_command<L: LlmClient + Send + Sync>(
     env: IpcEnvelope,
     pool: &crate::agent::AgentPool,
     llm: &L,
+    parallel: bool,
 ) -> bool {
     match env.command.command_type {
         CommandType::CloseEnv => {
@@ -1623,14 +1635,24 @@ async fn dispatch_command<L: LlmClient + Send + Sync>(
             false
         }
         CommandType::Interview => {
-            match execute_interview(pool, llm, &env.command.args).await {
+            let outcome = if parallel {
+                execute_interview_parallel(pool, llm, &env.command.args).await
+            } else {
+                execute_interview(pool, llm, &env.command.args).await
+            };
+            match outcome {
                 Ok(result) => SimulationIPCServer::send_success(env, result),
                 Err(e) => SimulationIPCServer::send_error(env, e),
             }
             true
         }
         CommandType::BatchInterview => {
-            match execute_batch_interview(pool, llm, &env.command.args).await {
+            let outcome = if parallel {
+                execute_batch_interview_parallel(pool, llm, &env.command.args).await
+            } else {
+                execute_batch_interview(pool, llm, &env.command.args).await
+            };
+            match outcome {
                 Ok(result) => SimulationIPCServer::send_success(env, result),
                 Err(e) => SimulationIPCServer::send_error(env, e),
             }
@@ -1763,6 +1785,291 @@ async fn execute_batch_interview<L: LlmClient + Send + Sync>(
     m.insert("interviews_count".to_string(), Value::from(results.len() as u64));
     m.insert("results".to_string(), Value::Object(results));
     Ok(m)
+}
+
+// ===========================================================================
+// PARALLEL (dual-platform) interview dispatch — port of `ParallelIPCHandler`
+// (run_parallel_simulation.py:217-600).
+//
+// Python runs TWO separate OASIS environments (`twitter_env`, `reddit_env`) where the same
+// numeric `agent_id` denotes two DIFFERENT agents — one per platform. teri runs ONE unified
+// pool (`load_agent_pool("parallel")` unions both platforms' profiles), where each agent carries
+// `SocialProfile.platform` and the same `user_id` can appear once per platform. So:
+//   - "platform available" (Python `self.{platform}_env` truthy) ≡ the pool has ≥1 agent on
+//     that platform ([`pool_has_platform`]).
+//   - per-platform `agent_graph.get_agent(agent_id)` ≡ resolve the pool agent whose
+//     `(user_id, platform)` matches ([`resolve_agent_on_platform`]); a raise (unknown id) ≡ `None`.
+// This is the faithful `[≠]U030-UNIFIED-LOOP` mapping: the unified pool reproduces the
+// dual-platform routing/result shape; only the OASIS `env.step`+`trace`-DB mechanism stays
+// `[≠]U028-OASIS-INTERNALS` (teri runs the agent's LLM inline, as in the single-env path).
+//
+// Selection by run mode mirrors Python selecting `ParallelIPCHandler` vs `IPCHandler` by which
+// script launched: `dispatch_command(parallel=true)` for a `platform="parallel"` run, the
+// untouched single-env `execute_interview`/`execute_batch_interview` otherwise (S-865/866/868
+// preserved byte-for-byte).
+// ===========================================================================
+
+/// OASIS-style lowercase platform string (`"twitter"` / `"reddit"`) for a `Platform`.
+fn platform_str(p: crate::agent::Platform) -> &'static str {
+    match p {
+        crate::agent::Platform::Twitter => "twitter",
+        crate::agent::Platform::Reddit => "reddit",
+    }
+}
+
+/// Does the pool contain at least one agent on `platform`? teri analog of Python's
+/// `self.{platform}_env` truthiness check (env availability).
+fn pool_has_platform(pool: &crate::agent::AgentPool, platform: &str) -> bool {
+    pool.agents.iter().any(|a| {
+        a.persona
+            .social
+            .as_ref()
+            .map(|s| platform_str(s.platform) == platform)
+            .unwrap_or(false)
+    })
+}
+
+/// Resolve the pool agent matching BOTH `user_id == agent_id` and `platform`. teri analog of
+/// per-platform `agent_graph.get_agent(agent_id)` (which raises on an unknown id → `None` here).
+fn resolve_agent_on_platform<'a>(
+    pool: &'a crate::agent::AgentPool,
+    agent_id: i64,
+    platform: &str,
+) -> Option<&'a crate::agent::Agent> {
+    pool.agents.iter().find(|a| {
+        a.persona
+            .social
+            .as_ref()
+            .is_some_and(|s| s.user_id as i64 == agent_id && platform_str(s.platform) == platform)
+    })
+}
+
+/// Run one interview on one platform — port of `_interview_single_platform`
+/// (run_parallel_simulation.py:317-343). Returns EITHER a success result map
+/// (`{agent_id, response, timestamp, platform}`) OR an error map (`{platform, error}`); the
+/// caller checks for the `"error"` key (Python `if "error" in result`).
+async fn execute_interview_one_platform<L: LlmClient + Send + Sync>(
+    pool: &crate::agent::AgentPool,
+    llm: &L,
+    agent_id: i64,
+    prompt: &str,
+    platform: &str,
+) -> Map<String, Value> {
+    // Python: `if not env` → `{"platform": platform, "error": f"{platform}平台不可用"}`.
+    if !pool_has_platform(pool, platform) {
+        return error_map(platform, &format!("{platform}平台不可用"));
+    }
+    // Python: `agent = agent_graph.get_agent(agent_id)` (raises on unknown → caught → error map).
+    let Some(agent) = resolve_agent_on_platform(pool, agent_id, platform) else {
+        return error_map(platform, &format!("Agent {agent_id} not found"));
+    };
+    let interview_prompt = build_interview_prompt(agent, prompt);
+    match llm.complete(&interview_prompt).await {
+        // `_get_interview_result(agent_id)` shape + `result["platform"] = actual_platform`.
+        Ok(response) => {
+            let mut m = interview_result(agent_id, response);
+            m.insert("platform".to_string(), Value::String(platform.to_string()));
+            m
+        }
+        // Python: `except Exception as e: return {"platform": platform, "error": str(e)}`.
+        Err(e) => error_map(platform, &e.to_string()),
+    }
+}
+
+/// `{platform, error}` map (the `_interview_single_platform` failure shape).
+fn error_map(platform: &str, error: &str) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("platform".to_string(), Value::String(platform.to_string()));
+    m.insert("error".to_string(), Value::String(error.to_string()));
+    m
+}
+
+/// Execute a parallel (dual-platform) single-agent interview — port of
+/// `ParallelIPCHandler.handle_interview` (run_parallel_simulation.py:345-414).
+///
+/// - `platform` ∈ {twitter, reddit}: interview ONLY that platform; success → the single result
+///   map (with `platform` key), error → `Err` (→ `send_response` failed).
+/// - `platform` absent: interview EVERY available platform, return
+///   `{agent_id, prompt, platforms: {twitter: …, reddit: …}}`; succeeds if ≥1 platform succeeds
+///   (`success_count > 0`), else `Err("twitter: …; reddit: …")`. No platform available at all →
+///   `Err("没有可用的模拟环境")`.
+async fn execute_interview_parallel<L: LlmClient + Send + Sync>(
+    pool: &crate::agent::AgentPool,
+    llm: &L,
+    args: &Map<String, Value>,
+) -> std::result::Result<Map<String, Value>, String> {
+    let agent_id = args.get("agent_id").and_then(Value::as_i64).unwrap_or(0);
+    let prompt = args.get("prompt").and_then(Value::as_str).unwrap_or("");
+    let platform = args.get("platform").and_then(Value::as_str);
+
+    // Platform specified → single-platform path.
+    if let Some(p) = platform
+        && (p == "twitter" || p == "reddit")
+    {
+        let result = execute_interview_one_platform(pool, llm, agent_id, prompt, p).await;
+        return match result.get("error").and_then(Value::as_str) {
+            Some(err) => Err(err.to_string()),
+            None => Ok(result),
+        };
+    }
+
+    // No platform → interview both available platforms.
+    let has_twitter = pool_has_platform(pool, "twitter");
+    let has_reddit = pool_has_platform(pool, "reddit");
+    if !has_twitter && !has_reddit {
+        return Err("没有可用的模拟环境".to_string());
+    }
+
+    let mut platforms = Map::new();
+    let mut success_count = 0u64;
+    let mut errors: Vec<String> = Vec::new();
+    // Insertion order twitter→reddit mirrors Python `platforms_to_interview` build order.
+    for p in ["twitter", "reddit"] {
+        let available = if p == "twitter" { has_twitter } else { has_reddit };
+        if !available {
+            continue;
+        }
+        let result = execute_interview_one_platform(pool, llm, agent_id, prompt, p).await;
+        match result.get("error").and_then(Value::as_str) {
+            Some(err) => errors.push(format!("{p}: {err}")),
+            None => success_count += 1,
+        }
+        platforms.insert(p.to_string(), Value::Object(result));
+    }
+
+    if success_count > 0 {
+        let mut m = Map::new();
+        m.insert("agent_id".to_string(), Value::from(agent_id));
+        m.insert("prompt".to_string(), Value::String(prompt.to_string()));
+        m.insert("platforms".to_string(), Value::Object(platforms));
+        Ok(m)
+    } else {
+        // Python joins per-platform errors with "; ".
+        Err(errors.join("; "))
+    }
+}
+
+/// Execute a parallel (dual-platform) batch interview — port of
+/// `ParallelIPCHandler.handle_batch_interview` (run_parallel_simulation.py:416-514).
+///
+/// Each item routes by its own `platform` (falling back to the command-level default); an item
+/// with neither is interviewed on BOTH available platforms (added to each platform's batch). For
+/// a platform with ≥1 RESOLVED item, EVERY item of that platform is collected (resolved → LLM
+/// response; unresolvable → `{response: null, timestamp: null}`, mirroring `_get_interview_result`
+/// returning a no-row record); if a platform has 0 resolved items it contributes nothing (Python
+/// guards `if {platform}_actions:`). Results are keyed `"{platform}_{agent_id}"`. Empty →
+/// `Err("没有成功的采访")`.
+async fn execute_batch_interview_parallel<L: LlmClient + Send + Sync>(
+    pool: &crate::agent::AgentPool,
+    llm: &L,
+    args: &Map<String, Value>,
+) -> std::result::Result<Map<String, Value>, String> {
+    let interviews = args.get("interviews").and_then(Value::as_array).cloned().unwrap_or_default();
+    let default_platform = args.get("platform").and_then(Value::as_str);
+
+    // Group items by platform (Python: twitter / reddit / both).
+    let mut twitter_items: Vec<&Value> = Vec::new();
+    let mut reddit_items: Vec<&Value> = Vec::new();
+    let mut both_items: Vec<&Value> = Vec::new();
+    for item in &interviews {
+        match item.get("platform").and_then(Value::as_str).or(default_platform) {
+            Some("twitter") => twitter_items.push(item),
+            Some("reddit") => reddit_items.push(item),
+            _ => both_items.push(item),
+        }
+    }
+    // Distribute "both" items to each AVAILABLE platform's batch (Python:
+    // `if self.{platform}_env: {platform}_interviews.extend(both_platforms_interviews)`).
+    let has_twitter = pool_has_platform(pool, "twitter");
+    let has_reddit = pool_has_platform(pool, "reddit");
+    if has_twitter {
+        twitter_items.extend(both_items.iter().copied());
+    }
+    if has_reddit {
+        reddit_items.extend(both_items.iter().copied());
+    }
+
+    let mut results = Map::new();
+    // Insertion order twitter→reddit mirrors Python (twitter batch processed first).
+    for (platform, items, available) in
+        [("twitter", &twitter_items, has_twitter), ("reddit", &reddit_items, has_reddit)]
+    {
+        collect_platform_batch(pool, llm, platform, items, available, &mut results).await;
+    }
+
+    if results.is_empty() {
+        // Python: `else: send_response(id, "failed", error="没有成功的采访")`.
+        return Err("没有成功的采访".to_string());
+    }
+    let mut m = Map::new();
+    m.insert("interviews_count".to_string(), Value::from(results.len() as u64));
+    m.insert("results".to_string(), Value::Object(results));
+    Ok(m)
+}
+
+/// Collect one platform's batch into `results` (keyed `"{platform}_{agent_id}"`). Mirrors the
+/// Python per-platform block: only proceed if ≥1 item RESOLVES (`if {platform}_actions:`), then
+/// emit a record for EVERY item — resolved items get the LLM response, unresolvable items get a
+/// null-response record (Python's `_get_interview_result` no-row shape).
+async fn collect_platform_batch<L: LlmClient + Send + Sync>(
+    pool: &crate::agent::AgentPool,
+    llm: &L,
+    platform: &str,
+    items: &[&Value],
+    available: bool,
+    results: &mut Map<String, Value>,
+) {
+    if items.is_empty() || !available {
+        return;
+    }
+    // Resolve each item's agent on this platform up front (Python builds `{platform}_actions`).
+    let resolved: Vec<(i64, &str, bool)> = items
+        .iter()
+        .filter_map(|item| {
+            let agent_id = item.get("agent_id").and_then(Value::as_i64)?;
+            let prompt = item.get("prompt").and_then(Value::as_str).unwrap_or("");
+            let ok = resolve_agent_on_platform(pool, agent_id, platform).is_some();
+            if !ok {
+                tracing::warn!("批量采访: 无法获取{}Agent {}", platform, agent_id);
+            }
+            Some((agent_id, prompt, ok))
+        })
+        .collect();
+
+    // Python `if {platform}_actions:` — only collect when ≥1 item resolved on this platform.
+    if !resolved.iter().any(|(_, _, ok)| *ok) {
+        return;
+    }
+    for (agent_id, prompt, ok) in resolved {
+        let mut record = if ok {
+            let agent =
+                resolve_agent_on_platform(pool, agent_id, platform).expect("resolved above");
+            let interview_prompt = build_interview_prompt(agent, prompt);
+            match llm.complete(&interview_prompt).await {
+                Ok(response) => interview_result(agent_id, response),
+                // LLM failure → null-response record (the no-result shape), platform-keyed below.
+                Err(e) => {
+                    tracing::warn!("批量采访: {}Agent {} LLM 失败: {}", platform, agent_id, e);
+                    interview_result_null(agent_id)
+                }
+            }
+        } else {
+            // Unresolvable on this platform → Python `_get_interview_result` returns a no-row
+            // record `{agent_id, response: None, timestamp: None}`.
+            interview_result_null(agent_id)
+        };
+        record.insert("platform".to_string(), Value::String(platform.to_string()));
+        results.insert(format!("{platform}_{agent_id}"), Value::Object(record));
+    }
+}
+
+/// `{agent_id, response: null, timestamp: null}` — the `_get_interview_result` no-DB-row shape.
+fn interview_result_null(agent_id: i64) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("agent_id".to_string(), Value::from(agent_id));
+    m.insert("response".to_string(), Value::Null);
+    m.insert("timestamp".to_string(), Value::Null);
+    m
 }
 
 /// Cooperative-then-force terminate of a single run's tasks — port of `_terminate_process`
@@ -3232,6 +3539,215 @@ mod lifecycle_tests {
         assert_eq!(err, "没有有效的Agent");
     }
 
+    // ---- PARALLEL (dual-platform) interview dispatch — Cycle 59 (S-920/921/922/924) ----
+
+    /// Build an agent on a specific platform (the unioned-pool analog of OASIS per-platform envs).
+    fn social_agent_on(user_id: u64, name: &str, platform: crate::agent::Platform) -> Agent {
+        let mut a = pool_with_social_agent(user_id, name).agents.pop().unwrap();
+        if let Some(s) = a.persona.social.as_mut() {
+            s.platform = platform;
+        }
+        a
+    }
+
+    /// Pool unioning the given `(user_id, name, platform)` agents (mirrors
+    /// `load_agent_pool("parallel")` — same `user_id` may appear once per platform).
+    fn parallel_pool(specs: &[(u64, &str, crate::agent::Platform)]) -> AgentPool {
+        let mut pool = AgentPool::new();
+        for (uid, name, plat) in specs {
+            pool.add_agent(social_agent_on(*uid, name, *plat));
+        }
+        pool
+    }
+
+    /// platform="twitter" → interview ONLY twitter, result carries the `platform` key.
+    #[tokio::test]
+    async fn parallel_interview_specified_platform() {
+        use crate::agent::Platform::{Reddit, Twitter};
+        let pool = parallel_pool(&[(7, "AdaT", Twitter), (7, "AdaR", Reddit)]);
+        let mut args = Map::new();
+        args.insert("agent_id".into(), Value::from(7i64));
+        args.insert("prompt".into(), Value::String("q".into()));
+        args.insert("platform".into(), Value::String("twitter".into()));
+
+        let r = execute_interview_parallel(&pool, &MockLlm, &args).await.expect("ok");
+        assert_eq!(r["platform"], Value::String("twitter".into()));
+        assert_eq!(r["response"], Value::String("Think(idle)".into()));
+        assert!(!r.contains_key("platforms"), "single-platform result is not wrapped");
+    }
+
+    /// No platform → interview BOTH platforms; `{agent_id, prompt, platforms:{twitter, reddit}}`.
+    #[tokio::test]
+    async fn parallel_interview_both_platforms() {
+        use crate::agent::Platform::{Reddit, Twitter};
+        let pool = parallel_pool(&[(7, "AdaT", Twitter), (7, "AdaR", Reddit)]);
+        let mut args = Map::new();
+        args.insert("agent_id".into(), Value::from(7i64));
+        args.insert("prompt".into(), Value::String("q".into()));
+
+        let r = execute_interview_parallel(&pool, &MockLlm, &args).await.expect("ok");
+        assert_eq!(r["agent_id"], Value::from(7i64));
+        assert_eq!(r["prompt"], Value::String("q".into()));
+        let platforms = r["platforms"].as_object().unwrap();
+        assert_eq!(platforms["twitter"]["platform"], Value::String("twitter".into()));
+        assert_eq!(platforms["twitter"]["response"], Value::String("Think(idle)".into()));
+        assert_eq!(platforms["reddit"]["platform"], Value::String("reddit".into()));
+        // Insertion order twitter→reddit preserved (preserve_order).
+        let keys: Vec<&String> = platforms.keys().collect();
+        assert_eq!(keys, vec!["twitter", "reddit"]);
+    }
+
+    /// No platform + only twitter present → partial success: `platforms` has just twitter.
+    #[tokio::test]
+    async fn parallel_interview_both_one_platform_only() {
+        use crate::agent::Platform::Twitter;
+        let pool = parallel_pool(&[(7, "AdaT", Twitter)]);
+        let mut args = Map::new();
+        args.insert("agent_id".into(), Value::from(7i64));
+        args.insert("prompt".into(), Value::String("q".into()));
+
+        let r = execute_interview_parallel(&pool, &MockLlm, &args).await.expect("ok");
+        let platforms = r["platforms"].as_object().unwrap();
+        assert!(platforms.contains_key("twitter"));
+        assert!(!platforms.contains_key("reddit"), "reddit not in pool → not interviewed");
+    }
+
+    /// Empty pool (no platform available at all) → `没有可用的模拟环境`.
+    #[tokio::test]
+    async fn parallel_interview_no_env_errs() {
+        let pool = AgentPool::new();
+        let mut args = Map::new();
+        args.insert("agent_id".into(), Value::from(7i64));
+        let err = execute_interview_parallel(&pool, &MockLlm, &args).await.unwrap_err();
+        assert_eq!(err, "没有可用的模拟环境");
+    }
+
+    /// platform specified but that platform absent → `{platform}平台不可用` surfaced as the error.
+    #[tokio::test]
+    async fn parallel_interview_specified_platform_unavailable_errs() {
+        use crate::agent::Platform::Twitter;
+        let pool = parallel_pool(&[(7, "AdaT", Twitter)]);
+        let mut args = Map::new();
+        args.insert("agent_id".into(), Value::from(7i64));
+        args.insert("platform".into(), Value::String("reddit".into()));
+        let err = execute_interview_parallel(&pool, &MockLlm, &args).await.unwrap_err();
+        assert_eq!(err, "reddit平台不可用");
+    }
+
+    /// No platform, agent unknown on BOTH available platforms → joined per-platform errors.
+    #[tokio::test]
+    async fn parallel_interview_both_all_fail_errs() {
+        use crate::agent::Platform::{Reddit, Twitter};
+        let pool = parallel_pool(&[(7, "AdaT", Twitter), (8, "BobR", Reddit)]);
+        let mut args = Map::new();
+        args.insert("agent_id".into(), Value::from(99i64));
+        let err = execute_interview_parallel(&pool, &MockLlm, &args).await.unwrap_err();
+        assert_eq!(err, "twitter: Agent 99 not found; reddit: Agent 99 not found");
+    }
+
+    /// Batch: per-item platform routing → results keyed `{platform}_{agent_id}`.
+    #[tokio::test]
+    async fn parallel_batch_routes_by_platform() {
+        use crate::agent::Platform::{Reddit, Twitter};
+        let pool = parallel_pool(&[(7, "AdaT", Twitter), (8, "BobR", Reddit)]);
+        let mut args = Map::new();
+        args.insert(
+            "interviews".into(),
+            Value::Array(vec![
+                serde_json::json!({"agent_id": 7, "prompt": "q1", "platform": "twitter"}),
+                serde_json::json!({"agent_id": 8, "prompt": "q2", "platform": "reddit"}),
+            ]),
+        );
+        let r = execute_batch_interview_parallel(&pool, &MockLlm, &args).await.expect("ok");
+        assert_eq!(r["interviews_count"], Value::from(2u64));
+        let res = r["results"].as_object().unwrap();
+        assert_eq!(res["twitter_7"]["platform"], Value::String("twitter".into()));
+        assert_eq!(res["reddit_8"]["platform"], Value::String("reddit".into()));
+    }
+
+    /// Batch: an item with NO platform is interviewed on BOTH platforms (both → twitter+reddit).
+    #[tokio::test]
+    async fn parallel_batch_both_platforms_item() {
+        use crate::agent::Platform::{Reddit, Twitter};
+        let pool = parallel_pool(&[(5, "AdaT", Twitter), (5, "AdaR", Reddit)]);
+        let mut args = Map::new();
+        args.insert(
+            "interviews".into(),
+            Value::Array(vec![serde_json::json!({"agent_id": 5, "prompt": "q"})]),
+        );
+        let r = execute_batch_interview_parallel(&pool, &MockLlm, &args).await.expect("ok");
+        let res = r["results"].as_object().unwrap();
+        assert!(res.contains_key("twitter_5"));
+        assert!(res.contains_key("reddit_5"));
+        assert_eq!(r["interviews_count"], Value::from(2u64));
+    }
+
+    /// Batch: a platform with ≥1 resolved item collects EVERY item — unresolvable ones get a
+    /// null-response record (the `_get_interview_result` no-row shape).
+    #[tokio::test]
+    async fn parallel_batch_unresolvable_gets_null_record() {
+        use crate::agent::Platform::Twitter;
+        let pool = parallel_pool(&[(7, "AdaT", Twitter)]);
+        let mut args = Map::new();
+        args.insert(
+            "interviews".into(),
+            Value::Array(vec![
+                serde_json::json!({"agent_id": 7, "prompt": "q1", "platform": "twitter"}),
+                serde_json::json!({"agent_id": 8, "prompt": "ghost", "platform": "twitter"}),
+            ]),
+        );
+        let r = execute_batch_interview_parallel(&pool, &MockLlm, &args).await.expect("ok");
+        let res = r["results"].as_object().unwrap();
+        assert_eq!(res["twitter_7"]["response"], Value::String("Think(idle)".into()));
+        assert_eq!(res["twitter_8"]["response"], Value::Null);
+        assert_eq!(res["twitter_8"]["timestamp"], Value::Null);
+        assert_eq!(r["interviews_count"], Value::from(2u64));
+    }
+
+    /// Batch: a platform with ZERO resolved items contributes nothing → overall empty → error.
+    #[tokio::test]
+    async fn parallel_batch_no_results_errs() {
+        use crate::agent::Platform::Twitter;
+        let pool = parallel_pool(&[(7, "AdaT", Twitter)]);
+        let mut args = Map::new();
+        args.insert(
+            "interviews".into(),
+            Value::Array(vec![
+                serde_json::json!({"agent_id": 9, "prompt": "x", "platform": "reddit"}),
+            ]),
+        );
+        let err = execute_batch_interview_parallel(&pool, &MockLlm, &args).await.unwrap_err();
+        assert_eq!(err, "没有成功的采访");
+    }
+
+    /// Single-platform run (parallel=false) is UNAFFECTED: `dispatch_command(parallel=false)`
+    /// routes to the original `execute_interview` returning the unwrapped single result.
+    #[tokio::test]
+    async fn dispatch_single_mode_unwrapped_result() {
+        let pool = pool_with_social_agent(7, "Ada");
+        let (mut client, mut server) = channel(IPC_CHANNEL_BUFFER);
+        server.start();
+        // client sends an interview; server polls + dispatches with parallel=false.
+        let send = tokio::spawn(async move {
+            client.send_interview(7, "q", None, Duration::from_secs(5)).await
+        });
+        // Service exactly one command.
+        loop {
+            match server.try_poll() {
+                CommandPoll::Command(env) => {
+                    assert!(dispatch_command(env, &pool, &MockLlm, false).await);
+                    break;
+                }
+                CommandPoll::Empty => tokio::time::sleep(Duration::from_millis(5)).await,
+                CommandPoll::Disconnected => panic!("client dropped early"),
+            }
+        }
+        let resp = send.await.unwrap().expect("interview ok");
+        // parallel=false → original shape: top-level response, NO `platforms` wrap.
+        assert_eq!(resp.result.as_ref().unwrap()["response"], Value::String("Think(idle)".into()));
+        assert!(resp.result.as_ref().unwrap().get("platforms").is_none());
+    }
+
     /// THE KEYSTONE end-to-end: a live `run_sim_body` finishes its (0-tick) run, then stays alive
     /// in wait-for-commands mode servicing IPC. A client interviews an agent (→ LLM response),
     /// an unknown agent_id fails gracefully, and `close_env` completes + breaks the loop so the
@@ -3249,6 +3765,7 @@ mod lifecycle_tests {
             Arc::new(MockLlm),
             server,
             shutdown,
+            false, // single-platform mode
         ));
 
         // Interview a real agent → completed + the {agent_id, response, timestamp} shape.
@@ -3294,6 +3811,7 @@ mod lifecycle_tests {
             Arc::new(MockLlm),
             server,
             Arc::clone(&shutdown),
+            false, // single-platform mode
         ));
         // Let the run finish + enter the wait loop, then trip the flag.
         tokio::time::sleep(Duration::from_millis(120)).await;
@@ -3320,6 +3838,7 @@ mod lifecycle_tests {
             Arc::new(MockLlm),
             server,
             shutdown,
+            false, // single-platform mode
         ));
         tokio::time::sleep(Duration::from_millis(120)).await;
         drop(client); // all senders gone → try_poll yields Disconnected → loop breaks

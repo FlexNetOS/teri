@@ -4332,3 +4332,39 @@ filter, routing preserved). Conservative under-marking retained: S-904/938/939/9
 coroutines, producer-proven, full contract pending cycle D); S-920/921/922/924 STAY [ ] (parallel handler,
 cycle B); S-934 STAY [ ] (dual-LLM, bucket-3 TO-PORT cycle C); S-877 STAYS [~]. U-028/U-029/U-030 units
 STAY [ ]. No over-flip.
+
+## Cycle 59 — PORT parallel ParallelIPCHandler dual-platform interview (S-920/921/922/924 → [x])
+
+PORTED the dual-platform interview handler (`ParallelIPCHandler`, run_parallel_simulation.py:217-601)
+into teri as a parallel-mode dispatch path. **+11 tests, 1519→1530 lib green**, clippy
+`--all-targets --all-features` clean, fmt clean, Y-not-regressed (develop=7c354a5).
+
+NEW (simulation_runner.rs): `platform_str` / `pool_has_platform` / `resolve_agent_on_platform`
+(unified-pool routing); `execute_interview_one_platform` (port of `_interview_single_platform`);
+`execute_interview_parallel` (port of `handle_interview` — platform-specified single result vs
+no-platform `{agent_id,prompt,platforms:{twitter,reddit}}` dual, success_count>0, joined errors,
+`没有可用的模拟环境`); `execute_batch_interview_parallel`+`collect_platform_batch` (port of
+`handle_batch_interview` — per-item platform with default fallback, no-platform item→both, ≥1-resolved
+guard, unresolvable→null-record, keyed `{platform}_{agent_id}`, `没有成功的采访`); `interview_result_null`.
+`dispatch_command` gains a `parallel: bool` selecting parallel vs single-env path; threaded through
+`run_sim_body`/`spawn_sim_task`; call site `parallel = !matches!(platform, "twitter"|"reddit")`.
+
+**THE [≠]U030-UNIFIED-LOOP RESOLUTION:** Python runs two separate OASIS envs where the same `agent_id`
+is two different agents (one per platform); teri's unified `load_agent_pool("parallel")` holds each
+`user_id` once per platform with `SocialProfile.platform`. So "platform available" ≡ pool has ≥1 agent
+on that platform; per-platform `get_agent(agent_id)` ≡ resolve `(user_id, platform)`. The OASIS
+`env.step`+`trace`-DB read stays `[≠]U028-OASIS-INTERNALS` (LLM inline). Run-mode selection mirrors
+Python launching `ParallelIPCHandler` vs `IPCHandler` by which script runs.
+
+**PARITY PASS (rust-port-parity-verifier, 4/4 CONFIRMED-FAITHFUL, no over-claim):** all 6 refutation
+targets confirmed — (1) platform-specified single result unwrapped w/ platform key; (2) both-platforms
+dual shape, success_count logic, twitter→reddit order, partial-availability, neither-env error,
+joined-error fallback unreachable; (3) batch four sub-points — both-distribution, ≥1-resolved guard,
+unresolvable→null-record (faithful to `_get_interview_result` no-row), distinct `没有成功的采访`;
+(4) process_commands platform passthrough + identical CloseEnv; (5) **NO-DOWNGRADE-OF-Y CONFIRMED-INTACT**
+— single path routes to UNCHANGED `execute_interview`/`execute_batch_interview` (S-865/866/868
+byte-preserved, `没有有效的Agent` unchanged, unwrapped shape), real twitter/reddit runs set
+parallel=false, 1530 tests green; (6) asyncio.gather→sequential observably equivalent (platform-keyed,
+order-independent aggregation, deterministic twitter→reddit key order). **S-920/921/922/924 FLIPPED [x].**
+S-923 stays `[≠]` (OASIS DB). S-934 (dual-LLM)=cycle C, S-877/904/938/939/940=composite [ ]/[~].
+**U-028/U-029/U-030 units STAY [ ]** (S-934 + run-coroutine contract pending — no over-flip).
