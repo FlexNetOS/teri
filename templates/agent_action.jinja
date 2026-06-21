@@ -38,6 +38,14 @@ World State:
 You are an active user on the **{{ platform }}** social network. Choose ONE action that this
 user would realistically take right now, given their personality and what is happening.
 
+{% if feed_posts %}
+## Recent posts in your feed
+{% for p in feed_posts %}
+- {{ p.id }} (by user {{ p.author }}, {{ p.likes }} likes, {{ p.shares }} shares): {{ p.content }}
+{% endfor %}
+Use these exact post ids when you LIKE_POST / DISLIKE_POST / REPOST / QUOTE_POST / CREATE_COMMENT.
+{% endif %}
+
 {% if platform == "twitter" %}
 1. **CREATE_POST(content=...)** - Write a new public post. Example: CREATE_POST(content=Just read a fascinating paper on swarm intelligence!)
 2. **LIKE_POST(target_id=...)** - Like an existing post. Example: LIKE_POST(target_id=post-12)

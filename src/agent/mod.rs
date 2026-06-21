@@ -1,6 +1,7 @@
 use crate::error::{Result, TeriError};
 use crate::graph::{Entity, KnowledgeGraph, Relation};
 use crate::llm::LlmClient;
+use crate::sim::social_world::FeedSnapshot;
 use crate::sim::{Action, SocialAction, TargetKind, WorldState};
 use chrono::Utc;
 use minijinja::{Environment, context};
@@ -333,10 +334,11 @@ impl Agent {
     pub async fn prepare_action<L: LlmClient>(
         &self,
         world: &WorldState,
+        feed: Option<&FeedSnapshot>,
         llm: &L,
     ) -> Result<Action> {
         let relevant_memories = self.retrieve_relevant_memories(world);
-        let context = self.construct_context(world, &relevant_memories);
+        let context = self.construct_context(world, &relevant_memories, feed);
         let action_str = self.generate_action_with_fallback(&context, llm).await?;
         // Robustness: a single unparseable LLM line must NOT abort the whole simulation (the run
         // loop propagates this `Result` via `?`). An action string we cannot classify is treated
@@ -364,8 +366,10 @@ impl Agent {
         // Retrieve relevant memories
         let relevant_memories = self.retrieve_relevant_memories(world);
 
-        // Construct context from world state + memories
-        let context = self.construct_context(world, &relevant_memories);
+        // Construct context from world state + memories. `step` is the standalone single-agent
+        // path (tests / non-social callers); it has no social feed, so pass `None` — the feed
+        // section is omitted and the prompt is byte-identical to before the feed-back landed.
+        let context = self.construct_context(world, &relevant_memories, None);
 
         // Set state to Acting
         self.set_state(AgentState::Acting);
@@ -447,8 +451,19 @@ impl Agent {
         scored_memories.iter().take(10).map(|(_, m)| *m).collect()
     }
 
-    /// Construct context string from world state and memories
-    fn construct_context(&self, world: &WorldState, memories: &[&MemoryEntry]) -> String {
+    /// Construct context string from world state and memories.
+    ///
+    /// When `feed` is `Some` and non-empty, a "Recent posts in your feed:" section is appended so
+    /// a social agent can target REAL post ids (`LIKE_POST(target_id=...)`, `REPOST(post_id=...)`,
+    /// `CREATE_COMMENT(post_id=...)`). The section is round-trippable by
+    /// [`ActionGenerator::parse_feed_posts`]. Generic (non-social) agents pass `feed = None`, so
+    /// the section is omitted and the prompt is byte-identical (no-downgrade).
+    fn construct_context(
+        &self,
+        world: &WorldState,
+        memories: &[&MemoryEntry],
+        feed: Option<&FeedSnapshot>,
+    ) -> String {
         let mut context = format!(
             "Agent: {}\nRole: {}\nState: {:?}\n\n",
             self.persona.name, self.persona.role, self.state
@@ -485,6 +500,30 @@ impl Agent {
             for (key, value) in &world.variables {
                 context.push_str(&format!("- {}: {:.2}\n", key, value));
             }
+        }
+
+        // Add the social feed (recency-ranked recent posts) so the agent can react to REAL posts.
+        // Format is round-trippable by `parse_feed_posts`:
+        //   - [post-12 by user 7 | 3 likes | 1 shares] <content>
+        // The section is terminated with a blank line so the section-end parser (find "\n\n")
+        // bounds it exactly like the other sections. When `feed` is `None`/empty (every
+        // non-social caller) NOTHING is appended, so the generic prompt is byte-identical.
+        if let Some(feed) = feed
+            && !feed.is_empty()
+        {
+            // Separate from any preceding section with a blank line (the World State section above
+            // is not blank-line-terminated; other sections are).
+            if !context.ends_with("\n\n") {
+                context.push('\n');
+            }
+            context.push_str("Recent posts in your feed:\n");
+            for p in &feed.posts {
+                context.push_str(&format!(
+                    "- [post-{} by user {} | {} likes | {} shares] {}\n",
+                    p.id, p.author_user_id, p.num_likes, p.num_shares, p.content
+                ));
+            }
+            context.push('\n');
         }
 
         context
@@ -1702,6 +1741,7 @@ impl ActionGenerator {
         let relevant_memories = self.parse_relevant_memories(context);
         let world_variables = self.parse_world_variables(context);
         let world_tick = self.parse_world_tick(context);
+        let feed_posts = self.parse_feed_posts(context);
 
         // Convert HashMap to Vec of tuples for MiniJinja iteration
         let world_variables_seq: Vec<(String, f32)> = world_variables.into_iter().collect();
@@ -1748,6 +1788,7 @@ impl ActionGenerator {
             recent_events => recent_events,
             relevant_memories => relevant_memories,
             world_variables => world_variables_seq,
+            feed_posts => feed_posts,
         };
 
         let prompt = env
@@ -1839,6 +1880,66 @@ impl ActionGenerator {
         }
         0
     }
+
+    /// Parse the "Recent posts in your feed:" section emitted by `construct_context`. Each line is
+    /// `- [post-<id> by user <author> | <likes> likes | <shares> shares] <content>`. A malformed
+    /// line is skipped (fail-closed) rather than aborting the prompt.
+    fn parse_feed_posts(&self, context: &str) -> Vec<FeedPostView> {
+        let mut posts = Vec::new();
+        let Some(start) = context.find("Recent posts in your feed:") else {
+            return posts;
+        };
+        let section_start = start + "Recent posts in your feed:".len();
+        let section_end = context[section_start..]
+            .find("\n\n")
+            .map(|i| section_start + i)
+            .unwrap_or(context.len());
+        for line in context[section_start..section_end].lines() {
+            let Some(rest) = line.strip_prefix("- [") else {
+                continue;
+            };
+            let Some((meta, content)) = rest.split_once("] ") else {
+                continue;
+            };
+            // meta = "post-<id> by user <author> | <likes> likes | <shares> shares"
+            let mut parts = meta.split(" | ");
+            let id_author = parts.next().unwrap_or("");
+            let likes_str = parts.next().unwrap_or("");
+            let shares_str = parts.next().unwrap_or("");
+            let id = id_author
+                .strip_prefix("post-")
+                .and_then(|s| s.split_whitespace().next())
+                .and_then(|s| s.parse::<i64>().ok());
+            let author =
+                id_author.rsplit("user ").next().and_then(|s| s.trim().parse::<i64>().ok());
+            let (Some(id), Some(author)) = (id, author) else {
+                continue;
+            };
+            let likes =
+                likes_str.split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let shares =
+                shares_str.split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            posts.push(FeedPostView {
+                id: format!("post-{id}"),
+                author,
+                likes,
+                shares,
+                content: content.to_string(),
+            });
+        }
+        posts
+    }
+}
+
+/// Template-facing view of a feed post (used in `agent_action.jinja`'s feed section). `id` is the
+/// `post-<n>` string the agent should copy verbatim into `LIKE_POST(target_id=...)` / etc.
+#[derive(Debug, Clone, Serialize)]
+struct FeedPostView {
+    id: String,
+    author: i64,
+    likes: i64,
+    shares: i64,
+    content: String,
 }
 
 impl Default for ActionGenerator {
@@ -2509,6 +2610,111 @@ mod tests {
             prompt.contains("A relentless skeptic who questions every claim"),
             "the recovered OASIS persona text must appear in the decision prompt: {prompt}"
         );
+    }
+
+    /// Build a single social agent (twitter) for feed-in-prompt tests.
+    fn social_agent(name: &str) -> Agent {
+        let social = SocialProfile {
+            user_id: 7,
+            user_name: "u7".to_string(),
+            bio: String::new(),
+            persona: String::new(),
+            platform: Platform::Twitter,
+            karma: 1000,
+            friend_count: 100,
+            follower_count: 150,
+            following_count: 100,
+            statuses_count: 500,
+            age: None,
+            gender: None,
+            mbti: None,
+            country: None,
+            profession: None,
+            interested_topics: vec![],
+            posting_style: None,
+            source_entity_uuid: None,
+            source_entity_type: None,
+            created_at: String::new(),
+        };
+        Agent::new(Persona {
+            name: name.to_string(),
+            background: "bg".to_string(),
+            traits: vec![],
+            role: "agent".to_string(),
+            social: Some(social),
+        })
+    }
+
+    /// Workstream C: the recency-ranked feed snapshot must reach a social agent's decision prompt,
+    /// carrying the exact post ids the agent should target. This is the load-bearing feed-back
+    /// proof — without it agents are told to LIKE_POST(target_id=...) with no ids to use.
+    #[test]
+    fn test_feed_appears_in_social_agent_prompt() {
+        let agent = social_agent("Ada");
+        let world = WorldState::new();
+        let feed = crate::sim::social_world::FeedSnapshot {
+            posts: vec![
+                crate::sim::social_world::FeedPost {
+                    id: 12,
+                    author_user_id: 4,
+                    content: "swarm intelligence paper".to_string(),
+                    num_likes: 3,
+                    num_shares: 1,
+                },
+                crate::sim::social_world::FeedPost {
+                    id: 9,
+                    author_user_id: 5,
+                    content: "thoughts on the policy".to_string(),
+                    num_likes: 0,
+                    num_shares: 0,
+                },
+            ],
+        };
+
+        // construct_context appends the feed section, then generate_prompt round-trips it.
+        let context = agent.construct_context(&world, &[], Some(&feed));
+        assert!(context.contains("Recent posts in your feed:"));
+
+        let generator = ActionGenerator::new();
+        let prompt = generator.generate_prompt(&agent, &context).unwrap();
+        assert!(prompt.contains("Recent posts in your feed"), "feed header missing: {prompt}");
+        assert!(prompt.contains("post-12"), "feed post id 12 missing: {prompt}");
+        assert!(prompt.contains("post-9"), "feed post id 9 missing: {prompt}");
+        assert!(prompt.contains("swarm intelligence paper"), "feed content missing: {prompt}");
+        // The parser recovered the like count.
+        assert!(prompt.contains("3 likes"), "feed like count missing: {prompt}");
+    }
+
+    /// No-downgrade: with `feed = None` (every non-social caller, and `Agent::step`) NO feed section
+    /// is appended and the prompt has no feed block — byte-identical to before feed-back landed.
+    #[test]
+    fn test_no_feed_section_when_feed_is_none() {
+        let agent = social_agent("Ada");
+        let world = WorldState::new();
+        let context = agent.construct_context(&world, &[], None);
+        assert!(!context.contains("Recent posts in your feed"));
+        let generator = ActionGenerator::new();
+        let prompt = generator.generate_prompt(&agent, &context).unwrap();
+        assert!(!prompt.contains("Recent posts in your feed"));
+    }
+
+    /// `parse_feed_posts` round-trips the exact `construct_context` format and skips malformed
+    /// lines fail-closed (a bad line never aborts the prompt).
+    #[test]
+    fn test_parse_feed_posts_round_trip_and_skip_malformed() {
+        let generator = ActionGenerator::new();
+        let context = "Recent posts in your feed:\n\
+            - [post-12 by user 7 | 3 likes | 1 shares] hello world\n\
+            - garbage line that does not match\n\
+            - [post-9 by user 4 | 0 likes | 0 shares] another\n\n";
+        let parsed = generator.parse_feed_posts(context);
+        assert_eq!(parsed.len(), 2, "malformed line must be skipped: {parsed:?}");
+        assert_eq!(parsed[0].id, "post-12");
+        assert_eq!(parsed[0].author, 7);
+        assert_eq!(parsed[0].likes, 3);
+        assert_eq!(parsed[0].shares, 1);
+        assert_eq!(parsed[0].content, "hello world");
+        assert_eq!(parsed[1].id, "post-9");
     }
 
     /// A generic agent (no social profile) must produce a prompt with NO Persona section — the
