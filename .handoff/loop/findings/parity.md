@@ -4767,3 +4767,163 @@ the porter de-dup line 648 vs 559 in a follow-up, but it does NOT block this uni
 `[!] U-024-PROD-PENDING` (path-proven, returns env-not-running until the live producer lands —
 tracked, reasoned, NOT a skip). Y-not-regressed: **YES** (1544/0, additive seam). No
 disguised-skip `[≠]`; the DTO-widening `[≠]` was a hidden downgrade now CORRECTED and verified.
+
+---
+
+## cycle-68 U-017 ZepToolsService method sweep — parity verdict (2026-06-21, opus, default-skeptical)
+
+**Scope:** S-299..S-318 (20 symbols). Source X: `MiroFish/backend/app/services/zep_tools.py`
+`ZepToolsService` (L401+). Rust Y: `.worktrees/mirofish-port/teri/src/services/zep_tools.rs`.
+Baseline: **1544/0 lib tests green** (no regression; re-run after analysis: 1544/0).
+
+### Architecture finding (resolves the cycle-4 "returns empty/NotImplementedError" worry)
+The cycle-4 `ZepToolsService<L>` wrapper was **refactored under DECISION-11**: every graph-touching
+method MIGRATED to `ReportTools<'g, L>` (the real `&KnowledgeGraph`-bound facade, struct :618).
+`ZepToolsService<L>` (struct :2961) now retains ONLY the DTO + retry namespace (S-299..S-304).
+**Stub hunt:** grep for `NotImplementedError|todo!|unimplemented!|"graph reference not available"|
+"return empty"` → **0 hits**. No method silently returns empty where the graph has data. The
+cycle-4 premature-claim risk did NOT survive into the current tree — those stubs are gone.
+
+**Live-path proof:** the report ReACT loop constructs `ReportTools::new/with_runner`
+(report.rs:517,551,700,872; report/mod.rs threads `&ReportTools`). `ZepToolsService<L>` is
+**never constructed or called** outside its own module (only comments in report.rs reference it).
+So S-305..S-318 behavior lives on `ReportTools` (the live path) and is what I verified.
+
+### Per-symbol verdict
+- **S-299 ZepToolsService type** `[≠]` — retained DTO/retry namespace, dead-but-back-compat; graph
+  behavior migrated to `ReportTools` (DECISION-11). Not a downgrade: no observable output dropped.
+- **S-300 MAX_RETRIES=3** `[x]` — `pub const MAX_RETRIES: i32 = 3` (:2969), byte-identical.
+- **S-301 RETRY_DELAY=2.0** `[x]` — `pub const RETRY_DELAY: f64 = 2.0` (:2971).
+- **S-302 __init__** `[x]` — `new(api_key, llm_client)` stores both (:2974). (Python ValueError on
+  missing key is `[≠]` — no Zep auth in teri, DECISION-9 Q1; keyless substrate.)
+- **S-303 llm (lazy property)** `[x]` — `llm()->Option<&L>` + `set_llm` (:2979). Lazy `LLMClient()`
+  default-construction is `[≠]` (teri injects the client; no global default ctor).
+- **S-304 _call_with_retry** `[≠]` (challenged, survives) — retry is non-contractual for in-process
+  petgraph reads (DECISION-9 Q9): `ReportTools` has NO retry and that is correct (no I/O to retry).
+  NOTE: the retained dead method's backoff formula `((attempt*RETRY_DELAY) as i64).max(2)` yields
+  delays {2,2} vs Python's doubling {2,4} — a real divergence BUT on a **zero-caller dead method**
+  whose entire retry concept is `[≠]`. Not gating. (If this method is ever revived, the backoff
+  must be fixed to match `delay*=2`.)
+- **S-305 search_graph** `[x]` — `ReportTools::search_graph` (:1066) → `local_search`. Python's
+  Zep-cloud hybrid+cross-encoder path is `[≠]` (server-side, inexpressible); Python's OWN fallback
+  IS `_local_search`, which is what teri reproduces. Faithful to the reachable behavior.
+- **S-306 _local_search** `[x]` — `local_search` (:947). Differential-verified: tokenization
+  (split on `,`/`，`/whitespace, len>1), match_score (exact→100, per-kw→+10), score-desc sort,
+  limit cap, edges/nodes/both scopes, node-summary-as-fact (`[name]: summary`). Matches Python
+  L546-648 line-for-line.
+- **S-307 get_all_nodes** `[x]` — `get_all_nodes` (:663) maps `graph.get_all_entities()`→NodeInfo.
+  Test `test_get_all_nodes_count`. (summary/attributes `[≠]` DECISION-9 Q2.)
+- **S-308 get_all_edges** `[x]` — `get_all_edges` (:680), include_temporal fills valid_at/invalid_at
+  from `Relation.valid_at` (GAP-1). Tests `test_get_all_edges_count/_temporal`. (uuid/fact `[≠]` Q4.)
+- **S-309 get_node_detail** `[x]` — `get_node_detail` (:700), uuid parse→get_entity_by_id→None on
+  miss/bad-uuid. Tests `_found/_missing/_bad_uuid` (the except→None contract is ported).
+- **S-310 get_node_edges** `[x]` — `get_node_edges` (:718) filters all_edges by src/tgt==uuid.
+  Test `test_get_node_edges`. (except→[] preserved via empty filter on bad uuid.)
+- **S-311 get_entities_by_type** `[x]` — `get_entities_by_type` (:735) via U-016 reader label
+  filter. Tests `_person/_unknown`.
+- **S-312 get_entity_summary** `[x]` — `get_entity_summary` (:764): search_graph→find by ci-name→
+  node_edges→dict{entity_name,entity_info,related_facts,related_edges,total_relations}, key order
+  preserved. Tests `_found/_not_found`.
+- **S-313 get_graph_statistics** `[x]` — `get_graph_statistics` (:821): {graph_id,total_nodes,
+  total_edges,entity_types,relation_types}; Entity/Node excluded; first-seen insertion order via
+  preserve_order Map (NOT randomized HashMap). Test `test_get_graph_statistics`.
+- **S-314 get_simulation_context** `[x]` — `get_simulation_context` (:877): documented 0→30 limit
+  mapping present (`if limit==0 {30}`), search+stats+typed-entity filter, `entities[:limit]`,
+  total_entities = full typed count. Test `test_get_simulation_context_structure`. (per-entity
+  `summary=""` is `[≠]` Q2.)
+- **S-315 insight_forge** `[~]` **DOWNGRADE — needs porter follow-up.** See below.
+- **S-316 _generate_sub_queries** `[~]` **DOWNGRADE — needs porter follow-up.** See below.
+- **S-317 panorama_search** `[x]` — `panorama_search` (:1109): active/historical split via
+  `partition_edges_at(t)` (GAP-1), temporal tag `[valid - invalid] fact`, relevance sort, limit,
+  include_expired gate. Tests `_active_vs_historical/_exclude_expired`. (`edge.fact` synthesized
+  from kind+names since `Relation` has no LLM sentence — `[≠]` Q4, but classification preserved.)
+- **S-318 quick_search** `[x]` — `quick_search` (:1087) → search_graph(scope="edges"). Tests
+  `_returns_search_result_type/_empty_graph`, dispatch `test_execute_by_name_quick_search`.
+
+### THE DOWNGRADE (S-315 + S-316) — disguised-skip `[≠]` REJECTED, reclassified `[~]`
+Tried to refute the existing `[!]` (b2-pending) flag and it did NOT survive:
+- **Python primary path:** `insight_forge` Step 1 calls `_generate_sub_queries`, which uses the
+  **LLM** (`self.llm.chat_json(messages, temperature=0.3)` with a system prompt) to decompose the
+  query into sub-queries. The hard-coded variants (`{q} 的主要参与者 / 的原因和影响 / 的发展过程`)
+  are Python's **exception-path fallback only** (zep_tools.py:1135-1143).
+- **Rust behavior:** `ReportTools::insight_forge` (:1241) is a **sync `pub fn`** that **hard-codes
+  exactly those 4 fallback variants and NEVER calls the LLM**. It also calls `search_graph`→
+  `local_search` (keyword), NOT the semantic `query_vec_similarity`. So both the LLM-decomposition
+  AND the semantic-search halves of the Python contract are skipped. (`_generate_sub_queries` has
+  **no faithful counterpart anywhere** in the Rust — it is the absent primary path, not just the
+  absent insight_forge step.)
+- **Why this is `[~]` not `[≠]`:** the deferral rationale ("`[!]` b2-pending: needs OQ-3") is
+  **STALE**. The ledger records **GAP-2/OQ-3 (`query_vec_similarity`) RESOLVED 2026-06-14** and
+  **GAP-OQ3-EMBED (embeddings) RESOLVED 2026-06-17**, both explicitly noted as "ENABLES U-017
+  insight_forge". And `self.llm.chat_json` is demonstrably available — used at zep_tools.rs:1603 &
+  :1668 in `select_agents_for_interview` in the SAME impl. The substrate EXISTS; the source produces
+  a **distinct observable output** (LLM-decomposed, scenario-aware sub-queries vs. 4 fixed string
+  templates → materially different `sub_queries` + `semantic_facts` on the live ReACT path at
+  zep_tools.rs:2672). That is a **portable feature being skipped**, the exact downgrade class the
+  no-downgrade gate must catch — NOT inexpressible, NOT non-contractual, NOT a superset. Reject as
+  `[≠]`; record `[~]`.
+- **Live path confirmed:** dispatched at `execute_by_name` :2672 (the sync ReACT tool dispatcher),
+  reached by report/mod.rs. NOT dead → real downgrade, not a dead-duplicate.
+- **Fix exceeds this cycle (verifier scope):** faithful repair requires making `insight_forge`
+  (and `_generate_sub_queries`) **async** + threading async through `execute_by_name`/the ReACT
+  dispatch in report/mod.rs, then wiring `chat_json` (sub-queries) + `query_vec_similarity`
+  (semantic search). That is a porter-sized change with blast radius into the dispatcher signature.
+  **Flagged for a follow-up porter cycle, NOT silently waved.**
+
+### VERDICT: **FAIL** (unit not done) — 16/20 `[x]`, 2 justified `[≠]` (S-299,S-304), 1 `[≠]`(implicit on retained type), **2 `[~]` downgrades (S-315, S-316)**
+The unit CANNOT be marked done: rollup rule fails on S-315/S-316. No regression (1544/0). The
+stub-hunt cleared S-305..S-314,S-317,S-318 (real graph reads, differential tests present); the
+ONE genuine downgrade is the LLM-sub-query + semantic-search skip in insight_forge, now correctly
+reclassified from a stale `[!]` to a `[~]` requiring a porter follow-up cycle.
+
+**Follow-up porter cycle needed:** S-315 `insight_forge` + S-316 `_generate_sub_queries` — port the
+LLM `chat_json` sub-query decomposition (temp 0.3, system+user prompts verbatim) as the PRIMARY
+path with the 4 Chinese variants kept ONLY as the exception fallback; route per-sub-query search
+through `query_vec_similarity` (GAP-2, available) for semantic ranking. Make `insight_forge` async
+and thread async through `execute_by_name` + report/mod.rs ReACT dispatch.
+
+---
+
+## cycle-68 · U-017 DTO sweep (S-223..S-278, 56 symbols) · parity verifier · 2026-06-21
+
+**Scope:** the 5 result DTOs in `services/zep_tools.rs` vs Python `zep_tools.py` (SearchResult, NodeInfo, EdgeInfo, InsightForgeResult, PanoramaResult) — field-for-field + byte-for-byte `to_dict`/`to_text`. Default-skeptical; tried to REFUTE each.
+
+**Method:** generated Python golden output for each DTO's `to_dict()`/`to_text()` over happy + empty + named/unnamed inputs (standalone dataclass re-decl to avoid `zep_cloud` import), then diffed against the Rust. Adjudicated the cited `[≠]` decisions against teri's ACTUAL graph types (`src/graph/mod.rs`).
+
+### Refutation results — 4 REAL DOWNGRADES FOUND & FIXED (not waved through)
+
+These are the MiroFish→teri cycle-8/9 class (a portable observable-output feature dropped under a `[≠]` rationalization or silently). The graph-capability `[≠]` (Q2/Q4) is legitimate for the empty VALUE, but it does NOT license dropping the dict KEY or dropping data teri actually has:
+
+1. **S-237 `NodeInfo.to_dict` — dropped the `summary` key.** Python emits 5 keys (`uuid,name,labels,summary,attributes`); Rust emitted 4. Even with the legit `summary=""` `[≠]` value, the serialized dict SHAPE diverged byte-for-byte. → Added `"summary"` key in Python order. The `[≠]` is on the VALUE only; the KEY is contractual.
+
+2. **S-251 `EdgeInfo.to_dict` — emitted ≤9 of 11 keys.** (a) `source_node_name`/`target_node_name` keys entirely absent; (b) `created_at/valid_at/invalid_at/expired_at` were emitted only `if Some(...)`, so a non-temporal edge dropped 4 keys that Python emits as `null`. → Now emits all 11 keys in Python order, `null` for `None`.
+
+3. **S-245/S-246 `EdgeInfo.source_node_name`/`target_node_name` — fields ABSENT from the struct.** This was the disguised downgrade: teri DOES have the entity names available at construction (`panorama_search` builds a uuid→NodeInfo `node_map`; `get_all_edges` can resolve via `graph.get_entity_by_id`). The names were being thrown away. NOT inexpressible → a real `[~]`. → Added both fields, wired names through BOTH constructors (`get_all_edges`, `panorama_search`).
+
+4. **S-252 `EdgeInfo.to_text` — rendered uuid-prefix instead of names.** Python: `source = source_node_name or source_node_uuid[:8]`. Rust used uuid prefix unconditionally → observable downgrade `aaaaaaaa --[X]--> bbbbbbbb` instead of `Alice --[X]--> Acme`. → Now `name or uuid[:8]`, both paths golden-tested.
+
+### Legitimate `[≠]` (survived the challenge — value-only, key present, graph-inexpressible)
+
+Adjudicated against `src/graph/mod.rs`: `Entity{id,name,kind}` (no summary, no attributes), `Relation{kind,weight,valid_at}` (no UUID, no fact sentence). For these the FIELD/KEY is faithful; only the VALUE is empty because the capability genuinely does not exist in teri's graph:
+- **S-235 `NodeInfo.summary` = ""** (DECISION-9 Q2) — no per-entity summary. Verified mod.rs:45.
+- **S-236 `NodeInfo.attributes` = {}** (DECISION-9 Q2) — no attribute bag. Verified mod.rs:45.
+- **S-240 `EdgeInfo.uuid` = ""** (DECISION-9 Q4) — no edge UUID. Verified mod.rs:82.
+- **S-242 `EdgeInfo.fact` = ""** (DECISION-9 Q4) — no LLM fact sentence; `panorama_search` synthesizes a fact string separately for active/historical classification. Verified mod.rs:82.
+Consumer tolerance confirmed: `to_text`/`to_dict`/panorama classification all handle empty values, no panic (panorama + edge_info + node_info tests green).
+
+### Faithful as-found (`[x]`, no change needed)
+
+- **SearchResult (S-223..S-230):** byte-for-byte. `to_dict` 5-key, `to_text` Chinese literals/separators/empty-facts branch all match golden.
+- **InsightForgeResult (S-255..S-266):** 9 fields field-for-field; `to_dict` 9 keys in order; `to_text` entity-insight `summary` filter `!is_empty()` == Python falsy-empty; `"{}"` quoting + 条/个 units match.
+- **PanoramaResult (S-267..S-278):** 9 fields; `to_dict` 9 keys; `to_text` full non-truncated assembly with Chinese section headers. Nested node/edge dicts now correct via the S-237/S-251 fixes.
+- **EdgeInfo.is_expired/is_invalid (S-253/S-254):** `Some(...)` checks match Python `is not None`; the prior `is_invalid = source_node_uuid.is_empty()` divergence was already corrected and is regression-pinned.
+
+### Code changed (real downgrade fixes)
+
+`src/services/zep_tools.rs`: added 2 `EdgeInfo` fields; rewrote `EdgeInfo::to_dict` (11 keys, null-explicit), `EdgeInfo::to_text` (name-or-uuid), `NodeInfo::to_dict` (+summary key); `edge_triple_to_edge_info` now takes name params, wired at both call sites; updated 4 test literals; added 3 byte-for-byte golden tests.
+
+**Test count: 1547 passed (was 1544 baseline; +3 goldens, 0 regressions).**
+
+### Verdict
+
+**U-017 DTO sweep: PASS — 56/56 symbols covered.** 52 `[x]` (incl. 4 fixed downgrades), 4 `[≠]` (S-235/236/240/242 — value-only, key-present, graph-inexpressible, each survived the `[≠]` challenge). 0 `[~]` remaining.

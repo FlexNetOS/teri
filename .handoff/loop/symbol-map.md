@@ -322,62 +322,62 @@
 
 ## U-017 — `backend/app/services/zep_tools.py`
 
-- [ ] S-223 · `unit:U-017` · `type` · `SearchResult` · dataclass: facts,edges,nodes,query,total_count · `zep_tools.py:28`
-- [ ] S-224 · `unit:U-017` · `field` · `SearchResult.facts` · `zep_tools.py:30`
-- [ ] S-225 · `unit:U-017` · `field` · `SearchResult.edges` · `zep_tools.py:31`
-- [ ] S-226 · `unit:U-017` · `field` · `SearchResult.nodes` · `zep_tools.py:32`
-- [ ] S-227 · `unit:U-017` · `field` · `SearchResult.query` · `zep_tools.py:33`
-- [ ] S-228 · `unit:U-017` · `field` · `SearchResult.total_count` · `zep_tools.py:34`
-- [ ] S-229 · `unit:U-017` · `method` · `SearchResult.to_dict` · `zep_tools.py:36`
-- [ ] S-230 · `unit:U-017` · `method` · `SearchResult.to_text` · text render for LLM · `zep_tools.py:45`
-- [ ] S-231 · `unit:U-017` · `type` · `NodeInfo` · `zep_tools.py:58`
-- [ ] S-232 · `unit:U-017` · `field` · `NodeInfo.uuid` · `zep_tools.py:60`
-- [ ] S-233 · `unit:U-017` · `field` · `NodeInfo.name` · `zep_tools.py:61`
-- [ ] S-234 · `unit:U-017` · `field` · `NodeInfo.labels` · `zep_tools.py:62`
-- [ ] S-235 · `unit:U-017` · `field` · `NodeInfo.summary` · `zep_tools.py:63`
-- [ ] S-236 · `unit:U-017` · `field` · `NodeInfo.attributes` · `zep_tools.py:64`
-- [ ] S-237 · `unit:U-017` · `method` · `NodeInfo.to_dict` · `zep_tools.py:66`
-- [ ] S-238 · `unit:U-017` · `method` · `NodeInfo.to_text` · `zep_tools.py:75`
-- [ ] S-239 · `unit:U-017` · `type` · `EdgeInfo` · `zep_tools.py:82`
-- [ ] S-240 · `unit:U-017` · `field` · `EdgeInfo.uuid` · `zep_tools.py:84`
-- [ ] S-241 · `unit:U-017` · `field` · `EdgeInfo.name` · `zep_tools.py:85`
-- [ ] S-242 · `unit:U-017` · `field` · `EdgeInfo.fact` · `zep_tools.py:86`
-- [ ] S-243 · `unit:U-017` · `field` · `EdgeInfo.source_node_uuid` · `zep_tools.py:87`
-- [ ] S-244 · `unit:U-017` · `field` · `EdgeInfo.target_node_uuid` · `zep_tools.py:88`
-- [ ] S-245 · `unit:U-017` · `field` · `EdgeInfo.source_node_name` · `zep_tools.py:89`
-- [ ] S-246 · `unit:U-017` · `field` · `EdgeInfo.target_node_name` · `zep_tools.py:90`
-- [ ] S-247 · `unit:U-017` · `field` · `EdgeInfo.created_at` · `zep_tools.py:92`
-- [ ] S-248 · `unit:U-017` · `field` · `EdgeInfo.valid_at` · `zep_tools.py:93`
-- [ ] S-249 · `unit:U-017` · `field` · `EdgeInfo.invalid_at` · `zep_tools.py:94`
-- [ ] S-250 · `unit:U-017` · `field` · `EdgeInfo.expired_at` · `zep_tools.py:95`
-- [ ] S-251 · `unit:U-017` · `method` · `EdgeInfo.to_dict` · `zep_tools.py:97`
-- [ ] S-252 · `unit:U-017` · `method` · `EdgeInfo.to_text` · `zep_tools.py:112`
-- [ ] S-253 · `unit:U-017` · `method` · `EdgeInfo.is_expired` · `zep_tools.py:128`
-- [ ] S-254 · `unit:U-017` · `method` · `EdgeInfo.is_invalid` · `zep_tools.py:133`
-- [ ] S-255 · `unit:U-017` · `type` · `InsightForgeResult` · `zep_tools.py:139`
-- [ ] S-256 · `unit:U-017` · `field` · `InsightForgeResult.query` · `zep_tools.py:144`
-- [ ] S-257 · `unit:U-017` · `field` · `InsightForgeResult.simulation_requirement` · `zep_tools.py:145`
-- [ ] S-258 · `unit:U-017` · `field` · `InsightForgeResult.sub_queries` · `zep_tools.py:146`
-- [ ] S-259 · `unit:U-017` · `field` · `InsightForgeResult.semantic_facts` · `zep_tools.py:149`
-- [ ] S-260 · `unit:U-017` · `field` · `InsightForgeResult.entity_insights` · `zep_tools.py:150`
-- [ ] S-261 · `unit:U-017` · `field` · `InsightForgeResult.relationship_chains` · `zep_tools.py:151`
-- [ ] S-262 · `unit:U-017` · `field` · `InsightForgeResult.total_facts` · `zep_tools.py:154`
-- [ ] S-263 · `unit:U-017` · `field` · `InsightForgeResult.total_entities` · `zep_tools.py:155`
-- [ ] S-264 · `unit:U-017` · `field` · `InsightForgeResult.total_relationships` · `zep_tools.py:156`
-- [ ] S-265 · `unit:U-017` · `method` · `InsightForgeResult.to_dict` · `zep_tools.py:158`
-- [ ] S-266 · `unit:U-017` · `method` · `InsightForgeResult.to_text` · `zep_tools.py:171`
-- [ ] S-267 · `unit:U-017` · `type` · `PanoramaResult` · `zep_tools.py:215`
-- [ ] S-268 · `unit:U-017` · `field` · `PanoramaResult.query` · `zep_tools.py:220`
-- [ ] S-269 · `unit:U-017` · `field` · `PanoramaResult.all_nodes` · `zep_tools.py:223`
-- [ ] S-270 · `unit:U-017` · `field` · `PanoramaResult.all_edges` · `zep_tools.py:225`
-- [ ] S-271 · `unit:U-017` · `field` · `PanoramaResult.active_facts` · `zep_tools.py:227`
-- [ ] S-272 · `unit:U-017` · `field` · `PanoramaResult.historical_facts` · `zep_tools.py:229`
-- [ ] S-273 · `unit:U-017` · `field` · `PanoramaResult.total_nodes` · `zep_tools.py:232`
-- [ ] S-274 · `unit:U-017` · `field` · `PanoramaResult.total_edges` · `zep_tools.py:233`
-- [ ] S-275 · `unit:U-017` · `field` · `PanoramaResult.active_count` · `zep_tools.py:234`
-- [ ] S-276 · `unit:U-017` · `field` · `PanoramaResult.historical_count` · `zep_tools.py:235`
-- [ ] S-277 · `unit:U-017` · `method` · `PanoramaResult.to_dict` · `zep_tools.py:237`
-- [ ] S-278 · `unit:U-017` · `method` · `PanoramaResult.to_text` · `zep_tools.py:250`
+- [x] S-223 · `unit:U-017` · `type` · `SearchResult` · dataclass: facts,edges,nodes,query,total_count · `zep_tools.py:28` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-224 · `unit:U-017` · `field` · `SearchResult.facts` · `zep_tools.py:30` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-225 · `unit:U-017` · `field` · `SearchResult.edges` · `zep_tools.py:31` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-226 · `unit:U-017` · `field` · `SearchResult.nodes` · `zep_tools.py:32` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-227 · `unit:U-017` · `field` · `SearchResult.query` · `zep_tools.py:33` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-228 · `unit:U-017` · `field` · `SearchResult.total_count` · `zep_tools.py:34` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-229 · `unit:U-017` · `method` · `SearchResult.to_dict` · `zep_tools.py:36` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)** — byte-for-byte 5-key dict matches Python golden
+- [x] S-230 · `unit:U-017` · `method` · `SearchResult.to_text` · text render for LLM · `zep_tools.py:45` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)** — Chinese literals/separators match
+- [x] S-231 · `unit:U-017` · `type` · `NodeInfo` · `zep_tools.py:58` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-232 · `unit:U-017` · `field` · `NodeInfo.uuid` · `zep_tools.py:60` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-233 · `unit:U-017` · `field` · `NodeInfo.name` · `zep_tools.py:61` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-234 · `unit:U-017` · `field` · `NodeInfo.labels` · `zep_tools.py:62` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [≠] S-235 · `unit:U-017` · `field` · `NodeInfo.summary` · `zep_tools.py:63` · **[≠] DECISION-9 Q2 (cycle-68 U-017)** — field/key PRESENT & faithful; VALUE `""` because teri `Entity{id,name,kind}` has no per-entity summary (graph-inexpressible, verified src/graph/mod.rs:45). Consumers tolerate empty, no panic.
+- [≠] S-236 · `unit:U-017` · `field` · `NodeInfo.attributes` · `zep_tools.py:64` · **[≠] DECISION-9 Q2 (cycle-68 U-017)** — field/key PRESENT & faithful; VALUE `{}` because teri `Entity` has no attribute bag (graph-inexpressible, verified src/graph/mod.rs:45).
+- [x] S-237 · `unit:U-017` · `method` · `NodeInfo.to_dict` · `zep_tools.py:66` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)** — FIXED downgrade: was dropping `summary` key (4 vs Python 5). Now all 5 keys byte-for-byte (golden `test_node_info_to_dict_emits_summary_key_byte_for_byte`).
+- [x] S-238 · `unit:U-017` · `method` · `NodeInfo.to_text` · `zep_tools.py:75` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)** — entity_type next-non-Entity/Node label logic matches
+- [x] S-239 · `unit:U-017` · `type` · `EdgeInfo` · `zep_tools.py:82` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)** — FIXED: added missing `source_node_name`/`target_node_name`; struct now field-for-field with Python.
+- [≠] S-240 · `unit:U-017` · `field` · `EdgeInfo.uuid` · `zep_tools.py:84` · **[≠] DECISION-9 Q4 (cycle-68 U-017)** — field/key PRESENT; VALUE `""` because teri `Relation{kind,weight,valid_at}` has no edge UUID (graph-inexpressible, verified src/graph/mod.rs:82).
+- [x] S-241 · `unit:U-017` · `field` · `EdgeInfo.name` · `zep_tools.py:85` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)** — `relation.kind.to_string()`
+- [≠] S-242 · `unit:U-017` · `field` · `EdgeInfo.fact` · `zep_tools.py:86` · **[≠] DECISION-9 Q4 (cycle-68 U-017)** — field/key PRESENT; VALUE `""` because teri `Relation` has no LLM fact sentence (graph-inexpressible). `panorama_search` synthesizes facts separately for classification. Verified src/graph/mod.rs:82.
+- [x] S-243 · `unit:U-017` · `field` · `EdgeInfo.source_node_uuid` · `zep_tools.py:87` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-244 · `unit:U-017` · `field` · `EdgeInfo.target_node_uuid` · `zep_tools.py:88` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-245 · `unit:U-017` · `field` · `EdgeInfo.source_node_name` · `zep_tools.py:89` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)** — FIXED real downgrade: field was ABSENT (teri HAS names via node_map / get_entity_by_id, was dropping them). Added field + wired through both constructors. `to_text` now renders names not uuid prefix.
+- [x] S-246 · `unit:U-017` · `field` · `EdgeInfo.target_node_name` · `zep_tools.py:90` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)** — FIXED real downgrade (same as S-245).
+- [x] S-247 · `unit:U-017` · `field` · `EdgeInfo.created_at` · `zep_tools.py:92` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-248 · `unit:U-017` · `field` · `EdgeInfo.valid_at` · `zep_tools.py:93` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-249 · `unit:U-017` · `field` · `EdgeInfo.invalid_at` · `zep_tools.py:94` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-250 · `unit:U-017` · `field` · `EdgeInfo.expired_at` · `zep_tools.py:95` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-251 · `unit:U-017` · `method` · `EdgeInfo.to_dict` · `zep_tools.py:97` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)** — FIXED downgrade: was OMITTING name keys + the 4 temporal keys when None (≤9 keys). Now all 11 keys in Python order with explicit `null` (golden `test_edge_info_to_dict_emits_all_eleven_keys_byte_for_byte`).
+- [x] S-252 · `unit:U-017` · `method` · `EdgeInfo.to_text` · `zep_tools.py:112` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)** — FIXED: now `name or uuid[:8]` (was uuid-only). Named + uuid-fallback both golden-tested; include_temporal branch matches.
+- [x] S-253 · `unit:U-017` · `method` · `EdgeInfo.is_expired` · `zep_tools.py:128` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)** — `expired_at.is_some()`
+- [x] S-254 · `unit:U-017` · `method` · `EdgeInfo.is_invalid` · `zep_tools.py:133` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)** — `invalid_at.is_some()` (prior `source_node_uuid.is_empty()` divergence corrected; pinned by `test_edge_info_is_invalid_uses_invalid_at`)
+- [x] S-255 · `unit:U-017` · `type` · `InsightForgeResult` · `zep_tools.py:139` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)** — 9 fields field-for-field
+- [x] S-256 · `unit:U-017` · `field` · `InsightForgeResult.query` · `zep_tools.py:144` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-257 · `unit:U-017` · `field` · `InsightForgeResult.simulation_requirement` · `zep_tools.py:145` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-258 · `unit:U-017` · `field` · `InsightForgeResult.sub_queries` · `zep_tools.py:146` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-259 · `unit:U-017` · `field` · `InsightForgeResult.semantic_facts` · `zep_tools.py:149` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)** — field present; keyword fallback (`[!]` OQ-3 vec-similarity deferred, structure preserved)
+- [x] S-260 · `unit:U-017` · `field` · `InsightForgeResult.entity_insights` · `zep_tools.py:150` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-261 · `unit:U-017` · `field` · `InsightForgeResult.relationship_chains` · `zep_tools.py:151` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-262 · `unit:U-017` · `field` · `InsightForgeResult.total_facts` · `zep_tools.py:154` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-263 · `unit:U-017` · `field` · `InsightForgeResult.total_entities` · `zep_tools.py:155` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-264 · `unit:U-017` · `field` · `InsightForgeResult.total_relationships` · `zep_tools.py:156` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-265 · `unit:U-017` · `method` · `InsightForgeResult.to_dict` · `zep_tools.py:158` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)** — all 9 keys in Python order
+- [x] S-266 · `unit:U-017` · `method` · `InsightForgeResult.to_text` · `zep_tools.py:171` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)** — entity `summary` filter `!is_empty()` matches Python falsy-empty; `"{}"` quoting + 条/个 units match golden
+- [x] S-267 · `unit:U-017` · `type` · `PanoramaResult` · `zep_tools.py:215` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)** — 9 fields field-for-field
+- [x] S-268 · `unit:U-017` · `field` · `PanoramaResult.query` · `zep_tools.py:220` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-269 · `unit:U-017` · `field` · `PanoramaResult.all_nodes` · `zep_tools.py:223` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)** — `Vec<NodeInfo>`, to_dict maps `n.to_dict()` (inherits S-237 fix)
+- [x] S-270 · `unit:U-017` · `field` · `PanoramaResult.all_edges` · `zep_tools.py:225` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)** — `Vec<EdgeInfo>`, to_dict maps `e.to_dict()` (inherits S-251 fix)
+- [x] S-271 · `unit:U-017` · `field` · `PanoramaResult.active_facts` · `zep_tools.py:227` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-272 · `unit:U-017` · `field` · `PanoramaResult.historical_facts` · `zep_tools.py:229` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-273 · `unit:U-017` · `field` · `PanoramaResult.total_nodes` · `zep_tools.py:232` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-274 · `unit:U-017` · `field` · `PanoramaResult.total_edges` · `zep_tools.py:233` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-275 · `unit:U-017` · `field` · `PanoramaResult.active_count` · `zep_tools.py:234` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-276 · `unit:U-017` · `field` · `PanoramaResult.historical_count` · `zep_tools.py:235` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)**
+- [x] S-277 · `unit:U-017` · `method` · `PanoramaResult.to_dict` · `zep_tools.py:237` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)** — all 9 keys; nested node/edge dicts now byte-correct via S-237/S-251 fixes
+- [x] S-278 · `unit:U-017` · `method` · `PanoramaResult.to_text` · `zep_tools.py:250` · **parity VERIFIED 2026-06-21 (cycle-68 U-017)** — full (non-truncated) assembly, Chinese section headers match
 - [x] S-279 · `unit:U-017` · `type` · `AgentInterview` · `zep_tools.py:285` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
 - [x] S-280 · `unit:U-017` · `field` · `AgentInterview.agent_name` · `zep_tools.py:287` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
 - [x] S-281 · `unit:U-017` · `field` · `AgentInterview.agent_role` · `zep_tools.py:288` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
@@ -398,26 +398,26 @@
 - [x] S-296 · `unit:U-017` · `field` · `InterviewResult.interviewed_count` · `zep_tools.py:361` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
 - [x] S-297 · `unit:U-017` · `method` · `InterviewResult.to_dict` · `zep_tools.py:363` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
 - [x] S-298 · `unit:U-017` · `method` · `InterviewResult.to_text` · `zep_tools.py:375` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
-- [ ] S-299 · `unit:U-017` · `type` · `ZepToolsService` · high-level Zep retrieval tools for ReportAgent · `zep_tools.py:401`
-- [ ] S-300 · `unit:U-017` · `field` · `ZepToolsService.MAX_RETRIES` · 3 · `zep_tools.py:422`
-- [ ] S-301 · `unit:U-017` · `field` · `ZepToolsService.RETRY_DELAY` · 2.0s · `zep_tools.py:423`
-- [ ] S-302 · `unit:U-017` · `method` · `ZepToolsService.__init__` · `zep_tools.py:425`
-- [ ] S-303 · `unit:U-017` · `method` · `ZepToolsService.llm` · lazy property → LLMClient · `zep_tools.py:436`
-- [ ] S-304 · `unit:U-017` · `method` · `ZepToolsService._call_with_retry` · `zep_tools.py:442`
-- [ ] S-305 · `unit:U-017` · `method` · `ZepToolsService.search_graph` · Zep hybrid search + cross-encoder, falls back to _local_search · `zep_tools.py:464`
-- [ ] S-306 · `unit:U-017` · `method` · `ZepToolsService._local_search` · keyword-scored fallback · `zep_tools.py:546`
-- [ ] S-307 · `unit:U-017` · `method` · `ZepToolsService.get_all_nodes` · `zep_tools.py:650`
-- [ ] S-308 · `unit:U-017` · `method` · `ZepToolsService.get_all_edges` · `zep_tools.py:678`
-- [ ] S-309 · `unit:U-017` · `method` · `ZepToolsService.get_node_detail` · `zep_tools.py:716`
-- [ ] S-310 · `unit:U-017` · `method` · `ZepToolsService.get_node_edges` · `zep_tools.py:748`
-- [ ] S-311 · `unit:U-017` · `method` · `ZepToolsService.get_entities_by_type` · `zep_tools.py:780`
-- [ ] S-312 · `unit:U-017` · `method` · `ZepToolsService.get_entity_summary` · `zep_tools.py:808`
-- [ ] S-313 · `unit:U-017` · `method` · `ZepToolsService.get_graph_statistics` · `zep_tools.py:855`
-- [ ] S-314 · `unit:U-017` · `method` · `ZepToolsService.get_simulation_context` · `zep_tools.py:890`
-- [ ] S-315 · `unit:U-017` · `method` · `ZepToolsService.insight_forge` · LLM sub-queries → semantic search → InsightForgeResult · `zep_tools.py:945`
-- [ ] S-316 · `unit:U-017` · `method` · `ZepToolsService._generate_sub_queries` · `zep_tools.py:1092`
-- [ ] S-317 · `unit:U-017` · `method` · `ZepToolsService.panorama_search` · all nodes+edges classified active vs historical · `zep_tools.py:1145`
-- [ ] S-318 · `unit:U-017` · `method` · `ZepToolsService.quick_search` · `zep_tools.py:1237`
+- [≠] S-299 · `unit:U-017` · `type` · `ZepToolsService` · high-level Zep retrieval tools for ReportAgent · `zep_tools.py:401` · **parity VERIFIED 2026-06-21 (cycle-68 U-017): graph behavior migrated to `ReportTools<'g,L>` (DECISION-11, live path); retained struct is back-compat DTO/retry namespace — no observable output dropped, NOT a stub (cycle-4 empty-returns are GONE)**
+- [x] S-300 · `unit:U-017` · `field` · `ZepToolsService.MAX_RETRIES` · 3 · `zep_tools.py:422` · **parity VERIFIED 2026-06-21 (cycle-68 U-017): const = 3**
+- [x] S-301 · `unit:U-017` · `field` · `ZepToolsService.RETRY_DELAY` · 2.0s · `zep_tools.py:423` · **parity VERIFIED 2026-06-21 (cycle-68 U-017): const = 2.0**
+- [x] S-302 · `unit:U-017` · `method` · `ZepToolsService.__init__` · `zep_tools.py:425` · **parity VERIFIED 2026-06-21 (cycle-68 U-017): new(api_key, llm_client); Zep-auth ValueError [≠] DECISION-9 Q1**
+- [x] S-303 · `unit:U-017` · `method` · `ZepToolsService.llm` · lazy property → LLMClient · `zep_tools.py:436` · **parity VERIFIED 2026-06-21 (cycle-68 U-017): llm()/set_llm; default LLMClient() ctor [≠] (teri injects client)**
+- [≠] S-304 · `unit:U-017` · `method` · `ZepToolsService._call_with_retry` · `zep_tools.py:442` · **parity VERIFIED 2026-06-21 (cycle-68 U-017): retry non-contractual for in-process petgraph (DECISION-9 Q9); zero live callers — dead back-compat. NOTE backoff {2,2} vs Python {2,4} on this dead method; fix if ever revived**
+- [x] S-305 · `unit:U-017` · `method` · `ZepToolsService.search_graph` · Zep hybrid search + cross-encoder, falls back to _local_search · `zep_tools.py:464` · **parity VERIFIED 2026-06-21 (cycle-68 U-017): ReportTools::search_graph→local_search; Zep cloud hybrid/cross-encoder [≠] (server-side); reproduces Python's own _local_search fallback**
+- [x] S-306 · `unit:U-017` · `method` · `ZepToolsService._local_search` · keyword-scored fallback · `zep_tools.py:546` · **parity VERIFIED 2026-06-21 (cycle-68 U-017): tokenize+match_score(100/+10)+score-desc+limit+scopes+summary-as-fact, line-for-line**
+- [x] S-307 · `unit:U-017` · `method` · `ZepToolsService.get_all_nodes` · `zep_tools.py:650` · **parity VERIFIED 2026-06-21 (cycle-68 U-017): get_all_entities→NodeInfo; summary/attributes [≠] Q2**
+- [x] S-308 · `unit:U-017` · `method` · `ZepToolsService.get_all_edges` · `zep_tools.py:678` · **parity VERIFIED 2026-06-21 (cycle-68 U-017): temporal valid_at/invalid_at (GAP-1); uuid/fact [≠] Q4**
+- [x] S-309 · `unit:U-017` · `method` · `ZepToolsService.get_node_detail` · `zep_tools.py:716` · **parity VERIFIED 2026-06-21 (cycle-68 U-017): uuid parse→get_entity_by_id→None on miss/bad (except→None ported)**
+- [x] S-310 · `unit:U-017` · `method` · `ZepToolsService.get_node_edges` · `zep_tools.py:748` · **parity VERIFIED 2026-06-21 (cycle-68 U-017): filter all_edges by src/tgt==uuid; except→[] preserved**
+- [x] S-311 · `unit:U-017` · `method` · `ZepToolsService.get_entities_by_type` · `zep_tools.py:780` · **parity VERIFIED 2026-06-21 (cycle-68 U-017): U-016 reader label filter**
+- [x] S-312 · `unit:U-017` · `method` · `ZepToolsService.get_entity_summary` · `zep_tools.py:808` · **parity VERIFIED 2026-06-21 (cycle-68 U-017): search+ci-name-find+node_edges; dict key order preserved**
+- [x] S-313 · `unit:U-017` · `method` · `ZepToolsService.get_graph_statistics` · `zep_tools.py:855` · **parity VERIFIED 2026-06-21 (cycle-68 U-017): {graph_id,nodes,edges,entity_types,relation_types}; Entity/Node excluded; first-seen insertion order (preserve_order)**
+- [x] S-314 · `unit:U-017` · `method` · `ZepToolsService.get_simulation_context` · `zep_tools.py:890` · **parity VERIFIED 2026-06-21 (cycle-68 U-017): 0→30 limit mapping present; search+stats+typed-entity filter+entities[:limit]; per-entity summary="" [≠] Q2**
+- [~] S-315 · `unit:U-017` · `method` · `ZepToolsService.insight_forge` · LLM sub-queries → semantic search → InsightForgeResult · `zep_tools.py:945` · **DOWNGRADE 2026-06-21 (cycle-68 U-017): sync fn hard-codes the 4-variant FALLBACK, never calls LLM chat_json (primary path) and uses keyword local_search NOT query_vec_similarity. Stale `[!]` b2-rationale REJECTED — OQ-3/GAP-2 + embeddings are RESOLVED (ledger) and chat_json is available (used :1603/:1668). Distinct observable output skipped on LIVE path (execute_by_name :2672). Needs porter follow-up (make async, wire LLM decomposition + semantic search)**
+- [~] S-316 · `unit:U-017` · `method` · `ZepToolsService._generate_sub_queries` · `zep_tools.py:1092` · **DOWNGRADE 2026-06-21 (cycle-68 U-017): NO faithful counterpart — the LLM chat_json(temp 0.3, system+user prompt) decomposition is absent entirely; only the exception-path Chinese variants are inlined into insight_forge. Portable feature skipped (substrate available). Needs porter follow-up alongside S-315**
+- [x] S-317 · `unit:U-017` · `method` · `ZepToolsService.panorama_search` · all nodes+edges classified active vs historical · `zep_tools.py:1145` · **parity VERIFIED 2026-06-21 (cycle-68 U-017): partition_edges_at(t) active/historical (GAP-1), temporal tag, relevance sort, limit, include_expired gate; edge.fact synthesized [≠] Q4 (classification preserved)**
+- [x] S-318 · `unit:U-017` · `method` · `ZepToolsService.quick_search` · `zep_tools.py:1237` · **parity VERIFIED 2026-06-21 (cycle-68 U-017): search_graph(scope="edges")**
 - [x] S-319 · `unit:U-017` · `method` · `ZepToolsService.interview_agents` · loads profiles, LLM selects agents, generates questions, calls SimulationRunner.interview_agents_batch · `zep_tools.py:1272` · **parity VERIFIED 2026-06-21 (cycle-67 U-024): logic-complete; terminal live-IPC call `[!] U-024-PROD-PENDING` until producer U-026-k lands**
 - [x] S-320 · `unit:U-017` · `method` · `ZepToolsService._clean_tool_call_response` · `zep_tools.py:1485` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
 - [x] S-321 · `unit:U-017` · `method` · `ZepToolsService._load_agent_profiles` · reads reddit JSON or twitter CSV · `zep_tools.py:1505` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**

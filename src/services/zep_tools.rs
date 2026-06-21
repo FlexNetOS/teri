@@ -116,6 +116,10 @@ impl NodeInfo {
         m.insert("uuid".into(), self.uuid.clone().into());
         m.insert("name".into(), self.name.clone().into());
         m.insert("labels".into(), serde_json::to_value(&self.labels).unwrap_or_default());
+        // Python `to_dict` emits `summary` (key order: uuid, name, labels, summary,
+        // attributes). It is `""` in teri ([≠] DECISION-9 Q2: no per-entity summary),
+        // but the KEY must still be present to match the byte-for-byte dict shape.
+        m.insert("summary".into(), self.summary.clone().into());
         m.insert("attributes".into(), serde_json::to_value(&self.attributes).unwrap_or_default());
         m
     }
@@ -142,6 +146,8 @@ pub struct EdgeInfo {
     pub fact: String,
     pub source_node_uuid: String,
     pub target_node_uuid: String,
+    pub source_node_name: Option<String>,
+    pub target_node_name: Option<String>,
     pub created_at: Option<String>,
     pub valid_at: Option<String>,
     pub invalid_at: Option<String>,
@@ -158,33 +164,35 @@ impl EdgeInfo {
         m.insert("source_node_uuid".into(), self.source_node_uuid.clone().into());
         m.insert("target_node_uuid".into(), self.target_node_uuid.clone().into());
 
-        if let Some(v) = &self.created_at {
-            m.insert("created_at".into(), v.clone().into());
-        }
-        if let Some(v) = &self.valid_at {
-            m.insert("valid_at".into(), v.clone().into());
-        }
-        if let Some(v) = &self.invalid_at {
-            m.insert("invalid_at".into(), v.clone().into());
-        }
-        if let Some(v) = &self.expired_at {
-            m.insert("expired_at".into(), v.clone().into());
-        }
+        // Python `to_dict` ALWAYS emits these keys (value `null` when the field is
+        // `None`/`Optional[str] = None`). Omitting a key would diverge from the
+        // byte-for-byte dict shape, so emit `serde_json::Value::Null` explicitly.
+        let opt = |v: &Option<String>| -> serde_json::Value {
+            v.clone().map(serde_json::Value::String).unwrap_or(serde_json::Value::Null)
+        };
+        m.insert("source_node_name".into(), opt(&self.source_node_name));
+        m.insert("target_node_name".into(), opt(&self.target_node_name));
+        m.insert("created_at".into(), opt(&self.created_at));
+        m.insert("valid_at".into(), opt(&self.valid_at));
+        m.insert("invalid_at".into(), opt(&self.invalid_at));
+        m.insert("expired_at".into(), opt(&self.expired_at));
 
         m
     }
 
     /// Convert to text matching Python `to_text()`.
     pub fn to_text(&self, include_temporal: bool) -> String {
-        let source = if self.source_node_uuid.len() > 8 {
-            &self.source_node_uuid[..8]
-        } else {
-            &self.source_node_uuid
+        // Python: `source = self.source_node_name or self.source_node_uuid[:8]`.
+        // A present, non-empty name wins; otherwise fall back to the uuid prefix.
+        let uuid_prefix =
+            |s: &str| -> String { if s.len() > 8 { s[..8].to_string() } else { s.to_string() } };
+        let source = match self.source_node_name.as_deref() {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => uuid_prefix(&self.source_node_uuid),
         };
-        let target = if self.target_node_uuid.len() > 8 {
-            &self.target_node_uuid[..8]
-        } else {
-            &self.target_node_uuid
+        let target = match self.target_node_name.as_deref() {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => uuid_prefix(&self.target_node_uuid),
         };
 
         let mut base =
@@ -682,7 +690,16 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
             .get_all_edges()
             .into_iter()
             .map(|(from_id, to_id, relation)| {
-                edge_triple_to_edge_info(from_id, to_id, &relation, include_temporal)
+                let src_name = self.graph.get_entity_by_id(from_id).map(|e| e.name.clone());
+                let tgt_name = self.graph.get_entity_by_id(to_id).map(|e| e.name.clone());
+                edge_triple_to_edge_info(
+                    from_id,
+                    to_id,
+                    &relation,
+                    include_temporal,
+                    src_name,
+                    tgt_name,
+                )
             })
             .collect()
     }
@@ -1137,7 +1154,10 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
         // Build all_edges (both active + historical combined, with temporal info).
         let mut all_edges: Vec<EdgeInfo> = Vec::new();
         for (from_id, to_id, rel) in active_triples.iter().chain(historical_triples.iter()) {
-            all_edges.push(edge_triple_to_edge_info(*from_id, *to_id, rel, true));
+            let src_name = node_map.get(&from_id.to_string()).map(|n| n.name.clone());
+            let tgt_name = node_map.get(&to_id.to_string()).map(|n| n.name.clone());
+            all_edges
+                .push(edge_triple_to_edge_info(*from_id, *to_id, rel, true, src_name, tgt_name));
         }
 
         // Build keyword relevance scorer (mirrors Python `relevance_score`).
@@ -2159,6 +2179,8 @@ fn edge_triple_to_edge_info(
     to_id: uuid::Uuid,
     relation: &crate::graph::Relation,
     include_temporal: bool,
+    source_node_name: Option<String>,
+    target_node_name: Option<String>,
 ) -> EdgeInfo {
     let (valid_at_str, invalid_at_str, expired_at_str) = if include_temporal {
         match relation.valid_at {
@@ -2179,6 +2201,10 @@ fn edge_triple_to_edge_info(
         fact: String::new(), // [≠] DECISION-9 Q4
         source_node_uuid: from_id.to_string(),
         target_node_uuid: to_id.to_string(),
+        // teri DOES have entity names available; thread them through so `to_text`
+        // renders readable endpoints (Python: `source_node_name or uuid[:8]`).
+        source_node_name,
+        target_node_name,
         created_at: None, // [≠] DECISION-9 Q4: Relation has no created_at
         valid_at: valid_at_str,
         invalid_at: invalid_at_str,
@@ -3149,6 +3175,8 @@ mod tests {
             name: "FRIENDS".into(),
             fact: "They are friends".into(),
             uuid: "".into(),
+            source_node_name: None,
+            target_node_name: None,
             created_at: None,
             valid_at: None,
             invalid_at: None,
@@ -3159,6 +3187,70 @@ mod tests {
         assert!(text.contains("def98765"));
     }
 
+    // ── U-017 cycle-68 DTO parity goldens (byte-for-byte vs Python `to_dict`/`to_text`) ──
+
+    #[test]
+    fn test_node_info_to_dict_emits_summary_key_byte_for_byte() {
+        // Python golden:
+        // {"uuid":"u1","name":"Alice","labels":["Entity","Person"],"summary":"","attributes":{}}
+        let node = NodeInfo {
+            uuid: "u1".into(),
+            name: "Alice".into(),
+            labels: vec!["Entity".into(), "Person".into()],
+            summary: String::new(),
+            attributes: serde_json::Map::new(),
+        };
+        let got = serde_json::to_string(&node.to_dict()).unwrap();
+        assert_eq!(
+            got,
+            r#"{"uuid":"u1","name":"Alice","labels":["Entity","Person"],"summary":"","attributes":{}}"#
+        );
+    }
+
+    #[test]
+    fn test_edge_info_to_dict_emits_all_eleven_keys_byte_for_byte() {
+        // Python golden (names present): all 11 keys, null where Optional==None.
+        let edge = EdgeInfo {
+            uuid: String::new(),
+            name: "WorksFor".into(),
+            fact: String::new(),
+            source_node_uuid: "aaaaaaaa1111".into(),
+            target_node_uuid: "bbbbbbbb2222".into(),
+            source_node_name: Some("Alice".into()),
+            target_node_name: Some("Acme".into()),
+            created_at: None,
+            valid_at: None,
+            invalid_at: None,
+            expired_at: None,
+        };
+        let got = serde_json::to_string(&edge.to_dict()).unwrap();
+        assert_eq!(
+            got,
+            r#"{"uuid":"","name":"WorksFor","fact":"","source_node_uuid":"aaaaaaaa1111","target_node_uuid":"bbbbbbbb2222","source_node_name":"Alice","target_node_name":"Acme","created_at":null,"valid_at":null,"invalid_at":null,"expired_at":null}"#
+        );
+        // to_text prefers the names over the uuid prefix (Python `name or uuid[:8]`).
+        assert_eq!(edge.to_text(false), "关系: Alice --[WorksFor]--> Acme\n事实: ");
+    }
+
+    #[test]
+    fn test_edge_info_to_text_falls_back_to_uuid_prefix() {
+        // Python golden (no names): '关系: aaaaaaaa --[WorksFor]--> bbbbbbbb\n事实: '
+        let edge = EdgeInfo {
+            uuid: String::new(),
+            name: "WorksFor".into(),
+            fact: String::new(),
+            source_node_uuid: "aaaaaaaa1111".into(),
+            target_node_uuid: "bbbbbbbb2222".into(),
+            source_node_name: None,
+            target_node_name: None,
+            created_at: None,
+            valid_at: None,
+            invalid_at: None,
+            expired_at: None,
+        };
+        assert_eq!(edge.to_text(false), "关系: aaaaaaaa --[WorksFor]--> bbbbbbbb\n事实: ");
+    }
+
     #[test]
     fn test_edge_info_expired() {
         let edge = EdgeInfo {
@@ -3167,6 +3259,8 @@ mod tests {
             name: "TEST".into(),
             fact: "fact".into(),
             uuid: "".into(),
+            source_node_name: None,
+            target_node_name: None,
             created_at: None,
             valid_at: None,
             invalid_at: None,
@@ -3184,6 +3278,8 @@ mod tests {
             name: "TEST".into(),
             fact: "fact".into(),
             uuid: "".into(),
+            source_node_name: None,
+            target_node_name: None,
             created_at: None,
             valid_at: None,
             invalid_at: None, // no invalid_at → NOT invalid per Python semantics
@@ -3198,6 +3294,8 @@ mod tests {
             name: "TEST".into(),
             fact: "fact".into(),
             uuid: "".into(),
+            source_node_name: None,
+            target_node_name: None,
             created_at: None,
             valid_at: None,
             invalid_at: Some("2024-01-01".to_string()), // invalid_at set → true
