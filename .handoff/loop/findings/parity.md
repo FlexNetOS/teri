@@ -4597,3 +4597,58 @@ against the cited Python source; every branch has a dedicated non-vacuous route 
 **Summary:** 3/3 routes flip `[x]`. S-808 route contract faithful with the `[!] U026-d-GRAPHREQ` graph-required
 path confirmed as an HONEST producer-frontier gap (records a FAILED task, never a silent success). No disguised
 feature-skips, no narrowing, no `[≠]` over-flips. Ledger-only; no Rust modified.
+
+---
+
+## Cycle 66 — U-009 S-069 `split_text_into_chunks` (reuse-Y verify-only) — 2026-06-20
+
+**Verdict: PASS.** Differential parity proven for `split_text_into_chunks` (X: `MiroFish/backend/app/utils/file_parser.py:161-202`) against its teri counterpart `split_text` (Y: `src/seed/text_processor.rs:44`). Char-faithful (not byte-faithful) on multibyte CJK separators. S-069 flips `[ ] → [x]`.
+
+**Method:** ran the REAL Python source function (inlined verbatim from file_parser.py:177-202) over a 17-case matrix; ran the SAME inputs through Rust `split_text` via a throwaway `#[test]` reading shared `inputs.json` and dumping `rust_out.json` (serde_json); diffed full lists exactly. Throwaway test removed afterward — `git diff src/seed/text_processor.rs` is empty (no tracked Rust modified).
+
+### Differential matrix (Python output == Rust output, full-list exact)
+
+| id | cs | ov | branch exercised | py_n | rs_n | match |
+|----|----|----|------------------|------|------|-------|
+| a_short_lt_chunk | 500 | 50 | len<=chunk_size, strip truthy → [text] | 1 | 1 | Y |
+| b_blank_ws | 500 | 50 | len<=chunk_size, strip falsy → [] | 0 | 0 | Y |
+| b2_empty | 500 | 50 | empty → [] | 0 | 0 | Y |
+| c_ascii_period_space | 50 | 5 | ASCII `. ` boundary backtrack + overlap | 3 | 3 | Y |
+| d_chinese_fullstop | 20 | 2 | multibyte `。` boundary (3-byte char) | 3 | 3 | Y |
+| e_no_sep_hard_cut | 5 | 0 | no qualifying sep → hard cut | 2 | 2 | Y |
+| e2_no_sep_remainder | 5 | 0 | hard cut + short final remainder | 3 | 3 | Y |
+| f_sep_below_threshold | 50 | 5 | sep at offset 1 (< 30%) REJECTED → hard cut | 2 | 2 | Y |
+| h_overlap_3plus | 10 | 3 | overlap across 7 chunks | 7 | 7 | Y |
+| i_mixed_cjk_ascii | 15 | 3 | mixed CJK+ASCII, `。！` separators | 5 | 5 | Y |
+| j_overlap_carry | 10 | 3 | overlap carries last 3 chars (HIJ…) | 3 | 3 | Y |
+| k_cjk_small_chunk | 5 | 1 | pure CJK, small chunk, `。` boundaries | 11 | 11 | Y |
+| l_jp_no_sep | 3 | 0 | 3-byte Hiragana, no sep, hard cut (never panics mid-char) | 4 | 4 | Y |
+| g_edge_cs7_offset2 | 7 | 0 | **int-vs-float edge**: last_sep=2, floor(0.3*7)=floor(2.1)=2 → 2>2.1 F / 2>2 F → REJECTED | 3 | 3 | Y |
+| g_edge_cs7_offset3 | 7 | 0 | **int-vs-float edge**: last_sep=3 → 3>2.1 T / 3>2 T → ACCEPTED | 4 | 4 | Y |
+| g_edge_cs10_offset3 | 10 | 0 | **int-vs-float edge**: last_sep=3, floor(0.3*10)=floor(3.0)=3 → 3>3.0 F / 3>3 F → REJECTED | 3 | 3 | Y |
+| g_edge_cs10_offset4 | 10 | 0 | **int-vs-float edge**: last_sep=4 → 4>3.0 T / 4>3 T → ACCEPTED | 3 | 3 | Y |
+
+**All 17 cases: full-list IDENTICAL** (not just lengths — chunk strings compared byte-for-byte, incl. CJK).
+
+### Int-vs-float threshold edge (highest-risk line) — PROVEN equivalent
+Python: `last_sep > chunk_size * 0.3` compares an INT char-offset against a FLOAT. Rust: `chars_before_sep > (chunk_size as f64 * 0.3) as usize` (truncates to floor first, then integer `>`). For any integer `n` and real `x≥0`: `n > x  ⟺  n > floor(x)` when `x` is non-integer, and `n > x ⟺ n > x` (= `n > floor(x)`) when `x` is integer — so `n > x ⟺ n > floor(x)` holds in BOTH regimes. Empirically confirmed at the exact boundary in all four `g_edge_*` probes:
+- cs=7 → `0.3*7 = 2.1`, floor=2: offset **2 rejected** (Python: `2 > 2.1` False; Rust: `2 > 2` False) — both hard-cut; offset **3 accepted** (`3 > 2.1`=`3 > 2`=True) — both backtrack. AGREE.
+- cs=10 → `0.3*10 = 3.0`, floor=3 (the integer-`x` regime): offset **3 rejected** (`3 > 3.0` False == `3 > 3` False); offset **4 accepted** (`4 > 3.0` == `4 > 3` True). AGREE.
+
+The floor-truncate-then-int-compare is faithful; no off-by-one across the boundary.
+
+### Multibyte / UTF-8 safety — PROVEN char-faithful
+The separator set includes 3-byte CJK punctuation `。！？`. Cases d, i, k (CJK) and l (3-byte Hiragana, no sep) produced byte-for-byte identical chunk strings, with Rust never panicking on a char boundary. Rust achieves Python's char-based `len`/slice/`rfind` semantics by collecting `char_indices()` boundaries up front and indexing only at those byte offsets, and by converting `window.rfind(sep)` byte offsets back to char counts (`window[..off].chars().count()`) before the threshold test. Char-faithful, not byte-faithful — exactly the contract.
+
+### Contract coverage (all 6 behaviors)
+1. Short/blank path (`len<=chunk_size` → `[text]`/`[]`): a, b, b2 ✓
+2. Separator priority list + rightmost-match + first-qualifying-wins: c, d, i, g_edge_* ✓ (order and `len(sep)`-char end arithmetic faithful)
+3. `last_sep > chunk_size*0.3` threshold (int-vs-float): f (below-threshold reject), g_edge_* (boundary) ✓
+4. `end = start + last_sep + len(sep)`, `chunk = text[start:end].strip()`, drop empties: all cases ✓
+5. Overlap advance `start = end - overlap if end < len else len`: h, j (overlap carry verified) ✓
+6. UTF-8 safety on multibyte: d, i, k, l ✓
+
+### Tests
+`cargo test -p teri --lib seed::text_processor` → **20 passed, 0 failed** (after throwaway harness removed). Tracked Rust unchanged (`git diff src/seed/text_processor.rs` empty).
+
+**No divergence. No `[≠]` needed.** S-069 is a faithful reuse-Y port → `[x]`.

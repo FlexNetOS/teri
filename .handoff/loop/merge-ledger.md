@@ -158,3 +158,10 @@ The differential gate (reuse is never trusted) refuted the reuse-Y class for eve
 - S-809 POST /prepare/status → `[x]`: full B1/B2a/B2b/B3a/B3b branch tree 1:1 to simulation.py:642-752; task.to_dict() byte-faithful (11 keys, order, status.value, isoformat); 6 branch tests green.
 - S-812 GET /history → `[x]`: exact 25-key enrichment order (current_round updated in place at pos 12); report_id newest-by-created_at-DESC avoids fs-order trap; 8 tests green.
 - `[!] U026-d-GRAPHREQ` HONEST GAP confirmed (NOT a route downgrade): teri prepare worker takes graph:&KnowledgeGraph required; graph-resolve failure → task still created+spawned with empty graph → 0 entities → terminal FAILED task observable via /prepare/status, never a route 500, never silent success. Faithful to Python's zero-entities→FAILED. Pre-recorded [~]/[≠] sub-leaves (STAGE4/NEGLIMIT/LIVEDATA/ZEPKEY/TRACEBACK) non-contractual/producer-frontier, none a feature skip.
+
+
+## Cycle 66 (33rd resume, 2026-06-20) — U-009 S-069 split_text_into_chunks (reuse-Y verify-only, single fn)
+- rust-port-parity-verifier DIFFERENTIAL gate: S-069 → `[x]`. teri `src/seed/text_processor.rs:44 split_text` already existed (distributed→U-013). NO Rust change (throwaway differential test reverted, tree clean); Y green (seed::text_processor 20 passed).
+- 17/17 differential matrix IDENTICAL (chunk strings byte-for-byte, real Python file_parser.py:177-202 inlined vs Rust): short/blank/empty, ASCII `. ` backtrack, multibyte CJK `。` backtrack, hard-cut no-sep, below-threshold reject, overlap-carry 3-7 chunks, mixed CJK+ASCII, 3-byte Hiragana, 4 threshold-edge probes.
+- HIGHEST-RISK LINE proven: Python INT `last_sep > chunk_size*0.3` (float) ≡ Rust `(chunk_size as f64*0.3) as usize` int `>` — for integer n, `n>x ⟺ n>floor(x)` in both non-integer and integer-x regimes. Empirically confirmed cs=7 (2.1→floor2) and cs=10 (3.0 integer-x case): no off-by-one across floor boundary.
+- Multibyte char-faithful (not byte-faithful): Rust pre-collects char_indices() boundaries + converts rfind byte offsets→char counts before threshold test; no mid-char panic on 3-byte CJK/Hiragana.

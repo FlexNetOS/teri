@@ -124,7 +124,7 @@
 - [x] S-066 · `unit:U-009` · `method` · `FileParser._extract_from_md` · markdown text extraction · `file_parser.py:128` · **rust-target:** `SeedIngestor::from_file` "md"|"markdown" arm → `read_plain_text` (encoding-fallback) at `src/seed/mod.rs`; tested: .md dispatch, .markdown dispatch
 - [x] S-067 · `unit:U-009` · `method` · `FileParser._extract_from_txt` · text file extraction · `file_parser.py:133` · **rust-target:** `SeedIngestor::read_plain_text` with `read_text_with_fallback` at `src/seed/mod.rs`; now handles non-UTF-8
 - [x] S-068 · `unit:U-009` · `method` · `FileParser.extract_from_multiple` · concatenates texts from multiple files · `file_parser.py:138` · **rust-target:** `SeedIngestor::from_files` at `src/seed/mod.rs`; in-order concat with `=== 文档 i: name ===` headers; per-file error tolerance; tested: order, headers, error tolerance
-- [ ] S-069 · `unit:U-009` · `fn` · `split_text_into_chunks` · character-count split with overlap · `file_parser.py:161` · distributed to U-013 (text_processor)
+- [x] S-069 · `unit:U-009` · `fn` · `split_text_into_chunks` · character-count split with overlap · `file_parser.py:161` · distributed to U-013 (text_processor); **rust-target:** `split_text` at `src/seed/text_processor.rs:44` — Cycle 66 parity: differential 17/17 exact-match vs real Python source (char-faithful incl. 3-byte CJK `。！？` separators; int-vs-float threshold `last_sep > chunk_size*0.3` proven equiv at floor boundaries cs=7 off2/3 & cs=10 off3/4; overlap-carry, hard-cut, below-threshold-reject all match); 20 tests green
 
 ---
 
