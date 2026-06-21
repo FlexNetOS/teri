@@ -162,19 +162,17 @@ pub fn validate_locale(raw: &str) -> String {
 //   3. CORS — CorsLayer::permissive() applied to /api/* routes (faithful scope).
 //   4. before/after_request logging — logging_middleware applied to all routes.
 //   5. Accept-Language → locale — accept_language_middleware applied to all routes.
-//   6. register_cleanup — BASIC graceful shutdown (ctrl_c/SIGTERM) is structural now;
-//      sim-process cleanup composes in when U-023/U-049 land. See pending deps above.
-//   7. Blueprints (graph_bp, simulation_bp, report_bp) — PENDING U-025/026/027.
-//      Placeholders are clearly marked below.
+//   6. register_cleanup — graceful shutdown LANDED: `serve` installs SIGTERM/SIGINT/SIGHUP
+//      handlers that run `SimulationRunner::cleanup_all` (terminate running sims, persist
+//      STOPPED) + an atexit-style backup on the non-signal exit path (U-049/U-050, U-023).
+//   7. Blueprints (graph_bp, simulation_bp, report_bp) — ALL MOUNTED (U-025/026/027 landed).
 //   8. GET /health — health_handler.
 // ---------------------------------------------------------------------------
 
 /// Build the axum Router — port of MiroFish `create_app()`.
 ///
-/// U-025 (sub-cycle a): graph blueprint is now wired under `/api/graph`.
-/// U-026 will add `.nest("/simulation", simulation_router(state.clone()))` to `api_router`.
-/// U-027 will add `.nest("/report", report_router(state.clone()))` to `api_router`.
-/// Both are one-line adds to the `api_router` below — the scaffold is ready.
+/// All three blueprints are mounted under `/api`: graph (U-025), simulation (U-026),
+/// and report (U-027) — each as a `.nest(...)` on `api_router` below.
 ///
 /// CORS scoping: We apply CORS to the whole `api_router` (all `/api/*` routes) by layering
 /// on the nested sub-router before nesting it under `/api`.  This matches MiroFish's
@@ -191,13 +189,11 @@ pub fn create_app(state: std::sync::Arc<ApiState>) -> Router {
     tracing::info!("MiroFish Backend 启动中...");
     tracing::info!("{}", "=".repeat(50));
 
-    // Blueprint sub-routers — U-025 (a): graph_bp; U-026 (a): simulation_bp (skeleton).
-    // U-027 adds: .nest("/report", report_router(state.clone()))
+    // Blueprint sub-routers — all three mounted: graph_bp (U-025), simulation_bp (U-026),
+    // report_bp (U-027).
     let api_router = Router::new()
         .nest("/graph", crate::api::graph::graph_router(state.clone()))
-        // U-026 (a): simulation blueprint — skeleton nested here; routes land in sub-cycles b–m.
         .nest("/simulation", crate::api::simulation::simulation_router(state.clone()))
-        // U-027 (a): report blueprint — report.py /api/report routes.
         .nest("/report", crate::api::report::report_router(state.clone()))
         // CORS scoped to /api/* (applied to api_router, not the top-level app)
         .layer(cors);
@@ -205,7 +201,7 @@ pub fn create_app(state: std::sync::Arc<ApiState>) -> Router {
     let router = Router::new()
         // GET /health (S-025) — no CORS, outside /api/*
         .route("/health", get(health_handler))
-        // /api/* with graph blueprint (and future simulation/report)
+        // /api/* with graph + simulation + report blueprints
         .nest("/api", api_router)
         // S-024 element 4 — request/response logging middleware (all routes)
         .layer(middleware::from_fn(logging_middleware))

@@ -5118,3 +5118,45 @@ The 4 claims independently confirmed against `server.rs` (serve fn, lines read 2
 - Running `teri serve` (not just tests) revealed a PRE-EXISTING crash: `axum::serve(tokio::net::TcpListener::from_std(listener)…)` panicked at startup — "Registering a blocking socket with the tokio runtime is unsupported" (tokio #7172). `std::net::TcpListener::bind` returns a BLOCKING socket; current tokio refuses `from_std` on it. Never caught by the 1552 tests because none call `serve()` (it binds a real socket + runs forever).
 - FIX (server.rs): `listener.set_nonblocking(true)?` before `from_std`. Now `teri serve` binds and serves.
 - RUNTIME-VERIFIED (live, /verify): server up (GET /health → 200 `{"status":"ok","service":"teri"}`); SIGTERM → "Received SIGTERM/SIGHUP, stopping server..." → exit 0; SIGINT → "Received SIGINT…" → exit 0; SIGHUP → "Received SIGTERM/SIGHUP…" → exit 0 (the U-050 SIGNAL_CONTRACT fix, now observable). i18n Accept-Language live: en→"Project not found", zh→"项目不存在", absent→zh, unsupported fr→zh (U-036 contract confirmed live).
+
+---
+
+## Cycle 73 (2026-06-21, 36th resume) — THREE-LEDGER RECONCILIATION (rollup-lag)
+
+**Trigger:** owner `/harness:rust-port-merge resume`. Recorded NEXT directive was the three-ledger
+reconciliation: symbol-map had reached symbol-complete ([ ]=0) while merge-ledger (27 [ ]) and
+parity-ledger (30 [ ]) lagged.
+
+**Method:** deterministic per-unit symbol tally (parse `unit:U-XXX` tags in symbol-map, classify each
+unit ALL-TERMINAL vs HAS-NONTERMINAL). Only two units had non-terminal symbols — both turned out to be
+stale `[~]` rollup-lag, not open work:
+- **U-003 / S-024 `create_app`**: its recorded blockers (blueprints U-025/026/027, cleanup U-023/049)
+  ALL landed. Confirmed in `server.rs`: `api_router` nests `/graph`+`/simulation`+`/report`; `serve()`
+  wires `SimulationRunner::cleanup_all` on SIGTERM/SIGINT/SIGHUP + atexit backup (runtime-verified
+  cycle 72/verify). → S-024 `[~]`→`[x]`.
+- **U-006 / S-043,S-044 retry recovery path**: the "retry-THEN-succeed untested" note was stale — test
+  `test_openai_retry_recovers_after_503` (llm.rs:1558) already implements the exact recorded technique
+  (static `AtomicUsize` matcher, 503 on req#1 → 200 on req#2, `assert_hits(1)`/`(1)`). 8/8 retry tests
+  green. → S-043/S-044 `[~]`→`[x]`.
+
+**No-over-flip verification (U-028/029/030):** the cycle-56 merge-ledger narrative flagged
+`ParallelIPCHandler` S-920/921/922/924 + S-934 + S-877 as "genuinely unported", but those were all
+closed in LATER cycles 59–61, each verifier-confirmed ([x]). Symbol-map shows U-028/029/030 fully
+terminal (no blank symbols). Roll-up is faithful, not premature.
+
+**Applied (auditable script /tmp/reconcile_c73.py, dry-run reviewed first):** 72 marker flips —
+4 symbol-map (S-024/043/044 `[~]`→`[x]`, S-SWS-001 `[!]`→`[≠]`), 36 merge-ledger, 32 parity-ledger.
+Guard: rollup-lag only — never re-adjudicate an already-terminal row (skipped U-049 `[x]` and U-004
+`[≠]`). Each flipped row carries a `ROLLED-UP cycle-73` audit suffix.
+
+**Build-health:** `cargo fmt --check` clean, `cargo clippy --all-targets` clean, `cargo test` 1567
+passed / 6 ignored (5 suites). Stale `server.rs` doc-comments corrected.
+
+**Result:** all three ledgers **99% terminal (1254/1256)**. The ONLY remaining non-terminal item is the
+**embedding owner-wall** — S-EMBED-001 (`unit:GAP-OQ3-EMBED` [!]) + merge GAP-2 [!], OQ-3:
+embedding-GENERATION backend (text→vector) has no substrate (shimmy lacks `/v1/embeddings`).
+`query_vec_similarity` (the cosine search) is DONE [x] and `insight_forge` is FAITHFULLY ported via
+`search_graph` [x] (the cycle-68 "should use embeddings" was a Python misread) — so this is a
+teri-native ENHANCEMENT beyond MiroFish parity, blocked on external infra, "do NOT fake an embedder."
+ESCALATED to owner (NEEDS-HUMAN owner-wall). PR #5 stays HELD pending that decision + a pre-DONE
+left-behind sweep.
