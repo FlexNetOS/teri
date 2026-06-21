@@ -4927,3 +4927,93 @@ Consumer tolerance confirmed: `to_text`/`to_dict`/panorama classification all ha
 ### Verdict
 
 **U-017 DTO sweep: PASS — 56/56 symbols covered.** 52 `[x]` (incl. 4 fixed downgrades), 4 `[≠]` (S-235/236/240/242 — value-only, key-present, graph-inexpressible, each survived the `[≠]` challenge). 0 `[~]` remaining.
+
+---
+
+## 2026-06-21 — cycle-69 — U-017 S-315/S-316 re-verification (async insight_forge + generate_sub_queries)
+
+**Gate:** rust-port-parity-verifier (no-downgrade, default-skeptical, fail-closed). Re-verify the cycle-68 `[~]` downgrade after the porter made `insight_forge` async + added LLM-primary `generate_sub_queries`. Refute, don't rubber-stamp.
+
+### THE SEARCH-METHOD ADJUDICATION (the crux — decided on Python evidence)
+
+Read Python `insight_forge` body (`zep_tools.py:945-1090`). Steps 2 (L996-1017):
+
+```python
+for sub_query in sub_queries:
+    search_result = self.search_graph(graph_id=graph_id, query=sub_query, limit=15, scope="edges")
+    ...
+main_search = self.search_graph(graph_id=graph_id, query=query, limit=20, scope="edges")
+```
+
+**Python `insight_forge` LITERALLY calls `self.search_graph(...)` per sub-query (limit 15, scope "edges") and a main-query `search_graph` (limit 20, scope "edges"). There is NO `query_vec_similarity` / distinct vector method in the body.** `search_graph` (`zep_tools.py:464`) IS the semantic method (Zep Cloud hybrid semantic+BM25, `reranker="cross_encoder"`) with a `_local_search` keyword fallback (the very fallback Python itself ships).
+
+→ The porter keeping `search_graph` (limit 15 sub / 20 main, scope edges) is **FAITHFUL**, not a downgrade. The cycle-68 finding's assertion "Python routes semantically via query_vec_similarity, not search_graph → keyword substitution is a downgrade" was a **MISREAD** of the Python body. The keyword-vs-semantic gap that cycle-68 flagged does not exist at the `insight_forge` layer — `search_graph` itself is S-305 (Zep hybrid `[≠]` server-side, reproduces Python's own `_local_search`), already parity-verified cycle-68. **Search method: RESOLVED, faithful.**
+
+### What the porter FIXED (cycle-68 → cycle-69), verified faithful
+
+- `insight_forge` is now `pub async fn` (zep_tools.rs:1339), live path via `execute_by_name_async` intercept (zep_tools.rs:3025-3045).
+- `generate_sub_queries` (zep_tools.rs:1255) NOW calls `self.llm.chat_json(temp 0.3)` with **byte-verbatim** system prompt (py:1104-1110) and user prompt (py:1112-1120), parses `{"sub_queries":[...]}`, `.take(max_queries)`, stringifies non-string elems. The 4 Chinese-variant fallback (`{query}`, `{query} 的主要参与者`, `{query} 的原因和影响`, `{query} 的发展过程`) fires **ONLY on `Err`**, byte-identical, in order — confirmed primary≠fallback (`test_insight_forge_primary_llm_sub_queries`, `test_insight_forge_keyword_fallback_structure`).
+- Seam clean: `execute_by_name_async` intercepts ONLY InsightForge + InterviewAgents, delegates every other tool unchanged to `execute_by_name`; sync `execute_inner` InsightForge arm (zep_tools.rs:2844) + `GetSimulationContext` redirect (zep_tools.rs:2932) use `insight_forge_keyword_fallback` (NO LLM call). No Send regression (1551 lib green). `new(graph,llm)` intact.
+- Assembly (`assemble_insight_forge_result` zep_tools.rs:1437): per-sub-query search → dedup via `seen_facts` HashSet → main-query search → entity-UUID extraction from edges → `get_node_detail` enrichment → `related_facts` ci-substring filter → relationship-chain `"{src} --[{name}]--> {tgt}"` with Vec-contains dedup → totals. Field order/9 fields/totals match Python (`InsightForgeResult` S-255, already verified). FAITHFUL.
+
+### What REFUTATION FOUND — NEW downgrade the porter introduced (S-316)
+
+**report_context truncation panics on the production input.** Rust `generate_sub_queries` (zep_tools.rs:1275):
+
+```rust
+&report_context[..report_context.len().min(500)]   // BYTE slice
+```
+
+Python `_generate_sub_queries` (py:1115): `report_context[:500]` — **CODEPOINT** slice, never panics.
+
+When `report_context` > 500 bytes AND byte 500 is not a UTF-8 char boundary → **Rust panics**. Chinese text is 3 bytes/char, so any Chinese report_context longer than ~167 chars triggers it. **PROVEN**: standalone repro panicked, and a differential test (200×"中" = 600 bytes) panicked at `src/services/zep_tools.rs:1275:32` ("byte index 500 is not a char boundary; it is inside '中'"). The LIVE report_context is Chinese — `format!("章节标题: {}\n模拟需求: {}", section.title, simulation_requirement)` (report/mod.rs:1043) — and routinely exceeds 500 bytes for normal multi-sentence simulation requirements. On that input Python truncates to 500 codepoints and proceeds; the Rust async `insight_forge` panics **inside the section-writing ReACT loop**, aborting report generation.
+
+This is a reachable, production-path divergence with a distinct observable behavior (panic vs clean truncation). NOT inexpressible (`.chars().take(500).collect::<String>()` is trivial), NOT non-contractual (the 500-truncation is an explicit ported contract), NOT a superset. → **Genuine downgrade. FAIL.** Because `insight_forge` (S-315) transitively calls `generate_sub_queries`, the panic propagates through the live S-315 path too.
+
+(The differential panic-test was used to PROVE the bug, then removed so the suite stays green — it belongs in the porter's fix as a passing regression test once the truncation is char-safe.)
+
+### 2nd minor divergence (S-315, lower severity)
+
+Relationship-chain name fallback (zep_tools.rs:1530-1537) builds `uuid_to_name` from `get_all_nodes` and does `uuid_to_name.get(uuid).map(|s| s.as_str()).unwrap_or_else(|| &uuid[..min(8)])`. Python (py:1079-1080): `node_map.get(uuid, default).name or source_uuid[:8]`. For an **empty-name** edge endpoint, Python's `or` falls back to `uuid[:8]`; Rust returns `Some("")` → emits `""` (no fallback). Divergence only when a graph node has an empty name. Note for the porter; not the blocking issue.
+
+### Gate results (Y context, real output)
+
+- `cargo test --lib`: **1551 passed / 0 failed** (1 suite, 12.16s) — meets ≥1551 baseline.
+- `cargo clippy --all-targets`: **0 warnings**.
+- `cargo fmt --check`: **clean**.
+
+### Y NOT REGRESSED: **YES.** 1551 green, clippy clean, fmt clean. The async seam intercepts only InsightForge/InterviewAgents; all other tools delegate unchanged. No Send regression. The downgrade is a NEW latent panic, not a regression of previously-green behavior.
+
+### Verdict
+
+- **S-315 `insight_forge`: `[~]` (STILL DOWNGRADE).** Search method now faithful (cycle-68 misread corrected), seam clean, assembly faithful — but the live async path inherits the S-316 byte-slice panic on production-sized Chinese report_context. Cannot flip to `[x]` until that panic is fixed. (Secondary: empty-name chain fallback.)
+- **S-316 `generate_sub_queries`: `[~]` (STILL DOWNGRADE).** LLM decomposition is now present and byte-faithful, BUT the `report_context[:500]` truncation is a byte-slice that PANICS on Chinese report_context >500 bytes where Python truncates cleanly. Proven panic at zep_tools.rs:1275:32. → Needs another porter cycle: char-boundary-safe truncation (`.chars().take(500).collect()`), ideally + the empty-name `or uuid[:8]` guard, + a passing >500-byte-Chinese regression test.
+
+**UNIT U-017 is NOT terminal.** 2 of 56 symbols remain `[~]` (S-315, S-316). The cycle-68 unit-PASS was premature on these two; U-017 cannot be marked unit-`[x]` / committed until S-315 + S-316 flip to `[x]`.
+
+**RETURN: FAIL** (S-315 `[~]`, S-316 `[~]`; route back to porter for the char-boundary-safe report_context truncation).
+
+---
+
+### 2026-06-21 — cycle-69 RE-VERIFY: PASS (both defects fixed; default-skeptical delta re-check)
+
+Orchestrator applied both fixes; re-verified the delta only.
+
+**Fix 1 — S-316 byte-slice panic (was the blocker): CONFIRMED.** `generate_sub_queries` (zep_tools.rs:1278) now truncates report_context with `report_context.chars().take(500).collect::<String>()` — a CODEPOINT cap. REFUTE attempts: (a) is the truncation still byte-based anywhere on this path? No — line 1278 is the only report_context truncation; the empty-context branch (L1266-1270) does not truncate, and the keyword-fallback path (L1414-1423) never touches report_context. (b) Does the 500-char cap match Python `[:500]` semantics? Yes — Python `[:500]` and `.chars().take(500)` are both 500-codepoint caps (Python str indexing is codepoint-based). No panic possible (char boundary always respected). Regression test `test_insight_forge_long_chinese_report_context_no_panic` (zep_tools.rs:3867) EXISTS, builds 300×"模"=900 bytes, asserts `!ctx.is_char_boundary(500)` (byte 500 splits a char), runs `insight_forge` and asserts the result — PASSES (part of the 1552-green suite).
+
+**Fix 2 — S-315 empty-name fallback (secondary): CONFIRMED.** Relationship-chain endpoint names (zep_tools.rs:1535-1542) now use `match uuid_to_name.get(uuid).map(|s| s.as_str()) { Some(n) if !n.is_empty() => n, _ => &uuid[..uuid.len().min(8)] }`. Matches Python L1079-1080 `node_map.get(uuid, NodeInfo('',…)).name or uuid[:8]` — the `_ =>` arm catches BOTH a missing key (None) AND an empty name (`Some("")`), exactly as Python's `or` short-circuits on the falsy empty string from the `NodeInfo('',…)` default. REFUTE: off-by-one vs `[:8]`? No — `uuid[..min(8)]` takes ≤8 leading bytes; Python `uuid[:8]` takes ≤8 leading codepoints; UUIDs are ASCII (hex + hyphens) so bytes==codepoints → identical. Byte-slice safe (ASCII, `min(8)` never exceeds len, never splits a char).
+
+**Rest of prior PASS findings — STAND (re-confirmed in source).** LLM-primary sub-queries (chat_json temp 0.3, byte-verbatim system+user prompts, `{"sub_queries":[...]}` parse, `take(max_queries)`); 4-variant exception fallback ONLY on `Err` (L1310-1318); `search_graph` faithful (Python `insight_forge` body literally calls `self.search_graph`, per-sub-query limit 15 + main-query limit 20, scope=edges; the cycle-68 "should use query_vec_similarity" was a confirmed misread); InsightForgeResult assembly (dedup via `seen_facts`, entity-UUID extraction, related_facts filter, relationship-chain dedup, totals) faithful. Seam: `execute_by_name_async` intercepts only InsightForge/InterviewAgents, delegates the rest unchanged; sync arm + GetSimulationContext redirect route through `insight_forge_keyword_fallback` (no LLM) — unchanged.
+
+**Gate results (Y context, real output, 2026-06-21):**
+- `cargo test --lib`: **1552 passed / 0 failed** (1 suite, 12.17s) — +1 over the 1551 baseline (the new regression test), green; new test confirmed among them.
+- `cargo clippy --all-targets`: **0 warnings** ("No issues found").
+- `cargo fmt --check`: **clean** (exit 0).
+
+**Y NOT REGRESSED: YES.** 1552 green (was 1551 + the new regression test), clippy clean, fmt clean. The latent panic is gone, not traded for a regression; no other behavior touched.
+
+**Verdict: S-315 → `[x]`, S-316 → `[x]`.** Both flipped in symbol-map.md.
+
+**UNIT U-017 IS NOW TERMINAL.** S-315 + S-316 were the only two non-terminal U-017 rows; with both `[x]`, every U-017 symbol is `[x]` or a justified `[≠]`. U-017 may be marked unit-`[x]` and committed.
+
+**RETURN: PASS** (S-315 `[x]`, S-316 `[x]`; U-017 unit terminal).
