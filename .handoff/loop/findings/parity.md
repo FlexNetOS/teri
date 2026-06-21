@@ -4229,3 +4229,51 @@ clean. No fresh port — pure mirrors of S-876. 9 `sim::activation` tests pass; 
 (verify-only, no code change). Y-not-regressed (develop=7c354a5).
 
 **Units STAY `[ ]`** — the IPC command-service loop gate (CYCLE 56 keystone) is unported; no over-flip.
+
+---
+
+## CYCLE 56 (2026-06-20, 30th resume) — KEYSTONE: IPC command-service loop + native interview execution
+
+**Ported** (simulation_runner.rs + simulation_ipc.rs): the post-simulation **wait-for-commands loop**
+into `run_sim_body` (after `engine.run()`: poll `ipc_server.try_poll()` → dispatch
+CloseEnv/Interview/BatchInterview; exit on close_env / shutdown flag / all-clients-dropped) + native
+`execute_interview` / `execute_batch_interview` (resolve pool agent by `social.user_id` → `llm.complete
+(build_interview_prompt(...))` → `{agent_id, response, timestamp}`). New `CommandPoll`/`try_poll`
+(distinguish Empty vs Disconnected). `spawn_sim_task` threads the run's `shutdown` flag into the body.
+
+**PARITY PASS (rust-port-parity-verifier, all 7 refutation targets confirmed faithful):**
+1. `dispatch_command` ≡ `process_commands` (py:343-384); CloseEnv→success`{message:"环境即将关闭"}`+exit;
+   the py:380 unknown-else is unreachable (3-variant CommandType + from_dict rejects unknown at deser).
+2. `execute_interview` shape ≡ `_get_interview_result` `{agent_id,response,timestamp}` (py:303-308);
+   OASIS `env.step(INTERVIEW)`+trace-DB read = `[≠]U028-OASIS-INTERNALS` (LLM output returned inline);
+   unknown agent_id→error (≡ `get_agent` raising); arg defaults `agent_id`/`prompt` matched.
+3. `execute_batch_interview`: per-item resolve, skip+warn unresolvable, empty→`"没有有效的Agent"`,
+   `{interviews_count, results}` keyed by agent_id string. Defensible `[≠]` sub-divergence: per-agent
+   `llm.complete` (no OASIS batched env.step) drops an LLM-failing agent — rides on OASIS-INTERNALS,
+   `[!]`-LLM-gated; contractually-portable behavior faithful.
+4. **NO-DOWNGRADE-OF-Y confirmed.** Lingering after `engine.run()` is FAITHFUL: wait_for_commands=True
+   is the MiroFish default (`__init__` py:398) and the Flask launcher (app/services/simulation_runner.py
+   :399-440) NEVER passes `--no-wait` → API runs ALWAYS linger (`poll() is None`→running). The 2 modified
+   cleanup tests (`cleanup_all_preserves_finished_run_state`, `..._stops_running_but_skips_finished`) now
+   send close_env to finish the run before asserting — a REQUIRED faithful-behavior update that PRESERVES
+   the FAIL-2 invariant (finished run keeps COMPLETED+no shutdown error+completed_at; gate discriminates
+   finished vs running). COMPLETED is NOT delayed by lingering (monitor marks it from actions.jsonl
+   `simulation_end` via `subscribe_completion` fired when `engine.run` returned —
+   `producer_run_reaches_completed_via_monitor` reaches COMPLETED while the task still lingers).
+5. 50ms poll cadence vs Python 0.5s = non-contractual, strictly more responsive; `Disconnected` exit is a
+   teri-substrate lifecycle nicety (Python relied on OS process kill), no observable divergence.
+6. **RESOLVES `[!] IPC-PRODUCER-PENDING`** for S-829/830/831/832 (interview) + S-833/834 (env/close) —
+   full route→client→mpsc→wait-loop→execute→oneshot-reply closed (proven by
+   `wait_for_commands_services_interview_then_close`: live interview→COMPLETED, unknown→Failed,
+   close_env→COMPLETED+loop exits+env not-alive).
+
+**FLIPS:** S-865/866/868 (twitter) + S-892/893/895 (reddit mirrors) → `[x]`. +7 tests 1512→1519,
+clippy `--all-targets`+`--all-features` clean, fmt clean, Y-not-regressed (develop=7c354a5).
+
+**NO OVER-FLIP (verifier-enforced):** S-920/921/922/924 (PARALLEL `ParallelIPCHandler`) STAY `[ ]` —
+GENUINELY UNPORTED with a RICHER contract (per-platform `platform` key, dual-platform integration shape
+`{platforms:{twitter,reddit}}`, `success_count`, `没有可用的模拟环境` error, platform routing/split at
+run_parallel_simulation.py:317-414) NOT covered by the single-env `dispatch_command`. S-877 stays `[~]`
+(env.step world-injection `[≠]` + signal pieces remain). S-904/938/939 stay `[ ]`. S-934 dual-LLM `[ ]`.
+**U-028/U-029/U-030 UNITS STAY `[ ]`** — each still carries OASIS env/SQLite/logging/signal-handler
+contracts (+ U-030 parallel handler + DB-enrichment); this port closed the IPC-consumer gate, not the units.

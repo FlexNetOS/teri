@@ -857,7 +857,9 @@ use tokio::task::JoinHandle;
 use crate::error::TeriError;
 use crate::llm::LlmClient;
 use crate::services::graph_memory::GraphMemoryManager;
-use crate::services::simulation_ipc::{SimulationIPCClient, SimulationIPCServer, channel};
+use crate::services::simulation_ipc::{
+    CommandPoll, CommandType, IpcEnvelope, SimulationIPCClient, SimulationIPCServer, channel,
+};
 use crate::services::simulation_manager::SimulationManager;
 use crate::sim::SimEngine;
 
@@ -1188,7 +1190,7 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
         // the run finishes before the monitor first polls, the monitor still observes `Some(..)`.
         let completion_rx = engine.subscribe_completion();
 
-        let task = spawn_sim_task(engine, pool, graph, llm, ipc_server);
+        let task = spawn_sim_task(engine, pool, graph, llm, ipc_server, Arc::clone(&shutdown));
 
         // process_pid stays None ([≠] value-only — no OS pid). runner_status → Running.
         state.runner_status = RunnerStatus::Running;
@@ -1522,6 +1524,7 @@ fn spawn_sim_task<L: LlmClient + Send + Sync + 'static>(
     graph: crate::graph::KnowledgeGraph,
     llm: Arc<L>,
     ipc_server: SimulationIPCServer,
+    shutdown: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     // Box+coerce the future to an explicit `Pin<Box<dyn Future + Send>>`. This sidesteps
     // rustc's higher-ranked-lifetime inference failure ("implementation of `FnOnce` is not
@@ -1529,9 +1532,17 @@ fn spawn_sim_task<L: LlmClient + Send + Sync + 'static>(
     // is handed to `tokio::spawn`. The explicit type annotation pins the lifetime so the
     // closure's `for<'a> FnMut(&'a Agent)` bound resolves. Behavior is unchanged.
     let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
-        Box::pin(run_sim_body(engine, pool, graph, llm, ipc_server));
+        Box::pin(run_sim_body(engine, pool, graph, llm, ipc_server, shutdown));
     tokio::spawn(fut)
 }
+
+/// Poll cadence for the post-simulation wait-for-commands loop.
+///
+/// Python loops on `await asyncio.wait_for(_shutdown_event.wait(), timeout=0.5)`
+/// (`run_twitter_simulation.py:~688`) — a 0.5 s poll interval. teri uses a finer 50 ms cadence:
+/// strictly more responsive (never a downgrade), and the interval itself is a non-contractual
+/// implementation detail (the observable contract is "pending commands get serviced").
+const WAIT_FOR_COMMANDS_POLL: Duration = Duration::from_millis(50);
 
 /// The body driven by the spawned simulation task.
 ///
@@ -1544,18 +1555,214 @@ async fn run_sim_body<L: LlmClient + Send + Sync + 'static>(
     mut pool: crate::agent::AgentPool,
     graph: crate::graph::KnowledgeGraph,
     llm: Arc<L>,
-    ipc_server: SimulationIPCServer,
+    mut ipc_server: SimulationIPCServer,
+    shutdown: Arc<AtomicBool>,
 ) {
     // Mark the env alive while the run is in progress (DECISION-16: `check_env_alive`
-    // reads this flag; interview commands are serviced by the (c)/(e) loop dispatch).
+    // reads this flag; interview commands are serviced by the wait-for-commands loop below).
     ipc_server.start();
 
     if let Err(e) = engine.run(&mut pool, &graph, &*llm).await {
         tracing::error!("模拟运行失败: {}", e);
     }
 
-    // Run finished (or aborted before this point) — mark env not-alive.
+    // ---------------------------------------------------------------------------------------
+    // Wait-for-commands mode — port of `IPCHandler.process_commands` (run_twitter_simulation.py:
+    // 343-384) driven by the runner's post-rounds wait loop (`while not _shutdown_event.is_set():
+    // await process_commands()`). After the simulation rounds finish, the env stays ALIVE and
+    // services IPC commands until a `close_env` arrives, the cooperative-stop flag is set, or
+    // every IPC client has been dropped (the run handle was removed — teri's analog of the OS
+    // killing the subprocess; Python relied on process death for that teardown).
+    //
+    // The run's COMPLETED status is decided by the monitor from the `actions.jsonl`
+    // `simulation_end` record (`subscribe_completion` fired the moment `engine.run` returned),
+    // NOT by this task ending — so lingering here to answer interviews does not delay completion.
+    // `pool` is owned exclusively by this body, so post-run interview execution has clean
+    // (`&pool`) access with no shared-mutability machinery.
+    // ---------------------------------------------------------------------------------------
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            break;
+        }
+        match ipc_server.try_poll() {
+            CommandPoll::Command(env) => {
+                // `dispatch_command` returns `false` only for `close_env` → exit the wait loop.
+                if !dispatch_command(env, &pool, &*llm).await {
+                    break;
+                }
+            }
+            CommandPoll::Empty => {
+                tokio::time::sleep(WAIT_FOR_COMMANDS_POLL).await;
+            }
+            CommandPoll::Disconnected => break,
+        }
+    }
+
+    // Run finished + env-loop exited — mark env not-alive.
     ipc_server.stop();
+}
+
+/// Dispatch one IPC command in the wait-for-commands loop.
+///
+/// Port of `IPCHandler.process_commands`' body (run_twitter_simulation.py:343-384). Returns
+/// `true` to keep the env alive (continue the loop) and `false` for `close_env` (exit the loop).
+/// `CommandType` has exactly three variants, so the match is exhaustive — Python's `else:
+/// "unknown command"` branch is unreachable here because `IPCCommand::from_dict` already rejects
+/// any unrecognised `command_type` string at deserialization time.
+async fn dispatch_command<L: LlmClient + Send + Sync>(
+    env: IpcEnvelope,
+    pool: &crate::agent::AgentPool,
+    llm: &L,
+) -> bool {
+    match env.command.command_type {
+        CommandType::CloseEnv => {
+            // Python: send_response(id, "completed", result={"message": "环境即将关闭"}); return False.
+            let mut m = Map::new();
+            m.insert("message".to_string(), Value::String("环境即将关闭".to_string()));
+            SimulationIPCServer::send_success(env, m);
+            false
+        }
+        CommandType::Interview => {
+            match execute_interview(pool, llm, &env.command.args).await {
+                Ok(result) => SimulationIPCServer::send_success(env, result),
+                Err(e) => SimulationIPCServer::send_error(env, e),
+            }
+            true
+        }
+        CommandType::BatchInterview => {
+            match execute_batch_interview(pool, llm, &env.command.args).await {
+                Ok(result) => SimulationIPCServer::send_success(env, result),
+                Err(e) => SimulationIPCServer::send_error(env, e),
+            }
+            true
+        }
+    }
+}
+
+/// Resolve a pool agent by its OASIS `user_id` (the interview `agent_id`).
+///
+/// Python resolves via `self.agent_graph.get_agent(agent_id)` which raises if the id is unknown
+/// (caught → `send_response(..., "failed", error=str(e))`). teri matches `SocialProfile.user_id`
+/// across the pool (the same id `load_agent_pool` assigns) and returns `None` on no match, which
+/// the caller turns into an error response.
+fn resolve_agent_by_user_id(
+    pool: &crate::agent::AgentPool,
+    agent_id: i64,
+) -> Option<&crate::agent::Agent> {
+    pool.agents
+        .iter()
+        .find(|a| a.persona.social.as_ref().map(|s| s.user_id as i64) == Some(agent_id))
+}
+
+/// Build the interview prompt fed to the agent's LLM.
+///
+/// teri-native analog of OASIS `env.step({agent: ManualAction(INTERVIEW, {"prompt": prompt})})`
+/// (`IPCHandler.handle_interview`, run_twitter_simulation.py:214). The OASIS prompt-composition
+/// internals are `[≠]U028-OASIS-INTERNALS` (camel-ai builds its own system+interview message);
+/// the differentially-portable contract is "the agent answers the question in first person, in
+/// character, via its LLM". The persona context (name + background + the recovered OASIS
+/// `social.persona` blob) grounds the answer the same way the decision prompt does.
+fn build_interview_prompt(agent: &crate::agent::Agent, prompt: &str) -> String {
+    let persona = &agent.persona;
+    let mut ctx = format!("You are {}.\n{}\n", persona.name, persona.background);
+    if let Some(social) = persona.social.as_ref()
+        && !social.persona.is_empty()
+    {
+        ctx.push_str(&format!("Persona: {}\n", social.persona));
+    }
+    format!(
+        "{ctx}\nYou are being interviewed. Answer the following question in the first person, \
+         staying fully in character.\nQuestion: {prompt}"
+    )
+}
+
+/// Execute a single-agent interview natively.
+///
+/// Port of `IPCHandler.handle_interview` (run_twitter_simulation.py:214-247): resolve the agent,
+/// run the interview action, return the result. The OASIS path was `env.step(ManualAction
+/// (INTERVIEW))` then `_get_interview_result(agent_id)` reading the `trace` SQLite DB
+/// (`[≠]U028-OASIS-INTERNALS`); teri runs the agent's LLM directly and returns the response
+/// inline (no DB round-trip). Result shape mirrors `_get_interview_result`'s
+/// `{agent_id, response, timestamp}` (run_twitter_simulation.py:300-343). The actual response
+/// text is LLM-generated → non-deterministic, the same `[!]`-LLM-gated class as the producer
+/// decisions; the contract that IS gated here is resolution + shape + error behavior.
+async fn execute_interview<L: LlmClient + Send + Sync>(
+    pool: &crate::agent::AgentPool,
+    llm: &L,
+    args: &Map<String, Value>,
+) -> std::result::Result<Map<String, Value>, String> {
+    // Python: args.get("agent_id", 0) / args.get("prompt", "").
+    let agent_id = args.get("agent_id").and_then(Value::as_i64).unwrap_or(0);
+    let prompt = args.get("prompt").and_then(Value::as_str).unwrap_or("");
+
+    let agent = resolve_agent_by_user_id(pool, agent_id)
+        .ok_or_else(|| format!("Agent {agent_id} not found"))?;
+    let interview_prompt = build_interview_prompt(agent, prompt);
+    let response = llm.complete(&interview_prompt).await.map_err(|e| e.to_string())?;
+
+    Ok(interview_result(agent_id, response))
+}
+
+/// Shape one interview result, mirroring Python `_get_interview_result`'s
+/// `{agent_id, response, timestamp}` (run_twitter_simulation.py:303-308). `timestamp` is the
+/// completion time (Python read the OASIS `trace.created_at`; teri stamps it now — a timestamp
+/// source `[≠]` only).
+fn interview_result(agent_id: i64, response: String) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("agent_id".to_string(), Value::from(agent_id));
+    m.insert("response".to_string(), Value::String(response));
+    m.insert(
+        "timestamp".to_string(),
+        Value::String(crate::models::project::python_isoformat_local()),
+    );
+    m
+}
+
+/// Execute a batch interview natively.
+///
+/// Port of `IPCHandler.handle_batch_interview` (run_twitter_simulation.py:248-300): resolve each
+/// `{agent_id, prompt}`, skip unresolvable ids with a warning (Python's per-item `try/except`),
+/// and if NONE resolve return an error (`"没有有效的Agent"`). On success the shape is
+/// `{interviews_count, results}` where `results` is keyed by `agent_id` (Python's dict keyed by
+/// int → JSON string keys), each value the same `{agent_id, response, timestamp}` map.
+async fn execute_batch_interview<L: LlmClient + Send + Sync>(
+    pool: &crate::agent::AgentPool,
+    llm: &L,
+    args: &Map<String, Value>,
+) -> std::result::Result<Map<String, Value>, String> {
+    let interviews = args.get("interviews").and_then(Value::as_array).cloned().unwrap_or_default();
+
+    let mut results = Map::new();
+    for item in &interviews {
+        let Some(agent_id) = item.get("agent_id").and_then(Value::as_i64) else {
+            continue;
+        };
+        let prompt = item.get("prompt").and_then(Value::as_str).unwrap_or("");
+        let Some(agent) = resolve_agent_by_user_id(pool, agent_id) else {
+            tracing::warn!("批量采访: 无法获取Agent {}", agent_id);
+            continue;
+        };
+        let interview_prompt = build_interview_prompt(agent, prompt);
+        match llm.complete(&interview_prompt).await {
+            Ok(response) => {
+                results.insert(
+                    agent_id.to_string(),
+                    Value::Object(interview_result(agent_id, response)),
+                );
+            }
+            Err(e) => tracing::warn!("批量采访: Agent {} LLM 失败: {}", agent_id, e),
+        }
+    }
+
+    if results.is_empty() {
+        // Python: if not actions → send_response(id, "failed", error="没有有效的Agent").
+        return Err("没有有效的Agent".to_string());
+    }
+
+    let mut m = Map::new();
+    m.insert("interviews_count".to_string(), Value::from(results.len() as u64));
+    m.insert("results".to_string(), Value::Object(results));
+    Ok(m)
 }
 
 /// Cooperative-then-force terminate of a single run's tasks — port of `_terminate_process`
@@ -2917,6 +3124,212 @@ mod lifecycle_tests {
     }
 
     // -----------------------------------------------------------------------
+    // Wait-for-commands IPC service loop (CYCLE 56 keystone — U-028/029/030
+    // process_commands / handle_interview / handle_batch_interview).
+    // -----------------------------------------------------------------------
+
+    /// Build a single-agent pool whose one agent carries `social.user_id == user_id`, so
+    /// interview resolution (`resolve_agent_by_user_id`) can find it.
+    fn pool_with_social_agent(user_id: u64, name: &str) -> AgentPool {
+        let social = crate::agent::SocialProfile {
+            user_id,
+            user_name: format!("u{user_id}"),
+            bio: String::new(),
+            persona: String::new(),
+            platform: crate::agent::Platform::Twitter,
+            karma: 1000,
+            friend_count: 100,
+            follower_count: 150,
+            following_count: 100,
+            statuses_count: 500,
+            age: None,
+            gender: None,
+            mbti: None,
+            country: None,
+            profession: None,
+            interested_topics: vec![],
+            posting_style: None,
+            source_entity_uuid: None,
+            source_entity_type: None,
+            created_at: String::new(),
+        };
+        let mut pool = AgentPool::new();
+        pool.add_agent(Agent::new(Persona {
+            name: name.to_string(),
+            background: "an engineer".into(),
+            traits: vec![],
+            role: "agent".into(),
+            social: Some(social),
+        }));
+        pool
+    }
+
+    /// `execute_interview` resolves the pool agent by `user_id` and returns the
+    /// `{agent_id, response, timestamp}` shape (mirroring Python `_get_interview_result`).
+    #[tokio::test]
+    async fn execute_interview_resolves_and_shapes() {
+        let pool = pool_with_social_agent(7, "Ada");
+        let mut args = Map::new();
+        args.insert("agent_id".into(), Value::from(7i64));
+        args.insert("prompt".into(), Value::String("How do you feel?".into()));
+
+        let result = execute_interview(&pool, &MockLlm, &args).await.expect("interview ok");
+        assert_eq!(result["agent_id"], Value::from(7i64));
+        // MockLlm returns "Think(idle)" for any prompt — proves the LLM response flows through.
+        assert_eq!(result["response"], Value::String("Think(idle)".into()));
+        assert!(result.contains_key("timestamp"));
+    }
+
+    /// An unknown `agent_id` yields an error (Python `get_agent` raises → `send_response` failed).
+    #[tokio::test]
+    async fn execute_interview_unknown_agent_errs() {
+        let pool = pool_with_social_agent(7, "Ada");
+        let mut args = Map::new();
+        args.insert("agent_id".into(), Value::from(999i64));
+        args.insert("prompt".into(), Value::String("x".into()));
+
+        let err = execute_interview(&pool, &MockLlm, &args).await.unwrap_err();
+        assert!(err.contains("not found"), "unexpected err: {err}");
+    }
+
+    /// Batch interview collects per-agent results keyed by `agent_id`, skipping unresolvable ids.
+    #[tokio::test]
+    async fn execute_batch_interview_collects_and_skips_unresolvable() {
+        let mut pool = pool_with_social_agent(7, "Ada");
+        // add a second resolvable agent (user_id 8)
+        for a in pool_with_social_agent(8, "Bob").agents {
+            pool.add_agent(a);
+        }
+        let mut args = Map::new();
+        args.insert(
+            "interviews".into(),
+            Value::Array(vec![
+                serde_json::json!({"agent_id": 7, "prompt": "q1"}),
+                serde_json::json!({"agent_id": 99, "prompt": "ghost"}),
+                serde_json::json!({"agent_id": 8, "prompt": "q2"}),
+            ]),
+        );
+
+        let result = execute_batch_interview(&pool, &MockLlm, &args).await.expect("batch ok");
+        assert_eq!(result["interviews_count"], Value::from(2u64));
+        let results = result["results"].as_object().unwrap();
+        assert!(results.contains_key("7"));
+        assert!(results.contains_key("8"));
+        assert!(!results.contains_key("99"), "ghost agent must be skipped");
+        assert_eq!(results["7"]["agent_id"], Value::from(7i64));
+    }
+
+    /// Batch interview with NO resolvable agents errors (Python `if not actions` → failed).
+    #[tokio::test]
+    async fn execute_batch_interview_no_valid_agents_errs() {
+        let pool = pool_with_social_agent(7, "Ada");
+        let mut args = Map::new();
+        args.insert(
+            "interviews".into(),
+            Value::Array(vec![serde_json::json!({"agent_id": 404, "prompt": "ghost"})]),
+        );
+        let err = execute_batch_interview(&pool, &MockLlm, &args).await.unwrap_err();
+        assert_eq!(err, "没有有效的Agent");
+    }
+
+    /// THE KEYSTONE end-to-end: a live `run_sim_body` finishes its (0-tick) run, then stays alive
+    /// in wait-for-commands mode servicing IPC. A client interviews an agent (→ LLM response),
+    /// an unknown agent_id fails gracefully, and `close_env` completes + breaks the loop so the
+    /// task ends and the env is marked not-alive. This is the resolution of `[!] IPC-PRODUCER-PENDING`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wait_for_commands_services_interview_then_close() {
+        let pool = pool_with_social_agent(7, "Ada");
+        let engine = SimEngine::new(SimConfig::new(0, 1)); // 0 ticks → run() returns immediately
+        let (client, server) = channel(IPC_CHANNEL_BUFFER);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(run_sim_body(
+            engine,
+            pool,
+            KnowledgeGraph::new(),
+            Arc::new(MockLlm),
+            server,
+            shutdown,
+        ));
+
+        // Interview a real agent → completed + the {agent_id, response, timestamp} shape.
+        let resp = client
+            .send_interview(7, "How do you feel?", None, Duration::from_secs(5))
+            .await
+            .expect("send ok");
+        assert_eq!(resp.status, crate::services::simulation_ipc::CommandStatus::Completed);
+        let result = resp.result.expect("result");
+        assert_eq!(result["agent_id"], Value::from(7i64));
+        assert_eq!(result["response"], Value::String("Think(idle)".into()));
+
+        // Unknown agent → failed (not a panic, not a hang).
+        let bad = client
+            .send_interview(999, "x", None, Duration::from_secs(5))
+            .await
+            .expect("send ok");
+        assert_eq!(bad.status, crate::services::simulation_ipc::CommandStatus::Failed);
+        assert!(bad.error.unwrap().contains("not found"));
+
+        // close_env → completed + the loop breaks → task ends.
+        let close = client.send_close_env(Duration::from_secs(5)).await.expect("send ok");
+        assert_eq!(close.status, crate::services::simulation_ipc::CommandStatus::Completed);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("task should end after close_env")
+            .expect("task join ok");
+        assert!(!client.check_env_alive(), "env must be not-alive after close_env");
+    }
+
+    /// The wait loop exits when the cooperative shutdown flag is set (the SIGTERM analog), even
+    /// without a close_env command.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wait_for_commands_exits_on_shutdown_flag() {
+        let pool = pool_with_social_agent(7, "Ada");
+        let engine = SimEngine::new(SimConfig::new(0, 1));
+        let (client, server) = channel(IPC_CHANNEL_BUFFER);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(run_sim_body(
+            engine,
+            pool,
+            KnowledgeGraph::new(),
+            Arc::new(MockLlm),
+            server,
+            Arc::clone(&shutdown),
+        ));
+        // Let the run finish + enter the wait loop, then trip the flag.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        shutdown.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("task should end on shutdown flag")
+            .expect("join ok");
+        assert!(!client.check_env_alive());
+    }
+
+    /// The wait loop exits when every IPC client is dropped (the run handle was removed — teri's
+    /// analog of the OS killing the subprocess), via `CommandPoll::Disconnected`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wait_for_commands_exits_on_client_disconnect() {
+        let pool = pool_with_social_agent(7, "Ada");
+        let engine = SimEngine::new(SimConfig::new(0, 1));
+        let (client, server) = channel(IPC_CHANNEL_BUFFER);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(run_sim_body(
+            engine,
+            pool,
+            KnowledgeGraph::new(),
+            Arc::new(MockLlm),
+            server,
+            shutdown,
+        ));
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        drop(client); // all senders gone → try_poll yields Disconnected → loop breaks
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("task should end on client disconnect")
+            .expect("join ok");
+    }
+
+    // -----------------------------------------------------------------------
     // start_simulation
     // -----------------------------------------------------------------------
 
@@ -3326,7 +3739,11 @@ mod lifecycle_tests {
             .await
             .expect("start ok");
 
-        // Wait until the handle reports finished (poll() is not None analog).
+        // A run lingers in wait-for-commands mode after its rounds — the MiroFish default
+        // (`wait_for_commands = not args.no_wait`, and the Flask launcher never passes `--no-wait`),
+        // so the process stays alive (`poll() is None`) until close_env/SIGTERM. Send close_env so
+        // the task breaks the wait loop and actually finishes (the "poll() not None" analog).
+        let _ = runner.close_simulation_env(&sim_id, Duration::from_secs(5)).await;
         wait_until_finished(&runner, &sim_id).await;
         assert!(
             !runner.get_running_simulations().await.contains(&sim_id),
@@ -3394,6 +3811,8 @@ mod lifecycle_tests {
             .start_simulation(&done_id, "parallel", Some(1), false, None, run_inputs(1), None)
             .await
             .expect("start finished-run ok");
+        // Finish the run faithfully: a wait-for-commands run stays alive until close_env.
+        let _ = runner.close_simulation_env(&done_id, Duration::from_secs(5)).await;
         wait_until_finished(&runner, &done_id).await;
         // Record its COMPLETED final state.
         let mut done_state = SimulationRunState::new(done_id.clone());

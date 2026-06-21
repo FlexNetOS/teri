@@ -1081,10 +1081,10 @@
 - [ ] S-862 · `unit:U-028` · `method` · `IPCHandler.update_status` · writes env_status.json · `run_twitter_simulation.py:162`
 - [ ] S-863 · `unit:U-028` · `method` · `IPCHandler.poll_command` · scans ipc_commands/ · `run_twitter_simulation.py:170`
 - [ ] S-864 · `unit:U-028` · `method` · `IPCHandler.send_response` · writes response JSON · `run_twitter_simulation.py:193`
-- [ ] S-865 · `unit:U-028` · `method` · `IPCHandler.handle_interview` · calls OASIS env.interview_agent · `run_twitter_simulation.py:214`
-- [ ] S-866 · `unit:U-028` · `method` · `IPCHandler.handle_batch_interview` · `run_twitter_simulation.py:248`
+- [x] S-865 · `unit:U-028` · `method` · `IPCHandler.handle_interview` · calls OASIS env.interview_agent · `run_twitter_simulation.py:214` · **PARITY 2026-06-20 (Cycle 56, PASS)**: ported as native `execute_interview` (simulation_runner.rs) — resolve pool agent by `social.user_id` (`resolve_agent_by_user_id`; unknown→error faithful to `agent_graph.get_agent` raising), run `llm.complete(build_interview_prompt(...))`, return `{agent_id, response, timestamp}` (shape mirrors `_get_interview_result` py:303-308). OASIS `env.step(ManualAction(INTERVIEW))`+trace-DB read = `[≠]U028-OASIS-INTERNALS` (teri returns LLM output inline). Arg defaults `agent_id`/`prompt` matched. Verifier-confirmed.
+- [x] S-866 · `unit:U-028` · `method` · `IPCHandler.handle_batch_interview` · `run_twitter_simulation.py:248` · **PARITY 2026-06-20 (Cycle 56, PASS)**: native `execute_batch_interview` — per-item resolve, skip+warn unresolvable (py:271-272), empty→`"没有有效的Agent"` (py:274-276), success `{interviews_count, results}` keyed by agent_id string (py int-key→JSON string). Defensible `[≠]U028-OASIS-INTERNALS` sub-divergence: teri per-agent `llm.complete` (no OASIS batched `env.step` primitive) drops an agent whose LLM call fails; contractually-portable behavior faithful. Verifier-confirmed.
 - [ ] S-867 · `unit:U-028` · `method` · `IPCHandler._get_interview_result` · `run_twitter_simulation.py:300`
-- [ ] S-868 · `unit:U-028` · `method` · `IPCHandler.process_commands` · asyncio poll loop, 0.5s interval · `run_twitter_simulation.py:343`
+- [x] S-868 · `unit:U-028` · `method` · `IPCHandler.process_commands` · asyncio poll loop, 0.5s interval · `run_twitter_simulation.py:343` · **PARITY 2026-06-20 (Cycle 56, PASS)**: ported as the wait-for-commands loop in `run_sim_body` + `dispatch_command`. After `engine.run()` returns, loop polls `ipc_server.try_poll()` (50ms cadence, `[≠]` finer than Python 0.5s — never a downgrade) → CloseEnv `send_success({"message":"环境即将关闭"})`+exit / Interview / BatchInterview, exits on close_env / shutdown flag / all-clients-dropped (`CommandPoll::Disconnected`). The py:380 "unknown command" else-branch is unreachable (CommandType has 3 variants; `IPCCommand::from_dict` rejects unknown at deser). Faithful to MiroFish wait_for_commands=True default (Flask launcher never passes --no-wait). RESOLVES `[!] IPC-PRODUCER-PENDING` for S-829/830/831/832/833/834 end-to-end. Verifier-confirmed.
 - [ ] S-869 · `unit:U-028` · `type` · `TwitterSimulationRunner` · `run_twitter_simulation.py:385`
 - [ ] S-870 · `unit:U-028` · `field` · `TwitterSimulationRunner.AVAILABLE_ACTIONS` · `run_twitter_simulation.py:389`
 - [ ] S-871 · `unit:U-028` · `method` · `TwitterSimulationRunner.__init__` · `run_twitter_simulation.py:398`
@@ -1113,10 +1113,10 @@
 - [ ] S-889 · `unit:U-029` · `method` · `IPCHandler.update_status` · `run_reddit_simulation.py:162`
 - [ ] S-890 · `unit:U-029` · `method` · `IPCHandler.poll_command` · `run_reddit_simulation.py:170`
 - [ ] S-891 · `unit:U-029` · `method` · `IPCHandler.send_response` · `run_reddit_simulation.py:193`
-- [ ] S-892 · `unit:U-029` · `method` · `IPCHandler.handle_interview` · `run_reddit_simulation.py:214`
-- [ ] S-893 · `unit:U-029` · `method` · `IPCHandler.handle_batch_interview` · `run_reddit_simulation.py:248`
+- [x] S-892 · `unit:U-029` · `method` · `IPCHandler.handle_interview` · `run_reddit_simulation.py:214` · **PARITY 2026-06-20 (Cycle 56, PASS — reddit mirror of S-865)**: reddit IPCHandler is byte-structurally identical to twitter's; teri's single in-process pool services unioned reddit agents via the SAME `execute_interview`/`dispatch_command` path (resolve by social.user_id is platform-agnostic). Verifier-confirmed.
+- [x] S-893 · `unit:U-029` · `method` · `IPCHandler.handle_batch_interview` · `run_reddit_simulation.py:248` · **PARITY 2026-06-20 (Cycle 56, PASS — reddit mirror of S-866)**: covered by `execute_batch_interview` (same path, platform-agnostic resolution). Verifier-confirmed.
 - [ ] S-894 · `unit:U-029` · `method` · `IPCHandler._get_interview_result` · `run_reddit_simulation.py:300`
-- [ ] S-895 · `unit:U-029` · `method` · `IPCHandler.process_commands` · `run_reddit_simulation.py:343`
+- [x] S-895 · `unit:U-029` · `method` · `IPCHandler.process_commands` · `run_reddit_simulation.py:343` · **PARITY 2026-06-20 (Cycle 56, PASS — reddit mirror of S-868)**: covered by the `run_sim_body` wait-for-commands loop + `dispatch_command` (single in-process IPC server services both platforms). Verifier-confirmed.
 - [ ] S-896 · `unit:U-029` · `type` · `RedditSimulationRunner` · `run_reddit_simulation.py:385`
 - [ ] S-897 · `unit:U-029` · `field` · `RedditSimulationRunner.AVAILABLE_ACTIONS` · `run_reddit_simulation.py:389`
 - [ ] S-898 · `unit:U-029` · `method` · `RedditSimulationRunner.__init__` · `run_reddit_simulation.py:405`

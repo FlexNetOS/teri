@@ -1076,6 +1076,24 @@ pub struct SimulationIPCServer {
     running: Arc<AtomicBool>,
 }
 
+/// Outcome of a non-blocking command poll that distinguishes "no command yet" from "all
+/// clients gone".
+///
+/// `poll_commands()` collapses both `Empty` and `Disconnected` into `None`, which is the right
+/// shape for a one-shot poll. The wait-for-commands service loop (`run_sim_body`) needs the
+/// distinction: `Empty` → keep waiting (the env stays alive for more interview commands);
+/// `Disconnected` → every `SimulationIPCClient` has been dropped (the run handle was removed),
+/// so no command can ever arrive — exit the loop and let the env close. Python relied on the OS
+/// killing the subprocess for that teardown; teri detects it from the channel state.
+pub enum CommandPoll {
+    /// A pending command envelope (command + reply sink).
+    Command(IpcEnvelope),
+    /// The queue is empty but at least one client sender is still alive.
+    Empty,
+    /// All client senders have been dropped — no further command can arrive.
+    Disconnected,
+}
+
 impl SimulationIPCServer {
     /// Mark the server as running and set the liveness flag to `true`.
     ///
@@ -1130,6 +1148,20 @@ impl SimulationIPCServer {
     /// S-489
     pub fn poll_commands(&mut self) -> Option<IpcEnvelope> {
         self.rx.try_recv().ok()
+    }
+
+    /// Non-blocking poll that distinguishes `Empty` from `Disconnected`.
+    ///
+    /// Used by the wait-for-commands service loop in `run_sim_body` (the post-simulation window
+    /// where the env stays alive answering interview/close-env commands — the in-process analog
+    /// of `IPCHandler.process_commands`, `run_twitter_simulation.py:343`). The loop keeps waiting
+    /// on `Empty` and exits on `Disconnected` (all clients dropped) or a `close_env` command.
+    pub fn try_poll(&mut self) -> CommandPoll {
+        match self.rx.try_recv() {
+            Ok(env) => CommandPoll::Command(env),
+            Err(mpsc::error::TryRecvError::Empty) => CommandPoll::Empty,
+            Err(mpsc::error::TryRecvError::Disconnected) => CommandPoll::Disconnected,
+        }
     }
 
     /// Fire the oneshot reply for the given envelope.
