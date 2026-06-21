@@ -4515,3 +4515,85 @@ Differential, static code-diff + ran teri's existing parity tests (`cargo test -
 - **S-760 `_get_tools_description`** → `zep_tools.rs:1668` `get_tools_description`. **`[x]`** — header `可用工具：`, per-tool `- {name}: {desc}` + `  参数: {k: v, …}`, dict-insertion order preserved (report_agent.py:1127-1135). `test_get_tools_description_order`, `_contains_all_tools`, `_contains_params`.
 
 **VERDICT: PASS — 13/14 flip to `[x]`; S-752 → `[≠]` (non-contractual dead-source constant). interview_agents LEAF remains an honest `[!]` gap (tracked under U-022 sub-cycle e), but S-756 DISPATCH STRUCTURE is faithful and flips `[x]`. Zero MISSING, zero disguised feature-skip. Tests green: zep_tools 77 + report 210.**
+
+---
+
+## 2026-06-20 · Cycle 65 · U-026 sub-cycles (d)+(m) — three REUSE-Y routes (verify-only)
+
+**Verdict: PASS — S-808, S-809, S-812 all flip `[x]`.** Reuse-Y differential verification (routes already
+existed in teri); no Rust changed. Baseline green: `cargo test -p teri --lib api::simulation` = **141 passed,
+1392 filtered out** (`prepare` filter = 28 pass; `history` filter = 16 pass). Each route diffed branch-by-branch
+against the cited Python source; every branch has a dedicated non-vacuous route test.
+
+### S-808 · `POST /prepare` · prepare_simulation_route (simulation.rs:789, registered :127) ← simulation.py:360-639
+**PASS — route contract faithful; `[!] U026-d-GRAPHREQ` confirmed HONEST.**
+- Refutation attempted: tried to find a Python branch teri's route narrows or a path where the graph gap turns
+  into a *silent success*. Found neither.
+- 13-step control flow maps 1:1: simulation_id 400 (py:408-413 → rs:796), get_simulation None→404 (py:415-422
+  → rs:807), force_regenerate default false + already-prepared short-circuit 200 ready/already_prepared:true
+  (py:425-444 → rs:819-834), get_project None→404 (py:449-454 → rs:837), simulation_requirement empty→400
+  (py:457-462 → rs:849), document_text or "" (py:465 → rs:858), entity_types/use_llm(true)/parallel(5)
+  (py:467-469 → rs:862-869), SYNC entity-count preview best-effort (py:471-488 → rs:874-889), create_task
+  ("simulation_prepare",{simulation_id,project_id}) (py:491-498 → rs:892-896), status=PREPARING+save
+  (py:500-502 → rs:899-903), spawn worker (py:504-612 → rs:915), immediate 200 envelope (py:614-625 → rs:930).
+- Response envelope byte-shape identical: `{success:true, data:{simulation_id, task_id, status:"preparing",
+  message:t("api.prepareStarted"), already_prepared:false, expected_entities_count, entity_types}}`.
+- **`[!] U026-d-GRAPHREQ` HONEST GAP (simulation.rs:778-783):** teri's `prepare_simulation` worker takes
+  `graph:&KnowledgeGraph` as a REQUIRED input (no live Zep). On graph-resolve failure the ROUTE still
+  create_task + spawns the worker with an empty `KnowledgeGraph::new()` (rs:874-883); the worker then reads 0
+  entities → FAILED terminal, observable via `/prepare/status` as a **failed task**, NEVER a route 500 and
+  NEVER a silent success. This is faithful to Python's zero-entities→FAILED path — a downstream producer-frontier
+  gap (needs a seeded graph_build task for a green happy path), not a route-contract downgrade. The ROUTE
+  contract (accept request → spawn task → return 200 task-id envelope) is itself complete → route flips `[x]`.
+- `[~] U026-d-STAGE4` (copying_scripts band dead, kept for total_stages=4 fidelity) and `[≠] U026-ZEPKEY` /
+  `[≠] U025-TRACEBACK` are pre-recorded sub-leaf statuses, unchanged; none is a portable-feature skip.
+- Tests (non-vacuous, all green): `prepare_missing_simulation_id_400`, `prepare_sim_not_found_404`,
+  `prepare_already_prepared_short_circuit`, `prepare_project_missing_requirement_400`,
+  `prepare_happy_returns_preparing_with_task` — all 5 route branches exercised.
+
+### S-809 · `POST /prepare/status` · prepare_status_route (simulation.rs:959) ← simulation.py:642-752
+**PASS — full branch tree faithful, status envelope byte/shape-identical.**
+- Refutation attempted: checked whether teri collapses the two `check_simulation_prepared` calls or reorders
+  B1-before-task_id. It does not — both checks are present and ordered exactly as Python (a sim may finish
+  between them).
+- Branch tree maps 1:1: B1 simulation_id present → check_prepared → 200 ready/progress:100/already_prepared:true
+  (py:679-692 → rs:970-984); B2a task_id absent + simulation_id present → 200 not_started/progress:0
+  (py:696-707 → rs:990-1002); B2b neither → 400 requireTaskOrSimId (py:708-711 → rs:1004-1007); B3a task gone +
+  simulation_id now prepared → 200 ready/task_id/already_prepared:true (py:716-732 → rs:1016-1031), else 404
+  taskNotFound (py:734-737 → rs:1033-1036); B3b task found → to_dict + already_prepared:false (py:739-744 →
+  rs:1038-1045).
+- `task.to_dict()` (teri src/task.rs:164-178) is BYTE-faithful to Python Task.to_dict (models/task.py:39-53):
+  same 11 keys in the same order — `task_id, task_type, status, created_at, updated_at, progress, message,
+  progress_detail, result, error, metadata`; `status.as_str()`≡`status.value`; `python_isoformat()`≡`.isoformat()`.
+- Tests (all green): `prepare_status_neither_id_400` (B2b), `prepare_status_sim_not_prepared_not_started`
+  (B2a), `prepare_status_sim_prepared_ready` (B1), `prepare_status_task_found_returns_to_dict` (B3b),
+  `prepare_status_task_gone_no_sim_404` (B3a-else), `prepare_status_b1_precedes_task_id_when_prepared`
+  (ordering guard) — every branch covered.
+
+### S-812 · `GET /history` · get_simulation_history (simulation.rs:625, registered :124) ← simulation.py:877-987
+**PASS — 25-key enrichment order + report_id semantics byte-faithful.**
+- Refutation attempted: the strongest refutation candidate was the report_id helper — Python
+  `_get_report_id_for_simulation` returns the NEWEST report by `created_at` DESC, and teri's
+  `ReportManager::get_report_by_simulation` would return FIRST-in-fs-order (divergent for multi-report sims).
+  teri AVOIDS that trap by using `list_reports(Some(sim_id),1).first()` which sorts created_at DESC (same stable
+  sort as Python) → byte-faithful "newest report_id" (rs:724-728). No divergence.
+- Enrichment maps 1:1: limit default 20 (py:912 → rs:632), list ALL sims [:limit] (py:914-915 → rs:635/644),
+  config block simulation_requirement/total_simulation_hours + recommended_rounds=int(tsh*60/max(mpr,1))
+  (py:923-936 → rs:653-683), run-state block current_round/runner_status/total_rounds with idle/0/recommended
+  fallback (py:939-948 → rs:686-701), files[:3] {filename or "未知文件"} else [] (py:951-958 → rs:705-720),
+  report_id newest-or-null (py:961 → rs:724-729), version "v1.0.2" (py:964 → rs:732), created_date=created_at[:10]
+  (py:967-971 → rs:736-741), envelope `{success, data, count:len}` (py:975-979 → rs:748-752).
+- Key order: `history_key_order_preserved` asserts the EXACT 25-key Python dict-insertion order with
+  `current_round` UPDATED in place at pos 12 (IndexMap/preserve_order semantics ≡ Python `dict[k]=v`).
+- `[~] U026-m-NEGLIMIT` (negative ?limit → default 20; non-contractual, U-025 precedent) and `[!] U026-m-LIVEDATA`
+  (enrichment reads real on-disk state → faithful empty-run snapshot until producers U-028/029/030 land; same
+  read path flips to richer values automatically) are pre-recorded sub-leaf statuses — neither is a
+  portable-feature skip; the empty-run snapshot is the correct no-live-producer behavior.
+- Tests (all green): `history_empty_no_sims`, `history_single_sim_defaults`,
+  `history_with_config_recommended_rounds`, `history_recommended_rounds_truncates`,
+  `history_key_order_preserved`, `history_limit_caps_results`, `history_bad_limit_falls_back_to_default`,
+  `history_project_files_capped_and_defaulted`.
+
+**Summary:** 3/3 routes flip `[x]`. S-808 route contract faithful with the `[!] U026-d-GRAPHREQ` graph-required
+path confirmed as an HONEST producer-frontier gap (records a FAILED task, never a silent success). No disguised
+feature-skips, no narrowing, no `[≠]` over-flips. Ledger-only; no Rust modified.
