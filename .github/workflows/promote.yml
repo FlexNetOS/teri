@@ -1,0 +1,64 @@
+name: Promote develop → main
+
+# Promotes the green develop tip to main. The pipeline everywhere else is
+# push → PR → self-merge on green; main is the released line, so promotion is
+# deliberate: trigger it by hand (workflow_dispatch) or let the weekly schedule
+# fast-forward main once develop is verified. develop is the integration branch
+# and is always a strict ancestor-or-ahead of main, so the promotion is a
+# fast-forward — never a divergent merge.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly promotion window (Mondays 07:00 UTC) — only acts if develop is ahead AND verifies clean.
+    - cron: "0 7 * * 1"
+
+concurrency:
+  group: promote-main
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Re-verify the develop tip independently before it becomes main — belt-and-suspenders
+  # on top of the CI that already gated every PR into develop.
+  verify:
+    name: Verify develop tip
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features --verbose
+
+  promote:
+    name: Fast-forward main → develop
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fast-forward main to the verified develop tip
+        run: |
+          git fetch origin main develop
+          if [ "$(git rev-parse origin/main)" = "$(git rev-parse origin/develop)" ]; then
+            echo "main is already at develop ($(git rev-parse --short origin/develop)) — nothing to promote."
+            exit 0
+          fi
+          git checkout main
+          # --ff-only refuses to promote if develop has diverged from main (it never should);
+          # that refusal is the safety valve, not an error to paper over.
+          git merge --ff-only origin/develop
+          git push origin main
+          echo "Promoted main → $(git rev-parse --short HEAD)"
