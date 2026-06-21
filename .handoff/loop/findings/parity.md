@@ -4398,3 +4398,55 @@ mutation mechanism = legitimate `[≠]U028-SUBPROCESS-RUNNER` (shared with S-875
 **S-934 FLIPPED [x].** This closes the LAST bucket-3 TO-PORT symbol. **U-028/U-029/U-030 units STAY [ ]**
 — the remaining gate is the COMPOSITE run-coroutines S-877[~]/S-904/S-938/S-939/S-940 (full coroutine
 contract differential proof = cycle D), then the unit flips (cycle E). No over-flip.
+
+---
+
+## 2026-06-20 — PARITY VERDICT: S-938 / S-939 / S-940 (parallel sim coroutines, U-030 cycle D)
+
+Differential code-pass (no live LLM; both sides re-derived from source). Source X:
+`MiroFish/backend/scripts/run_parallel_simulation.py`. Rust Y:
+`.worktrees/mirofish-port/teri/src/{sim/mod.rs,services/simulation_runner.rs,api/{mod,simulation}.rs}`.
+
+### S-938 run_twitter_simulation (X:1101-1290) / S-939 run_reddit_simulation (X:1293-1489)
+| Sub-behavior | Verdict | X cite | Y cite |
+|---|---|---|---|
+| LLM selection: twitter use_boost=False / reddit use_boost=True | [x] | X:1130 / X:1322, create_model X:984-1037 | sim/mod.rs:1027-1043 (Reddit→boost, twitter+all-no-boost→llm); api/mod.rs:265-283 build_boost_llm |
+| boost fallback: empty boost_api_key → general LLM; base/model fall back | [x] | X:998-1016 | api/mod.rs:266-282 (empty key→None; base/model fall back to config.llm) |
+| run() None-boost == all-main (no-downgrade-of-Y) | [x] | n/a | sim/mod.rs:816-825 run() delegates run_with_boost(...,None) |
+| total_rounds = (hours*60)//mpr, max_rounds truncation | [x] | X:1214-1224 / X:1413-1423 | sim/mod.rs:399-433 from_simulation_config |
+| round-0 initial_posts: log+count EVERY post, skip unresolvable | [x] | X:1180-1207 / X:1371-1406 | sim/mod.rs:891-942 (per-post route by user_id, count, skip miss) |
+| round loop: round_start every round; empty round→round_end(+1,0) | [x] | X:1244-1251 | sim/mod.rs:984-996, 1095-1106 |
+| per-round action records (type/args/agent_id/name) | [x] | X:1262-1275 | sim/mod.rs:1066-1093 (platform-routed, oasis_action_type/args) |
+| simulation_end(total_rounds,total_actions) | [x] | X:1284 | sim/mod.rs:1131-1137 |
+| per-platform OASIS env setup + DB-poll action enrichment | [≠]U028-OASIS-INTERNALS / [≠]U030-UNIFIED-LOOP | X:1155-1162,1257 | challenged: no OASIS DB in Y; structural records ARE emitted; world-injection of round-0 posts is the only non-reproduced effect (substrate). Genuinely inexpressible. SURVIVES. |
+| round-0 dup-agent: twitter overwrite vs reddit list-append | [≠] non-contractual | X:1187 vs X:1378-1389 | challenged: affects ONLY OASIS env.step world-injection; the actions.jsonl record+count stream is IDENTICAL across platforms (log is per-post, pre-dedup). Unobservable in Y's contract. SURVIVES. |
+
+**S-938 FLIP-OK. S-939 FLIP-OK.** Dual-env→unified-pool collapse preserves per-platform agent identity
+(SocialProfile.platform + user_id held once per platform) and per-platform action routing (action lands
+in the committing agent's platform logger). No per-platform behavior silently lost.
+
+### S-940 main (X:1492-1650)
+| Sub-behavior | Verdict | X cite | Y cite |
+|---|---|---|---|
+| asyncio.gather(twitter,reddit) → unified SimEngine over unioned pool | [x] | X:1585-1589 | api/simulation.rs:2147-2153 (parallel dual-logger), sim/mod.rs:945-1122 unified loop |
+| twitter_only / reddit_only single-platform paths | [x] | X:1579-1582 | api/simulation.rs:2147-2151 single set; runner parallel=!twitter|reddit (1200) |
+| wait-for-commands loop until shutdown / close_env / disconnect | [x] | X:1614-1624 | simulation_runner.rs:1613-1629 run_sim_body loop |
+| process_commands dispatch: interview/batch→true, close_env→false | [x] | X:560-601 | simulation_runner.rs:1647-1686 dispatch_command |
+| parallel selects ParallelIPCHandler vs IPCHandler | [x] | X:1604-1610 | simulation_runner.rs:1662-1684 (parallel ? *_parallel : single-env) |
+| ParallelIPCHandler.handle_interview: platform→single; none→both; success_count>0; joined errors; 没有可用的模拟环境 | [x] | X:345-414 | simulation_runner.rs:1920-1974 execute_interview_parallel |
+| _interview_single_platform: env-unavail→error_map; unknown id→error_map; {platform,error} shape | [x] | X:317-343 | simulation_runner.rs:1875-1909 |
+| handle_batch_interview: per-item platform default-fallback; no-platform→both; ≥1-resolved guard; null record; {platform}_{agent_id} key; 没有成功的采访 | [x] | X:416-515 | simulation_runner.rs:1986-2097 (execute_batch_interview_parallel + collect_platform_batch + interview_result_null) |
+| distinct error strings (parallel 没有成功的采访 vs single 没有有效的Agent vs 没有可用的模拟环境) | [x] | X:514 / X:1805(single) / X:376 | simulation_runner.rs:2026 / 1805 / 1944 |
+| two-platform interview concurrency (asyncio.gather) | [≠] non-contractual | X:399 | challenged: Y runs platforms sequentially (1951-1962) but produces byte-identical {platforms:{...}} map, order, success_count, joined errors. IPC reply is single buffered response — no streaming/incremental contract. Concurrency is unobservable perf. SURVIVES. |
+| unknown command_type → "未知命令类型" | [≠] structural | X:599-601 | challenged: unreachable in Y — IPCCommand::from_dict rejects unknown type at deserialize (earlier, equivalent rejection). No observable downgrade. SURVIVES. |
+| asyncio.run/signal/setup_signal_handlers/SIGTERM/killpg entrypoint shell | [≠]U028-SUBPROCESS | X:1653-1699 | challenged: in-proc cooperative shutdown (AtomicBool) + terminate_handle grace-then-abort (1114-1138) reproduces the observable graceful-stop window; OS process/pgid/signals genuinely inexpressible. SURVIVES. |
+
+**S-940 FLIP-OK.** Orchestration logic (gather→unified loop, wait-for-commands, dual-platform IPC
+dispatch) fully ported; only the asyncio/process entrypoint shell + OASIS internals are justified [≠].
+
+### Coroutine-level: S-938 FLIP-OK · S-939 FLIP-OK · S-940 FLIP-OK
+No DROPPED-DOWNGRADE found. Highest-risk dual-env→single-loop collapse verified NON-narrowing: per-platform
+identity + action routing + result keying all preserved. Every [≠] survived the challenge (OASIS-internals
+inexpressible; dup-agent/concurrency non-contractual; entrypoint substrate). NOTE: result TEXT remains
+[!]-LLM-gated (same class as producer decisions) — shape/resolution/routing/error-behavior are what this
+differential proves.
