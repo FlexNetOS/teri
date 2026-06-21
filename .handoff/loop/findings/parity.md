@@ -4450,3 +4450,37 @@ identity + action routing + result keying all preserved. Every [≠] survived th
 inexpressible; dup-agent/concurrency non-contractual; entrypoint substrate). NOTE: result TEXT remains
 [!]-LLM-gated (same class as producer decisions) — shape/resolution/routing/error-behavior are what this
 differential proves.
+
+---
+
+## 2026-06-20 — U-022 residual SimulationRunner methods (S-609,618,623,628–635) — REUSE-Y verify pass
+
+Differential, static code-diff + ran teri's existing parity tests (`cargo test --features sqlite`,
+11/11 pass). Source: `MiroFish/backend/app/services/simulation_runner.py`. Port:
+`.worktrees/mirofish-port/teri/src/{services/simulation_runner.rs, services/simulation_ipc.rs, api/simulation.rs}`.
+
+| Symbol | Python | Verdict | Rust | Note |
+|---|---|---|---|---|
+| S-609 get_run_state | py:231 | [x] REUSE-Y | runner.rs:1034 | in-mem `runs` clone → fallback `load_run_state` (disk) — mirrors `_load_run_state` |
+| S-618 _read_actions_from_file | py:825 | [x] REUSE-Y (minor) | runner.rs:5627 | event_type/agent_id skip, platform/agent/round filters, field defaults match. Narrow filter edge: when a record carries a concrete platform≠filter while default==something else, Rust `record!=pf && default!=pf` keeps it where Python skips — only triggers on cross-platform records in a per-platform file (not hit in practice) |
+| S-623 cleanup_simulation_logs | py:1103 | [x] REUSE-Y | runner.rs:1454 | identical file list + twitter/reddit/actions.jsonl + in-mem removal; success/cleaned_files/errors shape matches (error *string* differs: `name: e` vs CJK `删除 x 失败` — non-contractual) |
+| S-628 check_env_alive | py:1374 | [x] REUSE-Y | runner.rs:5301 → ipc.rs:1047 | delegates to IPC client; `[≠]` env_status.json file-read replaced by in-proc AtomicBool (S-483) — correct (in-process IPC, no cross-proc file). Test: check_env_alive_reflects_start_and_stop |
+| S-629 get_env_status_detail | py:1392 | [x] REUSE-Y | runner.rs:5382 | reads env_status.json, default `{stopped,false,false,null}` on absent/invalid; field-by-field `.get()` defaults match. Test: env_status_reads_env_status_json |
+| S-630 interview_agent | py:1428 | [x] REUSE-Y | runner.rs:5317, route api:2932 | **timeout 60s parity** (route `parse_timeout(...,60.0)`). env-alive guard hoisted to route (→400 envNotRunning); `{success,agent_id,prompt,result/error,timestamp}` shape via shape_interview_result. IPC send_interview conditional platform key matches `if platform:` |
+| S-631 interview_agents_batch | py:1492 | [x] REUSE-Y | runner.rs:5340, route api:2983 | **timeout 120s parity**. per-item agent_id/prompt/platform validation, env-alive gate, interviews_count shape all mirror Python |
+| S-632 interview_all_agents | py:1551 | [x] REUSE-Y | runner.rs:5434, route api:3063 | reads simulation_config.json agent_configs, builds `{agent_id,prompt}` list, delegates to batch. **timeout 180s parity** (Python default 180.0 — NOT 120; route uses 180.0). Missing-config/empty-agents → Err. Test: interview_all_valid_but_no_env_400 |
+| S-633 close_simulation_env | py:1611 | [x] REUSE-Y (bounded [≠]) | runner.rs:5361, route api:3234 | timeout 30s parity; graceful-TimeoutError→200 verbatim CJK literal RESOLVED at route. Bounded `[≠] U026-l-ALREADYCLOSED`: Python's `not check_env_alive()` → `{success,message:"环境已经关闭"}` early-return is not produced (teri always sends) — non-contractual short-circuit, normal-close shape preserved; producer-pending regardless |
+| S-634 _get_interview_history_from_db | py:1659 | [x] REUSE-Y (DB is the known [≠]) | runner.rs:5489 (feature=sqlite) | SAME schema: `SELECT user_id,info,created_at FROM trace WHERE action='interview' [AND user_id=?] ORDER BY created_at DESC LIMIT ?`; info JSON → response/prompt, raw-fallback. The DB itself (twitter/reddit_simulation.db) = the producer-pending `[≠]U028-OASIS-INTERNALS` gap (teri has no OASIS world DB yet) — the READER is fully ported. Test: interview_history_populated_from_sqlite (real trace table) |
+| S-635 get_interview_history | py:1717 | [x] REUSE-Y | runner.rs:5586 (feature=sqlite), route api:3107 | platform→[twitter,reddit] default, per-platform db_path, DESC sort, multi-platform>limit truncation. Non-sqlite build: HONEST 500 if DB present (GAP-U026-SOCIALDB), faithful empty if absent — never silent-empty downgrade |
+
+### Summary
+- **[x] REUSE-Y FLIP-OK (11/11):** S-609, S-618, S-623, S-628, S-629, S-630, S-631, S-632, S-633, S-634, S-635.
+- **MISSING — needs port: NONE.** No method is unported/rubber-stamped. `interview_all_agents` and `get_interview_history` have REAL teri equivalents (profiles-read + batch-delegate; multi-platform DB read + sort/truncate), not partials.
+- **Bounded [≠] (do not flip to a downgrade):**
+  - S-634/635 SQLite `trace` DB read: faithful reader; the `*_simulation.db` PRODUCER is the known `[≠]U028-OASIS-INTERNALS` gap (teri has no relational OASIS world DB). Inexpressible TODAY, not a lazy drop — the non-sqlite path 500s honestly rather than silently emptying.
+  - S-628 env-alive: `env_status.json` file-read → in-proc AtomicBool (correct for in-process IPC; no cross-proc file exists to read).
+  - S-633 already-closed short-circuit: non-contractual (close still sends; normal shape preserved).
+- **Timeouts verified:** interview_agent 60s, batch 120s, interview_all 180s (source default, NOT the 120s in the task note), close_env 30s — all mirrored at the route `parse_timeout` defaults and IPC send methods.
+- **Architectural note (not a divergence):** Python's per-method `check_env_alive()→ValueError` guard is HOISTED to the route layer (→400 envNotRunning) in teri; runner methods are thinner but the observable end-to-end contract holds. Verified via the route tests.
+
+**VERDICT: PASS — 11/11 symbols REUSE-Y FLIP-OK. Zero MISSING. Flip S-609,618,623,628–635 to [x].**
