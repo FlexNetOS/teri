@@ -695,7 +695,9 @@ async fn chat_route(
     // load_entity_reader_graph applies the ZEP guard (inherited [≠] U026-ZEPKEY).
     let graph = load_entity_reader_graph(&state, &graph_id).await?;
     let llm = crate::api::build_llm(&state.config);
-    let tools = ReportTools::new(&graph, &llm);
+    // U-024: thread the live SimulationRunner so `interview_agents` can reach the
+    // batch-interview IPC seam (the SAME runner instance holds the live sims).
+    let tools = ReportTools::with_runner(&graph, &llm, Some(&state.sim_runner));
     let manager = report_manager(&state);
     let agent =
         crate::report::ReportAgent::new_react(&graph_id, &simulation_id, &simulation_requirement);
@@ -794,6 +796,11 @@ fn spawn_report_generation(
     llm: OpenAiAdapter,
     graph: KnowledgeGraph,
     upload_folder: String,
+    // U-024: owned `Arc` clone of the live runner, moved into the detached worker
+    // thread (a borrow cannot cross the `'static` thread boundary).
+    runner: Option<
+        std::sync::Arc<crate::services::simulation_runner::SimulationRunner<OpenAiAdapter>>,
+    >,
 ) {
     // Capture locale before spawning (report.py:125), re-apply in the thread.
     let locale = crate::i18n::get_locale();
@@ -817,6 +824,7 @@ fn spawn_report_generation(
                 llm,
                 graph,
                 upload_folder,
+                runner,
             )
             .await;
         }));
@@ -837,6 +845,11 @@ pub(crate) async fn report_generate_worker(
     llm: OpenAiAdapter,
     graph: KnowledgeGraph,
     upload_folder: String,
+    // U-024: optional live runner for interview_agents IPC. `None` in tests that
+    // drive the worker directly without an `ApiState` runner.
+    runner: Option<
+        std::sync::Arc<crate::services::simulation_runner::SimulationRunner<OpenAiAdapter>>,
+    >,
 ) {
     use crate::task::{TaskManager, TaskStatus};
 
@@ -854,7 +867,9 @@ pub(crate) async fn report_generate_worker(
     // Step 2-4: build agent + tools + manager + sink, generate (report.py:139-157).
     let mut agent =
         crate::report::ReportAgent::new_react(&graph_id, &simulation_id, &simulation_requirement);
-    let tools = ReportTools::new(&graph, &llm);
+    // U-024: bind the live runner (if any) so the ReACT loop's interview_agents
+    // tool reaches the batch-interview IPC seam.
+    let tools = ReportTools::with_runner(&graph, &llm, runner.as_deref());
     let manager = ReportManager::new(&upload_folder);
     let mut sink = TaskUpdateSink { task_id: task_id.clone() };
     let report = agent
@@ -1001,6 +1016,8 @@ async fn generate_report_route(
         llm,
         graph,
         state.config.upload_folder.clone(),
+        // U-024: pass the live runner so the generate ReACT loop can interview agents.
+        Some(state.sim_runner.clone()),
     );
 
     // Step 12: immediate response (report.py:182-192).
@@ -2172,6 +2189,7 @@ mod tests {
             llm,
             graph,
             state.config.upload_folder.clone(),
+            None,
         )
         .await;
         let task = crate::task::TaskManager::global().get_task(&task_id).expect("task");

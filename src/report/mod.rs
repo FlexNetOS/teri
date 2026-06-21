@@ -728,7 +728,7 @@ impl ReportAgent {
     /// * `tools` — `ReportTools` bound to the graph; provides `get_simulation_context`.
     /// * `llm`   — LLM client; `chat_json` is called with temperature=0.3.
     /// * `progress` — optional callback: `(stage: &str, pct: u32, msg: &str)`.
-    pub async fn plan_outline<L: LlmClient>(
+    pub async fn plan_outline<L: LlmClient + Send + Sync + 'static>(
         &self,
         tools: &ReportTools<'_, L>,
         llm: &L,
@@ -955,7 +955,7 @@ impl ReportAgent {
     // The signature is mandated by the port contract (mirrors Python's parameter list).
     // Sub-cycle (h) will wrap this in a higher-level API.
     #[allow(clippy::too_many_arguments)]
-    pub async fn generate_section_react<L: LlmClient>(
+    pub async fn generate_section_react<L: LlmClient + Send + Sync + 'static>(
         &self,
         section: &ReportSection,
         outline: &ReportOutline,
@@ -1243,14 +1243,16 @@ impl ReportAgent {
                     );
                 }
 
-                let result = tools.execute_by_name(
-                    &call.name,
-                    &call.parameters,
-                    &self.graph_id,
-                    &self.simulation_id,
-                    &self.simulation_requirement,
-                    &report_context,
-                );
+                let result = tools
+                    .execute_by_name_async(
+                        &call.name,
+                        &call.parameters,
+                        &self.graph_id,
+                        &self.simulation_id,
+                        &self.simulation_requirement,
+                        &report_context,
+                    )
+                    .await;
                 // (g1): log_tool_result
                 if let Some(l) = self.report_logger.as_ref() {
                     l.log_tool_result(
@@ -1632,7 +1634,7 @@ impl ReportAgent {
     ///
     /// Always returns a `Report`; the status is `Completed` on success, `Failed` on any error.
     #[allow(clippy::too_many_arguments)]
-    pub async fn generate_report<L: LlmClient>(
+    pub async fn generate_report<L: LlmClient + Send + Sync + 'static>(
         &mut self,
         tools: &crate::services::zep_tools::ReportTools<'_, L>,
         llm: &L,
@@ -2121,7 +2123,7 @@ impl ReportAgent {
     ///
     /// Runs up to 2 ReACT iterations; each iteration may execute at most 1 tool call.
     /// Returns immediately on the first iteration with no tool calls.
-    pub async fn chat<L: LlmClient>(
+    pub async fn chat<L: LlmClient + Send + Sync + 'static>(
         &self,
         tools: &crate::services::zep_tools::ReportTools<'_, L>,
         llm: &L,
@@ -2239,17 +2241,19 @@ impl ReportAgent {
                 if tool_calls_made.len() >= MAX_TOOL_CALLS_PER_CHAT {
                     break;
                 }
-                let raw_result = tools.execute_by_name(
-                    &call.name,
-                    &call.parameters,
-                    &self.graph_id,
-                    &self.simulation_id,
-                    &self.simulation_requirement,
-                    // report_context is not used by the chat variant in Python — pass a
-                    // minimal context string (execute_by_name's internal branches use it
-                    // only when non-empty; chat passes "" in Python via positional default).
-                    "",
-                );
+                let raw_result = tools
+                    .execute_by_name_async(
+                        &call.name,
+                        &call.parameters,
+                        &self.graph_id,
+                        &self.simulation_id,
+                        &self.simulation_requirement,
+                        // report_context is not used by the chat variant in Python — pass a
+                        // minimal context string (the internal branches use it only when
+                        // non-empty; chat passes "" in Python via positional default).
+                        "",
+                    )
+                    .await;
                 // Truncate result to 1500 CHARS (CJK-safe — report_agent.py:1855).
                 let result: String = {
                     let char_count = raw_result.chars().count();
@@ -2522,7 +2526,7 @@ mod tests {
     }
 
     // Helper: build an empty KnowledgeGraph + ReportTools fixture.
-    fn make_tools_fixture<'g, L: LlmClient>(
+    fn make_tools_fixture<'g, L: LlmClient + Send + Sync + 'static>(
         graph: &'g crate::graph::KnowledgeGraph,
         llm: &'g L,
     ) -> crate::services::zep_tools::ReportTools<'g, L> {

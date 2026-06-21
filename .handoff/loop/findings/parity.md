@@ -4652,3 +4652,118 @@ The separator set includes 3-byte CJK punctuation `。！？`. Cases d, i, k (CJ
 `cargo test -p teri --lib seed::text_processor` → **20 passed, 0 failed** (after throwaway harness removed). Tracked Rust unchanged (`git diff src/seed/text_processor.rs` empty).
 
 **No divergence. No `[≠]` needed.** S-069 is a faithful reuse-Y port → `[x]`.
+
+---
+
+## Cycle 67 — U-024 `interview_agents` leaf wiring + DTO widening (2026-06-21)
+
+**Verifier:** rust-port-parity gate (adversarial / fail-closed). Source X = MiroFish
+`zep_tools.py` (`interview_agents` 1272-1482, `AgentInterview` 285-340, `InterviewResult`
+341-398, helpers 1484-1763) + `report_agent.py` (dispatch 1008-1021). Port Y = teri worktree
+`port/mirofish`.
+
+### Gates (re-run in Y's context)
+- `cargo test --lib` → **1544 passed; 0 failed; 0 ignored** (raw `test result: ok.`).
+- `cargo clippy --all-targets` → **0 warnings** (exit 0, Finished clean).
+- `cargo fmt --check` → **clean** (exit 0).
+
+### What I tried to REFUTE, and whether it survived
+
+1. **DTO widening (the hidden `[≠]`→PORTED).** Diffed both dataclasses field-for-field.
+   - `AgentInterview`: 6 fields `{agent_name, agent_role, agent_bio, question, response,
+     key_quotes}` — Rust struct + `to_dict` key names/order IDENTICAL; `to_text` assembly
+     (`**name** (role)`, `_简介: …_`, `**Q:**`/`**A:**`, `关键引言` block) IDENTICAL.
+   - `InterviewResult`: 8 fields — Rust struct + `to_dict` (8 keys, same order incl.
+     `interviews:[i.to_dict()]`) + `to_text` skeleton (`## 深度采访报告`, `**采访主题:**`,
+     `**采访人数:** {x} / {y} 位模拟Agent`, `### 采访对象选择理由`, `\n---`, `### 采访实录`,
+     `#### 采访 #{i}: {name}`, `### 采访摘要与核心观点`, `（自动选择）`/`（无采访记录）`/`（无摘要）`)
+     IDENTICAL. The prior narrowed `{agent_interviews,questions,responses}` shape is GONE.
+   - **Differential run:** Python golden vs Rust for `AgentInterview.to_text` key-quote edge
+     cases (`问题3` skip, `<10`-char drop, `>150` hard `[:147]+...`, `。`-after-80 truncation,
+     leading-punct + quote-char strip) → **byte-identical** (temp test, since removed).
+     **SURVIVED → `[x]`.**
+
+2. **Key-quote extraction + tool-call cleaning (the regex-fragile core).** The shipped tests
+   did NOT cover Strategy-1/2 or the cleaning regexes, so I drove a fresh Python-golden vs
+   Rust differential over 6+4 adversarial inputs (happy multi-sentence sort-by-len-desc,
+   tool_name-JSON strip, Strategy-2 paired-quote fallback, all-short→[], markdown/heading
+   noise strip, 20-char boundary; clean: passthrough / head-`tool_name` check / `arguments`
+   unwrap / malformed-JSON `"content"` regex fallback w/ `\n`+`\"` unescape). **All matched
+   Python byte-for-byte.** SURVIVED → `extract_key_quotes` + `clean_tool_call_response` `[x]`.
+
+3. **10-step body fidelity.** Walked Python line-by-line vs Rust: req `[:50]` char-slice,
+   `InterviewResult(topic, custom or [])`, profile load + empty-guard early-return
+   (`未找到可采访的Agent人设文件`), `total_agents`, select (temp 0.3 + valid-index filter +
+   `使用默认选择策略` fallback), questions (temp 0.5, present-but-empty vs absent default,
+   3-item fallback), `INTERVIEW_PROMPT_PREFIX` (verbatim 6-rule CJK const) + numbered combined
+   prompt, batch dispatch w/ **180.0s** explicit timeout (not 120 default), `success` mapping,
+   `api_result.success==false`→`采访API调用失败：…请检查OASIS模拟环境状态。`, dual-platform parse
+   (`【Twitter平台回答】`/`【Reddit平台回答】`, `（该平台未获得回复）`), `agent_bio[:1000]`,
+   `key_quotes[:5]`, `interviewed_count`, summary (temp 0.3/max 800, locale-aware
+   `quote_instruction`, `"".join` no-sep, `共采访了…位受访者，包括：` fallback). ALL present and
+   faithful. The Chinese system/user prompt literals were compared verbatim. SURVIVED → `[x]`.
+
+4. **Exception ladder mapping.** Python `except ValueError` (env-not-running) → Rust
+   `Err(TeriError::Sim(msg))` → `采访失败：{msg}。模拟环境可能已关闭，请确保OASIS环境正在运行。`;
+   Python `except Exception` → Rust `Err(e)` (other) → `采访过程发生错误：{e}`. The in-band
+   `success==false` path is distinct from a thrown error in both. FAITHFUL.
+   - **Adjudicated non-divergence:** Rust `success = status==Completed && error.is_none()`.
+     Python `success = (status.value=="completed")` only (never reads error in the completed
+     branch). The extra `&& error.is_none()` is DEFENSIVE REDUNDANCY: the IPCResponse factories
+     (`simulation_ipc.rs:1197/1218`) construct Completed⇒error:None and Failed⇒error:Some as
+     mutually exclusive, so the extra clause is unreachable-to-falsify → non-contractual → `[x]`.
+
+5. **Path-base `[≠]` candidate (architecture risk flag).** Python `_load_agent_profiles` uses
+   `{module}/../../uploads/simulations/{sim}` and `interview_agents_batch` uses
+   `RUN_STATE_DIR = {module}/../../uploads/simulations`. CONFIRMED both Python paths resolve to
+   the SAME directory (`simulation_runner.py:208-211`). Rust unifies both onto
+   `runner.sim_data_dir()` (default `./uploads/simulations`). Same effective files →
+   non-contractual → NOT a `[≠]`, it's `[x]`.
+
+6. **Seam additive / Y-not-regressed.** `new(graph, llm)` delegates to
+   `with_runner(…, None)` byte-compatibly — all 4 `::new` callers + ~30 tests unchanged
+   (proven by 1544 green). Live routes (`report.rs:700,872`) use
+   `with_runner(…, Some(&state.sim_runner))`; debug routes (`517,551`) + test helper
+   (`report/mod.rs:2533`) stay on `new`. Type `Option<&SimulationRunner<L>>` UNIFIES (L =
+   OpenAiAdapter; build passes). Async dispatch: `execute_by_name_async` intercepts ONLY
+   `interview_agents`, delegates the other 6 tools to sync `execute_by_name` (no behavior
+   change, no needless `.await`). Both production sites (`report/mod.rs:1247,2245`) are inside
+   `async fn` → no Send regression (only `&self`/`&runner`/`&llm` held across await; runner's
+   `runs.lock().await` dropped before return). **Y-not-regressed: YES.**
+
+7. **Producer-pending path.** With `runner: None` (sync `execute_inner` arm) → honest `Err` →
+   `execute` wraps as the tolerated `工具执行失败: {e}`. With a runner but env-not-running →
+   `Err(TeriError::Sim)` → `采访失败：…` summary inside an `Ok(result)` (NOT a panic, NOT a
+   silent empty success). The async wrapper's tool-failure branch also yields `工具执行失败: {e}`.
+   The terminal live-IPC call remains **producer-pending** (`[!] U-024-PROD-PENDING`): full
+   logic ported, live data flips when the IPC producer (U-026-k) lands. This is path-proven,
+   NOT a downgrade.
+
+### i18n hygiene note (non-blocking)
+Duplicate `loadedProfiles` key in `i18n/locales/{en,zh}.json` (line 559 from a prior unit,
+line 648 from U-024). JSON last-wins → the U-024 value (`加载到 {count} 个Agent人设`) is the
+effective one. Console log strings are non-contractual; no observable parity impact. Recommend
+the porter de-dup line 648 vs 559 in a follow-up, but it does NOT block this unit.
+
+### Per-symbol verdict
+| Symbol | Verdict | Evidence |
+|---|---|---|
+| `AgentInterview` (widened DTO + to_dict/to_text) | **[x]** | field/key/order + to_text byte-diff vs Python golden |
+| `InterviewResult` (widened DTO + to_dict/to_text) | **[x]** | 8 fields, skeleton headers byte-identical |
+| `ReportTools::load_agent_profiles` | **[x]** | reddit-json/twitter-csv guards + field map faithful; same sim_data_dir base |
+| `ReportTools::clean_tool_call_response` | **[x]** | differential: passthrough/head-check/unwrap/regex-fallback match Python |
+| `ReportTools::select_agents_for_interview` | **[x]** | temp 0.3, valid-index filter, `使用默认选择策略` fallback, verbatim prompts |
+| `ReportTools::generate_interview_questions` | **[x]** | temp 0.5, present-vs-absent default, 3-item fallback, verbatim prompts |
+| `ReportTools::generate_interview_summary` | **[x]** | temp 0.3/max 800, locale quote_instruction, `""`-join, fallback |
+| `extract_key_quotes` (inline body helper) | **[x]** | differential Strategy-1/2 + 5 cleaning regexes match Python golden |
+| `ReportTools::interview_agents` (10-step async leaf) | **[x]** logic; **[!]** live-IPC producer-pending | full body faithful; terminal call env-not-running until U-026-k |
+| `ReportTools::with_runner` / `new` seam | **[x]** | additive; `new`=`with_runner(None)`; 1544 green, type unifies |
+| `execute_by_name_async` dispatch | **[x]** | intercepts only interview_agents, delegates others; tolerated `工具执行失败:` |
+| `SimulationRunner::sim_data_dir` accessor | **[x]** | exposes private field; used by profile load |
+| Route wiring (`report.rs` live sites + `report/mod.rs` `.await`) | **[x]** | live routes `with_runner(Some)`, debug stay `new`, no Send regression |
+
+### VERDICT: **PASS** (logic-complete, producer-pending on the terminal IPC call)
+13/13 symbols `[x]` for ported behavior; the single `interview_agents` terminal IPC call is
+`[!] U-024-PROD-PENDING` (path-proven, returns env-not-running until the live producer lands —
+tracked, reasoned, NOT a skip). Y-not-regressed: **YES** (1544/0, additive seam). No
+disguised-skip `[≠]`; the DTO-widening `[≠]` was a hidden downgrade now CORRECTED and verified.

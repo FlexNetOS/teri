@@ -378,26 +378,26 @@
 - [ ] S-276 · `unit:U-017` · `field` · `PanoramaResult.historical_count` · `zep_tools.py:235`
 - [ ] S-277 · `unit:U-017` · `method` · `PanoramaResult.to_dict` · `zep_tools.py:237`
 - [ ] S-278 · `unit:U-017` · `method` · `PanoramaResult.to_text` · `zep_tools.py:250`
-- [ ] S-279 · `unit:U-017` · `type` · `AgentInterview` · `zep_tools.py:285`
-- [ ] S-280 · `unit:U-017` · `field` · `AgentInterview.agent_name` · `zep_tools.py:287`
-- [ ] S-281 · `unit:U-017` · `field` · `AgentInterview.agent_role` · `zep_tools.py:288`
-- [ ] S-282 · `unit:U-017` · `field` · `AgentInterview.agent_bio` · `zep_tools.py:289`
-- [ ] S-283 · `unit:U-017` · `field` · `AgentInterview.question` · `zep_tools.py:290`
-- [ ] S-284 · `unit:U-017` · `field` · `AgentInterview.response` · `zep_tools.py:291`
-- [ ] S-285 · `unit:U-017` · `field` · `AgentInterview.key_quotes` · `zep_tools.py:292`
-- [ ] S-286 · `unit:U-017` · `method` · `AgentInterview.to_dict` · `zep_tools.py:294`
-- [ ] S-287 · `unit:U-017` · `method` · `AgentInterview.to_text` · `zep_tools.py:304`
-- [ ] S-288 · `unit:U-017` · `type` · `InterviewResult` · `zep_tools.py:341`
-- [ ] S-289 · `unit:U-017` · `field` · `InterviewResult.interview_topic` · `zep_tools.py:346`
-- [ ] S-290 · `unit:U-017` · `field` · `InterviewResult.interview_questions` · `zep_tools.py:347`
-- [ ] S-291 · `unit:U-017` · `field` · `InterviewResult.selected_agents` · `zep_tools.py:350`
-- [ ] S-292 · `unit:U-017` · `field` · `InterviewResult.interviews` · `zep_tools.py:352`
-- [ ] S-293 · `unit:U-017` · `field` · `InterviewResult.selection_reasoning` · `zep_tools.py:355`
-- [ ] S-294 · `unit:U-017` · `field` · `InterviewResult.summary` · `zep_tools.py:357`
-- [ ] S-295 · `unit:U-017` · `field` · `InterviewResult.total_agents` · `zep_tools.py:360`
-- [ ] S-296 · `unit:U-017` · `field` · `InterviewResult.interviewed_count` · `zep_tools.py:361`
-- [ ] S-297 · `unit:U-017` · `method` · `InterviewResult.to_dict` · `zep_tools.py:363`
-- [ ] S-298 · `unit:U-017` · `method` · `InterviewResult.to_text` · `zep_tools.py:375`
+- [x] S-279 · `unit:U-017` · `type` · `AgentInterview` · `zep_tools.py:285` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
+- [x] S-280 · `unit:U-017` · `field` · `AgentInterview.agent_name` · `zep_tools.py:287` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
+- [x] S-281 · `unit:U-017` · `field` · `AgentInterview.agent_role` · `zep_tools.py:288` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
+- [x] S-282 · `unit:U-017` · `field` · `AgentInterview.agent_bio` · `zep_tools.py:289` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
+- [x] S-283 · `unit:U-017` · `field` · `AgentInterview.question` · `zep_tools.py:290` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
+- [x] S-284 · `unit:U-017` · `field` · `AgentInterview.response` · `zep_tools.py:291` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
+- [x] S-285 · `unit:U-017` · `field` · `AgentInterview.key_quotes` · `zep_tools.py:292` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
+- [x] S-286 · `unit:U-017` · `method` · `AgentInterview.to_dict` · `zep_tools.py:294` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
+- [x] S-287 · `unit:U-017` · `method` · `AgentInterview.to_text` · `zep_tools.py:304` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
+- [x] S-288 · `unit:U-017` · `type` · `InterviewResult` · `zep_tools.py:341` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
+- [x] S-289 · `unit:U-017` · `field` · `InterviewResult.interview_topic` · `zep_tools.py:346` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
+- [x] S-290 · `unit:U-017` · `field` · `InterviewResult.interview_questions` · `zep_tools.py:347` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
+- [x] S-291 · `unit:U-017` · `field` · `InterviewResult.selected_agents` · `zep_tools.py:350` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
+- [x] S-292 · `unit:U-017` · `field` · `InterviewResult.interviews` · `zep_tools.py:352` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
+- [x] S-293 · `unit:U-017` · `field` · `InterviewResult.selection_reasoning` · `zep_tools.py:355` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
+- [x] S-294 · `unit:U-017` · `field` · `InterviewResult.summary` · `zep_tools.py:357` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
+- [x] S-295 · `unit:U-017` · `field` · `InterviewResult.total_agents` · `zep_tools.py:360` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
+- [x] S-296 · `unit:U-017` · `field` · `InterviewResult.interviewed_count` · `zep_tools.py:361` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
+- [x] S-297 · `unit:U-017` · `method` · `InterviewResult.to_dict` · `zep_tools.py:363` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
+- [x] S-298 · `unit:U-017` · `method` · `InterviewResult.to_text` · `zep_tools.py:375` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
 - [ ] S-299 · `unit:U-017` · `type` · `ZepToolsService` · high-level Zep retrieval tools for ReportAgent · `zep_tools.py:401`
 - [ ] S-300 · `unit:U-017` · `field` · `ZepToolsService.MAX_RETRIES` · 3 · `zep_tools.py:422`
 - [ ] S-301 · `unit:U-017` · `field` · `ZepToolsService.RETRY_DELAY` · 2.0s · `zep_tools.py:423`
@@ -418,12 +418,12 @@
 - [ ] S-316 · `unit:U-017` · `method` · `ZepToolsService._generate_sub_queries` · `zep_tools.py:1092`
 - [ ] S-317 · `unit:U-017` · `method` · `ZepToolsService.panorama_search` · all nodes+edges classified active vs historical · `zep_tools.py:1145`
 - [ ] S-318 · `unit:U-017` · `method` · `ZepToolsService.quick_search` · `zep_tools.py:1237`
-- [ ] S-319 · `unit:U-017` · `method` · `ZepToolsService.interview_agents` · loads profiles, LLM selects agents, generates questions, calls SimulationRunner.interview_agents_batch · `zep_tools.py:1272`
-- [ ] S-320 · `unit:U-017` · `method` · `ZepToolsService._clean_tool_call_response` · `zep_tools.py:1485`
-- [ ] S-321 · `unit:U-017` · `method` · `ZepToolsService._load_agent_profiles` · reads reddit JSON or twitter CSV · `zep_tools.py:1505`
-- [ ] S-322 · `unit:U-017` · `method` · `ZepToolsService._select_agents_for_interview` · LLM selects agents · `zep_tools.py:1551`
-- [ ] S-323 · `unit:U-017` · `method` · `ZepToolsService._generate_interview_questions` · `zep_tools.py:1634`
-- [ ] S-324 · `unit:U-017` · `method` · `ZepToolsService._generate_interview_summary` · `zep_tools.py:1683`
+- [x] S-319 · `unit:U-017` · `method` · `ZepToolsService.interview_agents` · loads profiles, LLM selects agents, generates questions, calls SimulationRunner.interview_agents_batch · `zep_tools.py:1272` · **parity VERIFIED 2026-06-21 (cycle-67 U-024): logic-complete; terminal live-IPC call `[!] U-024-PROD-PENDING` until producer U-026-k lands**
+- [x] S-320 · `unit:U-017` · `method` · `ZepToolsService._clean_tool_call_response` · `zep_tools.py:1485` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
+- [x] S-321 · `unit:U-017` · `method` · `ZepToolsService._load_agent_profiles` · reads reddit JSON or twitter CSV · `zep_tools.py:1505` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
+- [x] S-322 · `unit:U-017` · `method` · `ZepToolsService._select_agents_for_interview` · LLM selects agents · `zep_tools.py:1551` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
+- [x] S-323 · `unit:U-017` · `method` · `ZepToolsService._generate_interview_questions` · `zep_tools.py:1634` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
+- [x] S-324 · `unit:U-017` · `method` · `ZepToolsService._generate_interview_summary` · `zep_tools.py:1683` · **parity VERIFIED 2026-06-21 (cycle-67 U-024)**
 
 ---
 

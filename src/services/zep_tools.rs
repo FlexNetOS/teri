@@ -42,11 +42,14 @@
 use crate::error::{Result, TeriError};
 use crate::graph::{Entity, KnowledgeGraph};
 use crate::i18n::{t, t_args};
-use crate::llm::LlmClient;
+use crate::llm::{ChatMessage, ChatOptions, LlmClient};
 use crate::services::entity_reader::KnowledgeGraphEntityReader;
+use crate::services::simulation_runner::SimulationRunner;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::path::Path;
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // DTOs — port of Python dataclasses in zep_tools.py
@@ -422,60 +425,172 @@ impl PanoramaResult {
     }
 }
 
-/// Agent profile for interviews.
+/// A single agent's interview record.
 ///
-/// Port of `AgentInterview` dataclass (`zep_tools.py:284-337`).
+/// Port of `AgentInterview` dataclass (`zep_tools.py:285-340`). The full field
+/// set (U-024 DTO-widening; the prior narrowed `{agent_id, platform, profile}`
+/// shape was a hidden `[≠]` downgrade now corrected).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentInterview {
-    pub agent_id: i64,
-    pub platform: String,
-    pub profile: serde_json::Map<String, serde_json::Value>,
+    pub agent_name: String,
+    pub agent_role: String,
+    pub agent_bio: String,
+    pub question: String,
+    pub response: String,
+    pub key_quotes: Vec<String>,
 }
 
 impl AgentInterview {
-    /// Convert to dict matching Python `to_dict()`.
+    /// Convert to dict matching Python `to_dict()` (`zep_tools.py:294-300`).
     pub fn to_dict(&self) -> serde_json::Map<String, serde_json::Value> {
         let mut m = serde_json::Map::new();
-        m.insert("agent_id".into(), self.agent_id.into());
-        m.insert("platform".into(), self.platform.clone().into());
+        m.insert("agent_name".into(), self.agent_name.clone().into());
+        m.insert("agent_role".into(), self.agent_role.clone().into());
+        m.insert("agent_bio".into(), self.agent_bio.clone().into());
+        m.insert("question".into(), self.question.clone().into());
+        m.insert("response".into(), self.response.clone().into());
+        m.insert("key_quotes".into(), serde_json::to_value(&self.key_quotes).unwrap_or_default());
         m
     }
 
-    /// Convert to text matching Python `to_text()`.
+    /// Convert to text matching Python `to_text()` (`zep_tools.py:301-340`).
+    ///
+    /// Emits bold name/role, full bio, Q/A, then a `关键引言` block with the
+    /// elaborate per-quote cleaning (strip quote chars + leading punctuation,
+    /// skip `问题{1-9}`, truncate >150 chars at first `。` after pos 80, drop
+    /// quotes shorter than 10 chars). Byte-identical output required.
     pub fn to_text(&self) -> String {
-        format!("Agent {} ({})", self.agent_id, self.platform)
+        let mut text = format!("**{}** ({})\n", self.agent_name, self.agent_role);
+        text += &format!("_简介: {}_\n\n", self.agent_bio);
+        text += &format!("**Q:** {}\n\n", self.question);
+        text += &format!("**A:** {}\n", self.response);
+        if !self.key_quotes.is_empty() {
+            text += "\n**关键引言:**\n";
+            for quote in &self.key_quotes {
+                // Clean quotes: remove unicode quote chars (curly “”, straight ",
+                // CJK corner 「」) — equivalent to Python's chained `.replace(...)`.
+                let mut clean =
+                    quote.replace(['\u{201c}', '\u{201d}', '"', '\u{300c}', '\u{300d}'], "");
+                clean = clean.trim().to_string();
+                // Strip leading punctuation.
+                while !clean.is_empty() {
+                    let first = clean.chars().next().unwrap();
+                    if "，,；;：:、。！？\n\r\t ".contains(first) {
+                        let byte_len = first.len_utf8();
+                        clean = clean[byte_len..].to_string();
+                    } else {
+                        break;
+                    }
+                }
+                // Skip quotes containing 问题1-9.
+                let skip = ('1'..='9').any(|d| clean.contains(&format!("问题{}", d)));
+                if skip {
+                    continue;
+                }
+                // Truncate >150 chars.
+                let char_count = clean.chars().count();
+                if char_count > 150 {
+                    // Find first 。 after position 80.
+                    let chars: Vec<char> = clean.chars().collect();
+                    let dot_pos = chars[80..].iter().position(|&c| c == '。').map(|p| p + 80);
+                    if let Some(pos) = dot_pos {
+                        clean = chars[..=pos].iter().collect();
+                    } else {
+                        clean = chars[..147].iter().collect::<String>() + "...";
+                    }
+                }
+                if clean.chars().count() >= 10 {
+                    text += &format!("> \"{}\"\n", clean);
+                }
+            }
+        }
+        text
     }
 }
 
-/// Result from interview_agents operation.
+/// Result from `interview_agents` operation.
 ///
-/// Port of `InterviewResult` dataclass (`zep_tools.py:340-398`).
+/// Port of `InterviewResult` dataclass (`zep_tools.py:341-398`). The full field
+/// set (U-024 DTO-widening; the prior narrowed `{agent_interviews, questions,
+/// responses}` shape was a hidden `[≠]` downgrade now corrected).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InterviewResult {
-    pub agent_interviews: Vec<AgentInterview>,
-    pub questions: Vec<String>,
-    pub responses: Vec<String>,
+    pub interview_topic: String,
+    pub interview_questions: Vec<String>,
+    pub selected_agents: Vec<serde_json::Map<String, serde_json::Value>>,
+    pub interviews: Vec<AgentInterview>,
+    pub selection_reasoning: String,
+    pub summary: String,
+    pub total_agents: i64,
+    pub interviewed_count: i64,
 }
 
 impl InterviewResult {
-    /// Convert to dict matching Python `to_dict()`.
+    /// Construct with the two eagerly-set fields (Python `InterviewResult(
+    /// interview_topic=…, interview_questions=…)`, `zep_tools.py:1310`).
+    pub fn new(interview_topic: String, interview_questions: Vec<String>) -> Self {
+        Self { interview_topic, interview_questions, ..Default::default() }
+    }
+
+    /// Convert to dict matching Python `to_dict()` (`zep_tools.py:362-379`).
     pub fn to_dict(&self) -> serde_json::Map<String, serde_json::Value> {
         let mut m = serde_json::Map::new();
+        m.insert("interview_topic".into(), self.interview_topic.clone().into());
         m.insert(
-            "agent_interviews".into(),
-            serde_json::to_value(&self.agent_interviews).unwrap_or_default(),
+            "interview_questions".into(),
+            serde_json::to_value(&self.interview_questions).unwrap_or_default(),
         );
-        m.insert("questions".into(), serde_json::to_value(&self.questions).unwrap_or_default());
+        m.insert(
+            "selected_agents".into(),
+            serde_json::to_value(&self.selected_agents).unwrap_or_default(),
+        );
+        m.insert(
+            "interviews".into(),
+            serde_json::Value::Array(
+                self.interviews.iter().map(|i| serde_json::Value::Object(i.to_dict())).collect(),
+            ),
+        );
+        m.insert("selection_reasoning".into(), self.selection_reasoning.clone().into());
+        m.insert("summary".into(), self.summary.clone().into());
+        m.insert("total_agents".into(), self.total_agents.into());
+        m.insert("interviewed_count".into(), self.interviewed_count.into());
         m
     }
 
-    /// Convert to text matching Python `to_text()`.
+    /// Convert to text matching Python `to_text()` (`zep_tools.py:380-398`).
     pub fn to_text(&self) -> String {
-        let mut lines = Vec::new();
-        for interview in &self.agent_interviews {
-            lines.push(interview.to_text());
+        let mut text_parts = vec![
+            "## 深度采访报告".to_string(),
+            format!("**采访主题:** {}", self.interview_topic),
+            format!("**采访人数:** {} / {} 位模拟Agent", self.interviewed_count, self.total_agents),
+            "\n### 采访对象选择理由".to_string(),
+            if self.selection_reasoning.is_empty() {
+                "（自动选择）".to_string()
+            } else {
+                self.selection_reasoning.clone()
+            },
+            "\n---".to_string(),
+            "\n### 采访实录".to_string(),
+        ];
+
+        if !self.interviews.is_empty() {
+            for (i, interview) in self.interviews.iter().enumerate() {
+                text_parts.push(format!("\n#### 采访 #{}: {}", i + 1, interview.agent_name));
+                text_parts.push(interview.to_text());
+                text_parts.push("\n---".to_string());
+            }
+        } else {
+            text_parts.push("（无采访记录）\n\n---".to_string());
         }
-        lines.join("\n")
+
+        text_parts.push("\n### 采访摘要与核心观点".to_string());
+        text_parts.push(if self.summary.is_empty() {
+            "（无摘要）".to_string()
+        } else {
+            self.summary.clone()
+        });
+
+        text_parts.join("\n")
     }
 }
 
@@ -495,7 +610,12 @@ impl InterviewResult {
 /// (observable contract / `[≠]` label: the bound `&KnowledgeGraph` IS the
 /// selector; `graph_id` is ignored for selection but may appear in output
 /// fields such as `get_graph_statistics["graph_id"]`).
-pub struct ReportTools<'g, L: LlmClient> {
+///
+/// # U-024 `runner` seam
+/// `L` carries the `Send + Sync + 'static` bound required by `SimulationRunner<L>`
+/// so the optional `runner` borrow can be held. All real callers (`OpenAiAdapter`)
+/// and tests (`StubLlm`) already satisfy this; `new(graph, llm)` stays byte-compatible.
+pub struct ReportTools<'g, L: LlmClient + Send + Sync + 'static> {
     /// The knowledge graph being read. Replaces Zep's `graph_id` server-handle.
     graph: &'g KnowledgeGraph,
     /// LLM client for insight_forge sub-query generation.
@@ -503,15 +623,32 @@ pub struct ReportTools<'g, L: LlmClient> {
     llm: &'g L,
     /// Entity reader reusing U-016 substrate for entity-by-type / entity-summary reads.
     reader: KnowledgeGraphEntityReader<'g>,
+    /// Optional live simulation runner for `interview_agents` IPC dispatch (U-024).
+    /// `None` for the graph-only construction sites (debug routes, tests) — those
+    /// keep `new(graph, llm)`. `Some(...)` only on the report-generation routes that
+    /// can reach a live sim. `&'g` runner: caller-owned (`Arc` held by `ApiState`).
+    runner: Option<&'g SimulationRunner<L>>,
 }
 
-impl<'g, L: LlmClient> ReportTools<'g, L> {
+impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
     /// Create a new `ReportTools` binding graph and LLM by reference.
     ///
     /// Per DECISION-11, caller constructs handles; `ReportTools` borrows them.
+    /// Graph-only facade (`runner: None`) — back-compat with all existing callers.
     pub fn new(graph: &'g KnowledgeGraph, llm: &'g L) -> Self {
+        Self::with_runner(graph, llm, None)
+    }
+
+    /// Create a `ReportTools` binding graph + LLM + an optional live simulation
+    /// runner (U-024). The report-generation routes pass `Some(&state.sim_runner)`
+    /// so `interview_agents` can reach the live IPC seam.
+    pub fn with_runner(
+        graph: &'g KnowledgeGraph,
+        llm: &'g L,
+        runner: Option<&'g SimulationRunner<L>>,
+    ) -> Self {
         let reader = KnowledgeGraphEntityReader::new(graph);
-        Self { graph, llm, reader }
+        Self { graph, llm, reader, runner }
     }
 
     // -----------------------------------------------------------------------
@@ -1241,36 +1378,758 @@ impl<'g, L: LlmClient> ReportTools<'g, L> {
     }
 
     // -----------------------------------------------------------------------
-    // interview_agents — sub-cycle (e) DEFERRED — honest error string
+    // interview_agents (+ 5 private helpers) — U-024 full port
     //
-    // Port of `ZepToolsService.interview_agents(simulation_id, ...)` (`zep_tools.py:1272-`).
-    // Requires U-020 simulation IPC (already ported) + U-022 SimulationRunner
-    // (SimulationRunner.interview_agents_batch).
+    // Port of `ZepToolsService.interview_agents(simulation_id, ...)` and its 5
+    // private helpers (`zep_tools.py:1272-1763`). Requires a live `SimulationRunner`
+    // (threaded as `self.runner`) for the batch-interview IPC seam.
     //
-    // Per architect: return an honest error string the ReACT loop tolerates.
-    // Python `_execute_tool` wraps exceptions as "工具执行失败: {e}" — teri mirrors
-    // that (the loop keeps going, no downgrade to the loop; only `[!]` on the tool).
+    // [!] U-024-PROD-PENDING: the terminal IPC call returns env-not-running until
+    // the live IPC producer lands (U-026-k). The full logic is ported; only the
+    // live-data flip is deferred — NOT a stub.
     // -----------------------------------------------------------------------
 
-    /// Interview agents — requires U-022 SimulationRunner (sub-cycle (e) pending).
+    /// Load agent-profile dicts for a simulation.
     ///
-    /// Returns an `Err` describing the dependency so the ReACT loop can convert it
-    /// to an error-observation string without panicking.
-    pub fn interview_agents(
-        &self,
-        _simulation_id: &str,
-        _requirement: &str,
-        _sim_req: &str,
-        _max_agents: i64,
-        _custom_questions: Option<&str>,
-    ) -> Result<InterviewResult> {
-        // `[!]` sub-cycle (e) pending: interview_agents requires U-022 SimulationRunner
-        // integration (SimulationRunner::interview_agents_batch). U-022 is `- [ ]`.
-        // Mirror Python's try/except → "工具执行失败: ..." so the ReACT loop continues.
-        Err(TeriError::Unknown(
-            "interview_agents pending simulation IPC integration (sub-cycle e, U-022)".into(),
-        ))
+    /// Port of `_load_agent_profiles(simulation_id)` (`zep_tools.py:1505-1549`).
+    /// Prefers `reddit_profiles.json` (a JSON array, returned as-is); else falls
+    /// back to `twitter_profiles.csv` mapped row-by-row. Read failures log a
+    /// warning and fall through (returning an empty list).
+    fn load_agent_profiles(
+        sim_data_dir: &Path,
+        simulation_id: &str,
+    ) -> Vec<serde_json::Map<String, serde_json::Value>> {
+        let sim_dir = sim_data_dir.join(simulation_id);
+
+        // Prefer reddit_profiles.json (JSON array).
+        let reddit_path = sim_dir.join("reddit_profiles.json");
+        if reddit_path.exists() {
+            match std::fs::read_to_string(&reddit_path).map_err(|e| e.to_string()).and_then(|c| {
+                serde_json::from_str::<serde_json::Value>(&c).map_err(|e| e.to_string())
+            }) {
+                Ok(serde_json::Value::Array(arr)) => {
+                    let profiles: Vec<serde_json::Map<String, serde_json::Value>> = arr
+                        .into_iter()
+                        .filter_map(|v| match v {
+                            serde_json::Value::Object(m) => Some(m),
+                            _ => None,
+                        })
+                        .collect();
+                    tracing::info!(
+                        target: "teri::report",
+                        "{}",
+                        t_args(
+                            "console.loadedRedditProfiles",
+                            &[("count", &profiles.len())]
+                        )
+                    );
+                    return profiles;
+                }
+                Ok(_) => { /* not an array — fall through to twitter */ }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "teri::report",
+                        "{}",
+                        t_args("console.readRedditProfilesFailed", &[("error", &e)])
+                    );
+                }
+            }
+        }
+
+        // Fallback: twitter_profiles.csv via csv DictReader-equivalent.
+        let twitter_path = sim_dir.join("twitter_profiles.csv");
+        if twitter_path.exists() {
+            match csv::Reader::from_path(&twitter_path) {
+                Ok(mut rdr) => {
+                    let mut profiles: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
+                    for record in rdr.deserialize::<std::collections::HashMap<String, String>>() {
+                        match record {
+                            Ok(row) => {
+                                let get = |k: &str| row.get(k).cloned().unwrap_or_default();
+                                let mut m = serde_json::Map::new();
+                                m.insert("realname".into(), get("name").into());
+                                m.insert("username".into(), get("username").into());
+                                m.insert("bio".into(), get("description").into());
+                                m.insert("persona".into(), get("user_char").into());
+                                m.insert("profession".into(), "未知".into());
+                                profiles.push(m);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "teri::report",
+                                    "{}",
+                                    t_args(
+                                        "console.readTwitterProfilesFailed",
+                                        &[("error", &e.to_string())]
+                                    )
+                                );
+                            }
+                        }
+                    }
+                    tracing::info!(
+                        target: "teri::report",
+                        "{}",
+                        t_args(
+                            "console.loadedTwitterProfiles",
+                            &[("count", &profiles.len())]
+                        )
+                    );
+                    return profiles;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "teri::report",
+                        "{}",
+                        t_args(
+                            "console.readTwitterProfilesFailed",
+                            &[("error", &e.to_string())]
+                        )
+                    );
+                }
+            }
+        }
+
+        Vec::new()
     }
+
+    /// Clean a tool-call-wrapped response.
+    ///
+    /// Port of `_clean_tool_call_response(response)` (`zep_tools.py:1484-1504`,
+    /// static). If the response is empty or doesn't look like JSON, return as-is.
+    /// Otherwise unwrap `arguments.{content,text,body,message,reply}` (first hit);
+    /// on JSON/key error, regex-extract `"content": "..."`.
+    fn clean_tool_call_response(response: String) -> String {
+        let trimmed = response.trim();
+        if trimmed.is_empty() || !trimmed.starts_with('{') {
+            return response;
+        }
+        // `'tool_name' not in text[:80]` → return as-is.
+        let head: String = trimmed.chars().take(80).collect();
+        if !head.contains("tool_name") {
+            return response;
+        }
+        // Python `try: data = json.loads(text)` — the regex fallback runs ONLY in
+        // the `except (JSONDecodeError, KeyError, TypeError)` branch. A successful
+        // parse with no matching key falls through to `return response` (no regex).
+        match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(serde_json::Value::Object(data)) => {
+                if let Some(serde_json::Value::Object(args)) = data.get("arguments") {
+                    for key in ["content", "text", "body", "message", "reply"] {
+                        if let Some(v) = args.get(key) {
+                            // Python `str(data['arguments'][key])`.
+                            return match v {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                        }
+                    }
+                }
+                response
+            }
+            Ok(_) => response, // parsed but not a dict — Python's `isinstance(data, dict)` false
+            Err(_) => {
+                // JSONDecodeError → regex fallback: "content"\s*:\s*"((?:[^"\\]|\\.)*)"
+                let re = Regex::new(r#""content"\s*:\s*"((?:[^"\\]|\\.)*)""#).unwrap();
+                if let Some(g1) = re.captures(trimmed).and_then(|caps| caps.get(1)) {
+                    return g1.as_str().replace("\\n", "\n").replace("\\\"", "\"");
+                }
+                response
+            }
+        }
+    }
+
+    /// Select which agents to interview via the LLM.
+    ///
+    /// Port of `_select_agents_for_interview(...)` (`zep_tools.py:1551-1632`).
+    /// Returns `(selected_agents, selected_indices, reasoning)`. On any LLM
+    /// failure, falls back to the first `max_agents` profiles.
+    async fn select_agents_for_interview(
+        &self,
+        profiles: &[serde_json::Map<String, serde_json::Value>],
+        interview_requirement: &str,
+        simulation_requirement: &str,
+        max_agents: i64,
+    ) -> (Vec<serde_json::Map<String, serde_json::Value>>, Vec<usize>, String) {
+        let max_agents_usize = max_agents.max(0) as usize;
+
+        // Build per-profile summary dicts.
+        let mut agents_summary = Vec::new();
+        for (i, profile) in profiles.iter().enumerate() {
+            let name = resolve_agent_name(profile, i);
+            // Python `profile.get("profession", "未知")` — default ONLY when key absent.
+            let profession = py_get_str(profile, "profession", "未知");
+            let bio_full = py_get_str(profile, "bio", "");
+            let bio: String = bio_full.chars().take(200).collect();
+            let interested_topics = profile
+                .get("interested_topics")
+                .cloned()
+                .unwrap_or(serde_json::Value::Array(Vec::new()));
+
+            let mut m = serde_json::Map::new();
+            m.insert("index".into(), serde_json::Value::from(i));
+            m.insert("name".into(), name.into());
+            m.insert("profession".into(), profession.into());
+            m.insert("bio".into(), bio.into());
+            m.insert("interested_topics".into(), interested_topics);
+            agents_summary.push(serde_json::Value::Object(m));
+        }
+
+        // Python `json.dumps(agent_summaries, ensure_ascii=False, indent=2)`.
+        let agents_json =
+            serde_json::to_string_pretty(&agents_summary).unwrap_or_else(|_| "[]".to_string());
+
+        let system_prompt = "你是一个专业的采访策划专家。你的任务是根据采访需求，从模拟Agent列表中选择最适合采访的对象。\n\n选择标准：\n1. Agent的身份/职业与采访主题相关\n2. Agent可能持有独特或有价值的观点\n3. 选择多样化的视角（如：支持方、反对方、中立方、专业人士等）\n4. 优先选择与事件直接相关的角色\n\n返回JSON格式：\n{\n    \"selected_indices\": [选中Agent的索引列表],\n    \"reasoning\": \"选择理由说明\"\n}";
+        let sim_bg =
+            if simulation_requirement.is_empty() { "未提供" } else { simulation_requirement };
+        let user_prompt = format!(
+            "采访需求：\n{}\n\n模拟背景：\n{}\n\n可选择的Agent列表（共{}个）：\n{}\n\n请选择最多{}个最适合采访的Agent，并说明选择理由。",
+            interview_requirement,
+            sim_bg,
+            agents_summary.len(),
+            agents_json,
+            max_agents
+        );
+
+        let messages = [ChatMessage::system(system_prompt), ChatMessage::user(user_prompt)];
+        let opts = ChatOptions { temperature: Some(0.3), max_tokens: None };
+
+        let fallback = |profiles: &[serde_json::Map<String, serde_json::Value>]| {
+            let n = max_agents_usize.min(profiles.len());
+            let indices: Vec<usize> = (0..n).collect();
+            let selected: Vec<serde_json::Map<String, serde_json::Value>> = profiles[..n].to_vec();
+            (selected, indices, "使用默认选择策略".to_string())
+        };
+
+        match self.llm.chat_json::<serde_json::Value>(&messages, &opts).await {
+            Ok(resp) => {
+                let selected_indices_raw = resp
+                    .get("selected_indices")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let reasoning = resp
+                    .get("reasoning")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("基于相关性自动选择")
+                    .to_string();
+
+                // Take first max_agents indices, filter to valid in-range.
+                let mut selected_agents = Vec::new();
+                let mut valid_indices = Vec::new();
+                for idx_val in selected_indices_raw.iter().take(max_agents_usize) {
+                    // Python `if 0 <= idx < len(profiles)`.
+                    let valid =
+                        idx_val.as_i64().filter(|&idx| idx >= 0 && (idx as usize) < profiles.len());
+                    if let Some(idx) = valid {
+                        let u = idx as usize;
+                        selected_agents.push(profiles[u].clone());
+                        valid_indices.push(u);
+                    }
+                }
+                (selected_agents, valid_indices, reasoning)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "teri::report",
+                    "{}",
+                    t_args("console.llmSelectAgentFailed", &[("error", &e.to_string())])
+                );
+                fallback(profiles)
+            }
+        }
+    }
+
+    /// Generate interview questions via the LLM.
+    ///
+    /// Port of `_generate_interview_questions(...)` (`zep_tools.py:1634-1681`).
+    async fn generate_interview_questions(
+        &self,
+        interview_requirement: &str,
+        simulation_requirement: &str,
+        selected_agents: &[serde_json::Map<String, serde_json::Value>],
+    ) -> Vec<String> {
+        // Python `[a.get("profession", "未知") for a in selected_agents]`.
+        let agent_roles: Vec<String> =
+            selected_agents.iter().map(|a| py_get_str(a, "profession", "未知")).collect();
+
+        let system_prompt = "你是一个专业的记者/采访者。根据采访需求，生成3-5个深度采访问题。\n\n问题要求：\n1. 开放性问题，鼓励详细回答\n2. 针对不同角色可能有不同答案\n3. 涵盖事实、观点、感受等多个维度\n4. 语言自然，像真实采访一样\n5. 每个问题控制在50字以内，简洁明了\n6. 直接提问，不要包含背景说明或前缀\n\n返回JSON格式：{\"questions\": [\"问题1\", \"问题2\", ...]}";
+        let sim_bg =
+            if simulation_requirement.is_empty() { "未提供" } else { simulation_requirement };
+        let user_prompt = format!(
+            "采访需求：{}\n\n模拟背景：{}\n\n采访对象角色：{}\n\n请生成3-5个采访问题。",
+            interview_requirement,
+            sim_bg,
+            agent_roles.join(", ")
+        );
+
+        let messages = [ChatMessage::system(system_prompt), ChatMessage::user(user_prompt)];
+        let opts = ChatOptions { temperature: Some(0.5), max_tokens: None };
+
+        match self.llm.chat_json::<serde_json::Value>(&messages, &opts).await {
+            Ok(resp) => {
+                // Python `response.get("questions", [<1-item default>])` — default
+                // applies ONLY when the key is absent; present-but-empty returns [].
+                match resp.get("questions").and_then(|v| v.as_array()) {
+                    Some(arr) => {
+                        arr.iter().filter_map(|q| q.as_str().map(|s| s.to_string())).collect()
+                    }
+                    None => vec![format!("关于{}，您有什么看法？", interview_requirement)],
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "teri::report",
+                    "{}",
+                    t_args(
+                        "console.generateInterviewQuestionsFailed",
+                        &[("error", &e.to_string())]
+                    )
+                );
+                vec![
+                    format!("关于{}，您的观点是什么？", interview_requirement),
+                    "这件事对您或您所代表的群体有什么影响？".to_string(),
+                    "您认为应该如何解决或改进这个问题？".to_string(),
+                ]
+            }
+        }
+    }
+
+    /// Generate a summary across the interviews via the LLM.
+    ///
+    /// Port of `_generate_interview_summary(...)` (`zep_tools.py:1683-1763`).
+    async fn generate_interview_summary(
+        &self,
+        interviews: &[AgentInterview],
+        interview_requirement: &str,
+    ) -> String {
+        if interviews.is_empty() {
+            return "未完成任何采访".to_string();
+        }
+
+        let interview_texts: Vec<String> = interviews
+            .iter()
+            .map(|iv| {
+                let resp: String = iv.response.chars().take(500).collect();
+                format!("【{}（{}）】\n{}", iv.agent_name, iv.agent_role, resp)
+            })
+            .collect();
+
+        let quote_instruction = if crate::i18n::get_locale() == "zh" {
+            "引用受访者原话时使用中文引号「」"
+        } else {
+            "Use quotation marks \"\" when quoting interviewees"
+        };
+
+        let system_prompt = format!(
+            "你是一个专业的新闻编辑。请根据多位受访者的回答，生成一份采访摘要。\n\n摘要要求：\n1. 提炼各方主要观点\n2. 指出观点的共识和分歧\n3. 突出有价值的引言\n4. 客观中立，不偏袒任何一方\n5. 控制在1000字内\n\n格式约束（必须遵守）：\n- 使用纯文本段落，用空行分隔不同部分\n- 不要使用Markdown标题（如#、##、###）\n- 不要使用分割线（如---、***）\n- {}\n- 可以使用**加粗**标记关键词，但不要使用其他Markdown语法",
+            quote_instruction
+        );
+        // Python `"".join(interview_texts)` — NO separator between blocks.
+        let user_prompt = format!(
+            "采访主题：{}\n\n采访内容：\n{}\n\n请生成采访摘要。",
+            interview_requirement,
+            interview_texts.join("")
+        );
+
+        let messages = [ChatMessage::system(system_prompt), ChatMessage::user(user_prompt)];
+        let opts = ChatOptions { temperature: Some(0.3), max_tokens: Some(800) };
+
+        match self.llm.chat(&messages, &opts).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    target: "teri::report",
+                    "{}",
+                    t_args(
+                        "console.generateInterviewSummaryFailed",
+                        &[("error", &e.to_string())]
+                    )
+                );
+                let agent_names: Vec<String> =
+                    interviews.iter().map(|iv| iv.agent_name.clone()).collect();
+                format!("共采访了{}位受访者，包括：{}", interviews.len(), agent_names.join("、"))
+            }
+        }
+    }
+
+    /// Interview agents — the full U-024 port (`zep_tools.py:1272-1482`).
+    ///
+    /// Loads profiles, LLM-selects agents, LLM-generates questions, dispatches a
+    /// batch interview over the live `SimulationRunner` IPC seam, parses dual-
+    /// platform responses (cleaning tool-call wrappers + extracting key quotes),
+    /// and LLM-summarizes. `async` because it awaits IPC + 3 LLM calls.
+    pub async fn interview_agents(
+        &self,
+        simulation_id: &str,
+        interview_requirement: &str,
+        simulation_requirement: &str,
+        max_agents: i64,
+        custom_questions: Option<Vec<String>>,
+    ) -> Result<InterviewResult> {
+        // Step 0: start log (requirement char-sliced [:50]).
+        let req_head: String = interview_requirement.chars().take(50).collect();
+        tracing::info!(
+            target: "teri::report",
+            "{}",
+            t_args("console.interviewAgentsStart", &[("requirement", &req_head)])
+        );
+
+        let mut result = InterviewResult::new(
+            interview_requirement.to_string(),
+            custom_questions.unwrap_or_default(),
+        );
+
+        // The runner is the live IPC seam. Without it (graph-only facade), the
+        // sync `execute_inner` arm already returns the honest tolerated error;
+        // the async path only runs when a runner is threaded.
+        let runner = match self.runner {
+            Some(r) => r,
+            None => {
+                return Err(TeriError::Unknown(
+                    "interview_agents requires a live SimulationRunner (no runner threaded)".into(),
+                ));
+            }
+        };
+
+        // Step 1: load profiles.
+        let profiles = Self::load_agent_profiles(runner.sim_data_dir(), simulation_id);
+
+        // Empty-profiles guard → early return.
+        if profiles.is_empty() {
+            tracing::info!(
+                target: "teri::report",
+                "{}",
+                t_args("console.profilesNotFound", &[("simId", &simulation_id)])
+            );
+            result.summary = "未找到可采访的Agent人设文件".to_string();
+            return Ok(result);
+        }
+
+        result.total_agents = profiles.len() as i64;
+        tracing::info!(
+            target: "teri::report",
+            "{}",
+            t_args("console.loadedProfiles", &[("count", &profiles.len())])
+        );
+
+        // Step 2: select agents.
+        let (selected_agents, selected_indices, reasoning) = self
+            .select_agents_for_interview(
+                &profiles,
+                interview_requirement,
+                simulation_requirement,
+                max_agents,
+            )
+            .await;
+        result.selected_agents = selected_agents.clone();
+        result.selection_reasoning = reasoning;
+        let indices_repr = format!(
+            "[{}]",
+            selected_indices.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
+        );
+        tracing::info!(
+            target: "teri::report",
+            "{}",
+            t_args(
+                "console.selectedAgentsForInterview",
+                &[("count", &selected_agents.len()), ("indices", &indices_repr)]
+            )
+        );
+
+        // Step 3: questions (generate only if none supplied; log inside the branch
+        // to match Python `zep_tools.py:1340-1346`).
+        if result.interview_questions.is_empty() {
+            result.interview_questions = self
+                .generate_interview_questions(
+                    interview_requirement,
+                    simulation_requirement,
+                    &selected_agents,
+                )
+                .await;
+            tracing::info!(
+                target: "teri::report",
+                "{}",
+                t_args(
+                    "console.generatedInterviewQuestions",
+                    &[("count", &result.interview_questions.len())]
+                )
+            );
+        }
+
+        // Build combined prompt.
+        let combined_prompt = result
+            .interview_questions
+            .iter()
+            .enumerate()
+            .map(|(i, q)| format!("{}. {}", i + 1, q))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let optimized_prompt = format!("{}{}", INTERVIEW_AGENTS_PROMPT_PREFIX, combined_prompt);
+
+        // Step 4: batch interview.
+        let interviews_request: Vec<serde_json::Value> = selected_indices
+            .iter()
+            .map(|agent_idx| {
+                let mut m = serde_json::Map::new();
+                m.insert("agent_id".into(), serde_json::Value::from(*agent_idx));
+                m.insert("prompt".into(), optimized_prompt.clone().into());
+                serde_json::Value::Object(m)
+            })
+            .collect();
+
+        tracing::info!(
+            target: "teri::report",
+            "{}",
+            t_args(
+                "console.callingBatchInterviewApi",
+                &[("count", &interviews_request.len())]
+            )
+        );
+
+        // 180s timeout (NOT the 120s method default).
+        let api_result = match runner
+            .interview_agents_batch(
+                simulation_id,
+                interviews_request,
+                None,
+                Duration::from_secs_f64(180.0),
+            )
+            .await
+        {
+            Ok(resp) => resp,
+            Err(TeriError::Sim(msg)) => {
+                // env-not-running / not-found → ValueError branch.
+                tracing::warn!(
+                    target: "teri::report",
+                    "{}",
+                    t_args("console.interviewApiCallFailed", &[("error", &msg)])
+                );
+                result.summary =
+                    format!("采访失败：{}。模拟环境可能已关闭，请确保OASIS环境正在运行。", msg);
+                return Ok(result);
+            }
+            Err(e) => {
+                // Any other error → generic Exception branch.
+                tracing::error!(
+                    target: "teri::report",
+                    "{}",
+                    t_args("console.interviewApiCallException", &[("error", &e.to_string())])
+                );
+                result.summary = format!("采访过程发生错误：{}", e);
+                return Ok(result);
+            }
+        };
+
+        // Success check: status == Completed AND error.is_none().
+        let success = api_result.status
+            == crate::services::simulation_ipc::CommandStatus::Completed
+            && api_result.error.is_none();
+        let api_data = api_result.result.clone().unwrap_or_default();
+        let results_dict =
+            api_data.get("results").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+        tracing::info!(
+            target: "teri::report",
+            "{}",
+            t_args(
+                "console.interviewApiReturned",
+                &[("count", &results_dict.len()), ("success", &success)]
+            )
+        );
+
+        // API failure guard → early return.
+        if !success {
+            let error_msg = api_result.error.clone().unwrap_or_else(|| "未知错误".to_string());
+            tracing::warn!(
+                target: "teri::report",
+                "{}",
+                t_args("console.interviewApiReturnedFailure", &[("error", &error_msg)])
+            );
+            result.summary = format!("采访API调用失败：{}。请检查OASIS模拟环境状态。", error_msg);
+            return Ok(result);
+        }
+
+        // Step 5: parse results.
+        for (i, agent_idx) in selected_indices.iter().enumerate() {
+            let agent = &selected_agents[i];
+            // Python `agent.get("realname", agent.get("username", f"Agent_{agent_idx}"))`
+            // — `.get` defaults apply ONLY when the key is ABSENT (empty string wins).
+            let agent_name = resolve_agent_name(agent, *agent_idx);
+            let agent_role = py_get_str(agent, "profession", "未知");
+            let agent_bio = py_get_str(agent, "bio", "");
+
+            let twitter_result = results_dict
+                .get(&format!("twitter_{}", agent_idx))
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            let reddit_result = results_dict
+                .get(&format!("reddit_{}", agent_idx))
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+
+            let twitter_response_raw = twitter_result
+                .get("response")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let reddit_response_raw =
+                reddit_result.get("response").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+            let twitter_response = Self::clean_tool_call_response(twitter_response_raw);
+            let reddit_response = Self::clean_tool_call_response(reddit_response_raw);
+
+            let twitter_text = if twitter_response.is_empty() {
+                "（该平台未获得回复）".to_string()
+            } else {
+                twitter_response.clone()
+            };
+            let reddit_text = if reddit_response.is_empty() {
+                "（该平台未获得回复）".to_string()
+            } else {
+                reddit_response.clone()
+            };
+            let response_text = format!(
+                "【Twitter平台回答】\n{}\n\n【Reddit平台回答】\n{}",
+                twitter_text, reddit_text
+            );
+
+            // Key-quote extraction.
+            let combined_responses = format!("{} {}", twitter_response, reddit_response);
+            let key_quotes = extract_key_quotes(&combined_responses);
+
+            let agent_bio_truncated: String = agent_bio.chars().take(1000).collect();
+            let key_quotes_capped: Vec<String> = key_quotes.into_iter().take(5).collect();
+
+            result.interviews.push(AgentInterview {
+                agent_name,
+                agent_role,
+                agent_bio: agent_bio_truncated,
+                question: combined_prompt.clone(),
+                response: response_text,
+                key_quotes: key_quotes_capped,
+            });
+        }
+        result.interviewed_count = result.interviews.len() as i64;
+
+        // Step 6: summary.
+        if !result.interviews.is_empty() {
+            result.summary =
+                self.generate_interview_summary(&result.interviews, interview_requirement).await;
+        }
+
+        tracing::info!(
+            target: "teri::report",
+            "{}",
+            t_args(
+                "console.interviewAgentsComplete",
+                &[("count", &result.interviewed_count)]
+            )
+        );
+
+        Ok(result)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// interview_agents free helpers + verbatim literals (U-024)
+// ---------------------------------------------------------------------------
+
+/// Interview prompt prefix prepended to the combined questions
+/// (`zep_tools.py:1352-1362`). The 6-rule multi-line CJK block is OBSERVABLE in
+/// the prompt sent to the agent — preserve it byte-for-byte. NOTE: this is a
+/// DIFFERENT literal from the single-line `optimize_interview_prompt` prefix in
+/// `api::simulation` (which ports `simulation.py:23`).
+const INTERVIEW_AGENTS_PROMPT_PREFIX: &str = "你正在接受一次采访。请结合你的人设、所有的过往记忆与行动，以纯文本方式直接回答以下问题。\n回复要求：\n1. 直接用自然语言回答，不要调用任何工具\n2. 不要返回JSON格式或工具调用格式\n3. 不要使用Markdown标题（如#、##、###）\n4. 按问题编号逐一回答，每个回答以「问题X：」开头（X为问题编号）\n5. 每个问题的回答之间用空行分隔\n6. 回答要有实质内容，每个问题至少回答2-3句话\n\n";
+
+/// Python `dict.get(key, default)` for a string value: returns the stored string
+/// when the key is PRESENT (even if empty), else `default`. (Distinct from
+/// `.unwrap_or("")` which would also fire when the value is a non-string.)
+fn py_get_str(m: &serde_json::Map<String, serde_json::Value>, key: &str, default: &str) -> String {
+    match m.get(key) {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+        None => default.to_string(),
+    }
+}
+
+/// Python `profile.get("realname", profile.get("username", f"Agent_{idx}"))`:
+/// realname if its key is present, else username if present, else `Agent_{idx}`.
+fn resolve_agent_name(m: &serde_json::Map<String, serde_json::Value>, idx: usize) -> String {
+    if let Some(v) = m.get("realname") {
+        return match v {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+    }
+    if let Some(v) = m.get("username") {
+        return match v {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+    }
+    format!("Agent_{}", idx)
+}
+
+/// Extract key quotes from a combined dual-platform response.
+///
+/// Port of the inline key-quote extraction in `interview_agents`
+/// (`zep_tools.py:1421-1448`). The regexes + ordering are CONTRACTUAL; `len`
+/// throughout is a CHARACTER count.
+fn extract_key_quotes(combined_responses: &str) -> Vec<String> {
+    // Sequential cleaning (exact order from Python).
+    let re_heading = Regex::new(r"#{1,6}\s+").unwrap();
+    let re_toolname = Regex::new(r"\{[^}]*tool_name[^}]*\}").unwrap();
+    let re_markdown = Regex::new(r"[*_`|>~\-]{2,}").unwrap();
+    let re_question = Regex::new(r"问题\d+[：:]\s*").unwrap();
+    let re_bracket = Regex::new(r"【[^】]+】").unwrap();
+
+    let mut clean_text = re_heading.replace_all(combined_responses, "").into_owned();
+    clean_text = re_toolname.replace_all(&clean_text, "").into_owned();
+    clean_text = re_markdown.replace_all(&clean_text, "").into_owned();
+    clean_text = re_question.replace_all(&clean_text, "").into_owned();
+    clean_text = re_bracket.replace_all(&clean_text, "").into_owned();
+
+    // Strategy 1: full meaningful sentences.
+    // Python `re.split(r'[。！？]', clean_text)`.
+    let re_split = Regex::new(r"[。！？]").unwrap();
+    let re_leading = Regex::new(r"^[\s\W，,；;：:、]+").unwrap();
+
+    let mut meaningful: Vec<String> = re_split
+        .split(&clean_text)
+        .map(|s| s.trim().to_string())
+        .filter(|s| {
+            let len = s.chars().count();
+            (20..=150).contains(&len)
+                && !re_leading.is_match(s)
+                && !s.starts_with('{')
+                && !s.starts_with("问题")
+        })
+        .collect();
+
+    // `meaningful.sort(key=len, reverse=True)` — Python `len` is char count; ties
+    // keep input (insertion) order under a stable sort.
+    meaningful.sort_by_key(|s| std::cmp::Reverse(s.chars().count()));
+    let key_quotes: Vec<String> =
+        meaningful.into_iter().take(3).map(|s| format!("{}。", s)).collect();
+
+    if !key_quotes.is_empty() {
+        return key_quotes;
+    }
+
+    // Strategy 2: correctly-paired CJK/curly-quote long text.
+    let re_curly = Regex::new("\u{201c}([^\u{201c}\u{201d}]{15,100})\u{201d}").unwrap();
+    let re_corner = Regex::new("\u{300c}([^\u{300c}\u{300d}]{15,100})\u{300d}").unwrap();
+    let re_q_leading = Regex::new(r"^[，,；;：:、]").unwrap();
+
+    let mut paired: Vec<String> = Vec::new();
+    for caps in re_curly.captures_iter(&clean_text) {
+        paired.push(caps[1].to_string());
+    }
+    for caps in re_corner.captures_iter(&clean_text) {
+        paired.push(caps[1].to_string());
+    }
+    paired.into_iter().filter(|q| !re_q_leading.is_match(q)).take(3).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1717,7 +2576,7 @@ pub fn get_tools_description() -> String {
 
 // ── ReportTools::execute (report_agent.py:956–1062 `_execute_tool`) ─────────
 
-impl<'g, L: LlmClient> ReportTools<'g, L> {
+impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
     /// Dispatch a tool call by enum variant, parsing params and applying coercions.
     ///
     /// Port of `ReportAgent._execute_tool` (`report_agent.py:956–1062`).
@@ -1776,6 +2635,11 @@ impl<'g, L: LlmClient> ReportTools<'g, L> {
         }
     }
 
+    // `simulation_id` is now only threaded through the recursive redirect arms
+    // (SearchGraph/GetSimulationContext) after U-024 moved the live interview path
+    // to `execute_by_name_async`; the sync `InterviewAgents` arm no longer consumes
+    // it. The param stays in the signature for contract parity with `execute`.
+    #[allow(clippy::only_used_in_recursion)]
     fn execute_inner(
         &self,
         tool: ReportTool,
@@ -1818,24 +2682,28 @@ impl<'g, L: LlmClient> ReportTools<'g, L> {
             }
 
             // ── interview_agents (report_agent.py:1008–1021) ─────────────────
+            //
+            // U-024 sync arm (architecture §4 option ii): `interview_agents` is now an
+            // `async fn` requiring a live runner; the async dispatcher
+            // (`execute_by_name_async`) intercepts this tool name and runs the real
+            // body. The SYNC path (graph-only facades: debug routes / tests with
+            // `runner: None`) keeps returning the honest tolerated error so the ReACT
+            // loop continues (Python `_execute_tool` try/except → "工具执行失败: ...").
             ReportTool::InterviewAgents => {
-                // interview_topic falls back to "query" param (report_agent.py:1010)
-                let interview_topic = {
+                // Preserve the param coercions for parity (a bad `max_agents` still
+                // surfaces as the same failure text; topic falls back to `query`).
+                let _interview_topic = {
                     let t = str_param(params, "interview_topic");
                     if t.is_empty() { str_param(params, "query") } else { t }
                 };
-                // max_agents: str→int, then min(n, 10) (report_agent.py:1011–1014)
+                // max_agents: str→int, then min(n, 10) (report_agent.py:1011–1014).
                 let max_agents = coerce_int_param(params, "max_agents", 5)?;
-                let max_agents = max_agents.min(10);
-                // interview_agents returns Result; convert Err → Err (outer swallows to text)
-                let result = self.interview_agents(
-                    simulation_id,
-                    &interview_topic,
-                    simulation_requirement,
-                    max_agents,
-                    None,
-                )?;
-                Ok(result.to_text())
+                let _max_agents = max_agents.min(10);
+                Err(TeriError::Unknown(
+                    "interview_agents requires the async dispatch path (execute_by_name_async) \
+                     with a live SimulationRunner"
+                        .into(),
+                ))
             }
 
             // ── back-compat: search_graph → quick_search (report_agent.py:1025–1028) ──
@@ -1913,7 +2781,7 @@ impl<'g, L: LlmClient> ReportTools<'g, L> {
 
 // ── execute() entry-point: accepts a raw tool name string ───────────────────
 
-impl<'g, L: LlmClient> ReportTools<'g, L> {
+impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
     /// Execute a tool by raw name string (as the LLM emits it).
     ///
     /// Unknown tool names return `"未知工具: {name}。请使用以下工具之一: ..."`.
@@ -1942,6 +2810,83 @@ impl<'g, L: LlmClient> ReportTools<'g, L> {
                 tool_name
             ),
         }
+    }
+
+    /// Async tool dispatch — the variant the ReACT loop calls when a live runner
+    /// may be available (U-024, architecture §4).
+    ///
+    /// Intercepts ONLY `interview_agents` (the single tool that needs to `.await`
+    /// the batch-interview IPC + 3 LLM calls) and delegates every other tool name
+    /// to the existing sync [`execute_by_name`]. The interview branch mirrors
+    /// `execute`'s logging + `"工具执行失败: {e}"` error-wrapping so the loop keeps
+    /// going after a tool failure.
+    pub async fn execute_by_name_async(
+        &self,
+        tool_name: &str,
+        params: &serde_json::Map<String, serde_json::Value>,
+        graph_id: &str,
+        simulation_id: &str,
+        simulation_requirement: &str,
+        report_context: &str,
+    ) -> String {
+        if ReportTool::from_name(tool_name) == Some(ReportTool::InterviewAgents) {
+            // (g2): executingTool — report_agent.py:968.
+            let params_repr = serde_json::to_string(params).unwrap_or_else(|_| "{}".to_string());
+            tracing::info!(
+                target: "teri::report",
+                "{}",
+                t_args(
+                    "report.executingTool",
+                    &[("toolName", &tool_name), ("params", &params_repr)]
+                )
+            );
+
+            // interview_topic falls back to "query" param (report_agent.py:1010).
+            let interview_topic = {
+                let t = str_param(params, "interview_topic");
+                if t.is_empty() { str_param(params, "query") } else { t }
+            };
+            // max_agents: str→int, then min(n, 10) (report_agent.py:1011–1014).
+            let max_agents = match coerce_int_param(params, "max_agents", 5) {
+                Ok(n) => n.min(10),
+                Err(e) => return format!("工具执行失败: {}", e),
+            };
+
+            return match self
+                .interview_agents(
+                    simulation_id,
+                    &interview_topic,
+                    simulation_requirement,
+                    max_agents,
+                    None,
+                )
+                .await
+            {
+                Ok(result) => result.to_text(),
+                Err(e) => {
+                    // (g2): toolExecFailed — report_agent.py:1061.
+                    tracing::error!(
+                        target: "teri::report",
+                        "{}",
+                        t_args(
+                            "report.toolExecFailed",
+                            &[("toolName", &tool_name), ("error", &e.to_string())]
+                        )
+                    );
+                    format!("工具执行失败: {}", e)
+                }
+            };
+        }
+
+        // Every other tool name → existing sync dispatch (no .await needed).
+        self.execute_by_name(
+            tool_name,
+            params,
+            graph_id,
+            simulation_id,
+            simulation_requirement,
+            report_context,
+        )
     }
 }
 
@@ -2505,19 +3450,222 @@ mod tests {
         assert_eq!(result.simulation_requirement, "predict");
     }
 
-    // ── ReportTools::interview_agents honest-error tests ────────────────────
+    // ── ReportTools::interview_agents (U-024) ───────────────────────────────
 
+    // U-024: the sync `execute_by_name` path with `runner: None` (graph-only
+    // facade) keeps returning the honest tolerated error text — the async
+    // `interview_agents` body is only reachable via `execute_by_name_async`
+    // with a live runner. (The old direct sync `.interview_agents(...)` call is
+    // gone: the method is now `async fn` and requires a `SimulationRunner`.)
     #[test]
-    fn test_interview_agents_returns_honest_error() {
+    fn test_interview_agents_sync_path_returns_honest_error() {
+        let g = fixture_graph();
+        let llm = StubLlm;
+        let tools = ReportTools::new(&g, &llm); // runner: None
+        let params = params_with("interview_topic", "What do students think?");
+        let result = tools.execute_by_name("interview_agents", &params, "g", "s1", "req", "");
+        // The honest tolerated error text (Python `_execute_tool` try/except).
+        assert!(result.contains("工具执行失败"), "expected error text, got: {result}");
+    }
+
+    // The async dispatch with NO runner still yields the honest error text (the
+    // async `interview_agents` early-returns `Err` when `self.runner` is `None`).
+    #[tokio::test]
+    async fn test_interview_agents_async_no_runner_returns_error_text() {
+        let g = fixture_graph();
+        let llm = StubLlm;
+        let tools = ReportTools::new(&g, &llm); // runner: None
+        let params = params_with("interview_topic", "topic");
+        let result = tools
+            .execute_by_name_async("interview_agents", &params, "g", "s1", "req", "")
+            .await;
+        assert!(result.contains("工具执行失败"), "expected error text, got: {result}");
+    }
+
+    // The async dispatcher delegates every NON-interview tool to the sync path.
+    #[tokio::test]
+    async fn test_execute_by_name_async_delegates_other_tools() {
         let g = fixture_graph();
         let llm = StubLlm;
         let tools = ReportTools::new(&g, &llm);
-        let result = tools.interview_agents("sim1", "req", "sim_req", 5, None);
-        // Must be Err (not panic / not Ok with empty result)
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        // The error message is honest about the dependency.
-        assert!(err_msg.contains("interview_agents") || err_msg.contains("pending"));
+        let params = params_with("query", "Bob");
+        let sync = tools.execute_by_name("quick_search", &params, "g", "s1", "req", "");
+        let async_r =
+            tools.execute_by_name_async("quick_search", &params, "g", "s1", "req", "").await;
+        assert_eq!(sync, async_r);
+    }
+
+    // ── U-024 DTO parity tests (AgentInterview / InterviewResult) ────────────
+
+    #[test]
+    fn test_agent_interview_to_dict_field_set() {
+        let iv = AgentInterview {
+            agent_name: "Alice".to_string(),
+            agent_role: "学生".to_string(),
+            agent_bio: "bio text".to_string(),
+            question: "Q?".to_string(),
+            response: "A.".to_string(),
+            key_quotes: vec!["quote one".to_string()],
+        };
+        let d = iv.to_dict();
+        assert_eq!(d.get("agent_name").unwrap(), "Alice");
+        assert_eq!(d.get("agent_role").unwrap(), "学生");
+        assert_eq!(d.get("agent_bio").unwrap(), "bio text");
+        assert_eq!(d.get("question").unwrap(), "Q?");
+        assert_eq!(d.get("response").unwrap(), "A.");
+        assert_eq!(d.get("key_quotes").unwrap(), &serde_json::json!(["quote one"]));
+        // Exactly 6 keys, no extras.
+        assert_eq!(d.len(), 6);
+    }
+
+    #[test]
+    fn test_agent_interview_to_text_basic_format() {
+        let iv = AgentInterview {
+            agent_name: "Bob".to_string(),
+            agent_role: "工程师".to_string(),
+            agent_bio: "background".to_string(),
+            question: "你怎么看？".to_string(),
+            response: "我觉得不错。".to_string(),
+            key_quotes: vec![],
+        };
+        let txt = iv.to_text();
+        assert!(txt.contains("**Bob** (工程师)"));
+        assert!(txt.contains("_简介: background_"));
+        assert!(txt.contains("**Q:** 你怎么看？"));
+        assert!(txt.contains("**A:** 我觉得不错。"));
+        // No key-quote block when key_quotes is empty.
+        assert!(!txt.contains("**关键引言:**"));
+    }
+
+    #[test]
+    fn test_agent_interview_to_text_key_quote_cleaning() {
+        let iv = AgentInterview {
+            agent_name: "C".to_string(),
+            agent_role: "r".to_string(),
+            agent_bio: "b".to_string(),
+            question: "q".to_string(),
+            response: "resp".to_string(),
+            key_quotes: vec![
+                // Leading punctuation + curly quotes stripped, len >= 10 → kept.
+                "\u{201c}，这是一个足够长的引言内容。\u{201d}".to_string(),
+                // Contains 问题3 → skipped.
+                "问题3：这是一个被跳过的引言内容啊。".to_string(),
+                // Too short (< 10 chars after cleaning) → dropped.
+                "短句".to_string(),
+            ],
+        };
+        let txt = iv.to_text();
+        assert!(txt.contains("**关键引言:**"));
+        assert!(txt.contains("这是一个足够长的引言内容"));
+        // 问题3 quote skipped.
+        assert!(!txt.contains("被跳过"));
+        // Short quote dropped.
+        assert!(!txt.contains("> \"短句\""));
+    }
+
+    #[test]
+    fn test_agent_interview_to_text_truncation_over_150() {
+        // > 150 chars, with a 。 after position 80 → truncated at that period.
+        let head: String = "甲".repeat(85);
+        let tail: String = "乙".repeat(80);
+        let quote = format!("{}。{}", head, tail); // 85 + 1 + 80 = 166 chars
+        let iv = AgentInterview {
+            agent_name: "n".to_string(),
+            agent_role: "r".to_string(),
+            agent_bio: "b".to_string(),
+            question: "q".to_string(),
+            response: "x".to_string(),
+            key_quotes: vec![quote],
+        };
+        let txt = iv.to_text();
+        // Truncated to the first 。 after pos 80 → keeps head + 。, drops the 乙 tail.
+        assert!(txt.contains(&format!("> \"{}。\"", head)));
+        assert!(!txt.contains("乙乙"));
+    }
+
+    #[test]
+    fn test_interview_result_to_dict_field_set() {
+        let mut r = InterviewResult::new("主题".to_string(), vec!["q1".to_string()]);
+        r.total_agents = 5;
+        r.interviewed_count = 2;
+        r.summary = "摘要".to_string();
+        r.selection_reasoning = "理由".to_string();
+        let d = r.to_dict();
+        for k in [
+            "interview_topic",
+            "interview_questions",
+            "selected_agents",
+            "interviews",
+            "selection_reasoning",
+            "summary",
+            "total_agents",
+            "interviewed_count",
+        ] {
+            assert!(d.contains_key(k), "missing key {k}");
+        }
+        assert_eq!(d.get("interview_topic").unwrap(), "主题");
+        assert_eq!(d.get("total_agents").unwrap(), &serde_json::json!(5));
+        assert_eq!(d.get("interviewed_count").unwrap(), &serde_json::json!(2));
+        assert_eq!(d.len(), 8);
+    }
+
+    #[test]
+    fn test_interview_result_to_text_empty_interviews() {
+        let r = InterviewResult::new("我的主题".to_string(), vec![]);
+        let txt = r.to_text();
+        assert!(txt.contains("## 深度采访报告"));
+        assert!(txt.contains("**采访主题:** 我的主题"));
+        assert!(txt.contains("**采访人数:** 0 / 0 位模拟Agent"));
+        assert!(txt.contains("### 采访对象选择理由"));
+        // Empty reasoning → 自动选择 placeholder.
+        assert!(txt.contains("（自动选择）"));
+        // Empty interviews → 无采访记录.
+        assert!(txt.contains("（无采访记录）"));
+        // Empty summary → 无摘要.
+        assert!(txt.contains("### 采访摘要与核心观点"));
+        assert!(txt.contains("（无摘要）"));
+    }
+
+    #[test]
+    fn test_interview_result_to_text_non_empty() {
+        let mut r = InterviewResult::new("话题".to_string(), vec![]);
+        r.total_agents = 3;
+        r.interviewed_count = 1;
+        r.selection_reasoning = "因为相关".to_string();
+        r.summary = "总结内容".to_string();
+        r.interviews.push(AgentInterview {
+            agent_name: "受访者甲".to_string(),
+            agent_role: "教师".to_string(),
+            agent_bio: "bio".to_string(),
+            question: "1. q".to_string(),
+            response: "答复".to_string(),
+            key_quotes: vec![],
+        });
+        let txt = r.to_text();
+        assert!(txt.contains("**采访人数:** 1 / 3 位模拟Agent"));
+        assert!(txt.contains("因为相关"));
+        assert!(txt.contains("### 采访实录"));
+        assert!(txt.contains("#### 采访 #1: 受访者甲"));
+        assert!(txt.contains("**受访者甲** (教师)"));
+        assert!(txt.contains("### 采访摘要与核心观点"));
+        assert!(txt.contains("总结内容"));
+        assert!(!txt.contains("（无采访记录）"));
+    }
+
+    #[test]
+    fn test_clean_tool_call_response_passthrough_when_not_json() {
+        let plain = "这是一段普通的回答，没有任何工具调用。".to_string();
+        assert_eq!(ReportTools::<StubLlm>::clean_tool_call_response(plain.clone()), plain);
+        // Starts with { but no tool_name in first 80 chars → passthrough.
+        let no_tool = "{\"key\": \"value without the marker\"}".to_string();
+        assert_eq!(ReportTools::<StubLlm>::clean_tool_call_response(no_tool.clone()), no_tool);
+    }
+
+    #[test]
+    fn test_clean_tool_call_response_unwraps_arguments_content() {
+        let wrapped = "{\"tool_name\": \"reply\", \"arguments\": {\"content\": \"真实回答内容\"}}"
+            .to_string();
+        assert_eq!(ReportTools::<StubLlm>::clean_tool_call_response(wrapped), "真实回答内容");
     }
 
     // ── get_all_nodes / get_all_edges real reads ─────────────────────────────

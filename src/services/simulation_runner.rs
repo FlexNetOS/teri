@@ -1024,6 +1024,16 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
         }
     }
 
+    /// The simulation data directory root (`{SIMULATION_DATA_DIR}`).
+    ///
+    /// Exposes the private `sim_data_dir` field so consumers (e.g. U-024
+    /// `ReportTools::interview_agents`, which loads `{sim_data_dir}/{sim_id}`
+    /// agent-profile files) can resolve per-simulation paths without holding a
+    /// second config borrow.
+    pub fn sim_data_dir(&self) -> &std::path::Path {
+        &self.sim_data_dir
+    }
+
     /// Memory-cache-then-file load of a run state — port of `get_run_state` (S-609).
     ///
     /// Python: return `_run_states[id]` if present, else `_load_run_state(id)` (and cache it).
