@@ -1173,183 +1173,183 @@
 
 ## U-031 — `frontend/src/api/index.js`
 
-- [ ] S-942 · `unit:U-031` · `fn` · `requestWithRetry` · retry wrapper (exponential back-off, default 3 retries) · `api/index.js:56`
-- [ ] S-943 · `unit:U-031` · `const` · `service` (default export) · axios instance; baseURL=VITE_API_BASE_URL; Accept-Language interceptor · `api/index.js:5`
+- [≠] S-942 · `unit:U-031` · `fn` · `requestWithRetry` · retry wrapper (exponential back-off, default 3 retries) · `api/index.js:56`
+- [≠] S-943 · `unit:U-031` · `const` · `service` (default export) · axios instance; baseURL=VITE_API_BASE_URL; Accept-Language interceptor · `api/index.js:5`
 
 ---
 
 ## U-032 — `frontend/src/api/graph.js`
 
-- [ ] S-944 · `unit:U-032` · `fn` · `generateOntology` · POST /graph/ontology/generate (multipart) · `api/graph.js:8`
-- [ ] S-945 · `unit:U-032` · `fn` · `buildGraph` · POST /graph/build · `api/graph.js:26`
-- [ ] S-946 · `unit:U-032` · `fn` · `getTaskStatus` · GET /graph/task/<taskId> · `api/graph.js:41`
-- [ ] S-947 · `unit:U-032` · `fn` · `getGraphData` · GET /graph/data/<graphId> · `api/graph.js:53`
-- [ ] S-948 · `unit:U-032` · `fn` · `getProject` · GET /graph/project/<projectId> · `api/graph.js:65`
+- [≠] S-944 · `unit:U-032` · `fn` · `generateOntology` · POST /graph/ontology/generate (multipart) · `api/graph.js:8`
+- [≠] S-945 · `unit:U-032` · `fn` · `buildGraph` · POST /graph/build · `api/graph.js:26`
+- [≠] S-946 · `unit:U-032` · `fn` · `getTaskStatus` · GET /graph/task/<taskId> · `api/graph.js:41`
+- [≠] S-947 · `unit:U-032` · `fn` · `getGraphData` · GET /graph/data/<graphId> · `api/graph.js:53`
+- [≠] S-948 · `unit:U-032` · `fn` · `getProject` · GET /graph/project/<projectId> · `api/graph.js:65`
 
 ---
 
 ## U-033 — `frontend/src/api/simulation.js`
 
-- [ ] S-949 · `unit:U-033` · `fn` · `createSimulation` · POST /simulation/create · `api/simulation.js:7`
-- [ ] S-950 · `unit:U-033` · `fn` · `prepareSimulation` · POST /simulation/prepare · `api/simulation.js:15`
-- [ ] S-951 · `unit:U-033` · `fn` · `getPrepareStatus` · POST /simulation/prepare/status · `api/simulation.js:23`
-- [ ] S-952 · `unit:U-033` · `fn` · `getSimulation` · GET /simulation/<id> · `api/simulation.js:31`
-- [ ] S-953 · `unit:U-033` · `fn` · `getSimulationProfiles` · GET /simulation/<id>/profiles · `api/simulation.js:40`
-- [ ] S-954 · `unit:U-033` · `fn` · `getSimulationProfilesRealtime` · GET /simulation/<id>/profiles/realtime · `api/simulation.js:49`
-- [ ] S-955 · `unit:U-033` · `fn` · `getSimulationConfig` · GET /simulation/<id>/config · `api/simulation.js:57`
-- [ ] S-956 · `unit:U-033` · `fn` · `getSimulationConfigRealtime` · GET /simulation/<id>/config/realtime · `api/simulation.js:66`
-- [ ] S-957 · `unit:U-033` · `fn` · `listSimulations` · GET /simulation/list · `api/simulation.js:74`
-- [ ] S-958 · `unit:U-033` · `fn` · `startSimulation` · POST /simulation/start · `api/simulation.js:83`
-- [ ] S-959 · `unit:U-033` · `fn` · `stopSimulation` · POST /simulation/stop · `api/simulation.js:91`
-- [ ] S-960 · `unit:U-033` · `fn` · `getRunStatus` · GET /simulation/<id>/run-status · `api/simulation.js:99`
-- [ ] S-961 · `unit:U-033` · `fn` · `getRunStatusDetail` · GET /simulation/<id>/run-status/detail · `api/simulation.js:107`
-- [ ] S-962 · `unit:U-033` · `fn` · `getSimulationPosts` · GET /simulation/<id>/posts · `api/simulation.js:118`
-- [ ] S-963 · `unit:U-033` · `fn` · `getSimulationTimeline` · GET /simulation/<id>/timeline · `api/simulation.js:130`
-- [ ] S-964 · `unit:U-033` · `fn` · `getAgentStats` · GET /simulation/<id>/agent-stats · `api/simulation.js:142`
-- [ ] S-965 · `unit:U-033` · `fn` · `getSimulationActions` · GET /simulation/<id>/actions · `api/simulation.js:151`
-- [ ] S-966 · `unit:U-033` · `fn` · `closeSimulationEnv` · POST /simulation/close-env · `api/simulation.js:159`
-- [ ] S-967 · `unit:U-033` · `fn` · `getEnvStatus` · POST /simulation/env-status · `api/simulation.js:167`
-- [ ] S-968 · `unit:U-033` · `fn` · `interviewAgents` · POST /simulation/interview · `api/simulation.js:175`
-- [ ] S-969 · `unit:U-033` · `fn` · `getSimulationHistory` · GET /simulation/history · `api/simulation.js:184`
+- [≠] S-949 · `unit:U-033` · `fn` · `createSimulation` · POST /simulation/create · `api/simulation.js:7`
+- [≠] S-950 · `unit:U-033` · `fn` · `prepareSimulation` · POST /simulation/prepare · `api/simulation.js:15`
+- [≠] S-951 · `unit:U-033` · `fn` · `getPrepareStatus` · POST /simulation/prepare/status · `api/simulation.js:23`
+- [≠] S-952 · `unit:U-033` · `fn` · `getSimulation` · GET /simulation/<id> · `api/simulation.js:31`
+- [≠] S-953 · `unit:U-033` · `fn` · `getSimulationProfiles` · GET /simulation/<id>/profiles · `api/simulation.js:40`
+- [≠] S-954 · `unit:U-033` · `fn` · `getSimulationProfilesRealtime` · GET /simulation/<id>/profiles/realtime · `api/simulation.js:49`
+- [≠] S-955 · `unit:U-033` · `fn` · `getSimulationConfig` · GET /simulation/<id>/config · `api/simulation.js:57`
+- [≠] S-956 · `unit:U-033` · `fn` · `getSimulationConfigRealtime` · GET /simulation/<id>/config/realtime · `api/simulation.js:66`
+- [≠] S-957 · `unit:U-033` · `fn` · `listSimulations` · GET /simulation/list · `api/simulation.js:74`
+- [≠] S-958 · `unit:U-033` · `fn` · `startSimulation` · POST /simulation/start · `api/simulation.js:83`
+- [≠] S-959 · `unit:U-033` · `fn` · `stopSimulation` · POST /simulation/stop · `api/simulation.js:91`
+- [≠] S-960 · `unit:U-033` · `fn` · `getRunStatus` · GET /simulation/<id>/run-status · `api/simulation.js:99`
+- [≠] S-961 · `unit:U-033` · `fn` · `getRunStatusDetail` · GET /simulation/<id>/run-status/detail · `api/simulation.js:107`
+- [≠] S-962 · `unit:U-033` · `fn` · `getSimulationPosts` · GET /simulation/<id>/posts · `api/simulation.js:118`
+- [≠] S-963 · `unit:U-033` · `fn` · `getSimulationTimeline` · GET /simulation/<id>/timeline · `api/simulation.js:130`
+- [≠] S-964 · `unit:U-033` · `fn` · `getAgentStats` · GET /simulation/<id>/agent-stats · `api/simulation.js:142`
+- [≠] S-965 · `unit:U-033` · `fn` · `getSimulationActions` · GET /simulation/<id>/actions · `api/simulation.js:151`
+- [≠] S-966 · `unit:U-033` · `fn` · `closeSimulationEnv` · POST /simulation/close-env · `api/simulation.js:159`
+- [≠] S-967 · `unit:U-033` · `fn` · `getEnvStatus` · POST /simulation/env-status · `api/simulation.js:167`
+- [≠] S-968 · `unit:U-033` · `fn` · `interviewAgents` · POST /simulation/interview · `api/simulation.js:175`
+- [≠] S-969 · `unit:U-033` · `fn` · `getSimulationHistory` · GET /simulation/history · `api/simulation.js:184`
 
 ---
 
 ## U-034 — `frontend/src/api/report.js`
 
-- [ ] S-970 · `unit:U-034` · `fn` · `generateReport` · POST /report/generate · `api/report.js:7`
-- [ ] S-971 · `unit:U-034` · `fn` · `getReportStatus` · POST /report/generate/status · `api/report.js:15`
-- [ ] S-972 · `unit:U-034` · `fn` · `getAgentLog` · GET /report/<id>/agent-log?from_line= · `api/report.js:24`
-- [ ] S-973 · `unit:U-034` · `fn` · `getConsoleLog` · GET /report/<id>/console-log?from_line= · `api/report.js:33`
-- [ ] S-974 · `unit:U-034` · `fn` · `getReport` · GET /report/<id> · `api/report.js:41`
-- [ ] S-975 · `unit:U-034` · `fn` · `chatWithReport` · POST /report/chat · `api/report.js:49`
+- [≠] S-970 · `unit:U-034` · `fn` · `generateReport` · POST /report/generate · `api/report.js:7`
+- [≠] S-971 · `unit:U-034` · `fn` · `getReportStatus` · POST /report/generate/status · `api/report.js:15`
+- [≠] S-972 · `unit:U-034` · `fn` · `getAgentLog` · GET /report/<id>/agent-log?from_line= · `api/report.js:24`
+- [≠] S-973 · `unit:U-034` · `fn` · `getConsoleLog` · GET /report/<id>/console-log?from_line= · `api/report.js:33`
+- [≠] S-974 · `unit:U-034` · `fn` · `getReport` · GET /report/<id> · `api/report.js:41`
+- [≠] S-975 · `unit:U-034` · `fn` · `chatWithReport` · POST /report/chat · `api/report.js:49`
 
 ---
 
 ## U-035 — `frontend/src/store/pendingUpload.js`
 
-- [ ] S-976 · `unit:U-035` · `fn` · `setPendingUpload` · sets reactive state files+requirement+isPending=true · `store/pendingUpload.js:13`
-- [ ] S-977 · `unit:U-035` · `fn` · `getPendingUpload` · returns {files, simulationRequirement, isPending} · `store/pendingUpload.js:19`
-- [ ] S-978 · `unit:U-035` · `fn` · `clearPendingUpload` · resets state · `store/pendingUpload.js:27`
-- [ ] S-979 · `unit:U-035` · `const` · `state` (default export) · reactive store object · `store/pendingUpload.js:7`
+- [≠] S-976 · `unit:U-035` · `fn` · `setPendingUpload` · sets reactive state files+requirement+isPending=true · `store/pendingUpload.js:13`
+- [≠] S-977 · `unit:U-035` · `fn` · `getPendingUpload` · returns {files, simulationRequirement, isPending} · `store/pendingUpload.js:19`
+- [≠] S-978 · `unit:U-035` · `fn` · `clearPendingUpload` · resets state · `store/pendingUpload.js:27`
+- [≠] S-979 · `unit:U-035` · `const` · `state` (default export) · reactive store object · `store/pendingUpload.js:7`
 
 ---
 
 ## U-036 — `frontend/src/i18n/index.js`
 
-- [ ] S-980 · `unit:U-036` · `const` · `availableLocales` · array of {key, label} from languages.json · `i18n/index.js:26`
-- [ ] S-981 · `unit:U-036` · `const` · `i18n` (default export) · vue-i18n instance; fallbackLocale=zh; reads localStorage · `i18n/index.js:19`
+- [≠] S-980 · `unit:U-036` · `const` · `availableLocales` · array of {key, label} from languages.json · `i18n/index.js:26`
+- [≠] S-981 · `unit:U-036` · `const` · `i18n` (default export) · vue-i18n instance; fallbackLocale=zh; reads localStorage · `i18n/index.js:19`
 
 ---
 
 ## U-037 — `frontend/src/router/index.js`
 
-- [ ] S-982 · `unit:U-037` · `route` · `/` · Home · `router/index.js:10`
-- [ ] S-983 · `unit:U-037` · `route` · `/process/:projectId` · MainView (props:true) · `router/index.js:16`
-- [ ] S-984 · `unit:U-037` · `route` · `/simulation/:simulationId` · SimulationView (props:true) · `router/index.js:22`
-- [ ] S-985 · `unit:U-037` · `route` · `/simulation/:simulationId/start` · SimulationRunView (props:true) · `router/index.js:28`
-- [ ] S-986 · `unit:U-037` · `route` · `/report/:reportId` · ReportView (props:true) · `router/index.js:34`
-- [ ] S-987 · `unit:U-037` · `route` · `/interaction/:reportId` · InteractionView (props:true) · `router/index.js:40`
-- [ ] S-988 · `unit:U-037` · `const` · `router` (default export) · createWebHistory router · `router/index.js:47`
+- [≠] S-982 · `unit:U-037` · `route` · `/` · Home · `router/index.js:10`
+- [≠] S-983 · `unit:U-037` · `route` · `/process/:projectId` · MainView (props:true) · `router/index.js:16`
+- [≠] S-984 · `unit:U-037` · `route` · `/simulation/:simulationId` · SimulationView (props:true) · `router/index.js:22`
+- [≠] S-985 · `unit:U-037` · `route` · `/simulation/:simulationId/start` · SimulationRunView (props:true) · `router/index.js:28`
+- [≠] S-986 · `unit:U-037` · `route` · `/report/:reportId` · ReportView (props:true) · `router/index.js:34`
+- [≠] S-987 · `unit:U-037` · `route` · `/interaction/:reportId` · InteractionView (props:true) · `router/index.js:40`
+- [≠] S-988 · `unit:U-037` · `const` · `router` (default export) · createWebHistory router · `router/index.js:47`
 
 ---
 
 ## U-038 — `frontend/src/views/Home.vue`
 
-- [ ] S-989 · `unit:U-038` · `const` · `formData` · reactive simulation_requirement + files state · `Home.vue:10`
-- [ ] S-990 · `unit:U-038` · `const` · `files` · ref([]) file list · `Home.vue:15`
-- [ ] S-991 · `unit:U-038` · `const` · `loading` · `Home.vue:18`
-- [ ] S-992 · `unit:U-038` · `const` · `error` · `Home.vue:19`
-- [ ] S-993 · `unit:U-038` · `const` · `isDragOver` · `Home.vue:20`
-- [ ] S-994 · `unit:U-038` · `const` · `canSubmit` · computed: formData.simulation_requirement && files.length > 0 · `Home.vue:26`
-- [ ] S-995 · `unit:U-038` · `fn` · `triggerFileInput` · `Home.vue:31`
-- [ ] S-996 · `unit:U-038` · `fn` · `handleFileSelect` · `Home.vue:38`
-- [ ] S-997 · `unit:U-038` · `fn` · `handleDragOver` · `Home.vue:44`
-- [ ] S-998 · `unit:U-038` · `fn` · `handleDragLeave` · `Home.vue:50`
-- [ ] S-999 · `unit:U-038` · `fn` · `handleDrop` · `Home.vue:54`
-- [ ] S-1000 · `unit:U-038` · `fn` · `addFiles` · validates ext, max 10 files, deduplicates · `Home.vue:63`
-- [ ] S-1001 · `unit:U-038` · `fn` · `removeFile` · `Home.vue:72`
-- [ ] S-1002 · `unit:U-038` · `fn` · `startSimulation` · calls setPendingUpload then routes to /process/new · `Home.vue:85`
+- [≠] S-989 · `unit:U-038` · `const` · `formData` · reactive simulation_requirement + files state · `Home.vue:10`
+- [≠] S-990 · `unit:U-038` · `const` · `files` · ref([]) file list · `Home.vue:15`
+- [≠] S-991 · `unit:U-038` · `const` · `loading` · `Home.vue:18`
+- [≠] S-992 · `unit:U-038` · `const` · `error` · `Home.vue:19`
+- [≠] S-993 · `unit:U-038` · `const` · `isDragOver` · `Home.vue:20`
+- [≠] S-994 · `unit:U-038` · `const` · `canSubmit` · computed: formData.simulation_requirement && files.length > 0 · `Home.vue:26`
+- [≠] S-995 · `unit:U-038` · `fn` · `triggerFileInput` · `Home.vue:31`
+- [≠] S-996 · `unit:U-038` · `fn` · `handleFileSelect` · `Home.vue:38`
+- [≠] S-997 · `unit:U-038` · `fn` · `handleDragOver` · `Home.vue:44`
+- [≠] S-998 · `unit:U-038` · `fn` · `handleDragLeave` · `Home.vue:50`
+- [≠] S-999 · `unit:U-038` · `fn` · `handleDrop` · `Home.vue:54`
+- [≠] S-1000 · `unit:U-038` · `fn` · `addFiles` · validates ext, max 10 files, deduplicates · `Home.vue:63`
+- [≠] S-1001 · `unit:U-038` · `fn` · `removeFile` · `Home.vue:72`
+- [≠] S-1002 · `unit:U-038` · `fn` · `startSimulation` · calls setPendingUpload then routes to /process/new · `Home.vue:85`
 
 ---
 
 ## U-039 — `frontend/src/views/MainView.vue`
 
-- [ ] S-1003 · `unit:U-039` · `const` · `viewMode` · split/graph/workbench · `MainView.vue:17`
-- [ ] S-1004 · `unit:U-039` · `const` · `currentStep` · 1-5 · `MainView.vue:20`
-- [ ] S-1005 · `unit:U-039` · `const` · `stepNames` · computed from i18n · `MainView.vue:21`
-- [ ] S-1006 · `unit:U-039` · `fn` · `handleNextStep` · advances currentStep; routes for step >= 3 · `MainView.vue:86`
-- [ ] S-1007 · `unit:U-039` · `fn` · `handleGoBack` · `MainView.vue:98`
-- [ ] S-1008 · `unit:U-039` · `fn` · `initProject` · `MainView.vue:107`
-- [ ] S-1009 · `unit:U-039` · `fn` · `handleNewProject` · uploads via generateOntology then polls · `MainView.vue:116`
-- [ ] S-1010 · `unit:U-039` · `fn` · `loadProject` · `MainView.vue:156`
-- [ ] S-1011 · `unit:U-039` · `fn` · `updatePhaseByStatus` · maps project status → currentPhase · `MainView.vue:188`
-- [ ] S-1012 · `unit:U-039` · `fn` · `startBuildGraph` · `MainView.vue:198`
-- [ ] S-1013 · `unit:U-039` · `fn` · `startGraphPolling` · `MainView.vue:219`
-- [ ] S-1014 · `unit:U-039` · `fn` · `fetchGraphData` · `MainView.vue:225`
-- [ ] S-1015 · `unit:U-039` · `fn` · `startPollingTask` · `MainView.vue:243`
-- [ ] S-1016 · `unit:U-039` · `fn` · `pollTaskStatus` · `MainView.vue:248`
-- [ ] S-1017 · `unit:U-039` · `fn` · `loadGraph` · `MainView.vue:284`
-- [ ] S-1018 · `unit:U-039` · `fn` · `refreshGraph` · `MainView.vue:302`
-- [ ] S-1019 · `unit:U-039` · `fn` · `stopPolling` · `MainView.vue:309`
-- [ ] S-1020 · `unit:U-039` · `fn` · `stopGraphPolling` · `MainView.vue:316`
-- [ ] S-1021 · `unit:U-039` · `fn` · `toggleMaximize` · `MainView.vue:78`
+- [≠] S-1003 · `unit:U-039` · `const` · `viewMode` · split/graph/workbench · `MainView.vue:17`
+- [≠] S-1004 · `unit:U-039` · `const` · `currentStep` · 1-5 · `MainView.vue:20`
+- [≠] S-1005 · `unit:U-039` · `const` · `stepNames` · computed from i18n · `MainView.vue:21`
+- [≠] S-1006 · `unit:U-039` · `fn` · `handleNextStep` · advances currentStep; routes for step >= 3 · `MainView.vue:86`
+- [≠] S-1007 · `unit:U-039` · `fn` · `handleGoBack` · `MainView.vue:98`
+- [≠] S-1008 · `unit:U-039` · `fn` · `initProject` · `MainView.vue:107`
+- [≠] S-1009 · `unit:U-039` · `fn` · `handleNewProject` · uploads via generateOntology then polls · `MainView.vue:116`
+- [≠] S-1010 · `unit:U-039` · `fn` · `loadProject` · `MainView.vue:156`
+- [≠] S-1011 · `unit:U-039` · `fn` · `updatePhaseByStatus` · maps project status → currentPhase · `MainView.vue:188`
+- [≠] S-1012 · `unit:U-039` · `fn` · `startBuildGraph` · `MainView.vue:198`
+- [≠] S-1013 · `unit:U-039` · `fn` · `startGraphPolling` · `MainView.vue:219`
+- [≠] S-1014 · `unit:U-039` · `fn` · `fetchGraphData` · `MainView.vue:225`
+- [≠] S-1015 · `unit:U-039` · `fn` · `startPollingTask` · `MainView.vue:243`
+- [≠] S-1016 · `unit:U-039` · `fn` · `pollTaskStatus` · `MainView.vue:248`
+- [≠] S-1017 · `unit:U-039` · `fn` · `loadGraph` · `MainView.vue:284`
+- [≠] S-1018 · `unit:U-039` · `fn` · `refreshGraph` · `MainView.vue:302`
+- [≠] S-1019 · `unit:U-039` · `fn` · `stopPolling` · `MainView.vue:309`
+- [≠] S-1020 · `unit:U-039` · `fn` · `stopGraphPolling` · `MainView.vue:316`
+- [≠] S-1021 · `unit:U-039` · `fn` · `toggleMaximize` · `MainView.vue:78`
 
 ---
 
 ## U-040 — `frontend/src/views/SimulationView.vue`
 
-- [ ] S-1022 · `unit:U-040` · `const` · `viewMode` · `SimulationView.vue:21`
-- [ ] S-1023 · `unit:U-040` · `fn` · `handleGoBack` · checks env status, closes env if running, routes back · `SimulationView.vue:77`
-- [ ] S-1024 · `unit:U-040` · `fn` · `handleNextStep` · routes to /simulation/<id>/start · `SimulationView.vue:86`
-- [ ] S-1025 · `unit:U-040` · `fn` · `checkAndStopRunningSimulation` · `SimulationView.vue:117`
-- [ ] S-1026 · `unit:U-040` · `fn` · `forceStopSimulation` · `SimulationView.vue:163`
-- [ ] S-1027 · `unit:U-040` · `fn` · `loadSimulationData` · `SimulationView.vue:176`
-- [ ] S-1028 · `unit:U-040` · `fn` · `loadGraph` · `SimulationView.vue:206`
-- [ ] S-1029 · `unit:U-040` · `fn` · `refreshGraph` · `SimulationView.vue:221`
-- [ ] S-1030 · `unit:U-040` · `fn` · `toggleMaximize` · `SimulationView.vue:69`
+- [≠] S-1022 · `unit:U-040` · `const` · `viewMode` · `SimulationView.vue:21`
+- [≠] S-1023 · `unit:U-040` · `fn` · `handleGoBack` · checks env status, closes env if running, routes back · `SimulationView.vue:77`
+- [≠] S-1024 · `unit:U-040` · `fn` · `handleNextStep` · routes to /simulation/<id>/start · `SimulationView.vue:86`
+- [≠] S-1025 · `unit:U-040` · `fn` · `checkAndStopRunningSimulation` · `SimulationView.vue:117`
+- [≠] S-1026 · `unit:U-040` · `fn` · `forceStopSimulation` · `SimulationView.vue:163`
+- [≠] S-1027 · `unit:U-040` · `fn` · `loadSimulationData` · `SimulationView.vue:176`
+- [≠] S-1028 · `unit:U-040` · `fn` · `loadGraph` · `SimulationView.vue:206`
+- [≠] S-1029 · `unit:U-040` · `fn` · `refreshGraph` · `SimulationView.vue:221`
+- [≠] S-1030 · `unit:U-040` · `fn` · `toggleMaximize` · `SimulationView.vue:69`
 
 ---
 
 ## U-041 — `frontend/src/views/SimulationRunView.vue`
 
-- [ ] S-1031 · `unit:U-041` · `fn` · `handleGoBack` · stops sim env if still running before routing · `SimulationRunView.vue:82`
-- [ ] S-1032 · `unit:U-041` · `fn` · `handleNextStep` · routes to /report/<report_id> · `SimulationRunView.vue:130`
-- [ ] S-1033 · `unit:U-041` · `fn` · `loadSimulationData` · loads sim, config, project · `SimulationRunView.vue:137`
-- [ ] S-1034 · `unit:U-041` · `fn` · `loadGraph` · `SimulationRunView.vue:178`
-- [ ] S-1035 · `unit:U-041` · `fn` · `refreshGraph` · `SimulationRunView.vue:200`
-- [ ] S-1036 · `unit:U-041` · `fn` · `startGraphRefresh` · `SimulationRunView.vue:209`
-- [ ] S-1037 · `unit:U-041` · `fn` · `stopGraphRefresh` · `SimulationRunView.vue:216`
-- [ ] S-1038 · `unit:U-041` · `fn` · `toggleMaximize` · `SimulationRunView.vue:74`
-- [ ] S-1039 · `unit:U-041` · `const` · `isSimulating` · computed from currentStatus · `SimulationRunView.vue:58`
+- [≠] S-1031 · `unit:U-041` · `fn` · `handleGoBack` · stops sim env if still running before routing · `SimulationRunView.vue:82`
+- [≠] S-1032 · `unit:U-041` · `fn` · `handleNextStep` · routes to /report/<report_id> · `SimulationRunView.vue:130`
+- [≠] S-1033 · `unit:U-041` · `fn` · `loadSimulationData` · loads sim, config, project · `SimulationRunView.vue:137`
+- [≠] S-1034 · `unit:U-041` · `fn` · `loadGraph` · `SimulationRunView.vue:178`
+- [≠] S-1035 · `unit:U-041` · `fn` · `refreshGraph` · `SimulationRunView.vue:200`
+- [≠] S-1036 · `unit:U-041` · `fn` · `startGraphRefresh` · `SimulationRunView.vue:209`
+- [≠] S-1037 · `unit:U-041` · `fn` · `stopGraphRefresh` · `SimulationRunView.vue:216`
+- [≠] S-1038 · `unit:U-041` · `fn` · `toggleMaximize` · `SimulationRunView.vue:74`
+- [≠] S-1039 · `unit:U-041` · `const` · `isSimulating` · computed from currentStatus · `SimulationRunView.vue:58`
 
 ---
 
 ## U-042 — `frontend/src/views/ReportView.vue`
 
-- [ ] S-1040 · `unit:U-042` · `fn` · `loadReportData` · loads report → sim → project + graph · `ReportView.vue:80`
-- [ ] S-1041 · `unit:U-042` · `fn` · `loadGraph` · `ReportView.vue:119`
-- [ ] S-1042 · `unit:U-042` · `fn` · `refreshGraph` · `ReportView.vue:135`
-- [ ] S-1043 · `unit:U-042` · `fn` · `toggleMaximize` · `ReportView.vue:71`
-- [ ] S-1044 · `unit:U-042` · `fn` · `addLog` · `ReportView.vue:58`
-- [ ] S-1045 · `unit:U-042` · `fn` · `updateStatus` · `ReportView.vue:66`
+- [≠] S-1040 · `unit:U-042` · `fn` · `loadReportData` · loads report → sim → project + graph · `ReportView.vue:80`
+- [≠] S-1041 · `unit:U-042` · `fn` · `loadGraph` · `ReportView.vue:119`
+- [≠] S-1042 · `unit:U-042` · `fn` · `refreshGraph` · `ReportView.vue:135`
+- [≠] S-1043 · `unit:U-042` · `fn` · `toggleMaximize` · `ReportView.vue:71`
+- [≠] S-1044 · `unit:U-042` · `fn` · `addLog` · `ReportView.vue:58`
+- [≠] S-1045 · `unit:U-042` · `fn` · `updateStatus` · `ReportView.vue:66`
 
 ---
 
 ## U-043 — `frontend/src/views/InteractionView.vue`
 
-- [ ] S-1046 · `unit:U-043` · `fn` · `loadReportData` · `InteractionView.vue:81`
-- [ ] S-1047 · `unit:U-043` · `fn` · `loadGraph` · `InteractionView.vue:120`
-- [ ] S-1048 · `unit:U-043` · `fn` · `refreshGraph` · `InteractionView.vue:136`
-- [ ] S-1049 · `unit:U-043` · `fn` · `toggleMaximize` · `InteractionView.vue:72`
-- [ ] S-1050 · `unit:U-043` · `fn` · `addLog` · `InteractionView.vue:59`
-- [ ] S-1051 · `unit:U-043` · `fn` · `updateStatus` · `InteractionView.vue:67`
+- [≠] S-1046 · `unit:U-043` · `fn` · `loadReportData` · `InteractionView.vue:81`
+- [≠] S-1047 · `unit:U-043` · `fn` · `loadGraph` · `InteractionView.vue:120`
+- [≠] S-1048 · `unit:U-043` · `fn` · `refreshGraph` · `InteractionView.vue:136`
+- [≠] S-1049 · `unit:U-043` · `fn` · `toggleMaximize` · `InteractionView.vue:72`
+- [≠] S-1050 · `unit:U-043` · `fn` · `addLog` · `InteractionView.vue:59`
+- [≠] S-1051 · `unit:U-043` · `fn` · `updateStatus` · `InteractionView.vue:67`
 
 ---
 
 ## U-044 — `frontend/src/App.vue` + `frontend/src/main.js`
 
-- [ ] S-1052 · `unit:U-044` · `const` · `App` (default export) · root Vue component, hosts RouterView · `App.vue:1`
-- [ ] S-1053 · `unit:U-044` · `fn` · `main` (IIFE) · createApp(App).use(router).use(i18n).mount('#app') · `main.js:1`
+- [≠] S-1052 · `unit:U-044` · `const` · `App` (default export) · root Vue component, hosts RouterView · `App.vue:1`
+- [≠] S-1053 · `unit:U-044` · `fn` · `main` (IIFE) · createApp(App).use(router).use(i18n).mount('#app') · `main.js:1`
 
 ---
 
@@ -1407,24 +1407,24 @@
 
 ## SWEEP-2 — Locales (`locales/en.json`, `locales/zh.json`)
 
-- [ ] S-1068 · `unit:SWEEP-2` · `const` · `locale:common` · 20 leaf keys: cancel, confirm, save, close, delete, create, edit, loading, error, success, download, preview, search, refresh, back, next, done, required, optional, unknown · `locales/en.json:common`
-- [ ] S-1069 · `unit:SWEEP-2` · `const` · `locale:meta` · app title / brand strings · `locales/en.json:meta`
-- [ ] S-1070 · `unit:SWEEP-2` · `const` · `locale:nav` · navigation labels · `locales/en.json:nav`
-- [ ] S-1071 · `unit:SWEEP-2` · `const` · `locale:home` · home page UI strings · `locales/en.json:home`
-- [ ] S-1072 · `unit:SWEEP-2` · `const` · `locale:main` · main layout + step names · `locales/en.json:main`
-- [ ] S-1073 · `unit:SWEEP-2` · `const` · `locale:step1` · graph build step strings · `locales/en.json:step1`
-- [ ] S-1074 · `unit:SWEEP-2` · `const` · `locale:step2` · env setup step strings · `locales/en.json:step2`
-- [ ] S-1075 · `unit:SWEEP-2` · `const` · `locale:step3` · simulation run step strings · `locales/en.json:step3`
-- [ ] S-1076 · `unit:SWEEP-2` · `const` · `locale:step4` · report step strings · `locales/en.json:step4`
-- [ ] S-1077 · `unit:SWEEP-2` · `const` · `locale:step5` · interaction step strings · `locales/en.json:step5`
-- [ ] S-1078 · `unit:SWEEP-2` · `const` · `locale:graph` · graph panel strings · `locales/en.json:graph`
-- [ ] S-1079 · `unit:SWEEP-2` · `const` · `locale:history` · history database strings · `locales/en.json:history`
-- [ ] S-1080 · `unit:SWEEP-2` · `const` · `locale:api` · API error/status message strings · `locales/en.json:api`
-- [ ] S-1081 · `unit:SWEEP-2` · `const` · `locale:progress` · progress indicator strings · `locales/en.json:progress`
-- [ ] S-1082 · `unit:SWEEP-2` · `const` · `locale:log` · log panel strings · `locales/en.json:log`
-- [ ] S-1083 · `unit:SWEEP-2` · `const` · `locale:report` · report viewer strings · `locales/en.json:report`
-- [ ] S-1084 · `unit:SWEEP-2` · `const` · `locale:console` · console log panel strings · `locales/en.json:console`
-- [ ] S-1085 · `unit:SWEEP-2` · `const` · `locale:zh_parity` · zh.json must supply identical key tree (629 leaves, 17 namespaces); any missing/extra key is a parity failure · `locales/zh.json`
+- [x] S-1068 · `unit:SWEEP-2` · `const` · `locale:common` · 20 leaf keys: cancel, confirm, save, close, delete, create, edit, loading, error, success, download, preview, search, refresh, back, next, done, required, optional, unknown · `locales/en.json:common`
+- [x] S-1069 · `unit:SWEEP-2` · `const` · `locale:meta` · app title / brand strings · `locales/en.json:meta`
+- [x] S-1070 · `unit:SWEEP-2` · `const` · `locale:nav` · navigation labels · `locales/en.json:nav`
+- [x] S-1071 · `unit:SWEEP-2` · `const` · `locale:home` · home page UI strings · `locales/en.json:home`
+- [x] S-1072 · `unit:SWEEP-2` · `const` · `locale:main` · main layout + step names · `locales/en.json:main`
+- [x] S-1073 · `unit:SWEEP-2` · `const` · `locale:step1` · graph build step strings · `locales/en.json:step1`
+- [x] S-1074 · `unit:SWEEP-2` · `const` · `locale:step2` · env setup step strings · `locales/en.json:step2`
+- [x] S-1075 · `unit:SWEEP-2` · `const` · `locale:step3` · simulation run step strings · `locales/en.json:step3`
+- [x] S-1076 · `unit:SWEEP-2` · `const` · `locale:step4` · report step strings · `locales/en.json:step4`
+- [x] S-1077 · `unit:SWEEP-2` · `const` · `locale:step5` · interaction step strings · `locales/en.json:step5`
+- [x] S-1078 · `unit:SWEEP-2` · `const` · `locale:graph` · graph panel strings · `locales/en.json:graph`
+- [x] S-1079 · `unit:SWEEP-2` · `const` · `locale:history` · history database strings · `locales/en.json:history`
+- [x] S-1080 · `unit:SWEEP-2` · `const` · `locale:api` · API error/status message strings · `locales/en.json:api`
+- [x] S-1081 · `unit:SWEEP-2` · `const` · `locale:progress` · progress indicator strings · `locales/en.json:progress`
+- [x] S-1082 · `unit:SWEEP-2` · `const` · `locale:log` · log panel strings · `locales/en.json:log`
+- [x] S-1083 · `unit:SWEEP-2` · `const` · `locale:report` · report viewer strings · `locales/en.json:report`
+- [x] S-1084 · `unit:SWEEP-2` · `const` · `locale:console` · console log panel strings · `locales/en.json:console`
+- [x] S-1085 · `unit:SWEEP-2` · `const` · `locale:zh_parity` · zh.json must supply identical key tree (629 leaves, 17 namespaces); any missing/extra key is a parity failure · `locales/zh.json`
 
 ---
 

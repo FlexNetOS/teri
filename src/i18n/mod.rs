@@ -37,7 +37,7 @@
 //! after creation — the entire future must be wrapped.  `with_locale` provides a named wrapper
 //! for ergonomics at call sites.
 //!
-//! # S-040 `get_locale` — request-context branch (PENDING-U-002/U-003)
+//! # S-040 `get_locale` — request-context branch (LANDED in `accept_language_middleware`)
 //!
 //! Python's `get_locale` has **two branches**:
 //! ```python
@@ -46,15 +46,14 @@
 //!     return raw if raw in _translations else 'zh'
 //! return getattr(_thread_local, 'locale', 'zh')
 //! ```
-//! Branch 1 (Flask request context → `Accept-Language` header) is **not yet portable** because
-//! teri's axum HTTP layer (U-002 `api/routes.rs`, U-003 `api/handlers.rs`) has not been ported.
-//! When those units land, this branch MUST be wired up:
-//!   - Read the `Accept-Language` header from the axum `Extension`/extractor or from a
-//!     request-scoped task-local set by middleware.
-//!   - Validate: `if translations().contains_key(raw) { raw } else { "zh".to_string() }`.
-//!   - Set the task-local via `LOCALE.scope(validated_locale, handler_future).await` in the
-//!     axum middleware, so inner calls to `get_locale()` see the request locale automatically.
-//!     Branch 2 (task-local fallback, default `"zh"`) is fully implemented here.
+//! Branch 1 (Flask request context → `Accept-Language` header) is ported in teri's axum HTTP
+//! layer as `accept_language_middleware` (`src/server.rs`), applied to all routes:
+//! - Reads the `Accept-Language` header from the axum `HeaderMap`.
+//! - Validates via `is_supported_locale(raw)` → `raw` else `"zh"` (matching `raw in _translations`).
+//! - Wraps the handler in `with_locale(validated_locale, next.run(request)).await`, so inner
+//!   calls to `get_locale()` see the request locale automatically.
+//!
+//! Branch 2 (task-local fallback, default `"zh"`) is implemented here in `get_locale`.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -153,17 +152,12 @@ where
 
 /// Returns the active locale string.
 ///
-/// **Branch 1 — request-context (PENDING-U-002/U-003):**
-/// When teri's axum HTTP layer lands (U-002 `api/routes.rs`, U-003 `api/handlers.rs`), this
-/// function must gain a second branch:
-/// ```text
-/// if request_context_active() {
-///     let raw = accept_language_header().unwrap_or("zh");
-///     return if translations().contains_key(raw) { raw } else { "zh" };
-/// }
-/// ```
-/// The axum middleware should call `with_locale(validated_locale, handler)` so inner calls to
-/// `get_locale()` already see the correct value without an explicit check here.
+/// **Branch 1 — request-context (LANDED in `accept_language_middleware`):**
+/// teri's axum HTTP layer ports Python's `has_request_context()` branch as
+/// `accept_language_middleware` (`src/server.rs`), applied to all routes. It reads the
+/// `Accept-Language` header, validates via `is_supported_locale` (→ `raw` else `"zh"`), and
+/// calls `with_locale(validated_locale, handler).await` so inner calls to `get_locale()`
+/// already see the request locale — no explicit request-context check is needed here.
 ///
 /// **Branch 2 — task-local fallback (fully implemented):**
 /// Reads the `LOCALE` task-local; defaults to `"zh"` when unset, matching Python's

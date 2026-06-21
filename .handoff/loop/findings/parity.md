@@ -5017,3 +5017,25 @@ Orchestrator applied both fixes; re-verified the delta only.
 **UNIT U-017 IS NOW TERMINAL.** S-315 + S-316 were the only two non-terminal U-017 rows; with both `[x]`, every U-017 symbol is `[x]` or a justified `[≠]`. U-017 may be marked unit-`[x]` and committed.
 
 **RETURN: PASS** (S-315 `[x]`, S-316 `[x]`; U-017 unit terminal).
+
+## Cycle 70 (35th resume, 2026-06-21) — FRONTEND U-031..U-044 [≠]FRONTEND-SPA + i18n rescue
+
+**Class:** consumer-contract verification (keep-Vue units). teri is the Rust BACKEND; the MiroFish Vue SPA is a separate-concern API consumer, genuinely not portable to a Rust backend → out-of-substrate [≠]. The no-downgrade obligation for these units is the **backend contract**, gated below.
+
+**GATE: no-consumer-contract-downgrade — PASS** (adversarial parity-verifier, default-skeptical):
+- Existence: every SPA→backend call (5 graph + 24 simulation + 6 report) resolves to a teri axum route (incl. `/ontology/generate` multipart).
+- Shapes (diffed SPA destructure ⟷ teri handler ⟷ X Flask, file:line both sides):
+  - U-039 task-poll: `Task.to_dict` 11-key + `RunState.to_dict` 23-key + prepare/generate status branches — HOLDS.
+  - U-040 config/profiles: config/realtime nested `summary` object — HOLDS.
+  - U-042 agent-log `from_line`: teri honors+echoes `from_line`, `{logs,total_lines,from_line,has_more}` — HOLDS.
+  - U-043 chat: req `{simulation_id,message,chat_history:[{role,content}]}` → `{response,tool_calls,sources}` — HOLDS.
+  - U-036 Accept-Language: teri `accept_language_middleware` ports X `get_locale()` (header→is_supported_locale→with_locale) — HOLDS (genuinely consumed both sides, not a no-op).
+  - U-041 "SSE": **premise corrected** — SPA uses NO EventSource (`grep EventSource frontend/src`=0); `/stream` is one-shot JSON `{logs,count}` in X and teri — HOLDS.
+
+**Adjudication:** U-031..U-044 (14 units / 112 symbols) → `[≠]FRONTEND-SPA`.
+
+**Rescued from wrongly-pending (no-leave-behind):**
+- U-005 `i18n::t` → `[x]`: symbols S-036..042 were PARITY-VERIFIED 2026-06-17 (opus, 17 differential inputs) but the merge-ledger ROW was never rolled up from pending. mod.rs req-ctx-branch doc-comment said PENDING-U-002/U-003 — STALE: the branch is landed in `accept_language_middleware` (server.rs). Doc-comment corrected (doc-only; clippy clean, fmt clean).
+- SWEEP-2 locale table → `[x]`: 629/629 keys + 0 value-mismatches (en & zh) vs MiroFish/locales; languages.json byte-identical (7 langs). 18 section-symbols verified.
+
+**Build health:** cargo check ✓, clippy --lib `No issues found` ✓, fmt ✓, 1552 lib tests pass (Y-not-regressed; only change is doc-comment text). DONE-progress 80%→92%.
