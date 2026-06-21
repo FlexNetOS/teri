@@ -882,6 +882,9 @@ pub struct GraphMemoryUpdater<L: LlmClient + Send + Sync + 'static> {
     counters: Arc<UpdaterCounters>,
     /// Buffer size snapshot — written by worker, read by get_stats.
     buffer_snapshot: BufferSnapshot,
+    /// Workstream B (U6): optional vector index; when set, each flushed batch's new facts are
+    /// re-embedded into the redb store under `graph_namespace(graph_label)`.
+    vector_index: Option<crate::services::graph_builder::GraphVectorIndex>,
 }
 
 impl<L: LlmClient + Send + Sync + 'static> GraphMemoryUpdater<L> {
@@ -914,7 +917,18 @@ impl<L: LlmClient + Send + Sync + 'static> GraphMemoryUpdater<L> {
             running: Arc::new(AtomicBool::new(false)),
             counters: Arc::new(UpdaterCounters::default()),
             buffer_snapshot: Arc::new(Mutex::new(initial_snapshot)),
+            vector_index: None,
         }
+    }
+
+    /// Workstream B (U6): attach a vector index so flushed batches re-embed their new facts
+    /// (builder-style). `None` is a no-op (keyword search still surfaces accrued facts).
+    pub fn with_vector_index(
+        mut self,
+        vector_index: Option<crate::services::graph_builder::GraphVectorIndex>,
+    ) -> Self {
+        self.vector_index = vector_index;
+        self
     }
 
     /// Start the background worker task.
@@ -941,9 +955,20 @@ impl<L: LlmClient + Send + Sync + 'static> GraphMemoryUpdater<L> {
         let running = Arc::clone(&self.running);
         let counters = Arc::clone(&self.counters);
         let buffer_snapshot = Arc::clone(&self.buffer_snapshot);
+        let vector_index = self.vector_index.clone();
 
         let handle = tokio::spawn(crate::i18n::with_locale(locale, async move {
-            worker_loop(rx, graph, llm, graph_label, running, counters, buffer_snapshot).await;
+            worker_loop(
+                rx,
+                graph,
+                llm,
+                graph_label,
+                running,
+                counters,
+                buffer_snapshot,
+                vector_index,
+            )
+            .await;
         }));
 
         self.worker = Some(handle);
@@ -1092,6 +1117,7 @@ impl<L: LlmClient + Send + Sync + 'static> GraphMemoryUpdater<L> {
 ///
 /// `[≠]` SEND_INTERVAL between flushes: the 0.5 s Zep network rate-limit sleep is omitted
 /// (in-process extraction has no remote rate to throttle; non-contractual; DECISION-14 §4).
+#[allow(clippy::too_many_arguments)]
 async fn worker_loop<L: LlmClient + Send + Sync + 'static>(
     mut rx: mpsc::UnboundedReceiver<AgentActivity>,
     graph: Arc<Mutex<KnowledgeGraph>>,
@@ -1100,6 +1126,7 @@ async fn worker_loop<L: LlmClient + Send + Sync + 'static>(
     running: Arc<AtomicBool>,
     counters: Arc<UpdaterCounters>,
     buffer_snapshot: BufferSnapshot,
+    vector_index: Option<crate::services::graph_builder::GraphVectorIndex>,
 ) {
     // Per-platform activity buffers — exclusively owned by the worker (no lock needed).
     // Seeded with the two initial platforms matching Python's `_platform_buffers` (L252-255).
@@ -1129,7 +1156,16 @@ async fn worker_loop<L: LlmClient + Send + Sync + 'static>(
 
             update_buffer_snapshot(&platform_buffers, &buffer_snapshot).await;
 
-            flush_batch(batch, &platform, &graph, &llm, &graph_label, &counters).await;
+            flush_batch(
+                batch,
+                &platform,
+                &graph,
+                &llm,
+                &graph_label,
+                &counters,
+                vector_index.as_ref(),
+            )
+            .await;
             // [≠] SEND_INTERVAL 0.5 s sleep omitted (Zep network rate-limit; non-contractual).
         }
     }
@@ -1145,7 +1181,16 @@ async fn worker_loop<L: LlmClient + Send + Sync + 'static>(
             let platform_name = platform_display_name(platform);
             info!("发送{}平台剩余的 {} 条活动", platform_name, buffer.len());
             let batch: Vec<AgentActivity> = std::mem::take(buffer);
-            flush_batch(batch, platform, &graph, &llm, &graph_label, &counters).await;
+            flush_batch(
+                batch,
+                platform,
+                &graph,
+                &llm,
+                &graph_label,
+                &counters,
+                vector_index.as_ref(),
+            )
+            .await;
         }
     }
 
@@ -1172,6 +1217,7 @@ async fn update_buffer_snapshot(
 ///
 /// `[≠]` MAX_RETRIES/RETRY_DELAY literal retry-loop: the 3-attempt Zep-network retry cadence
 /// is omitted (DECISION-14 §4). The *resilience* (continue-on-error + failed_count) IS ported.
+#[allow(clippy::too_many_arguments)]
 async fn flush_batch<L: LlmClient + Send + Sync + 'static>(
     activities: Vec<AgentActivity>,
     platform: &str,
@@ -1179,6 +1225,7 @@ async fn flush_batch<L: LlmClient + Send + Sync + 'static>(
     llm: &Arc<L>,
     graph_label: &str,
     counters: &Arc<UpdaterCounters>,
+    vector_index: Option<&crate::services::graph_builder::GraphVectorIndex>,
 ) {
     if activities.is_empty() {
         return;
@@ -1210,6 +1257,19 @@ async fn flush_batch<L: LlmClient + Send + Sync + 'static>(
                 platform_name,
                 graph_label
             );
+
+            // Workstream B (U6): re-embed the accrued episode so sim-accrued facts become
+            // searchable by cosine (keyword search already surfaces them — this is the cosine
+            // upgrade). Best-effort: an embed failure is logged inside append_graph_vector.
+            if let Some(idx) = vector_index {
+                crate::services::graph_backend::append_graph_vector(
+                    graph_label,
+                    &combined_text,
+                    &idx.embedder,
+                    &idx.store,
+                )
+                .await;
+            }
         }
         Err(e) => {
             // Non-fatal: increment failed_count and continue (port of L433, L392-394).
@@ -1753,6 +1813,58 @@ mod updater_tests {
 
         updater.stop().await;
     }
+
+    /// Workstream B (U6): with a vector index attached, a flushed batch re-embeds the accrued
+    /// episode into the redb store under the graph's namespace — so the sim-accrued fact becomes
+    /// searchable by cosine.
+    #[tokio::test]
+    async fn test_flushed_batch_reembeds_episode_vector() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/embeddings");
+            then.status(200).header("Content-Type", "application/json").body(
+                r#"{"object":"list","data":[{"object":"embedding","embedding":[1.0,0.0],"index":0}]}"#,
+            );
+        });
+        let emb = std::sync::Arc::new(crate::embedding::EmbeddingClient::new(
+            &crate::config::LlmConfig {
+                base_url: server.base_url(),
+                api_key: String::new(),
+                model: "m".into(),
+                embed_model: "e".into(),
+                timeout_secs: 5,
+                max_retries: 0,
+            },
+        ));
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = std::sync::Arc::new(crate::memory::MemoryStore::new(tmp.path()).unwrap());
+        let vector_index = Some(crate::services::graph_builder::GraphVectorIndex {
+            embedder: emb,
+            store: store.clone(),
+        });
+
+        let graph = Arc::new(Mutex::new(KnowledgeGraph::new()));
+        let llm = Arc::new(MockLlm::new(r#"[{"name": "Carol", "kind": "Person"}]"#, "[]"));
+        let graph_label = "episode-graph".to_string();
+        let mut updater = GraphMemoryUpdater::new(Arc::clone(&graph), llm, graph_label.clone())
+            .with_vector_index(vector_index);
+        updater.start();
+
+        for _ in 0..BATCH_SIZE {
+            updater.add_activity(make_activity("twitter", "CREATE_POST"));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        updater.stop().await;
+
+        // The accrued episode must now be a searchable vector under the graph namespace.
+        let ns = crate::services::graph_backend::graph_namespace(&graph_label);
+        let stored = store.read_vec(ns, 100).await.unwrap();
+        assert!(
+            !stored.is_empty(),
+            "flushed batch must re-embed at least one episode vector into the graph namespace"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1834,6 +1946,11 @@ use crate::error::TeriError;
 pub struct GraphMemoryManager<L: LlmClient + Send + Sync + 'static> {
     /// Map of simulation_id → updater.  Port of `_updaters` (S-532) + `_lock` (S-533).
     updaters: tokio::sync::Mutex<HashMap<String, GraphMemoryUpdater<L>>>,
+    /// Workstream B (U6): optional vector index. When set, every updater this manager creates
+    /// re-embeds the entities/edge facts accrued from a flushed activity batch into the redb
+    /// store under the graph's namespace, so sim-accrued facts become searchable by cosine.
+    /// `None` (the default) ⇒ no re-embed (keyword search still surfaces them — no-downgrade).
+    vector_index: Option<crate::services::graph_builder::GraphVectorIndex>,
     /// Idempotency guard for `stop_all`. Port of `_stop_all_done` (S-537).
     ///
     /// Set to `true` on the first call to `stop_all`; subsequent calls return immediately.
@@ -1848,6 +1965,19 @@ impl<L: LlmClient + Send + Sync + 'static> GraphMemoryManager<L> {
         Self {
             updaters: tokio::sync::Mutex::new(HashMap::new()),
             stop_all_done: AtomicBool::new(false),
+            vector_index: None,
+        }
+    }
+
+    /// Workstream B (U6): construct a manager whose updaters re-embed sim-accrued graph facts
+    /// into the vector store. `None` is equivalent to [`new`](Self::new).
+    pub fn with_vector_index(
+        vector_index: Option<crate::services::graph_builder::GraphVectorIndex>,
+    ) -> Self {
+        Self {
+            updaters: tokio::sync::Mutex::new(HashMap::new()),
+            stop_all_done: AtomicBool::new(false),
+            vector_index,
         }
     }
 
@@ -1880,7 +2010,8 @@ impl<L: LlmClient + Send + Sync + 'static> GraphMemoryManager<L> {
             old.stop().await;
         }
 
-        let mut updater = GraphMemoryUpdater::new(graph, llm, graph_label);
+        let mut updater = GraphMemoryUpdater::new(graph, llm, graph_label)
+            .with_vector_index(self.vector_index.clone());
         updater.start();
         updaters.insert(simulation_id.to_string(), updater);
 

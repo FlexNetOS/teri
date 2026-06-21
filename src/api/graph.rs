@@ -46,7 +46,7 @@ use crate::api::{ApiError, ApiState, build_llm};
 use crate::llm::LlmClient;
 use crate::models::project::{ProjectManager, ProjectStatus};
 use crate::seed::{self, SeedIngestor};
-use crate::services::graph_builder::{ProjectCompletion, build_graph_async_with_completion};
+use crate::services::graph_builder::ProjectCompletion;
 use crate::services::ontology::OntologyGenerator;
 
 // ---------------------------------------------------------------------------
@@ -616,8 +616,12 @@ async fn build_graph(
     // Status is 500 but uses the 2-key client-error body shape (not the 3-key
     // server traceback shape) — matches Python's `jsonify({"success":False,"error":...}), 500`.
     // -----------------------------------------------------------------------
+    // Workstream B: the guard fires ONLY when the Zep backend is selected and its key is empty.
+    // Under the default Native backend the build proceeds keyless (this is the 500→200 flip).
     let mut errors: Vec<String> = Vec::new();
-    if state.config.zep_api_key.as_deref().unwrap_or("").is_empty() {
+    if state.config.graph_backend == crate::config::GraphBackendKind::Zep
+        && state.config.zep_api_key.as_deref().unwrap_or("").is_empty()
+    {
         errors.push(crate::i18n::t("api.zepApiKeyMissing"));
     }
     if !errors.is_empty() {
@@ -799,7 +803,16 @@ async fn build_graph(
     // `[≠] U025-TASKNAME`: Python task name = f"构建图谱: {graph_name}"; teri uses stable
     // "graph_build" token (U-015 verified surface); graph_name is in task metadata.
     // -----------------------------------------------------------------------
-    let task_id = build_graph_async_with_completion(
+    // Workstream B: pass the shared vector index so the built graph's entities/edge facts are
+    // embedded into the redb store for semantic search. `None` when the store is unavailable
+    // (keyword fallback) — never blocks the build.
+    let vector_index = state.graph_vectors.as_ref().map(|store| {
+        crate::services::graph_builder::GraphVectorIndex {
+            embedder: state.embedder.clone(),
+            store: store.clone(),
+        }
+    });
+    let task_id = crate::services::graph_builder::build_graph_async_with_completion_indexed(
         build_llm(&state.config),
         text,
         ontology,
@@ -808,6 +821,7 @@ async fn build_graph(
         chunk_overlap,
         3, // batch_size (mirrors graph.py:443; [≠] Zep-batch artifact, accepted/ignored)
         Some(ProjectCompletion { manager: pm.clone(), project_id: project_id.clone() }),
+        vector_index,
     );
 
     // -----------------------------------------------------------------------
@@ -922,8 +936,10 @@ async fn get_graph_data(
     Path(graph_id): Path<String>,
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<Value>, ApiError> {
-    // Step 1: ZEP guard (graph.py:575-579) — 500 with 2-key body (not traceback shape).
-    if state.config.zep_api_key.as_deref().unwrap_or("").is_empty() {
+    // Step 1: ZEP guard (graph.py:575-579) — Workstream B: fires ONLY under the Zep backend.
+    if state.config.graph_backend == crate::config::GraphBackendKind::Zep
+        && state.config.zep_api_key.as_deref().unwrap_or("").is_empty()
+    {
         return Err(ApiError::client(
             StatusCode::INTERNAL_SERVER_ERROR,
             crate::i18n::t("api.zepApiKeyMissing"),
@@ -1110,8 +1126,10 @@ async fn delete_graph(
     Path(graph_id): Path<String>,
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<Value>, ApiError> {
-    // Step 1: ZEP guard (graph.py:603-607) — 500 with 2-key body.
-    if state.config.zep_api_key.as_deref().unwrap_or("").is_empty() {
+    // Step 1: ZEP guard (graph.py:603-607) — Workstream B: fires ONLY under the Zep backend.
+    if state.config.graph_backend == crate::config::GraphBackendKind::Zep
+        && state.config.zep_api_key.as_deref().unwrap_or("").is_empty()
+    {
         return Err(ApiError::client(
             StatusCode::INTERNAL_SERVER_ERROR,
             crate::i18n::t("api.zepApiKeyMissing"),
@@ -2480,13 +2498,16 @@ mod tests {
     // Guard tests
     // -----------------------------------------------------------------------
 
-    /// Step 1: ZEP guard — missing zep_api_key → 500 configError (2-key body, NOT 3-key).
+    /// Workstream B migration: under the Zep backend, a missing zep_api_key → 500 configError
+    /// (2-key body, NOT 3-key). The guard is preserved — it just fires only when Zep is selected.
     #[tokio::test]
-    async fn build_graph_500_zep_key_missing() {
+    async fn build_graph_500_zep_key_missing_under_zep_backend() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = crate::Config::build_test();
         config.upload_folder = tmp.path().to_string_lossy().to_string();
-        // Clear the zep_api_key so the guard fires
+        // Select the Zep backend AND clear the key so the guard fires.
+        config.graph_backend = crate::GraphBackendKind::Zep;
+        config.graph_backend_raw = "zep".to_string();
         config.zep_api_key = None;
         let state = Arc::new(crate::api::ApiState::new(config));
         let app = crate::server::create_app(state);
@@ -2501,6 +2522,56 @@ mod tests {
             json.get("traceback").is_none(),
             "ZEP config error must use 2-key body (no traceback): {json}"
         );
+    }
+
+    /// Workstream B headline: under the DEFAULT Native backend, build does NOT require a zep key.
+    /// The guard does not fire — the request proceeds past it (a missing project then yields the
+    /// normal 404, proving we got PAST the old 500 guard with no ZEP_API_KEY). This is the
+    /// keyless 500→proceed flip.
+    #[tokio::test]
+    async fn build_graph_keyless_native_proceeds_past_guard() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = crate::Config::build_test();
+        config.upload_folder = tmp.path().to_string_lossy().to_string();
+        // Default Native backend, NO zep key.
+        config.graph_backend = crate::GraphBackendKind::Native;
+        config.graph_backend_raw = "native".to_string();
+        config.zep_api_key = None;
+        let state = Arc::new(crate::api::ApiState::new(config));
+        let app = crate::server::create_app(state);
+
+        // A non-existent project_id → 404 projectNotFound (we are PAST the guard, not stuck at it).
+        let (status, json) =
+            post_build(app, serde_json::json!({"project_id": "does-not-exist"})).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "Native backend must pass the zep guard keylessly (expected 404, not 500): {json}"
+        );
+        assert_ne!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "must NOT 500 on a missing zep key under Native: {json}"
+        );
+    }
+
+    /// Workstream B: a real keyless build under Native completes (200) with no ZEP_API_KEY.
+    #[tokio::test]
+    async fn build_graph_keyless_native_200() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = crate::Config::build_test();
+        config.upload_folder = tmp.path().to_string_lossy().to_string();
+        config.graph_backend = crate::GraphBackendKind::Native;
+        config.graph_backend_raw = "native".to_string();
+        config.zep_api_key = None;
+        let state = Arc::new(crate::api::ApiState::new(config));
+        let project_id = seed_project_ready_for_build(&state);
+        let app = crate::server::create_app(state);
+
+        let (status, json) = post_build(app, serde_json::json!({ "project_id": project_id })).await;
+        assert_eq!(status, StatusCode::OK, "keyless Native build must 200: {json}");
+        assert_eq!(json["success"], true, "must be success envelope: {json}");
+        assert!(json["data"]["task_id"].as_str().is_some(), "must return a task_id: {json}");
     }
 
     /// Step 3: missing project_id → 400 requireProjectId.
@@ -3167,18 +3238,36 @@ mod tests {
     // get_graph_data: ZEP key missing → 500 (2-key, no traceback)
     // -----------------------------------------------------------------------
 
-    /// Build a test app with zep_api_key cleared (None / empty) so the ZEP guard fires.
+    /// Build a test app that selects the Zep backend with no key, so the ZEP guard fires.
+    ///
+    /// Workstream B migration: the guard is now backend-gated, so "guard must fire" means
+    /// "Zep backend selected + key empty". Under the default Native backend these routes are
+    /// keyless (covered by the `*_keyless_native_*` tests).
     fn test_app_no_zep() -> (axum::Router, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let mut config = crate::Config::build_test();
         config.upload_folder = tmp.path().to_string_lossy().to_string();
+        config.graph_backend = crate::GraphBackendKind::Zep; // select zep so the guard applies
+        config.graph_backend_raw = "zep".to_string();
         config.zep_api_key = None; // guard must fire
         let state = std::sync::Arc::new(crate::api::ApiState::new(config));
         (crate::server::create_app(state), tmp)
     }
 
+    /// Build a keyless Native-backend test app (no ZEP_API_KEY) so the guard does NOT fire.
+    fn test_app_native_keyless() -> (axum::Router, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let mut config = crate::Config::build_test();
+        config.upload_folder = tmp.path().to_string_lossy().to_string();
+        config.graph_backend = crate::GraphBackendKind::Native;
+        config.graph_backend_raw = "native".to_string();
+        config.zep_api_key = None;
+        let state = std::sync::Arc::new(crate::api::ApiState::new(config));
+        (crate::server::create_app(state), tmp)
+    }
+
     #[tokio::test]
-    async fn get_graph_data_zep_missing_500() {
+    async fn get_graph_data_zep_missing_500_under_zep_backend() {
         let (app, _tmp) = test_app_no_zep();
         let resp = app
             .oneshot(
@@ -3199,6 +3288,33 @@ mod tests {
         assert!(
             json.get("traceback").is_none(),
             "ZEP-guard 500 must NOT have traceback (2-key body)"
+        );
+    }
+
+    /// Workstream B: under Native (no zep key), /data does NOT 500 at the guard. A missing graph
+    /// then yields the normal server error ("graph not found"), proving we passed the guard.
+    #[tokio::test]
+    async fn get_graph_data_keyless_native_passes_guard() {
+        let (app, _tmp) = test_app_native_keyless();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/graph/data/some-graph-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // The guard no longer blocks; the failure (if any) is now the downstream "graph not
+        // found" server error, which carries a traceback (3-key body) — distinct from the
+        // 2-key zep-guard body. Either way it is NOT the zep-key-missing message.
+        let err = json["error"].as_str().unwrap_or("");
+        assert!(
+            !err.contains("ZEP") && !err.contains("Zep") && !err.contains("zep"),
+            "Native keyless /data must not surface the zep-key guard (status={status}): {json}"
         );
     }
 
@@ -3448,7 +3564,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn delete_graph_zep_missing_500() {
+    async fn delete_graph_zep_missing_500_under_zep_backend() {
         let (app, _tmp) = test_app_no_zep();
         let resp = app
             .oneshot(
@@ -3469,6 +3585,32 @@ mod tests {
         assert!(
             json.get("traceback").is_none(),
             "ZEP-guard 500 must NOT have traceback (2-key body)"
+        );
+    }
+
+    /// Workstream B: under Native (no zep key), delete does NOT 500 at the zep guard. The graph
+    /// delete is a faithful success envelope even for an unknown id (TaskManager has no remove
+    /// API — see delete_graph), so we get 200 with no zep key.
+    #[tokio::test]
+    async fn delete_graph_keyless_native_passes_guard() {
+        let (app, _tmp) = test_app_native_keyless();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/graph/delete/some-graph-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let err = json["error"].as_str().unwrap_or("");
+        assert!(
+            !err.to_lowercase().contains("zep"),
+            "Native keyless delete must not hit the zep guard (status={status}): {json}"
         );
     }
 

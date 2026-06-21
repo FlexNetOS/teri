@@ -14,9 +14,18 @@
 
 [secrets]
 LLM_API_KEY = { required = true, description = "API key for the LLM backend (OpenAI-compatible)" }
+# Workstream B: ZEP_API_KEY is OPTIONAL and required ONLY when GRAPH_BACKEND=zep. Under the
+# default native backend the whole pipeline (graph build → entities → search → report) runs keyless.
+ZEP_API_KEY = { required = false, description = "Zep API key — required only when GRAPH_BACKEND=zep (the native default needs none)" }
 
 [config]
 description = "All teri configuration is environment-driven; see LLM_* and SIM_* env vars in README.md"
+# Workstream B: graph backend selector. Default `native` (keyless petgraph + redb vector search);
+# set `zep` to select the no-downgrade Zep seam (then ZEP_API_KEY becomes required).
+GRAPH_BACKEND = { default = "native", description = "Graph backend: native (default, keyless) | zep" }
+# Embeddings flow for native semantic graph search (OpenAI-compatible /v1/embeddings via shimmy).
+EMBED_MODEL = { default = "all-MiniLM-L6-v2", description = "Embedding model for graph entity/edge vectors" }
+LLM_BASE_URL = { default = "http://127.0.0.1:11435/v1", description = "OpenAI-compatible base URL (shimmy local) for completions + embeddings" }
 
 [toolchain]
 llm_backends = ["openai", "anthropic", "gemini"]

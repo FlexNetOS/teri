@@ -93,6 +93,19 @@ fn report_manager(state: &ApiState) -> ReportManager {
     ReportManager::new(&state.config.upload_folder)
 }
 
+/// Workstream B (U4): build the embedding-search lens for the report ReACT tools from shared
+/// state. `None` when the vector store is unavailable — the tools then use keyword search
+/// (no-downgrade, keyless-safe).
+fn graph_search_lens(state: &ApiState) -> Option<crate::services::zep_tools::GraphSearchLens> {
+    state
+        .graph_vectors
+        .as_ref()
+        .map(|store| crate::services::zep_tools::GraphSearchLens {
+            embedder: state.embedder.clone(),
+            store: store.clone(),
+        })
+}
+
 // ===========================================================================
 // Sub-cycle (a) — pure read routes
 // ===========================================================================
@@ -515,8 +528,24 @@ async fn tools_search_route(
     let graph = load_entity_reader_graph(&state, &graph_id).await?;
     let llm = crate::api::build_llm(&state.config);
     let tools = ReportTools::new(&graph, &llm);
-    // scope omitted in source → Python default "edges".
-    let result = tools.search_graph(&graph_id, &query, limit, Some("edges"));
+    // Workstream B (U4): embedding-cosine search with keyword fallback (no-downgrade). When no
+    // vector store is available, this is identical to the keyword `search_graph`. scope omitted
+    // in source → Python default "edges".
+    let result = match &state.graph_vectors {
+        Some(store) => {
+            crate::services::graph_backend::semantic_search(
+                &tools,
+                &graph_id,
+                &query,
+                limit,
+                Some("edges"),
+                &state.embedder,
+                store,
+            )
+            .await
+        }
+        None => tools.search_graph(&graph_id, &query, limit, Some("edges")),
+    };
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -697,7 +726,8 @@ async fn chat_route(
     let llm = crate::api::build_llm(&state.config);
     // U-024: thread the live SimulationRunner so `interview_agents` can reach the
     // batch-interview IPC seam (the SAME runner instance holds the live sims).
-    let tools = ReportTools::with_runner(&graph, &llm, Some(&state.sim_runner));
+    let tools = ReportTools::with_runner(&graph, &llm, Some(&state.sim_runner))
+        .with_search_lens(graph_search_lens(&state));
     let manager = report_manager(&state);
     let agent =
         crate::report::ReportAgent::new_react(&graph_id, &simulation_id, &simulation_requirement);
@@ -801,6 +831,8 @@ fn spawn_report_generation(
     runner: Option<
         std::sync::Arc<crate::services::simulation_runner::SimulationRunner<OpenAiAdapter>>,
     >,
+    // Workstream B (U4): optional embedding-search lens, moved into the detached worker thread.
+    search_lens: Option<crate::services::zep_tools::GraphSearchLens>,
 ) {
     // Capture locale before spawning (report.py:125), re-apply in the thread.
     let locale = crate::i18n::get_locale();
@@ -825,6 +857,7 @@ fn spawn_report_generation(
                 graph,
                 upload_folder,
                 runner,
+                search_lens,
             )
             .await;
         }));
@@ -850,6 +883,8 @@ pub(crate) async fn report_generate_worker(
     runner: Option<
         std::sync::Arc<crate::services::simulation_runner::SimulationRunner<OpenAiAdapter>>,
     >,
+    // Workstream B (U4): optional embedding-search lens for the ReACT search tools.
+    search_lens: Option<crate::services::zep_tools::GraphSearchLens>,
 ) {
     use crate::task::{TaskManager, TaskStatus};
 
@@ -869,7 +904,8 @@ pub(crate) async fn report_generate_worker(
         crate::report::ReportAgent::new_react(&graph_id, &simulation_id, &simulation_requirement);
     // U-024: bind the live runner (if any) so the ReACT loop's interview_agents
     // tool reaches the batch-interview IPC seam.
-    let tools = ReportTools::with_runner(&graph, &llm, runner.as_deref());
+    let tools =
+        ReportTools::with_runner(&graph, &llm, runner.as_deref()).with_search_lens(search_lens);
     let manager = ReportManager::new(&upload_folder);
     let mut sink = TaskUpdateSink { task_id: task_id.clone() };
     let report = agent
@@ -1018,6 +1054,8 @@ async fn generate_report_route(
         state.config.upload_folder.clone(),
         // U-024: pass the live runner so the generate ReACT loop can interview agents.
         Some(state.sim_runner.clone()),
+        // Workstream B (U4): pass the embedding-search lens so the ReACT search tools run cosine.
+        graph_search_lens(&state),
     );
 
     // Step 12: immediate response (report.py:182-192).
@@ -1656,11 +1694,16 @@ mod tests {
         task_id
     }
 
-    /// Build an app whose `zep_api_key` is None so the inherited ZEP guard fires.
+    /// Build an app that selects the Zep backend with no key, so the inherited ZEP guard fires.
+    ///
+    /// Workstream B migration: the shared `load_entity_reader_graph` guard is backend-gated, so
+    /// the report routes only hit it under the Zep backend; under Native they are keyless.
     fn test_app_no_zep() -> (axum::Router, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let mut config = crate::Config::build_test();
         config.upload_folder = tmp.path().to_string_lossy().to_string();
+        config.graph_backend = crate::GraphBackendKind::Zep;
+        config.graph_backend_raw = "zep".to_string();
         config.zep_api_key = None;
         (crate::server::create_app(Arc::new(ApiState::new(config))), tmp)
     }
@@ -1712,7 +1755,7 @@ mod tests {
     /// `[≠] U026-ZEPKEY` inherited: empty zep_api_key → 500 zepApiKeyMissing (validation
     /// passes first since both graph_id+query are present, THEN the ZEP guard fires).
     #[tokio::test]
-    async fn tools_search_zep_guard_500() {
+    async fn tools_search_zep_guard_500_under_zep_backend() {
         let (app, _t) = test_app_no_zep();
         let (status, json) = post_json(
             app,
@@ -1722,6 +1765,34 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(json["success"], false);
+    }
+
+    /// Workstream B: under Native, /tools/search with a real graph returns 200 with no zep key
+    /// (cosine-ranked SearchResult shape preserved). Uses a seeded graph so resolution succeeds.
+    #[tokio::test]
+    async fn tools_search_keyless_native_200_shape() {
+        let _t = tempfile::TempDir::new().expect("temp dir");
+        let mut config = crate::Config::build_test();
+        config.upload_folder = _t.path().to_string_lossy().to_string();
+        config.graph_backend = crate::GraphBackendKind::Native;
+        config.graph_backend_raw = "native".to_string();
+        config.zep_api_key = None; // truly keyless
+        let state = Arc::new(ApiState::new(config));
+        let graph_id = seed_graph_task();
+        let app = crate::server::create_app(state);
+        let (status, json) = post_json(
+            app,
+            "/api/report/tools/search",
+            serde_json::json!({"graph_id": graph_id, "query": "Alice"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "keyless Native search must 200: {json}");
+        assert_eq!(json["success"], true);
+        let d = &json["data"];
+        // SearchResult shape preserved (facts/edges/nodes/query/total_count keys present).
+        for key in ["facts", "edges", "nodes", "query", "total_count"] {
+            assert!(d.get(key).is_some(), "SearchResult must keep key {key}: {json}");
+        }
     }
 
     // ---- /tools/statistics --------------------------------------------------
@@ -1760,7 +1831,7 @@ mod tests {
 
     /// `[≠] U026-ZEPKEY` inherited: statistics ZEP guard → 500.
     #[tokio::test]
-    async fn tools_statistics_zep_guard_500() {
+    async fn tools_statistics_zep_guard_500_under_zep_backend() {
         let (app, _t) = test_app_no_zep();
         let (status, json) =
             post_json(app, "/api/report/tools/statistics", serde_json::json!({"graph_id": "g"}))
@@ -1890,6 +1961,9 @@ mod tests {
         let mut config = crate::Config::build_test();
         config.upload_folder = tmp.path().to_string_lossy().to_string();
         config.oasis_simulation_data_dir = tmp.path().join("sims").to_string_lossy().to_string();
+        // Workstream B: select the Zep backend so the guard still fires after resolution.
+        config.graph_backend = crate::GraphBackendKind::Zep;
+        config.graph_backend_raw = "zep".to_string();
         config.zep_api_key = None; // ZEP guard fires after resolution
         let state = Arc::new(ApiState::new(config));
 
@@ -1922,6 +1996,9 @@ mod tests {
         let mut config = crate::Config::build_test();
         config.upload_folder = tmp.path().to_string_lossy().to_string();
         config.oasis_simulation_data_dir = tmp.path().join("sims").to_string_lossy().to_string();
+        // Workstream B: select the Zep backend so the guard still fires after resolution.
+        config.graph_backend = crate::GraphBackendKind::Zep;
+        config.graph_backend_raw = "zep".to_string();
         config.zep_api_key = None;
         let state = Arc::new(ApiState::new(config));
 
@@ -2190,6 +2267,7 @@ mod tests {
             graph,
             state.config.upload_folder.clone(),
             None,
+            None, // Workstream B: no search lens in this worker unit test
         )
         .await;
         let task = crate::task::TaskManager::global().get_task(&task_id).expect("task");

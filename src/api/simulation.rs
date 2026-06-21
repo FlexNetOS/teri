@@ -209,9 +209,12 @@ pub(crate) async fn load_entity_reader_graph(
     state: &ApiState,
     graph_id: &str,
 ) -> Result<KnowledgeGraph, ApiError> {
-    // Step 1: ZEP guard — KEEP IT (matches Python source + U-025 precedent)
-    // `[≠] U026-ZEPKEY`: guard KEPT; teri config carries zep_api_key.
-    if state.config.zep_api_key.as_deref().unwrap_or("").is_empty() {
+    // Step 1: ZEP guard — Workstream B: fires ONLY when the Zep backend is selected.
+    // `[≠] U026-ZEPKEY`: guard KEPT but backend-gated; under the default Native backend this
+    // shared graph-resolution path (entities + all report tools/chat/generate routes) is keyless.
+    if state.config.graph_backend == crate::config::GraphBackendKind::Zep
+        && state.config.zep_api_key.as_deref().unwrap_or("").is_empty()
+    {
         return Err(ApiError::client(
             StatusCode::INTERNAL_SERVER_ERROR,
             crate::i18n::t("api.zepApiKeyMissing"),
@@ -3836,11 +3839,29 @@ mod tests {
         (task_id, alice_id.to_string(), entity_type)
     }
 
-    /// Build an app with zep_api_key = None so the ZEP guard fires.
+    /// Build an app that selects the Zep backend with no key, so the ZEP guard fires.
+    ///
+    /// Workstream B migration: the shared `load_entity_reader_graph` guard is now backend-gated,
+    /// so "guard must fire" requires selecting the Zep backend. Under the default Native backend
+    /// these routes are keyless (see `test_app_native_keyless_sim`).
     fn test_app_no_zep_sim() -> (axum::Router, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let mut config = crate::Config::build_test();
         config.upload_folder = tmp.path().to_string_lossy().to_string();
+        config.graph_backend = crate::GraphBackendKind::Zep;
+        config.graph_backend_raw = "zep".to_string();
+        config.zep_api_key = None;
+        let state = Arc::new(ApiState::new(config));
+        (crate::server::create_app(state), tmp)
+    }
+
+    /// Build a keyless Native-backend app (no ZEP_API_KEY) — the guard does NOT fire.
+    fn test_app_native_keyless_sim() -> (axum::Router, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let mut config = crate::Config::build_test();
+        config.upload_folder = tmp.path().to_string_lossy().to_string();
+        config.graph_backend = crate::GraphBackendKind::Native;
+        config.graph_backend_raw = "native".to_string();
         config.zep_api_key = None;
         let state = Arc::new(ApiState::new(config));
         (crate::server::create_app(state), tmp)
@@ -3946,9 +3967,10 @@ mod tests {
         assert_eq!(json["data"]["filtered_count"], 2);
     }
 
-    /// GET /entities/:graph_id — ZEP guard empty → 500 api.zepApiKeyMissing
+    /// Workstream B migration: GET /entities/:graph_id under the Zep backend with no key
+    /// → 500 api.zepApiKeyMissing (the guard is preserved, just backend-gated).
     #[tokio::test]
-    async fn get_graph_entities_zep_guard_empty_500() {
+    async fn get_graph_entities_zep_guard_empty_500_under_zep_backend() {
         let (graph_id, _alice_id, _entity_type) = seed_entity_graph_task();
         let (app, _tmp) = test_app_no_zep_sim();
         let resp = app
@@ -3968,6 +3990,31 @@ mod tests {
         assert!(json.get("error").is_some(), "must have error key");
         // ZEP guard uses ApiError::client → 2-key body (no traceback)
         assert!(json.get("traceback").is_none(), "ZEP guard must not emit traceback");
+    }
+
+    /// Workstream B headline: GET /entities/:graph_id under the DEFAULT Native backend returns
+    /// 200 with NO ZEP_API_KEY — profiles are generatable keylessly. This is the 500→200 flip.
+    #[tokio::test]
+    async fn get_graph_entities_keyless_native_200() {
+        let (graph_id, _alice_id, _entity_type) = seed_entity_graph_task();
+        let (app, _tmp) = test_app_native_keyless_sim();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/simulation/entities/{graph_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "Native backend must serve entities keylessly (200, not 500)"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"], true, "must be success envelope: {json}");
     }
 
     /// GET /entities/unknown-graph-id — graph not found → 500 server
@@ -4051,7 +4098,7 @@ mod tests {
 
     /// GET /entities/:graph_id/:entity_uuid — ZEP guard → 500
     #[tokio::test]
-    async fn get_entity_detail_zep_guard_500() {
+    async fn get_entity_detail_zep_guard_500_under_zep_backend() {
         let (graph_id, alice_id, _entity_type) = seed_entity_graph_task();
         let (app, _tmp) = test_app_no_zep_sim();
         let resp = app
@@ -4156,7 +4203,7 @@ mod tests {
 
     /// GET /entities/:graph_id/by-type/:type — ZEP guard → 500
     #[tokio::test]
-    async fn get_entities_by_type_zep_guard_500() {
+    async fn get_entities_by_type_zep_guard_500_under_zep_backend() {
         let (graph_id, _alice_id, entity_type) = seed_entity_graph_task();
         let (app, _tmp) = test_app_no_zep_sim();
         let resp = app

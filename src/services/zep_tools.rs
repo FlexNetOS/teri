@@ -635,6 +635,22 @@ pub struct ReportTools<'g, L: LlmClient + Send + Sync + 'static> {
     /// keep `new(graph, llm)`. `Some(...)` only on the report-generation routes that
     /// can reach a live sim. `&'g` runner: caller-owned (`Arc` held by `ApiState`).
     runner: Option<&'g SimulationRunner<L>>,
+    /// Workstream B (U4): optional embedding-search lens. When `Some`, the search-bearing ReACT
+    /// tools (`quick_search`/`panorama_search`/`insight_forge`) run embedding cosine over the
+    /// graph's vector namespace (with keyword fallback). `None` ⇒ keyword search only
+    /// (back-compat with every existing construction site). Held as `Arc`s so it is cheap to
+    /// attach and matches `ApiState`'s shared handles.
+    search_lens: Option<GraphSearchLens>,
+}
+
+/// Workstream B: the embedding-search lens attached to a [`ReportTools`].
+///
+/// Bundles the shared embedding client + redb vector store + the per-graph namespace key so the
+/// search-bearing tools can run cosine retrieval. Cheap to clone (all `Arc`).
+#[derive(Clone)]
+pub struct GraphSearchLens {
+    pub embedder: std::sync::Arc<crate::embedding::EmbeddingClient>,
+    pub store: std::sync::Arc<crate::memory::MemoryStore>,
 }
 
 impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
@@ -655,7 +671,15 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
         runner: Option<&'g SimulationRunner<L>>,
     ) -> Self {
         let reader = KnowledgeGraphEntityReader::new(graph);
-        Self { graph, llm, reader, runner }
+        Self { graph, llm, reader, runner, search_lens: None }
+    }
+
+    /// Attach a Workstream B embedding-search lens (builder-style). Returns `self` so it can be
+    /// chained after `new`/`with_runner`. With a lens attached, the search-bearing ReACT tools
+    /// run embedding cosine (keyword fallback); without it they stay keyword-only.
+    pub fn with_search_lens(mut self, lens: Option<GraphSearchLens>) -> Self {
+        self.search_lens = lens;
+        self
     }
 
     // -----------------------------------------------------------------------
@@ -1089,6 +1113,37 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
         self.local_search(graph_id, query, limit, scope)
     }
 
+    /// Workstream B (U4): embedding-cosine search with keyword fallback.
+    ///
+    /// When this `ReportTools` carries a [`GraphSearchLens`] (attached via `with_search_lens`),
+    /// the query is embedded and cosine-ranked over the graph's vector namespace, then mapped
+    /// back to the SAME `SearchResult` shape `search_graph` returns. When no lens is attached,
+    /// OR the embedding call fails, OR the graph has no vectors, this falls back to the keyword
+    /// `search_graph` — never a downgrade. This is the async entry the report ReACT tools use.
+    pub async fn search_graph_semantic(
+        &self,
+        graph_id: &str,
+        query: &str,
+        limit: i64,
+        scope: Option<&str>,
+    ) -> SearchResult {
+        match &self.search_lens {
+            Some(lens) => {
+                crate::services::graph_backend::semantic_search(
+                    self,
+                    graph_id,
+                    query,
+                    limit,
+                    scope,
+                    &lens.embedder,
+                    &lens.store,
+                )
+                .await
+            }
+            None => self.search_graph(graph_id, query, limit, scope),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // quick_search — real graph read
     //
@@ -1366,12 +1421,19 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
             t_args("console.generatedSubQueries", &[("count", &sub_queries.len())])
         );
 
-        let result = self.assemble_insight_forge_result(
-            graph_id,
-            query,
-            simulation_requirement,
-            sub_queries,
-        );
+        // Workstream B (U4): with a search lens, the sub-query searches run embedding cosine
+        // (keyword fallback); without one, the original keyword assembler is used (back-compat).
+        let result = if self.search_lens.is_some() {
+            self.assemble_insight_forge_result_semantic(
+                graph_id,
+                query,
+                simulation_requirement,
+                sub_queries,
+            )
+            .await
+        } else {
+            self.assemble_insight_forge_result(graph_id, query, simulation_requirement, sub_queries)
+        };
 
         tracing::info!(
             target: "teri::report",
@@ -1444,31 +1506,88 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
         simulation_requirement: &str,
         sub_queries: Vec<String>,
     ) -> InsightForgeResult {
-        // Step 2: per-sub-query search (mirrors Python's search_graph per sub-query).
+        // Step 2: per-sub-query KEYWORD search (sync path — no lens).
         let mut all_facts: Vec<String> = Vec::new();
         let mut all_edges: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
         let mut seen_facts: HashSet<String> = HashSet::new();
 
         for sub_query in &sub_queries {
             let result = self.search_graph(graph_id, sub_query, 15, Some("edges"));
-            for fact in result.facts {
-                if !seen_facts.contains(&fact) {
-                    seen_facts.insert(fact.clone());
-                    all_facts.push(fact);
-                }
-            }
-            all_edges.extend(result.edges);
+            Self::merge_search_into(&mut all_facts, &mut all_edges, &mut seen_facts, result);
         }
-
-        // Also search the original query (Python L1011-1021).
         let main_search = self.search_graph(graph_id, query, 20, Some("edges"));
-        for fact in main_search.facts {
+        Self::merge_search_into(&mut all_facts, &mut all_edges, &mut seen_facts, main_search);
+
+        self.assemble_insight_forge_tail(
+            graph_id,
+            query,
+            simulation_requirement,
+            sub_queries,
+            all_facts,
+            all_edges,
+        )
+    }
+
+    /// Workstream B (U4): semantic variant of `assemble_insight_forge_result` — identical
+    /// assembly but the per-sub-query + main-query searches run embedding cosine
+    /// (`search_graph_semantic`, keyword fallback). Used by the live async insight_forge when a
+    /// search lens is attached; falls through to the keyword path otherwise.
+    async fn assemble_insight_forge_result_semantic(
+        &self,
+        graph_id: &str,
+        query: &str,
+        simulation_requirement: &str,
+        sub_queries: Vec<String>,
+    ) -> InsightForgeResult {
+        let mut all_facts: Vec<String> = Vec::new();
+        let mut all_edges: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
+        let mut seen_facts: HashSet<String> = HashSet::new();
+
+        for sub_query in &sub_queries {
+            let result = self.search_graph_semantic(graph_id, sub_query, 15, Some("edges")).await;
+            Self::merge_search_into(&mut all_facts, &mut all_edges, &mut seen_facts, result);
+        }
+        let main_search = self.search_graph_semantic(graph_id, query, 20, Some("edges")).await;
+        Self::merge_search_into(&mut all_facts, &mut all_edges, &mut seen_facts, main_search);
+
+        self.assemble_insight_forge_tail(
+            graph_id,
+            query,
+            simulation_requirement,
+            sub_queries,
+            all_facts,
+            all_edges,
+        )
+    }
+
+    /// Merge one `SearchResult` into the running insight-forge accumulators (dedup facts).
+    fn merge_search_into(
+        all_facts: &mut Vec<String>,
+        all_edges: &mut Vec<serde_json::Map<String, serde_json::Value>>,
+        seen_facts: &mut HashSet<String>,
+        result: SearchResult,
+    ) {
+        for fact in result.facts {
             if !seen_facts.contains(&fact) {
                 seen_facts.insert(fact.clone());
                 all_facts.push(fact);
             }
         }
+        all_edges.extend(result.edges);
+    }
 
+    /// Steps 3–4 of insight_forge (entity enrichment + relationship chains), shared by the
+    /// keyword and semantic assemblers. Identical to the original tail; only the upstream search
+    /// (keyword vs cosine) differs.
+    fn assemble_insight_forge_tail(
+        &self,
+        graph_id: &str,
+        query: &str,
+        simulation_requirement: &str,
+        sub_queries: Vec<String>,
+        all_facts: Vec<String>,
+        all_edges: Vec<serde_json::Map<String, serde_json::Value>>,
+    ) -> InsightForgeResult {
         let total_facts = all_facts.len() as i64;
 
         // Step 3: extract entity UUIDs from edges and build entity insights.
@@ -3099,6 +3218,54 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
             };
         }
 
+        // ── Workstream B (U4) quick_search async intercept ───────────────────
+        // With a search lens attached, run embedding-cosine search (keyword fallback). Without a
+        // lens this branch is skipped and the sync keyword path below runs (back-compat).
+        if tool == Some(ReportTool::QuickSearch) && self.search_lens.is_some() {
+            let params_repr = serde_json::to_string(params).unwrap_or_else(|_| "{}".to_string());
+            tracing::info!(
+                target: "teri::report",
+                "{}",
+                t_args(
+                    "report.executingTool",
+                    &[("toolName", &tool_name), ("params", &params_repr)]
+                )
+            );
+            let query = str_param(params, "query");
+            let limit = match coerce_int_param(params, "limit", 10) {
+                Ok(n) => n,
+                Err(e) => return format!("工具执行失败: {}", e),
+            };
+            let result = self.search_graph_semantic(graph_id, &query, limit, Some("edges")).await;
+            return result.to_text();
+        }
+
+        // ── Workstream B (U4) panorama_search async intercept ─────────────────
+        // panorama_search blends active/historical edges; with a lens we rank the edge corpus by
+        // embedding cosine before the temporal partition. Falls back to the sync keyword panorama
+        // when no lens / no vectors (the sync method already classifies active vs historical).
+        if tool == Some(ReportTool::PanoramaSearch) && self.search_lens.is_some() {
+            let params_repr = serde_json::to_string(params).unwrap_or_else(|_| "{}".to_string());
+            tracing::info!(
+                target: "teri::report",
+                "{}",
+                t_args(
+                    "report.executingTool",
+                    &[("toolName", &tool_name), ("params", &params_repr)]
+                )
+            );
+            let query = str_param(params, "query");
+            let include_expired = coerce_include_expired(params, true);
+            // Cosine-rank a candidate set first; if it yields facts, surface them, otherwise the
+            // keyword panorama (temporal-aware) is the faithful fallback.
+            let semantic = self.search_graph_semantic(graph_id, &query, 50, Some("edges")).await;
+            if semantic.total_count > 0 {
+                return semantic.to_text();
+            }
+            let result = self.panorama_search(graph_id, &query, include_expired, 50, None);
+            return result.to_text();
+        }
+
         // Every other tool name → existing sync dispatch (no .await needed).
         self.execute_by_name(
             tool_name,
@@ -3521,6 +3688,31 @@ mod tests {
         let result = tools.quick_search("graph1", "anything", 10);
         assert_eq!(result.total_count, 0);
         assert!(result.facts.is_empty());
+    }
+
+    /// Workstream B no-downgrade: without a search lens, `search_graph_semantic` is identical to
+    /// the keyword `search_graph` (same SearchResult shape + contents).
+    #[tokio::test]
+    async fn test_search_graph_semantic_without_lens_equals_keyword() {
+        let g = fixture_graph();
+        let llm = StubLlm;
+        let tools = ReportTools::new(&g, &llm); // no lens
+        let keyword = tools.search_graph("graph1", "Alice", 10, Some("edges"));
+        let semantic = tools.search_graph_semantic("graph1", "Alice", 10, Some("edges")).await;
+        assert_eq!(semantic.query, keyword.query);
+        assert_eq!(semantic.total_count, keyword.total_count);
+        assert_eq!(semantic.facts, keyword.facts);
+        assert_eq!(semantic.edges.len(), keyword.edges.len());
+    }
+
+    /// Workstream B: `with_search_lens(None)` is a no-op (back-compat) — search stays keyword.
+    #[tokio::test]
+    async fn test_with_search_lens_none_is_keyword() {
+        let g = fixture_graph();
+        let llm = StubLlm;
+        let tools = ReportTools::new(&g, &llm).with_search_lens(None);
+        let semantic = tools.search_graph_semantic("graph1", "Alice", 10, Some("edges")).await;
+        assert_eq!(semantic.query, "Alice");
     }
 
     // ── ReportTools::panorama_search tests ──────────────────────────────────

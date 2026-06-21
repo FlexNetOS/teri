@@ -16,6 +16,11 @@ pub const AGENT_VEC_KEY_PREFIX: &str = "agent_vec";
 
 const KV_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("kv");
 
+/// Process-monotonic counter that disambiguates `write_vec` keys sharing a millisecond timestamp.
+/// Without it, two same-millisecond writes collide on `agent:{id}:vec:{ts}` and the second
+/// silently overwrites the first (a latent bug that intermittently lost vectors under load).
+static VEC_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
     pub timestamp: chrono::DateTime<chrono::Utc>,
@@ -238,7 +243,12 @@ impl MemoryStore {
 
     pub async fn write_vec(&self, agent_id: Uuid, entry: &VectorEntry) -> Result<()> {
         let ts = entry.timestamp.timestamp_millis();
-        let key = format!("agent:{agent_id}:vec:{ts}");
+        // Workstream B: append a process-monotonic sequence so two writes sharing a millisecond
+        // timestamp do not collide on the key (the prior `vec:{ts}` key silently overwrote
+        // same-ms siblings). The `:vec:` prefix is preserved, so `read_vec` /
+        // `query_vec_similarity` prefix scans are unchanged.
+        let seq = VEC_WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let key = format!("agent:{agent_id}:vec:{ts}:{seq:020}");
         let value = serde_json::to_vec(entry)
             .map_err(|e| TeriError::Memory(format!("Serialization error: {e}")))?;
         let db = self.db.clone();
@@ -257,6 +267,49 @@ impl MemoryStore {
         })
         .await
         .map_err(|e| TeriError::Memory(format!("Task join error: {e}")))?
+    }
+
+    /// Write many `VectorEntry`s under one namespace in a single transaction, using a
+    /// monotonic `(timestamp, index)` key so entries written in a tight loop never collide
+    /// on the millisecond timestamp.
+    ///
+    /// Workstream B: graph build embeds dozens/hundreds of entities at once; `write_vec`'s
+    /// `vec:{ts}` key (millisecond resolution) would overwrite siblings sharing a millisecond.
+    /// The key here is `agent:{namespace}:vec:{ts}:{index:010}` — still under the `:vec:` prefix
+    /// so `query_vec_similarity`/`read_vec` scan it unchanged. Returns the number written.
+    pub async fn write_vec_batch(&self, namespace: Uuid, entries: &[VectorEntry]) -> Result<usize> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        // Serialize up-front so the blocking closure owns plain bytes.
+        let mut records: Vec<(String, Vec<u8>)> = Vec::with_capacity(entries.len());
+        for (i, entry) in entries.iter().enumerate() {
+            let ts = entry.timestamp.timestamp_millis();
+            let key = format!("agent:{namespace}:vec:{ts}:{i:010}");
+            let value = serde_json::to_vec(entry)
+                .map_err(|e| TeriError::Memory(format!("Serialization error: {e}")))?;
+            records.push((key, value));
+        }
+        let db = self.db.clone();
+        let count = records.len();
+        tokio::task::spawn_blocking(move || {
+            let write_txn =
+                db.begin_write().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
+            {
+                let mut table = write_txn
+                    .open_table(KV_TABLE)
+                    .map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
+                for (key, value) in &records {
+                    table
+                        .insert(key.as_str(), value.as_slice())
+                        .map_err(|e| TeriError::Memory(format!("Write error: {e}")))?;
+                }
+            }
+            write_txn.commit().map_err(|e| TeriError::Memory(format!("Commit error: {e}")))
+        })
+        .await
+        .map_err(|e| TeriError::Memory(format!("Task join error: {e}")))??;
+        Ok(count)
     }
 
     pub async fn read_vec(&self, agent_id: Uuid, limit: usize) -> Result<Vec<VectorEntry>> {
@@ -391,6 +444,46 @@ impl MemoryStore {
         // Return at most top_k results, discarding scores.
         let results = scored.into_iter().take(top_k).map(|(_, entry)| entry).collect();
         Ok(results)
+    }
+
+    /// Delete every `VectorEntry` stored under a namespace (`agent:{namespace}:vec:*`).
+    ///
+    /// Workstream B (R4): rebuilding a graph for the same `graph_id` must clear that graph's
+    /// vector namespace first, or stale vectors from a prior build pollute search. The namespace
+    /// `Uuid` is the per-graph key (see `graph_backend::graph_namespace`). Returns the number of
+    /// entries removed. A namespace with no vectors is a no-op (`Ok(0)`).
+    pub async fn clear_vec_namespace(&self, namespace: Uuid) -> Result<usize> {
+        let prefix = format!("agent:{namespace}:vec:");
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let write_txn =
+                db.begin_write().map_err(|e| TeriError::Memory(format!("Tx error: {e}")))?;
+            let removed = {
+                let mut table = write_txn
+                    .open_table(KV_TABLE)
+                    .map_err(|e| TeriError::Memory(format!("Table error: {e}")))?;
+                // `retain` keeps every entry for which the predicate returns true and drops the
+                // rest. We keep entries that do NOT start with this namespace's prefix, counting
+                // the dropped ones. This avoids a separate collect-keys-then-remove pass.
+                let mut count = 0usize;
+                table
+                    .retain(|k, _v| {
+                        let drop_it = k.starts_with(prefix.as_str());
+                        if drop_it {
+                            count += 1;
+                        }
+                        !drop_it
+                    })
+                    .map_err(|e| TeriError::Memory(format!("Retain error: {e}")))?;
+                count
+            };
+            write_txn
+                .commit()
+                .map_err(|e| TeriError::Memory(format!("Commit error: {e}")))?;
+            Ok(removed)
+        })
+        .await
+        .map_err(|e| TeriError::Memory(format!("Task join error: {e}")))?
     }
 
     /// Embed `content` via the [`EmbeddingClient`] and persist it as a [`VectorEntry`].
@@ -870,6 +963,58 @@ mod tests {
         assert_eq!(results.len(), 1);
         // We can't directly read the score but the identical vector must rank first (and only).
         assert_eq!(results[0].content, "identical");
+    }
+
+    // ===== Workstream B: write_vec_batch + clear_vec_namespace =====
+
+    #[tokio::test]
+    async fn test_write_vec_batch_no_collision_same_millisecond() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let store = MemoryStore::new(temp_dir.path()).expect("store");
+        let ns = Uuid::new_v4();
+        // All entries share the SAME timestamp → would collide under write_vec's vec:{ts} key.
+        let ts = chrono::Utc::now();
+        let entries: Vec<VectorEntry> = (0..5)
+            .map(|i| VectorEntry {
+                timestamp: ts,
+                content: format!("entry {i}"),
+                embedding: vec![(i + 1) as f32, 0.0],
+                importance: 0.5,
+            })
+            .collect();
+        let n = store.write_vec_batch(ns, &entries).await.expect("batch write");
+        assert_eq!(n, 5);
+        let read = store.read_vec(ns, 100).await.expect("read");
+        assert_eq!(read.len(), 5, "all 5 entries persisted despite identical timestamp");
+    }
+
+    #[tokio::test]
+    async fn test_clear_vec_namespace_removes_only_that_namespace() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let store = MemoryStore::new(temp_dir.path()).expect("store");
+        let ns_a = Uuid::new_v4();
+        let ns_b = Uuid::new_v4();
+        let mk = |c: &str| VectorEntry {
+            timestamp: chrono::Utc::now(),
+            content: c.to_string(),
+            embedding: vec![1.0, 0.0],
+            importance: 0.5,
+        };
+        store.write_vec_batch(ns_a, &[mk("a1"), mk("a2")]).await.expect("write a");
+        store.write_vec_batch(ns_b, &[mk("b1")]).await.expect("write b");
+
+        let removed = store.clear_vec_namespace(ns_a).await.expect("clear a");
+        assert_eq!(removed, 2, "both ns_a vectors removed");
+        assert!(store.read_vec(ns_a, 100).await.expect("read a").is_empty());
+        assert_eq!(store.read_vec(ns_b, 100).await.expect("read b").len(), 1, "ns_b untouched");
+    }
+
+    #[tokio::test]
+    async fn test_clear_vec_namespace_empty_is_noop() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let store = MemoryStore::new(temp_dir.path()).expect("store");
+        let removed = store.clear_vec_namespace(Uuid::new_v4()).await.expect("clear empty");
+        assert_eq!(removed, 0);
     }
 
     // ===== GAP-OQ3-EMBED end-to-end: EmbeddingClient -> write_vec_text/semantic_recall =====

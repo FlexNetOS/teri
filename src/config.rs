@@ -1,6 +1,44 @@
 use crate::error::{Result, TeriError};
 use serde::{Deserialize, Serialize};
 
+/// Selects which knowledge-graph backend the pipeline runs against.
+///
+/// Workstream B: teri's graph read/write surface is already 100% native (petgraph
+/// `KnowledgeGraph` + the redb vector store) — there is no live Zep HTTP client in the tree.
+/// This switch makes `Native` the keyless DEFAULT and keeps `Zep` SELECTABLE as the
+/// no-downgrade seam (it wraps the same native surface today; the `ZEP_API_KEY` guard is
+/// exercised only under `Zep`).
+///
+/// Parsed from the `GRAPH_BACKEND` env var (case-insensitive). Unknown values are a hard
+/// config error in [`Config::validate`] (fail-closed, consistent with teri's strict config
+/// validation) — they are NOT silently coerced to a default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum GraphBackendKind {
+    /// Native petgraph `KnowledgeGraph` + redb vector store. Keyless; the default.
+    #[default]
+    Native,
+    /// Zep backend (selectable, no-downgrade seam). Requires a non-empty `ZEP_API_KEY`.
+    /// Today it delegates to the same native surface — there is no live Zep client — but
+    /// selecting it still enforces the `ZEP_API_KEY` guard so the contract is preserved.
+    Zep,
+}
+
+impl GraphBackendKind {
+    /// Parse a `GRAPH_BACKEND` value (case-insensitive, trimmed).
+    ///
+    /// Returns `Ok(Native)`/`Ok(Zep)` for the two valid values and `Err` (with a clear
+    /// message listing the valid values) for anything else — fail-closed per owner Q2.
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_lowercase().as_str() {
+            "native" => Ok(GraphBackendKind::Native),
+            "zep" => Ok(GraphBackendKind::Zep),
+            other => Err(TeriError::Config(format!(
+                "GRAPH_BACKEND has an invalid value {other:?}; valid values are: native, zep"
+            ))),
+        }
+    }
+}
+
 /// All env-var-backed configuration for teri.
 ///
 /// This struct is an extend-Y of the original teri `Config` with MiroFish `Config` fields merged
@@ -23,8 +61,22 @@ pub struct Config {
     /// `app.config` behaviour.  Like MiroFish, teri does not actively use this for signing
     /// (no session/CSRF/flash usage in MiroFish) — it is loaded but passive.
     pub secret_key: String,
-    /// MiroFish U-001: Zep API key (env `ZEP_API_KEY`, required by validate()).
+    /// MiroFish U-001: Zep API key (env `ZEP_API_KEY`).
+    ///
+    /// Workstream B: required ONLY when `graph_backend == Zep`. Under the default
+    /// `Native` backend the whole pipeline runs keyless (this is the headline change).
     pub zep_api_key: Option<String>,
+    /// Workstream B: selects the graph backend (env `GRAPH_BACKEND`, default `native`).
+    ///
+    /// `Native` (default) ⇒ keyless petgraph + redb vector store; `Zep` ⇒ the selectable
+    /// no-downgrade seam that still enforces `ZEP_API_KEY`. An unknown env value is a hard
+    /// error in [`Config::validate`] (Q2, fail-closed).
+    pub graph_backend: GraphBackendKind,
+    /// Workstream B: holds the raw `GRAPH_BACKEND` env value (or `"native"` when unset) so
+    /// [`Config::validate`] can reject an unknown value with the user's exact input. Parsing
+    /// is deferred to `validate()` to keep `build()` infallible (it mirrors how the other
+    /// env fields are read leniently in `build` and checked in `validate`).
+    pub graph_backend_raw: String,
     /// MiroFish U-001: maximum HTTP upload body size in bytes (50 MB; not env-backed in source —
     /// constant 50 * 1024 * 1024).  Held as an inert field now; enforced by the axum server
     /// (U-002/U-003, not yet ported).
@@ -248,6 +300,16 @@ impl Config {
             secret_key: std::env::var("SECRET_KEY")
                 .unwrap_or_else(|_| "mirofish-secret-key".to_string()),
             zep_api_key: std::env::var("ZEP_API_KEY").ok(),
+            // Workstream B: GRAPH_BACKEND (default "native"). Read leniently here; an unknown
+            // value is rejected in validate() (Q2) so build() stays infallible. graph_backend
+            // holds the parsed kind (defaulting to Native when the raw value is invalid) while
+            // graph_backend_raw retains the user's exact input for the validate() error message.
+            graph_backend: {
+                let raw = std::env::var("GRAPH_BACKEND").unwrap_or_else(|_| "native".to_string());
+                GraphBackendKind::parse(&raw).unwrap_or_default()
+            },
+            graph_backend_raw: std::env::var("GRAPH_BACKEND")
+                .unwrap_or_else(|_| "native".to_string()),
             // 50 MB — constant in MiroFish (50 * 1024 * 1024).
             max_content_length: 50 * 1024 * 1024,
             upload_folder: std::env::var("UPLOAD_FOLDER")
@@ -285,6 +347,11 @@ impl Config {
     /// semantics.  For the MiroFish collect-all semantics (returns `Vec<String>` of all missing
     /// vars), use [`Config::validate_collect`].
     pub fn validate(&self) -> Result<()> {
+        // Workstream B (Q2): reject an unknown GRAPH_BACKEND value, fail-closed. This is checked
+        // FIRST because the rest of validation (and ZEP_API_KEY requirement) depends on the
+        // selected backend. A valid value ("native"/"zep", case-insensitive) is a no-op here.
+        GraphBackendKind::parse(&self.graph_backend_raw)?;
+
         // Collect all errors first (matching MiroFish contract); then map to Err if non-empty.
         let errors = self.validate_collect();
         if !errors.is_empty() {
@@ -326,6 +393,12 @@ impl Config {
     #[cfg(test)]
     pub fn build_test() -> Self {
         let mut c = Self::build(Some("test-llm-key"));
+        // Workstream B: default to the keyless Native backend so the broad test fleet runs
+        // without ZEP_API_KEY. `graph_backend_raw` is pinned to "native" so validate() passes
+        // regardless of the ambient GRAPH_BACKEND env when tests run. A still-present
+        // `zep_api_key` keeps the zep-path tests (which flip `graph_backend` to Zep) green.
+        c.graph_backend = GraphBackendKind::Native;
+        c.graph_backend_raw = "native".to_string();
         c.zep_api_key = Some("test-zep-key".to_string());
         c
     }
@@ -337,17 +410,24 @@ impl Config {
     /// errors and exit (code 1 in the MiroFish entrypoint, equivalent in teri's `run`/`serve`
     /// commands).
     ///
-    /// Required vars: `LLM_API_KEY`, `ZEP_API_KEY`.
+    /// Required vars: `LLM_API_KEY` always; `ZEP_API_KEY` ONLY when `graph_backend == Zep`.
     ///
     /// This is the direct port of the Python `validate()` classmethod return contract.  The
     /// existing `validate()` method preserves teri's `Result<()>` API for callers already using
     /// it.
+    ///
+    /// Workstream B: `ZEP_API_KEY` moved from unconditionally-required to required only under the
+    /// `Zep` backend. Under the default `Native` backend it is optional — the keyless headline.
     pub fn validate_collect(&self) -> Vec<String> {
         let mut errors: Vec<String> = Vec::new();
         if self.llm.api_key.is_empty() {
             errors.push("LLM_API_KEY is not set".to_string());
         }
-        if self.zep_api_key.as_deref().unwrap_or("").is_empty() {
+        // ZEP_API_KEY is required ONLY when the Zep backend is selected (fail-closed for the
+        // zep path; optional/keyless under Native).
+        if self.graph_backend == GraphBackendKind::Zep
+            && self.zep_api_key.as_deref().unwrap_or("").is_empty()
+        {
             errors.push("ZEP_API_KEY is not set".to_string());
         }
         errors
@@ -638,14 +718,16 @@ mod tests {
     // --- S-022 / validate_collect() tests (MiroFish contract: Vec<String>) ---
 
     #[test]
-    fn test_validate_collect_both_missing() {
-        // Both LLM_API_KEY (via empty api_key) and ZEP_API_KEY absent → 2 errors.
+    fn test_validate_collect_both_missing_under_zep_backend() {
+        // Workstream B migration: ZEP_API_KEY is required ONLY under the Zep backend. With the
+        // Zep backend selected AND both LLM_API_KEY (empty) and ZEP_API_KEY absent → 2 errors.
         let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_zep = std::env::var("ZEP_API_KEY");
         unsafe { std::env::remove_var("ZEP_API_KEY") };
 
         let mut c = Config::build(Some(""));
         c.zep_api_key = None;
+        c.graph_backend = GraphBackendKind::Zep;
         let errors = c.validate_collect();
         assert_eq!(errors.len(), 2, "expected 2 errors, got: {errors:?}");
         assert!(errors.iter().any(|e| e.contains("LLM_API_KEY")), "LLM_API_KEY error missing");
@@ -657,9 +739,24 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_collect_only_zep_missing() {
+    fn test_validate_collect_zep_missing_ignored_under_native_backend() {
+        // Workstream B: under the default Native backend, a missing ZEP_API_KEY is NOT an error.
+        // Only the LLM key (here present) gates — so the list is empty. This is the keyless path.
         let mut c = Config::build(Some("llm-key-present"));
         c.zep_api_key = None;
+        c.graph_backend = GraphBackendKind::Native;
+        let errors = c.validate_collect();
+        assert!(
+            errors.is_empty(),
+            "Native backend must not require ZEP_API_KEY; got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_collect_only_zep_missing_under_zep_backend() {
+        let mut c = Config::build(Some("llm-key-present"));
+        c.zep_api_key = None;
+        c.graph_backend = GraphBackendKind::Zep;
         let errors = c.validate_collect();
         assert_eq!(errors.len(), 1, "expected 1 error, got: {errors:?}");
         assert!(errors[0].contains("ZEP_API_KEY"));
@@ -682,16 +779,91 @@ mod tests {
         assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
     }
 
-    // --- validate() integration: ZEP_API_KEY now enforced ---
+    // --- validate() integration: ZEP_API_KEY enforced ONLY under the Zep backend (Workstream B) ---
 
     #[test]
-    fn test_validate_returns_err_when_zep_missing() {
+    fn test_validate_returns_err_when_zep_missing_under_zep_backend() {
+        // Migration: the guard still fires when the Zep backend is explicitly selected.
         let mut c = Config::build(Some("llm-key"));
         c.zep_api_key = None;
+        c.graph_backend = GraphBackendKind::Zep;
+        c.graph_backend_raw = "zep".to_string();
         let result = c.validate();
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("ZEP_API_KEY"), "error should mention ZEP_API_KEY: {msg}");
+    }
+
+    #[test]
+    fn test_validate_ok_when_zep_missing_under_native_backend() {
+        // Workstream B headline: under the default Native backend, a missing ZEP_API_KEY does
+        // NOT block validate() — the pipeline is keyless.
+        let mut c = Config::build(Some("llm-key"));
+        c.zep_api_key = None;
+        c.graph_backend = GraphBackendKind::Native;
+        c.graph_backend_raw = "native".to_string();
+        assert!(c.validate().is_ok(), "Native backend must validate keyless");
+    }
+
+    // --- Workstream B: GRAPH_BACKEND parsing + default ---
+
+    #[test]
+    fn test_graph_backend_default_native_when_unset() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("GRAPH_BACKEND");
+        unsafe { std::env::remove_var("GRAPH_BACKEND") };
+        let c = Config::build(Some("key"));
+        assert_eq!(c.graph_backend, GraphBackendKind::Native, "default backend must be Native");
+        assert_eq!(c.graph_backend_raw, "native");
+        if let Ok(v) = prev {
+            unsafe { std::env::set_var("GRAPH_BACKEND", v) }
+        }
+    }
+
+    #[test]
+    fn test_graph_backend_parses_zep_case_insensitive() {
+        assert_eq!(GraphBackendKind::parse("zep").unwrap(), GraphBackendKind::Zep);
+        assert_eq!(GraphBackendKind::parse("ZEP").unwrap(), GraphBackendKind::Zep);
+        assert_eq!(GraphBackendKind::parse("  Zep  ").unwrap(), GraphBackendKind::Zep);
+        assert_eq!(GraphBackendKind::parse("native").unwrap(), GraphBackendKind::Native);
+        assert_eq!(GraphBackendKind::parse("NATIVE").unwrap(), GraphBackendKind::Native);
+    }
+
+    #[test]
+    fn test_graph_backend_unknown_value_is_error() {
+        let err = GraphBackendKind::parse("postgres").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("native") && msg.contains("zep"),
+            "error must list valid values: {msg}"
+        );
+        assert!(msg.contains("postgres"), "error should echo the bad value: {msg}");
+    }
+
+    #[test]
+    fn test_validate_rejects_unknown_graph_backend() {
+        // The hard-error path (Q2): an unknown GRAPH_BACKEND fails validate() even with all
+        // keys present.
+        let mut c = Config::build(Some("llm-key"));
+        c.zep_api_key = Some("zep-key".to_string());
+        c.graph_backend_raw = "redis".to_string();
+        let result = c.validate();
+        assert!(result.is_err(), "unknown GRAPH_BACKEND must fail validate()");
+        assert!(result.unwrap_err().to_string().contains("GRAPH_BACKEND"));
+    }
+
+    #[test]
+    fn test_graph_backend_env_zep_parsed_in_build() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("GRAPH_BACKEND");
+        unsafe { std::env::set_var("GRAPH_BACKEND", "zep") };
+        let c = Config::build(Some("key"));
+        assert_eq!(c.graph_backend, GraphBackendKind::Zep);
+        assert_eq!(c.graph_backend_raw, "zep");
+        match prev {
+            Ok(v) => unsafe { std::env::set_var("GRAPH_BACKEND", v) },
+            Err(_) => unsafe { std::env::remove_var("GRAPH_BACKEND") },
+        }
     }
 
     // --- LLM_MODEL_NAME alias test (S-008) ---
