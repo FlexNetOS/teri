@@ -4277,3 +4277,24 @@ run_parallel_simulation.py:317-414) NOT covered by the single-env `dispatch_comm
 (env.step world-injection `[≠]` + signal pieces remain). S-904/938/939 stay `[ ]`. S-934 dual-LLM `[ ]`.
 **U-028/U-029/U-030 UNITS STAY `[ ]`** — each still carries OASIS env/SQLite/logging/signal-handler
 contracts (+ U-030 parallel handler + DB-enrichment); this port closed the IPC-consumer gate, not the units.
+
+---
+
+## CYCLE 57 (2026-06-20, 30th resume) — VERIFY-ONLY [x] ADJUDICATION (11 substrate-satisfied symbols)
+
+Converting part of the cycle-55 cartographer classification (findings/u030-orchestration-residual.md)
+into honest ledger marks. Each flip cites a CONCRETE landed teri symbol confirmed present (no over-flip;
+verify-only, no code change):
+- **S-859/886/913** CommandType → `simulation_ipc::CommandType` (simulation_ipc.rs:57; as_str matches Python .value).
+- **S-879/906/941** setup_signal_handlers → `with_shutdown` cooperative AtomicBool + `terminate_handle`
+  (STOP_GRACE/CLEANUP_GRACE cooperative-then-abort, simulation_runner.rs:878/886/1295/1387) + tokio::signal
+  (U-002/U-049). OS-signal registration = `[≠]U028-SUBPROCESS-RUNNER`; graceful+force contract faithful.
+- **S-925** load_config → `SimulationManager::get_simulation_config` (simulation_manager.rs:1650, U-023).
+- **S-926** FILTERED_ACTIONS → exhaustive `SocialAction` enum (refresh/sign_up are not variants → never logged).
+- **S-927** ACTION_TYPE_MAP → `SocialAction::oasis_action_type()` (sim/mod.rs:109, Cycle 49).
+- **S-928** get_agent_names_from_config → `load_agent_pool` Persona.name + log_action uses pool.persona.name.
+
+1519 lib unchanged (no code). U-028/U-029/U-030 units STAY [ ]. **>>> 3-CYCLE BUDGET REACHED.** Remaining
+to flip units: the rest of the [≠]/[x] adjudication sweep (logging/subprocess-IPC/subprocess-runner/OASIS-DB
+→ [≠] with tags) + PORT parallel ParallelIPCHandler S-920-924 (architect-first, unified-pool [≠]) + PORT
+S-934 dual-LLM + flip S-877/904/938/939 run-coroutines + then the units.

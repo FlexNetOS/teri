@@ -1075,7 +1075,7 @@
 - [ ] S-856 · `unit:U-028` · `type` · `MaxTokensWarningFilter` · suppresses camel-ai max_tokens warnings · `run_twitter_simulation.py:70`
 - [ ] S-857 · `unit:U-028` · `method` · `MaxTokensWarningFilter.filter` · `run_twitter_simulation.py:73`
 - [ ] S-858 · `unit:U-028` · `fn` · `setup_oasis_logging` · configures OASIS library loggers to files · `run_twitter_simulation.py:84`
-- [ ] S-859 · `unit:U-028` · `type` · `CommandType` · enum (local copy): INTERVIEW/BATCH_INTERVIEW/CLOSE_ENV · `run_twitter_simulation.py:139`
+- [x] S-859 · `unit:U-028` · `type` · `CommandType` · enum (local copy): INTERVIEW/BATCH_INTERVIEW/CLOSE_ENV · `run_twitter_simulation.py:139` · **VERIFY-ONLY [x] 2026-06-20 (Cycle 57)**: the script-local CommandType enum is satisfied by the landed `crate::services::simulation_ipc::CommandType` (simulation_ipc.rs:57; `as_str()` → "interview"/"batch_interview"/"close_env" match Python `.value`). Single shared teri type covers all 3 scripts' local copies.
 - [ ] S-860 · `unit:U-028` · `type` · `IPCHandler` · subprocess-side IPC handler · `run_twitter_simulation.py:146`
 - [ ] S-861 · `unit:U-028` · `method` · `IPCHandler.__init__` · `run_twitter_simulation.py:149`
 - [ ] S-862 · `unit:U-028` · `method` · `IPCHandler.update_status` · writes env_status.json · `run_twitter_simulation.py:162`
@@ -1095,7 +1095,7 @@
 - [x] S-876 · `unit:U-028` · `method` · `TwitterSimulationRunner._get_active_agents_for_round` · filters by activity schedule · `run_twitter_simulation.py:462` · PARITY 2026-06-19 (Cycle 3a): ported to `src/sim/activation.rs` `TimeActivationPolicy::{simulated_hour,active_agents}`+`select_multiplier`; differential MATCH on all §1A rows; `[≠]U028-RNG-SEQUENCE` survives bar (unseeded Python, non-contractual sequence). 500-seed fuzz clean. 1515 passed/clippy clean.
 - [~] S-877 · `unit:U-028` · `method` · `TwitterSimulationRunner.run` · async main loop; wait-for-commands mode after rounds · `run_twitter_simulation.py:531` · PARITY 2026-06-20 (Cycle 3b-i): PRODUCER HALF proven — actions.jsonl stream (`simulation_start` / `round_start`-always / per-Social `log_action` / `round_end` / `simulation_end`, 1-based rounds, `(tick*mpr/60)%24` hour, both independent `total_rounds` formulas) + activation gate (`user_id`-match, empty→continue) wired into `SimEngine::run` (`src/sim/mod.rs:734-947`) + `oasis_action_type`/`oasis_action_args` + `RunProducer`/`ActivationPolicy`. Differential vs `run_parallel_simulation.py:run_twitter_simulation:1101-1290` = MATCH; `[≠]U028-OASIS-INTERNALS` (no OASIS trace DB → enrichment keys inexpressible) survives bar. STAYS `[~]`: full run-loop contract (round-0 initial_posts→c3b-ii, wait-for-commands/IPC/env.step/signal shutdown) UNPORTED — no premature flip. 5 producer_tests / 1505 lib pass / clippy clean. **U-030 cycle C (2026-06-20, parity PASS):** round-0 `initial_posts` injection NOW PORTED & proven — `SimEngine::run` emits `round_start(0,0)` (all loggers) → per `event_config.initial_posts` entry a `CREATE_POST` `log_action(0,…,{"content":…})` ROUTED to the poster agent's `social.platform` logger (resolved by `user_id`; unresolvable id skipped, faithful to Python `except:pass` L1202) → `round_end(0,n)` (all loggers, n→`total_actions`); byte-faithful to `run_parallel_simulation.py:1171-1211` (twitter) / `1364-1410` (reddit, structurally identical logging). Single-platform now EMITS round-0 (parity FIX vs U-028 omission). `env.step` world-injection stays `[≠]U028-OASIS-INTERNALS` (no OASIS post-graph; records ARE emitted, only the world mutation gapped). STILL `[~]`: wait-for-commands/IPC/env.step-execution/signal-shutdown run-loop pieces remain (U-030). +1 `run_round0_initial_posts_route_by_platform` / 7 producer_tests / 1512 lib pass.
 - [ ] S-878 · `unit:U-028` · `fn` · `main` · entry-point; sets up asyncio loop · `run_twitter_simulation.py:707`
-- [ ] S-879 · `unit:U-028` · `fn` · `setup_signal_handlers` · SIGTERM/SIGINT/SIGHUP → graceful shutdown · `run_twitter_simulation.py:749`
+- [x] S-879 · `unit:U-028` · `fn` · `setup_signal_handlers` · SIGTERM/SIGINT/SIGHUP → graceful shutdown · `run_twitter_simulation.py:749` · **VERIFY-ONLY [x] 2026-06-20 (Cycle 57)**: the observable (signal → graceful-then-force shutdown with cleanup) is satisfied by the landed cooperative-stop substrate — `with_shutdown(Arc<AtomicBool>)` (honored at each `SimEngine::run` tick boundary + the wait-for-commands loop) + `terminate_handle` (STOP_GRACE/CLEANUP_GRACE cooperative-then-`task.abort()` force, simulation_runner.rs:878/886/1295/1387), wired to `tokio::signal` cleanup (U-002/U-049). The OS-signal-handler registration mechanism is `[≠]U028-SUBPROCESS-RUNNER` (in-process, no subprocess signals); the graceful+force contract is faithful.
 
 ---
 
@@ -1107,7 +1107,7 @@
 - [ ] S-883 · `unit:U-029` · `type` · `MaxTokensWarningFilter` · `run_reddit_simulation.py:70`
 - [ ] S-884 · `unit:U-029` · `method` · `MaxTokensWarningFilter.filter` · `run_reddit_simulation.py:73`
 - [ ] S-885 · `unit:U-029` · `fn` · `setup_oasis_logging` · `run_reddit_simulation.py:84`
-- [ ] S-886 · `unit:U-029` · `type` · `CommandType` · `run_reddit_simulation.py:139`
+- [x] S-886 · `unit:U-029` · `type` · `CommandType` · `run_reddit_simulation.py:139` · **VERIFY-ONLY [x] 2026-06-20 (Cycle 57)**: satisfied by `simulation_ipc::CommandType` (mirror of S-859).
 - [ ] S-887 · `unit:U-029` · `type` · `IPCHandler` · `run_reddit_simulation.py:146`
 - [ ] S-888 · `unit:U-029` · `method` · `IPCHandler.__init__` · `run_reddit_simulation.py:149`
 - [ ] S-889 · `unit:U-029` · `method` · `IPCHandler.update_status` · `run_reddit_simulation.py:162`
@@ -1127,7 +1127,7 @@
 - [x] S-903 · `unit:U-029` · `method` · `RedditSimulationRunner._get_active_agents_for_round` · `run_reddit_simulation.py:469` · **VERIFY-ONLY FLIP 2026-06-20 (Cycle 55, parity PASS)**: reddit≡twitter byte-identical body (run_reddit_simulation.py:469-521 diffed vs run_twitter_simulation.py:462-529 — same 9 time_config keys+defaults, same uniform×multiplier→int target_count, same peak/off/1.0 multiplier precedence, same active_hours+activity_level per-agent gating, same random.sample(min(target,len)) cap); fully covered by the landed `TimeActivationPolicy` (src/sim/activation.rs, S-876 port). `[≠]U028-RNG-SEQUENCE` carries unchanged (Python unseeded RNG → structure-only differential, no NEW divergence). No fresh port — verify-only mirror of S-876. 9 activation tests pass.
 - [ ] S-904 · `unit:U-029` · `method` · `RedditSimulationRunner.run` · `run_reddit_simulation.py:523`
 - [ ] S-905 · `unit:U-029` · `fn` · `main` · `run_reddit_simulation.py:695`
-- [ ] S-906 · `unit:U-029` · `fn` · `setup_signal_handlers` · `run_reddit_simulation.py:737`
+- [x] S-906 · `unit:U-029` · `fn` · `setup_signal_handlers` · `run_reddit_simulation.py:737` · **VERIFY-ONLY [x] 2026-06-20 (Cycle 57)**: satisfied by `with_shutdown` + `terminate_handle` (mirror of S-879).
 
 ---
 
@@ -1139,7 +1139,7 @@
 - [ ] S-910 · `unit:U-030` · `fn` · `init_logging_for_simulation` · `run_parallel_simulation.py:141`
 - [ ] S-911 · `unit:U-030` · `const` · `TWITTER_ACTIONS` · `run_parallel_simulation.py:178`
 - [ ] S-912 · `unit:U-030` · `const` · `REDDIT_ACTIONS` · `run_parallel_simulation.py:188`
-- [ ] S-913 · `unit:U-030` · `type` · `CommandType` · `run_parallel_simulation.py:210`
+- [x] S-913 · `unit:U-030` · `type` · `CommandType` · `run_parallel_simulation.py:210` · **VERIFY-ONLY [x] 2026-06-20 (Cycle 57)**: satisfied by `simulation_ipc::CommandType` (mirror of S-859).
 - [ ] S-914 · `unit:U-030` · `type` · `ParallelIPCHandler` · handles interview commands for both platforms · `run_parallel_simulation.py:217`
 - [ ] S-915 · `unit:U-030` · `method` · `ParallelIPCHandler.__init__` · `run_parallel_simulation.py:224`
 - [ ] S-916 · `unit:U-030` · `method` · `ParallelIPCHandler.update_status` · `run_parallel_simulation.py:246`
@@ -1151,10 +1151,10 @@
 - [ ] S-922 · `unit:U-030` · `method` · `ParallelIPCHandler.handle_batch_interview` · `run_parallel_simulation.py:416`
 - [ ] S-923 · `unit:U-030` · `method` · `ParallelIPCHandler._get_interview_result` · `run_parallel_simulation.py:517`
 - [ ] S-924 · `unit:U-030` · `method` · `ParallelIPCHandler.process_commands` · `run_parallel_simulation.py:560`
-- [ ] S-925 · `unit:U-030` · `fn` · `load_config` · `run_parallel_simulation.py:604`
-- [ ] S-926 · `unit:U-030` · `const` · `FILTERED_ACTIONS` · `run_parallel_simulation.py:611`
-- [ ] S-927 · `unit:U-030` · `const` · `ACTION_TYPE_MAP` · `run_parallel_simulation.py:614`
-- [ ] S-928 · `unit:U-030` · `fn` · `get_agent_names_from_config` · `run_parallel_simulation.py:633`
+- [x] S-925 · `unit:U-030` · `fn` · `load_config` · `run_parallel_simulation.py:604` · **VERIFY-ONLY [x] 2026-06-20 (Cycle 57)**: reads `simulation_config.json` from path → satisfied by the landed `SimulationManager::get_simulation_config` (simulation_manager.rs:1650, U-023).
+- [x] S-926 · `unit:U-030` · `const` · `FILTERED_ACTIONS` · `run_parallel_simulation.py:611` · **VERIFY-ONLY [x] 2026-06-20 (Cycle 57)**: `{refresh, sign_up}` (the actions excluded from actions.jsonl) — satisfied structurally by the exhaustive `SocialAction` enum (sim/mod.rs:32 doc: "only refresh/sign_up are filtered"; neither is a SocialAction variant → never logged). Behavioral contract (refresh/sign_up never appear in actions.jsonl) holds.
+- [x] S-927 · `unit:U-030` · `const` · `ACTION_TYPE_MAP` · `run_parallel_simulation.py:614` · **VERIFY-ONLY [x] 2026-06-20 (Cycle 57)**: maps DB action strings → actions.jsonl type strings; satisfied by `SocialAction::oasis_action_type()` (sim/mod.rs:109, already parity-verified Cycle 49 — emits the same target strings directly; source DB names are OASIS internals teri bypasses).
+- [x] S-928 · `unit:U-030` · `fn` · `get_agent_names_from_config` · `run_parallel_simulation.py:633` · **VERIFY-ONLY [x] 2026-06-20 (Cycle 57)**: extracts `{agent_id → entity_name}` for the actions.jsonl `agent_name` field — satisfied because `load_agent_pool` builds `Persona.name` from `entity_name`, and `SimEngine::run`'s `log_action` uses `pool.agents[idx].persona.name` directly (sim/mod.rs, Cycle 49 producer) — no separate map needed.
 - [ ] S-929 · `unit:U-030` · `fn` · `fetch_new_actions_from_db` · polls SQLite for new action rows · `run_parallel_simulation.py:657`
 - [ ] S-930 · `unit:U-030` · `fn` · `_enrich_action_context` · enriches action_args with post/user content from DB · `run_parallel_simulation.py:749`
 - [ ] S-931 · `unit:U-030` · `fn` · `_get_post_info` · `run_parallel_simulation.py:857`
@@ -1167,7 +1167,7 @@
 - [ ] S-938 · `unit:U-030` · `fn` · `run_twitter_simulation` · coroutine for asyncio.gather · `run_parallel_simulation.py:1101`
 - [ ] S-939 · `unit:U-030` · `fn` · `run_reddit_simulation` · coroutine for asyncio.gather · `run_parallel_simulation.py:1293`
 - [ ] S-940 · `unit:U-030` · `fn` · `main` · asyncio.gather both platforms · `run_parallel_simulation.py:1492`
-- [ ] S-941 · `unit:U-030` · `fn` · `setup_signal_handlers` · `run_parallel_simulation.py:1653`
+- [x] S-941 · `unit:U-030` · `fn` · `setup_signal_handlers` · `run_parallel_simulation.py:1653` · **VERIFY-ONLY [x] 2026-06-20 (Cycle 57)**: satisfied by `with_shutdown` + `terminate_handle` (mirror of S-879; the `multiprocessing.resource_tracker` cleanup is a multiprocessing artifact, not applicable to teri's in-process model).
 
 ---
 
