@@ -338,7 +338,15 @@ impl Agent {
         let relevant_memories = self.retrieve_relevant_memories(world);
         let context = self.construct_context(world, &relevant_memories);
         let action_str = self.generate_action_with_fallback(&context, llm).await?;
-        self.parse_and_validate_action(&action_str)
+        // Robustness: a single unparseable LLM line must NOT abort the whole simulation (the run
+        // loop propagates this `Result` via `?`). An action string we cannot classify is treated
+        // as "the agent failed to decide" → a no-op `Think`, exactly like the LLM-error fallback
+        // in `generate_action_with_fallback`. This keeps a long multi-agent run resilient to the
+        // occasional off-format completion a local model emits, instead of one bad token ending
+        // every other agent's turn too.
+        Ok(self.parse_and_validate_action(&action_str).unwrap_or_else(|_| {
+            Action::Think("I could not decide on a clear action this round".to_string())
+        }))
     }
 
     /// Mutation phase of a step: store action in memory and return to Idle.
@@ -1706,6 +1714,27 @@ impl ActionGenerator {
         // prompt is byte-identical to before (no regression).
         let agent_persona = agent.persona.social.as_ref().map(|s| s.persona.as_str()).unwrap_or("");
 
+        // U-028 c2 completion: an agent loaded from an OASIS profile (i.e. it carries a
+        // `SocialProfile`) must be offered the platform's social action space — CREATE_POST,
+        // LIKE_POST, CREATE_COMMENT, FOLLOW, … (config.py OASIS_TWITTER_ACTIONS /
+        // OASIS_REDDIT_ACTIONS) — so `parse_and_validate_action`'s `Action::Social` branch is
+        // actually reachable and the simulation produces social-media activity. Without this the
+        // decision prompt only ever offered the 5 generic actions, so every agent fell through to
+        // a generic Speak/Think and NO social action was ever generated (the gap the parser,
+        // `SocialAction`, and the platform loggers were all built to serve). Generic agents (no
+        // social profile) yield `is_social = false` → the template keeps the generic action menu
+        // verbatim (no regression to teri's native swarm mode).
+        let is_social = agent.persona.social.is_some();
+        let platform = agent
+            .persona
+            .social
+            .as_ref()
+            .map(|s| match s.platform {
+                Platform::Twitter => "twitter",
+                Platform::Reddit => "reddit",
+            })
+            .unwrap_or("");
+
         let template_context = context! {
             agent_name => &agent.persona.name,
             agent_role => &agent.persona.role,
@@ -1713,6 +1742,8 @@ impl ActionGenerator {
             agent_background => &agent.persona.background,
             agent_traits => &agent.persona.traits,
             agent_persona => agent_persona,
+            is_social => is_social,
+            platform => platform,
             world_tick => world_tick,
             recent_events => recent_events,
             relevant_memories => relevant_memories,
@@ -2497,6 +2528,122 @@ mod tests {
             !prompt.contains("Persona:"),
             "no social profile → no Persona section (no regression): {prompt}"
         );
+    }
+
+    /// Helper: a minimal `SocialProfile` on a given platform for prompt/menu tests.
+    #[cfg(test)]
+    fn test_social_profile(platform: Platform) -> SocialProfile {
+        SocialProfile {
+            user_id: 1,
+            user_name: "tester".to_string(),
+            bio: "bio".to_string(),
+            persona: "a persona".to_string(),
+            platform,
+            karma: 0,
+            friend_count: 0,
+            follower_count: 0,
+            following_count: 0,
+            statuses_count: 0,
+            age: None,
+            gender: None,
+            mbti: None,
+            country: None,
+            profession: None,
+            interested_topics: vec![],
+            posting_style: None,
+            source_entity_uuid: None,
+            source_entity_type: None,
+            created_at: String::new(),
+        }
+    }
+
+    /// U-028 c2 completion: a Twitter social agent's decision prompt MUST offer the OASIS social
+    /// action space (CREATE_POST etc.) so `Action::Social` is actually reachable — and MUST NOT
+    /// fall back to the generic Speak/Move menu (which never yields a social action).
+    #[test]
+    fn test_social_prompt_offers_twitter_actions() {
+        let generator = ActionGenerator::new();
+        let agent = Agent::new(Persona {
+            name: "Tweep".to_string(),
+            background: "b".to_string(),
+            traits: vec![],
+            role: "agent".to_string(),
+            social: Some(test_social_profile(Platform::Twitter)),
+        });
+        let prompt = generator.generate_prompt(&agent, "World Tick: 1\n\n").unwrap();
+        assert!(prompt.contains("twitter"), "names the platform: {prompt}");
+        assert!(prompt.contains("CREATE_POST(content="), "offers CREATE_POST: {prompt}");
+        assert!(prompt.contains("REPOST"), "offers REPOST (a twitter action): {prompt}");
+        // Twitter must NOT advertise reddit-only actions, and must NOT show the generic menu.
+        assert!(!prompt.contains("CREATE_COMMENT"), "no reddit-only CREATE_COMMENT on twitter");
+        assert!(
+            !prompt.contains("Move(location)"),
+            "social agent must not get the generic action menu: {prompt}"
+        );
+    }
+
+    /// The Reddit menu differs from Twitter (CREATE_COMMENT / TREND etc.) and must NOT leak
+    /// `REFRESH` — teri's parser intentionally does not handle it, so offering it would make the
+    /// agent emit an unparseable action.
+    #[test]
+    fn test_social_prompt_offers_reddit_actions_without_refresh() {
+        let generator = ActionGenerator::new();
+        let agent = Agent::new(Persona {
+            name: "Redditor".to_string(),
+            background: "b".to_string(),
+            traits: vec![],
+            role: "agent".to_string(),
+            social: Some(test_social_profile(Platform::Reddit)),
+        });
+        let prompt = generator.generate_prompt(&agent, "World Tick: 1\n\n").unwrap();
+        assert!(prompt.contains("reddit"), "names the platform: {prompt}");
+        assert!(prompt.contains("CREATE_COMMENT"), "offers reddit CREATE_COMMENT: {prompt}");
+        assert!(prompt.contains("TREND"), "offers reddit TREND: {prompt}");
+        assert!(
+            !prompt.contains("REFRESH"),
+            "must NOT offer REFRESH (parser filters it): {prompt}"
+        );
+    }
+
+    /// No-regression: a generic (non-social) agent still gets the original Speak/Move/… menu.
+    #[test]
+    fn test_generic_prompt_keeps_classic_action_menu() {
+        let generator = ActionGenerator::new();
+        let agent = Agent::new(Persona {
+            name: "Gen".to_string(),
+            background: "b".to_string(),
+            traits: vec![],
+            role: "agent".to_string(),
+            social: None,
+        });
+        let prompt = generator.generate_prompt(&agent, "World Tick: 1\n\n").unwrap();
+        assert!(prompt.contains("Speak(content)"), "generic menu intact: {prompt}");
+        assert!(
+            !prompt.contains("CREATE_POST"),
+            "generic agent gets no social actions: {prompt}"
+        );
+    }
+
+    /// The CREATE_POST string a social agent is now prompted to emit must round-trip through the
+    /// parser into an `Action::Social(CreatePost)` — closing the loop the prompt opens.
+    #[test]
+    fn test_create_post_string_parses_to_social_action() {
+        let agent = Agent::new(Persona {
+            name: "P".to_string(),
+            background: "b".to_string(),
+            traits: vec![],
+            role: "agent".to_string(),
+            social: Some(test_social_profile(Platform::Reddit)),
+        });
+        let action = agent
+            .parse_and_validate_action("CREATE_POST(content=Hello world from the swarm)")
+            .unwrap();
+        match action {
+            Action::Social(SocialAction::CreatePost { content }) => {
+                assert_eq!(content, "Hello world from the swarm")
+            }
+            other => panic!("expected Social(CreatePost), got {other:?}"),
+        }
     }
 
     #[test]
