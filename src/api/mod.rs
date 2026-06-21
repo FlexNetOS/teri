@@ -249,6 +249,39 @@ pub(crate) fn build_llm(config: &crate::Config) -> crate::llm::OpenAiAdapter {
     crate::llm::OpenAiAdapter::new(&config.llm)
 }
 
+/// Build the optional "boost" LLM client — port of `create_model(config, use_boost=True)`
+/// (`run_parallel_simulation.py:984-1037`). The dual-LLM optimization lets a parallel run drive
+/// each platform's agents against a DIFFERENT API provider (twitter → the general LLM, reddit →
+/// the boost LLM) for higher concurrency.
+///
+/// Boost is gated on `LLM_BOOST_API_KEY` exactly like Python's `has_boost_config = bool(boost_api_key)`:
+/// absent/empty → `None` (the run falls back to the single general LLM for every agent, byte-identical
+/// to a non-boost run). When present, the boost client uses `LLM_BOOST_API_KEY`, then
+/// `LLM_BOOST_BASE_URL` (falling back to the general `base_url` when unset — mirroring Python's
+/// `if llm_base_url:` conditional override, which leaves the previously-set general base in place when
+/// the boost base is empty), and `LLM_BOOST_MODEL_NAME` (falling back to the general `model`, which
+/// already encodes `LLM_MODEL_NAME`-or-default). Secrets are read from the process env (envctl-injected),
+/// never persisted.
+pub(crate) fn build_boost_llm(config: &crate::Config) -> Option<crate::llm::OpenAiAdapter> {
+    let boost_api_key = std::env::var("LLM_BOOST_API_KEY").unwrap_or_default();
+    if boost_api_key.is_empty() {
+        return None;
+    }
+    let boost_base_url = std::env::var("LLM_BOOST_BASE_URL").unwrap_or_default();
+    let boost_model = std::env::var("LLM_BOOST_MODEL_NAME").unwrap_or_default();
+    let cfg = crate::config::LlmConfig {
+        api_key: boost_api_key,
+        base_url: if boost_base_url.is_empty() {
+            config.llm.base_url.clone()
+        } else {
+            boost_base_url
+        },
+        model: if boost_model.is_empty() { config.llm.model.clone() } else { boost_model },
+        ..config.llm.clone()
+    };
+    Some(crate::llm::OpenAiAdapter::new(&cfg))
+}
+
 pub struct ApiState {
     pub config: crate::Config,
     /// U-026: shared simulation registry — owns the `state.json` cache (cross-request

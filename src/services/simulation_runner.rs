@@ -967,6 +967,11 @@ pub struct RunInputs<L: LlmClient + Send + Sync + 'static> {
     pub graph: crate::graph::KnowledgeGraph,
     /// The LLM client backing agent decisions.
     pub llm: Arc<L>,
+    /// Optional per-platform "boost" LLM (U-030 S-934 dual-LLM). When `Some`, reddit agents'
+    /// decisions run against this client and twitter agents against `llm`; `None` (single-platform
+    /// runs) → every agent uses `llm`. Set only for `platform == "parallel"` when `LLM_BOOST_API_KEY`
+    /// is configured (see `build_run_inputs`).
+    pub boost_llm: Option<Arc<L>>,
 }
 
 /// In-process simulation supervisor — port of `SimulationRunner` (`simulation_runner.py:196`).
@@ -1181,7 +1186,7 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
         // Cooperative-stop flag, installed on the engine and held in the handle.
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        let RunInputs { mut engine, pool, graph, llm } = inputs;
+        let RunInputs { mut engine, pool, graph, llm, boost_llm } = inputs;
         engine.with_shutdown(Arc::clone(&shutdown));
 
         // Subscribe to the terminal completion signal (U-048) BEFORE the engine moves into the
@@ -1193,8 +1198,16 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
         // Parallel run ⇒ dual-platform interview dispatch (ParallelIPCHandler analog). Anything
         // other than "twitter"/"reddit" is parallel — same predicate as the (6) platform flags.
         let parallel = !matches!(platform, "twitter" | "reddit");
-        let task =
-            spawn_sim_task(engine, pool, graph, llm, ipc_server, Arc::clone(&shutdown), parallel);
+        let task = spawn_sim_task(
+            engine,
+            pool,
+            graph,
+            llm,
+            boost_llm,
+            ipc_server,
+            Arc::clone(&shutdown),
+            parallel,
+        );
 
         // process_pid stays None ([≠] value-only — no OS pid). runner_status → Running.
         state.runner_status = RunnerStatus::Running;
@@ -1522,11 +1535,16 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
 /// environment alive for interview round-trips — DECISION-16). When `SimEngine::run` returns
 /// (naturally, or early via the cooperative-shutdown flag), the task ends and the IPC server
 /// is stopped + dropped.
+///
+/// Threads the full run context (engine/pool/graph/main+boost LLM/IPC server/shutdown/parallel-mode)
+/// into the task — hence the wide arg list; these are a single run's owned inputs, not separable.
+#[allow(clippy::too_many_arguments)]
 fn spawn_sim_task<L: LlmClient + Send + Sync + 'static>(
     engine: SimEngine,
     pool: crate::agent::AgentPool,
     graph: crate::graph::KnowledgeGraph,
     llm: Arc<L>,
+    boost_llm: Option<Arc<L>>,
     ipc_server: SimulationIPCServer,
     shutdown: Arc<AtomicBool>,
     parallel: bool,
@@ -1536,8 +1554,9 @@ fn spawn_sim_task<L: LlmClient + Send + Sync + 'static>(
     // general enough") on the `SimEngine::run` → `prepare_action` closure when the run future
     // is handed to `tokio::spawn`. The explicit type annotation pins the lifetime so the
     // closure's `for<'a> FnMut(&'a Agent)` bound resolves. Behavior is unchanged.
-    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
-        Box::pin(run_sim_body(engine, pool, graph, llm, ipc_server, shutdown, parallel));
+    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = Box::pin(
+        run_sim_body(engine, pool, graph, llm, boost_llm, ipc_server, shutdown, parallel),
+    );
     tokio::spawn(fut)
 }
 
@@ -1555,11 +1574,16 @@ const WAIT_FOR_COMMANDS_POLL: Duration = Duration::from_millis(50);
 /// `SimEngine::run` higher-ranked closure resolves cleanly under `tokio::spawn` — an inline
 /// block trips rustc's "implementation of `FnOnce` is not general enough" on the
 /// `prepare_action` borrow. Behavior is identical to an inline block.
+///
+/// Wide arg list = one run's owned context (engine/pool/graph/main+boost LLM/IPC server/shutdown/
+/// parallel-mode), threaded together into the task body; they are not separable concerns.
+#[allow(clippy::too_many_arguments)]
 async fn run_sim_body<L: LlmClient + Send + Sync + 'static>(
     engine: SimEngine,
     mut pool: crate::agent::AgentPool,
     graph: crate::graph::KnowledgeGraph,
     llm: Arc<L>,
+    boost_llm: Option<Arc<L>>,
     mut ipc_server: SimulationIPCServer,
     shutdown: Arc<AtomicBool>,
     parallel: bool,
@@ -1568,7 +1592,7 @@ async fn run_sim_body<L: LlmClient + Send + Sync + 'static>(
     // reads this flag; interview commands are serviced by the wait-for-commands loop below).
     ipc_server.start();
 
-    if let Err(e) = engine.run(&mut pool, &graph, &*llm).await {
+    if let Err(e) = engine.run_with_boost(&mut pool, &graph, &*llm, boost_llm.as_deref()).await {
         tracing::error!("模拟运行失败: {}", e);
     }
 
@@ -3367,6 +3391,7 @@ mod lifecycle_tests {
             pool,
             graph: KnowledgeGraph::new(),
             llm: Arc::new(MockLlm),
+            boost_llm: None,
         }
     }
 
@@ -3402,7 +3427,13 @@ mod lifecycle_tests {
             loggers: crate::sim::PlatformLoggerSet::single(platform_enum, logger),
             config,
         });
-        RunInputs { engine, pool, graph: KnowledgeGraph::new(), llm: Arc::new(MockLlm) }
+        RunInputs {
+            engine,
+            pool,
+            graph: KnowledgeGraph::new(),
+            llm: Arc::new(MockLlm),
+            boost_llm: None,
+        }
     }
 
     /// Like [`run_inputs_with_producer`] but with a DUAL-logger (twitter + reddit) producer (U-030
@@ -3427,7 +3458,13 @@ mod lifecycle_tests {
             loggers: crate::sim::PlatformLoggerSet::parallel(twitter, reddit),
             config,
         });
-        RunInputs { engine, pool, graph: KnowledgeGraph::new(), llm: Arc::new(MockLlm) }
+        RunInputs {
+            engine,
+            pool,
+            graph: KnowledgeGraph::new(),
+            llm: Arc::new(MockLlm),
+            boost_llm: None,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -3725,7 +3762,7 @@ mod lifecycle_tests {
     #[tokio::test]
     async fn dispatch_single_mode_unwrapped_result() {
         let pool = pool_with_social_agent(7, "Ada");
-        let (mut client, mut server) = channel(IPC_CHANNEL_BUFFER);
+        let (client, mut server) = channel(IPC_CHANNEL_BUFFER);
         server.start();
         // client sends an interview; server polls + dispatches with parallel=false.
         let send = tokio::spawn(async move {
@@ -3748,6 +3785,98 @@ mod lifecycle_tests {
         assert!(resp.result.as_ref().unwrap().get("platforms").is_none());
     }
 
+    // ---- DUAL-LLM boost routing — Cycle 60 (S-934) ----
+
+    /// Records every prompt it is asked to complete (to observe which client an agent was routed
+    /// to). Returns the generic `Think(idle)` action so the run advances without social logging.
+    struct RecordingLlm {
+        prompts: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl RecordingLlm {
+        fn new() -> Self {
+            Self { prompts: Arc::new(std::sync::Mutex::new(Vec::new())) }
+        }
+        fn count(&self) -> usize {
+            self.prompts.lock().unwrap().len()
+        }
+    }
+    #[async_trait]
+    impl LlmClient for RecordingLlm {
+        async fn complete(&self, p: &str) -> Result<String> {
+            self.prompts.lock().unwrap().push(p.to_string());
+            Ok("Think(idle)".to_string())
+        }
+        async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+            Err(TeriError::Llm("not used".into()))
+        }
+        async fn stream(
+            &self,
+            _: &str,
+        ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            Err(TeriError::Llm("not used".into()))
+        }
+        async fn chat(&self, _: &[ChatMessage], _: &ChatOptions) -> Result<String> {
+            Err(TeriError::Llm("not used".into()))
+        }
+        async fn chat_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _: &[ChatMessage],
+            _: &ChatOptions,
+        ) -> Result<T> {
+            Err(TeriError::Llm("not used".into()))
+        }
+    }
+
+    /// With a boost client installed, REDDIT agents route to boost and TWITTER agents to main
+    /// (`create_model(use_boost=True)` for the reddit coroutine, `False` for twitter).
+    #[tokio::test]
+    async fn run_with_boost_routes_reddit_to_boost() {
+        use crate::agent::Platform::{Reddit, Twitter};
+        let mut pool = AgentPool::new();
+        pool.add_agent(social_agent_on(1, "Tw", Twitter));
+        pool.add_agent(social_agent_on(2, "RdA", Reddit));
+        pool.add_agent(social_agent_on(3, "RdB", Reddit));
+        let main = RecordingLlm::new();
+        let boost = RecordingLlm::new();
+        let engine = SimEngine::new(SimConfig::new(1, 4)); // 1 tick → each agent prepares once
+        engine
+            .run_with_boost(&mut pool, &KnowledgeGraph::new(), &main, Some(&boost))
+            .await
+            .expect("run ok");
+        assert_eq!(boost.count(), 2, "both reddit agents → boost");
+        assert_eq!(main.count(), 1, "twitter agent → main");
+    }
+
+    /// With NO boost client, every agent (twitter AND reddit) uses the main client — no-downgrade
+    /// of the single-LLM path.
+    #[tokio::test]
+    async fn run_with_boost_none_uses_main_for_all() {
+        use crate::agent::Platform::{Reddit, Twitter};
+        let mut pool = AgentPool::new();
+        pool.add_agent(social_agent_on(1, "Tw", Twitter));
+        pool.add_agent(social_agent_on(2, "Rd", Reddit));
+        let main = RecordingLlm::new();
+        let engine = SimEngine::new(SimConfig::new(1, 4));
+        engine
+            .run_with_boost(&mut pool, &KnowledgeGraph::new(), &main, None)
+            .await
+            .expect("run ok");
+        assert_eq!(main.count(), 2, "no boost → both agents use main");
+    }
+
+    /// The thin `run()` wrapper delegates with no boost → every agent uses main (byte-identical to
+    /// the pre-dual-LLM behavior).
+    #[tokio::test]
+    async fn run_wrapper_uses_main_for_all() {
+        use crate::agent::Platform::Reddit;
+        let mut pool = AgentPool::new();
+        pool.add_agent(social_agent_on(2, "Rd", Reddit));
+        let main = RecordingLlm::new();
+        let engine = SimEngine::new(SimConfig::new(1, 4));
+        engine.run(&mut pool, &KnowledgeGraph::new(), &main).await.expect("run ok");
+        assert_eq!(main.count(), 1, "run() → reddit agent still uses main (no boost installed)");
+    }
+
     /// THE KEYSTONE end-to-end: a live `run_sim_body` finishes its (0-tick) run, then stays alive
     /// in wait-for-commands mode servicing IPC. A client interviews an agent (→ LLM response),
     /// an unknown agent_id fails gracefully, and `close_env` completes + breaks the loop so the
@@ -3763,6 +3892,7 @@ mod lifecycle_tests {
             pool,
             KnowledgeGraph::new(),
             Arc::new(MockLlm),
+            None, // boost_llm — single-LLM
             server,
             shutdown,
             false, // single-platform mode
@@ -3809,6 +3939,7 @@ mod lifecycle_tests {
             pool,
             KnowledgeGraph::new(),
             Arc::new(MockLlm),
+            None, // boost_llm — single-LLM
             server,
             Arc::clone(&shutdown),
             false, // single-platform mode
@@ -3836,6 +3967,7 @@ mod lifecycle_tests {
             pool,
             KnowledgeGraph::new(),
             Arc::new(MockLlm),
+            None, // boost_llm — single-LLM
             server,
             shutdown,
             false, // single-platform mode

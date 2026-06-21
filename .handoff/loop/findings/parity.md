@@ -4368,3 +4368,33 @@ parallel=false, 1530 tests green; (6) asyncio.gather→sequential observably equ
 order-independent aggregation, deterministic twitter→reddit key order). **S-920/921/922/924 FLIPPED [x].**
 S-923 stays `[≠]` (OASIS DB). S-934 (dual-LLM)=cycle C, S-877/904/938/939/940=composite [ ]/[~].
 **U-028/U-029/U-030 units STAY [ ]** (S-934 + run-coroutine contract pending — no over-flip).
+
+## Cycle 60 — PORT dual-LLM boost (S-934 → [x])
+
+PORTED the dual-LLM "boost" optimization (`create_model(config, use_boost)`,
+run_parallel_simulation.py:984-1037; twitter coroutine use_boost=False L1130, reddit use_boost=True
+L1322) as platform-specific LLM routing — bucket-3 TO-PORT under the standing "all optional features
+ported / no downgrades" constraint (NOT an owner-decision `[≠]`). **+3 tests, 1530→1533 lib green**,
+clippy `--all-targets --all-features` clean, fmt clean, Y-not-regressed (develop=7c354a5).
+
+NEW: `build_boost_llm(config)` (api/mod.rs) — gates on `LLM_BOOST_API_KEY` (empty→None ≡ Python
+`has_boost_config = bool(boost_api_key)`); boost client uses boost api_key, `LLM_BOOST_BASE_URL`
+(fallback to general base_url when empty, ≡ Python's `if llm_base_url:` conditional override),
+`LLM_BOOST_MODEL_NAME` (fallback to general model). `SimEngine::run` is now a thin wrapper delegating
+to NEW `run_with_boost(pool, graph, llm, boost_llm: Option<&L>)`; the prepared-futures loop routes
+REDDIT agents→boost / TWITTER (+all agents when boost None)→main. `RunInputs.boost_llm: Option<Arc<L>>`
+threaded `start_simulation`→`spawn_sim_task`→`run_sim_body`→`run_with_boost`; `build_run_inputs` sets
+boost ONLY for `platform=="parallel"` when configured.
+
+**PARITY PASS (rust-port-parity-verifier, 6/6 CONFIRMED-FAITHFUL/HONEST):** (1) build_boost_llm config
+selection faithful incl. base/model empty-field fallbacks (tail general-model divergences are
+pre-existing owner-resolved, not new); (2) routing direction REDDIT→boost / TWITTER→main NOT inverted;
+(3) parallel-only gating (single-platform reddit run gets NO boost); (4) has_boost-unset→all-main; (5)
+**NO-DOWNGRADE-OF-Y CONFIRMED** — `run()` delegates `run_with_boost(…, None)`, boost None short-circuits
+→ every agent uses main `llm`, byte-identical to the prior single-LLM loop, all ~18 pre-existing run()
+callers + prod path unaffected, 1533 tests green; (6) camel-ai `ModelFactory.create`+`os.environ`
+mutation mechanism = legitimate `[≠]U028-SUBPROCESS-RUNNER` (shared with S-875/S-902) — the observable
+(which endpoint/model each platform routes to) IS reproduced; response text is `[!]`-LLM-gated.
+**S-934 FLIPPED [x].** This closes the LAST bucket-3 TO-PORT symbol. **U-028/U-029/U-030 units STAY [ ]**
+— the remaining gate is the COMPOSITE run-coroutines S-877[~]/S-904/S-938/S-939/S-940 (full coroutine
+contract differential proof = cycle D), then the unit flips (cycle E). No over-flip.

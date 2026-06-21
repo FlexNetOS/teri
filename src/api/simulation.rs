@@ -2159,6 +2159,16 @@ async fn build_run_inputs(
     // llm: always OpenAiAdapter (the concrete monomorphization, DECISION-U025-1).
     let llm = Arc::new(crate::api::build_llm(&state.config));
 
+    // Dual-LLM boost (U-030 S-934): ONLY for a parallel run, and ONLY when `LLM_BOOST_API_KEY` is
+    // configured — reddit agents then run against the boost client, twitter against `llm`
+    // (`create_model(use_boost=True/False)` per coroutine). Single-platform runs and an unconfigured
+    // boost → `None` → every agent uses `llm` (byte-identical to before).
+    let boost_llm = if platform == "parallel" {
+        crate::api::build_boost_llm(&state.config).map(Arc::new)
+    } else {
+        None
+    };
+
     // graph + the updater's shared write-handle. The engine reads `graph` (currently a no-op);
     // the updater (U-021) writes the `Arc<Mutex<_>>` clone.
     let (graph, graph_for_updater) = if enable_graph_memory_update {
@@ -2175,7 +2185,7 @@ async fn build_run_inputs(
         (KnowledgeGraph::new(), None)
     };
 
-    Ok((RunInputs { engine, pool, graph, llm }, graph_for_updater))
+    Ok((RunInputs { engine, pool, graph, llm, boost_llm }, graph_for_updater))
 }
 
 /// Port of MiroFish `start_simulation` (simulation.py:1451-1641).

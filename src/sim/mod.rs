@@ -816,11 +816,29 @@ impl SimEngine {
     pub async fn run<L: crate::llm::LlmClient>(
         &self,
         pool: &mut crate::agent::AgentPool,
+        graph: &crate::graph::KnowledgeGraph,
+        llm: &L,
+    ) -> crate::error::Result<SimulationResult> {
+        // Thin wrapper preserving the original signature (every pre-existing caller is unaffected):
+        // a single-LLM run is a dual-LLM run with no boost client → every agent uses `llm`.
+        self.run_with_boost(pool, graph, llm, None).await
+    }
+
+    /// Run with an optional per-platform "boost" LLM — port of `run_parallel_simulation`'s
+    /// dual-LLM routing (`create_model(use_boost=False)` for twitter at L1130,
+    /// `create_model(use_boost=True)` for reddit at L1322). When `boost_llm` is `Some`, REDDIT
+    /// agents' decisions run against the boost client and twitter agents against `llm`; when
+    /// `None` (single-platform runs + every pre-existing caller via [`SimEngine::run`]), ALL agents
+    /// use `llm` — byte-identical to the prior single-LLM behavior (no-downgrade-of-Y).
+    pub async fn run_with_boost<L: crate::llm::LlmClient>(
+        &self,
+        pool: &mut crate::agent::AgentPool,
         // TODO(graph-context): pass per-agent subgraph slices once Agent::prepare_action
         // accepts a graph reference. Tracked: _graph param intentionally kept so callers
         // do not need an API change when the feature lands.
         _graph: &crate::graph::KnowledgeGraph,
         llm: &L,
+        boost_llm: Option<&L>,
     ) -> crate::error::Result<SimulationResult> {
         use futures::stream::{self, StreamExt};
 
@@ -1006,7 +1024,18 @@ impl SimEngine {
                 > = active_indices
                     .iter()
                     .map(|&idx| {
-                        Box::pin(pool.agents[idx].prepare_action(&world, llm))
+                        // Dual-LLM routing (U-030 S-934): a reddit agent uses the boost client when
+                        // one is installed (`create_model(use_boost=True)` for the reddit coroutine);
+                        // twitter agents — and EVERY agent when no boost client is installed — use the
+                        // general `llm` (`use_boost=False`). Both arms are `&L`, so the boxed future
+                        // type is identical.
+                        let use_boost = boost_llm.is_some()
+                            && matches!(
+                                pool.agents[idx].persona.social.as_ref().map(|s| s.platform),
+                                Some(crate::agent::Platform::Reddit)
+                            );
+                        let client: &L = if use_boost { boost_llm.unwrap() } else { llm };
+                        Box::pin(pool.agents[idx].prepare_action(&world, client))
                             as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send + '_>>
                     })
                     .collect();
