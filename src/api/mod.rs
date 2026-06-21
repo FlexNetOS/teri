@@ -298,6 +298,15 @@ pub struct ApiState {
     pub sim_runner: std::sync::Arc<
         crate::services::simulation_runner::SimulationRunner<crate::llm::OpenAiAdapter>,
     >,
+    /// Workstream B: shared redb vector store for graph entity/edge embeddings, namespaced
+    /// per `graph_id`. Built once from `config.persistence.memory_db_path` so build-time
+    /// embedding (graph_builder) and search-time cosine (report tools) hit the SAME store.
+    /// `None` if the store could not be opened (the path is unwritable) — callers then fall
+    /// back to keyword search, never failing the request (keyless-safe, no-downgrade).
+    pub graph_vectors: Option<std::sync::Arc<crate::memory::MemoryStore>>,
+    /// Workstream B: shared embedding client (OpenAI-compatible `/v1/embeddings`, keyless-aware)
+    /// used to embed entity/edge text at build time and the query at search time.
+    pub embedder: std::sync::Arc<crate::embedding::EmbeddingClient>,
 }
 
 impl ApiState {
@@ -312,11 +321,28 @@ impl ApiState {
         let sim_manager = std::sync::Arc::new(
             crate::services::simulation_manager::SimulationManager::from_config(&config),
         );
+        // Workstream B: open the shared graph-vector store (redb) once. A failure to open
+        // (e.g. an unwritable MEMORY_DB_PATH in a constrained test) is non-fatal: graph_vectors
+        // stays None and search falls back to keyword (no-downgrade, keyless-safe).
+        let graph_vectors = crate::memory::MemoryStore::new(&config.persistence.memory_db_path)
+            .map(std::sync::Arc::new)
+            .ok();
+        // Shared embedding client (keyless-aware; same LlmConfig as the LLM adapters).
+        let embedder = std::sync::Arc::new(crate::embedding::EmbeddingClient::new(&config.llm));
+        // Workstream B (U6): vector index passed to graph-memory updaters so sim-accrued facts
+        // are re-embedded into the store. `None` when the store is unavailable.
+        let vector_index =
+            graph_vectors
+                .as_ref()
+                .map(|store| crate::services::graph_builder::GraphVectorIndex {
+                    embedder: embedder.clone(),
+                    store: store.clone(),
+                });
         // Graph-memory manager (U-021) registry — builds per-platform updaters lazily; the
         // concrete `OpenAiAdapter` monomorphization is fixed here at the state boundary.
         let graph_mgr = std::sync::Arc::new(crate::services::graph_memory::GraphMemoryManager::<
             crate::llm::OpenAiAdapter,
-        >::new());
+        >::with_vector_index(vector_index));
         // Shared runner (U-022) — shares the SAME manager Arc (so state.json writes are
         // consistent) and uses the same sim-data dir as the manager.
         let sim_runner =
@@ -325,7 +351,8 @@ impl ApiState {
                 graph_mgr,
                 sim_manager.clone(),
             ));
-        Self { config, sim_manager, sim_runner }
+
+        Self { config, sim_manager, sim_runner, graph_vectors, embedder }
     }
 }
 

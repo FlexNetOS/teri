@@ -80,6 +80,21 @@ pub struct ProjectCompletion {
     pub project_id: String,
 }
 
+/// Workstream B: optional vector-index hook for `build_graph_async_with_completion_indexed`.
+///
+/// When `Some`, the worker embeds the built graph's entities + synthesized edge facts and
+/// writes them to the redb `MemoryStore` under the per-`graph_id` namespace (the graph_id is the
+/// task_id — DECISION-9). This is what upgrades native search from keyword-only to embedding
+/// cosine. It is BEST-EFFORT: an embedding-endpoint failure (e.g. shimmy down / keyless stub)
+/// is logged and the build still completes — search then falls back to keyword (no-downgrade).
+#[derive(Clone)]
+pub struct GraphVectorIndex {
+    /// Shared embedding client (OpenAI-compatible `/v1/embeddings`, keyless-aware).
+    pub embedder: std::sync::Arc<crate::embedding::EmbeddingClient>,
+    /// Shared redb vector store the report tools' semantic search reads from.
+    pub store: std::sync::Arc<crate::memory::MemoryStore>,
+}
+
 /// Asynchronously builds a knowledge graph from `text` and returns a task_id immediately.
 ///
 /// Port of `GraphBuilderService.build_graph_async` (S-189, `graph_builder.py:54`).
@@ -160,8 +175,44 @@ pub fn build_graph_async_with_completion<L>(
     graph_name: String,
     chunk_size: usize,
     chunk_overlap: usize,
+    batch_size: usize, // [≠] Zep-batching artifact; accepted, ignored
+    completion: Option<ProjectCompletion>,
+) -> String
+where
+    L: LlmClient + Clone + Send + Sync + 'static,
+{
+    // Workstream B: delegate to the indexed form with no vector index so the existing
+    // verified 8-arg surface is UNCHANGED (blast radius zero for all current callers).
+    build_graph_async_with_completion_indexed(
+        llm,
+        text,
+        ontology,
+        graph_name,
+        chunk_size,
+        chunk_overlap,
+        batch_size,
+        completion,
+        None,
+    )
+}
+
+/// Workstream B additive entry point: like `build_graph_async_with_completion` but also takes an
+/// optional [`GraphVectorIndex`]. When `Some`, the built graph's entities + edge facts are
+/// embedded and written to the redb vector store under the per-graph namespace (graph_id ==
+/// task_id), enabling embedding-cosine search. When `None`, behavior is identical to the
+/// non-indexed form (keyword search only). The vector write is best-effort and never fails the
+/// build.
+#[allow(clippy::too_many_arguments)]
+pub fn build_graph_async_with_completion_indexed<L>(
+    llm: L,
+    text: String,
+    ontology: Value,
+    graph_name: String,
+    chunk_size: usize,
+    chunk_overlap: usize,
     _batch_size: usize, // [≠] Zep-batching artifact; accepted, ignored
     completion: Option<ProjectCompletion>,
+    vector_index: Option<GraphVectorIndex>,
 ) -> String
 where
     L: LlmClient + Clone + Send + Sync + 'static,
@@ -189,6 +240,7 @@ where
             chunk_size,
             chunk_overlap,
             completion,
+            vector_index,
         )
         .await;
     }));
@@ -217,6 +269,7 @@ async fn build_graph_worker<L>(
     chunk_size: usize,
     chunk_overlap: usize,
     completion: Option<ProjectCompletion>,
+    vector_index: Option<GraphVectorIndex>,
 ) where
     L: LlmClient + Clone + Send + Sync + 'static,
 {
@@ -228,6 +281,7 @@ async fn build_graph_worker<L>(
         graph_name,
         chunk_size,
         chunk_overlap,
+        vector_index,
     )
     .await;
 
@@ -287,6 +341,7 @@ pub(crate) async fn build_graph_worker_inner<L>(
     graph_name: String,
     chunk_size: usize,
     chunk_overlap: usize,
+    vector_index: Option<GraphVectorIndex>,
 ) -> crate::error::Result<()>
 where
     L: LlmClient + Clone + Send + Sync + 'static,
@@ -408,6 +463,32 @@ where
     let graph_json_str = graph.serialize_to_json()?;
     let graph_json: Value = serde_json::from_str(&graph_json_str)
         .map_err(|e| TeriError::Graph(format!("Failed to re-parse graph JSON: {e}")))?;
+
+    // Workstream B (U3): embed the graph's entities + edge facts into the redb vector store
+    // under the per-graph namespace (graph_id == task_id) so the report tools' search() runs
+    // embedding cosine. BEST-EFFORT: a failure here (endpoint down / keyless stub) is logged
+    // and the build still completes — search falls back to keyword. The vectors are stored
+    // OUT OF BAND, so the serialized graph JSON above is unaffected (/data stays byte-identical).
+    if let Some(idx) = &vector_index {
+        let tools = crate::services::zep_tools::ReportTools::new(&graph, &llm);
+        match crate::services::graph_backend::embed_graph_vectors(
+            &tools,
+            task_id,
+            &idx.embedder,
+            &idx.store,
+        )
+        .await
+        {
+            Ok(n) => tracing::info!(
+                target: "teri::graph_builder",
+                "embedded {n} graph vectors for graph_id={task_id}"
+            ),
+            Err(e) => tracing::warn!(
+                target: "teri::graph_builder",
+                "graph vector indexing failed for graph_id={task_id} ({e}); keyword search fallback"
+            ),
+        }
+    }
 
     // Milestone 100% — complete (PORT)
     let result = json!({
@@ -568,6 +649,7 @@ mod tests {
             "TestGraph".to_string(),
             500,
             50,
+            None, // Workstream B: no vector index in this unit test
         )
         .await
         .expect("worker inner must not return Err");
@@ -649,6 +731,7 @@ mod tests {
             "FailGraph".to_string(),
             500,
             50,
+            None, // Workstream B: no vector index in this unit test
         )
         .await;
 

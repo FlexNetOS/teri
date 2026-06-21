@@ -17,7 +17,7 @@ pub mod services;
 pub mod sim;
 pub mod task;
 
-pub use config::Config;
+pub use config::{Config, GraphBackendKind};
 pub use error::{Result, TeriError};
 pub use llm::{
     AnthropicAdapter, ChatMessage, ChatOptions, ChatRole, GeminiAdapter, LlmClient, OpenAiAdapter,
