@@ -5160,3 +5160,42 @@ embedding-GENERATION backend (text→vector) has no substrate (shimmy lacks `/v1
 teri-native ENHANCEMENT beyond MiroFish parity, blocked on external infra, "do NOT fake an embedder."
 ESCALATED to owner (NEEDS-HUMAN owner-wall). PR #5 stays HELD pending that decision + a pre-DONE
 left-behind sweep.
+
+---
+
+## Cycle 74 (2026-06-21, 36th resume) — OQ-3 embedding backend WIRED (owner-directed)
+
+**Trigger:** owner answered the cycle-73 OQ-3 escalation: *implement EmbeddingClient, but reuse an
+existing meta crate* (pointer: `meta/meta-ruvector/crates`).
+
+**Discovery that changed the plan:** teri **already had** a complete, real, async `EmbeddingClient`
+(`src/embedding.rs`) — OpenAI-compatible `POST /v1/embeddings`, `embed`/`embed_batch` (input-order
+safe), keyless-aware, 7 httpmock tests (no fake/random embedder). Both it AND the cosine search
+`query_vec_similarity` were **dead code** (zero production callers): the two halves were built but never
+connected. So the genuine gap was **wiring**, not a missing client.
+
+**Decision (no-downgrade):** `ruvector-core::ApiEmbedding` (crates.io 2.2.3, `EmbeddingProvider` trait)
+was verified real and builds in teri — but it is a *blocking* client without keyless/batch-order
+handling. teri's existing client is *superior* (async, keyless, batch-order-safe). Adding ruvector-core
+would have DUPLICATED a working client = a downgrade. So the speculative dep was reverted (Cargo.toml/lock
+clean) and teri's own client used — honoring the owner's intent (reuse proven code, don't reinvent) even
+better, since the code already existed in-repo.
+
+**Implemented:** wired the two existing halves — new `MemoryStore::write_vec_text` (embed→store) and
+`MemoryStore::semantic_recall` (embed→`query_vec_similarity`), both taking `&EmbeddingClient`. Updated
+the stale gap docs in `memory/mod.rs` + `embedding.rs`. New end-to-end test
+`test_semantic_recall_end_to_end_via_embedding_client`: stores two texts via the real client (mocked
+`/v1/embeddings` serving distinct unit vectors by request body), `semantic_recall`s a query, asserts the
+semantically-aligned entry ranks first — the full text→vector→cosine path, no fake.
+
+**Honesty of the [x] flip:** the embedding-generation code path is complete, wired, tested, and reachable
+against ANY OpenAI-compatible `/v1/embeddings` (OpenAI itself, or shimmy once it serves the route) — the
+endpoint is a deployment config exactly like teri's LLM client needing an LLM endpoint. The shimmy-local
+route remains a shimmy-side enhancement (offline-only, out of teri scope), non-blocking. "Do NOT fake"
+honored throughout.
+
+**Build-health:** `cargo fmt` clean, `cargo clippy --all-targets` clean, `cargo test` **1568 passed** /
+6 ignored (5 suites; +1 vs cycle 73).
+
+**Result:** S-EMBED-001 + GAP-2 `[!]`→`[x]`. **All three ledgers 100% terminal (1256/1256).** Only the
+pre-DONE left-behind sweep now gates DONE → then open PR #5.

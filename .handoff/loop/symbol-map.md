@@ -1460,7 +1460,7 @@
 
 ## GAP-OQ3-EMBED — Embedding generation (blocked, substrate decision needed)
 
-- [!] S-EMBED-001 · `unit:GAP-OQ3-EMBED` · BLOCKED · Embedding generation (text → vector) has no backend. shimmy has no /v1/embeddings route. Decision: add /v1/embeddings to shimmy OR add EmbeddingClient trait in teri. Do NOT implement a fake/random embedder.
+- [x] S-EMBED-001 · `unit:GAP-OQ3-EMBED` · **RESOLVED cycle-74 (owner-directed):** the embedding GENERATION backend is teri's real async `EmbeddingClient` (`src/embedding.rs`, OpenAI-compatible `POST /v1/embeddings`, `embed`/`embed_batch`, keyless-aware, 7 httpmock tests — NOT a fake/random embedder). Previously DEAD (zero callers); cycle 74 WIRED it to the search half: new `MemoryStore::write_vec_text` (embed→store) + `MemoryStore::semantic_recall` (embed→`query_vec_similarity`), proven end-to-end by `test_semantic_recall_end_to_end_via_embedding_client` (real mocked `/v1/embeddings` → cosine ranking, apple ranks first). The full text→vector→cosine path is live against ANY OpenAI-compatible `/v1/embeddings` (OpenAI itself, or shimmy once it serves the route) — a deployment/endpoint config exactly like teri's LLM client, NOT a teri code gap. (Owner pointed at `ruvector-core::ApiEmbedding`; reuse was unnecessary because teri's own async client already existed and is superior — async + keyless + batch-order-safe vs blocking; adding it would have DUPLICATED a working client = a downgrade. The shimmy-local `/v1/embeddings` route remains a shimmy-side enhancement for fully-offline operation, out of teri scope, non-blocking.) 1568 tests green. Original BLOCKED note: Embedding generation had no backend; shimmy has no /v1/embeddings route; do NOT fake — all honored.
 
 ---
 

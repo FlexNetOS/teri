@@ -303,9 +303,12 @@ impl MemoryStore {
     /// # Zero-norm policy
     /// Stored entries or query vectors with L2-norm == 0.0 are skipped (avoiding div-by-zero).
     ///
-    /// # Embedding generation gap
-    /// This method takes a **precomputed** `query_embedding`. The upstream embedding generation
-    /// (text → vector) is NOT implemented here — see `- [!] GAP-OQ3-EMBED` in the parity ledger.
+    /// # Embedding generation
+    /// This method takes a **precomputed** `query_embedding`. To search by raw text, use
+    /// [`semantic_recall`](Self::semantic_recall), which embeds the text via the
+    /// [`EmbeddingClient`](crate::embedding::EmbeddingClient) (OpenAI-compatible `/v1/embeddings`)
+    /// and feeds the result here — closing GAP-OQ3-EMBED. This precomputed-vector entry point
+    /// stays for callers that already hold a query vector.
     pub async fn query_vec_similarity(
         &self,
         agent_id: Uuid,
@@ -388,6 +391,51 @@ impl MemoryStore {
         // Return at most top_k results, discarding scores.
         let results = scored.into_iter().take(top_k).map(|(_, entry)| entry).collect();
         Ok(results)
+    }
+
+    /// Embed `content` via the [`EmbeddingClient`] and persist it as a [`VectorEntry`].
+    ///
+    /// This is the **generation→storage** half of GAP-OQ3-EMBED: it joins the embedding
+    /// backend (`src/embedding.rs`, text→vector over an OpenAI-compatible `/v1/embeddings`
+    /// endpoint) to the vector store. Previously `write_vec` required a *precomputed*
+    /// embedding and there was no in-repo path that produced one; this method closes that.
+    ///
+    /// The vector dimensionality is whatever the configured embedding model returns; the
+    /// cosine search ([`query_vec_similarity`](Self::query_vec_similarity)) tolerates mixed
+    /// dimensions by skipping mismatches, so callers do not have to pin a dimension here.
+    pub async fn write_vec_text(
+        &self,
+        agent_id: Uuid,
+        embedder: &crate::embedding::EmbeddingClient,
+        content: &str,
+        importance: f32,
+    ) -> Result<()> {
+        let embedding = embedder.embed(content).await?;
+        let entry = VectorEntry {
+            timestamp: chrono::Utc::now(),
+            content: content.to_string(),
+            embedding,
+            importance,
+        };
+        self.write_vec(agent_id, &entry).await
+    }
+
+    /// Semantic recall: embed `query_text` via the [`EmbeddingClient`], then return the
+    /// `top_k` stored entries most cosine-similar to it.
+    ///
+    /// This is the **generation→search** half of GAP-OQ3-EMBED — the live feed that
+    /// `query_vec_similarity` was written to consume. It is the text-in/entries-out surface
+    /// a feature (e.g. semantic agent-memory recall) calls; `query_vec_similarity` remains
+    /// available for callers that already hold a precomputed query vector.
+    pub async fn semantic_recall(
+        &self,
+        agent_id: Uuid,
+        embedder: &crate::embedding::EmbeddingClient,
+        query_text: &str,
+        top_k: usize,
+    ) -> Result<Vec<VectorEntry>> {
+        let query_embedding = embedder.embed(query_text).await?;
+        self.query_vec_similarity(agent_id, &query_embedding, top_k).await
     }
 }
 
@@ -822,5 +870,74 @@ mod tests {
         assert_eq!(results.len(), 1);
         // We can't directly read the score but the identical vector must rank first (and only).
         assert_eq!(results[0].content, "identical");
+    }
+
+    // ===== GAP-OQ3-EMBED end-to-end: EmbeddingClient -> write_vec_text/semantic_recall =====
+
+    /// Full text→vector→cosine path through the REAL embedding client (mocked HTTP, never a
+    /// fake embedder): store two texts via `write_vec_text`, then `semantic_recall` a query and
+    /// assert the semantically-aligned entry ranks first. The mock serves distinct unit vectors
+    /// keyed by the request body, so ranking is determined by the generated embeddings — proving
+    /// the generation half is wired to the search half.
+    #[tokio::test]
+    async fn test_semantic_recall_end_to_end_via_embedding_client() {
+        use crate::config::LlmConfig;
+        use crate::embedding::EmbeddingClient;
+        use httpmock::prelude::*;
+
+        let server = MockServer::start();
+        // "fruit-red-apple" -> e1 = [1,0]
+        server.mock(|when, then| {
+            when.method(POST).path("/embeddings").body_contains("fruit-red-apple");
+            then.status(200).header("Content-Type", "application/json").body(
+                r#"{"object":"list","data":[{"object":"embedding","embedding":[1.0,0.0],"index":0}]}"#,
+            );
+        });
+        // "fast-red-car" -> e2 = [0,1]
+        server.mock(|when, then| {
+            when.method(POST).path("/embeddings").body_contains("fast-red-car");
+            then.status(200).header("Content-Type", "application/json").body(
+                r#"{"object":"list","data":[{"object":"embedding","embedding":[0.0,1.0],"index":0}]}"#,
+            );
+        });
+        // query "apple-query" -> aligned with the apple entry = [1,0]
+        server.mock(|when, then| {
+            when.method(POST).path("/embeddings").body_contains("apple-query");
+            then.status(200).header("Content-Type", "application/json").body(
+                r#"{"object":"list","data":[{"object":"embedding","embedding":[1.0,0.0],"index":0}]}"#,
+            );
+        });
+
+        let cfg = LlmConfig {
+            base_url: server.base_url(),
+            api_key: String::new(),
+            model: "unused".to_string(),
+            embed_model: "all-MiniLM-L6-v2".to_string(),
+            timeout_secs: 5,
+            max_retries: 0,
+        };
+        let embedder = EmbeddingClient::new(&cfg);
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let store = MemoryStore::new(temp_dir.path()).expect("store");
+        let agent_id = Uuid::new_v4();
+
+        store
+            .write_vec_text(agent_id, &embedder, "fruit-red-apple", 0.9)
+            .await
+            .expect("store apple via embedding");
+        store
+            .write_vec_text(agent_id, &embedder, "fast-red-car", 0.5)
+            .await
+            .expect("store car via embedding");
+
+        let hits = store
+            .semantic_recall(agent_id, &embedder, "apple-query", 2)
+            .await
+            .expect("semantic recall");
+
+        assert_eq!(hits.len(), 2, "both stored entries returned");
+        assert_eq!(hits[0].content, "fruit-red-apple", "apple must rank first for an apple query");
+        assert_eq!(hits[1].content, "fast-red-car");
     }
 }

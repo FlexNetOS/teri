@@ -12,8 +12,13 @@ use serde::{Deserialize, Serialize};
 //   Request:  {"model": "<name>", "input": "<text>" | ["<text>", ...]}
 //   Response: {"object":"list","data":[{"object":"embedding","embedding":[f32…],"index":N},…],…}
 //
-// GAP-OQ3-EMBED: generation half of vector similarity (the search half —
-// `query_vec_similarity` — is already in src/memory/mod.rs, GAP-2/done).
+// GAP-OQ3-EMBED: this is the generation half of vector similarity. It is wired to the
+// search half (`MemoryStore::query_vec_similarity`, GAP-2) by
+// `MemoryStore::write_vec_text` (embed→store) and `MemoryStore::semantic_recall`
+// (embed→search) in src/memory/mod.rs — so the full text→vector→cosine path is live
+// against any OpenAI-compatible `/v1/embeddings` endpoint (e.g. OpenAI, or shimmy once
+// it serves the route). With no embeddings endpoint configured the call simply errors
+// and callers fall back to keyword paths — never a fake/random embedder.
 // ============================================================================
 
 // ── Request / Response types ────────────────────────────────────────────────
