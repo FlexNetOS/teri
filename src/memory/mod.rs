@@ -21,6 +21,12 @@ const KV_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("kv");
 /// silently overwrites the first (a latent bug that intermittently lost vectors under load).
 static VEC_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Same disambiguation for `write_ltm`. The vec path was fixed in Workstream B, but the LTM
+/// path kept the bare `agent:{id}:ltm:{ts}` (millisecond) key, so two long-term memories an
+/// agent writes in the same millisecond would collide and silently lose one. Mirror the vec
+/// fix so the LTM store is collision-safe before it gets wired into the agent loop.
+static LTM_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
     pub timestamp: chrono::DateTime<chrono::Utc>,
@@ -67,7 +73,11 @@ impl MemoryStore {
 
     pub async fn write_ltm(&self, agent_id: Uuid, entry: &MemoryEntry) -> Result<()> {
         let ts = entry.timestamp.timestamp_millis();
-        let key = format!("agent:{agent_id}:ltm:{ts}");
+        // Append a process-monotonic sequence so same-millisecond LTM writes don't collide
+        // (mirrors `write_vec`). The `:ltm:` prefix is preserved, so `read_ltm` / `query_ltm`
+        // prefix scans are unchanged.
+        let seq = LTM_WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let key = format!("agent:{agent_id}:ltm:{ts}:{seq:020}");
         let value = serde_json::to_vec(entry)
             .map_err(|e| TeriError::Memory(format!("Serialization error: {e}")))?;
         let db = self.db.clone();
@@ -613,6 +623,31 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].content, "Test memory");
+    }
+
+    #[tokio::test]
+    async fn test_write_ltm_same_millisecond_no_collision() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let db_path = temp_dir.path().join("test.redb");
+        let store = MemoryStore::new(&db_path).expect("Failed to create memory store");
+        let agent_id = Uuid::new_v4();
+
+        // Five memories that all share the SAME timestamp (the same millisecond an
+        // agent could emit them in). With the old bare `ltm:{ts}` key these collided
+        // and only one survived; the monotonic sequence suffix keeps all five.
+        let ts = chrono::Utc::now();
+        for i in 0..5 {
+            store
+                .write_ltm(
+                    agent_id,
+                    &MemoryEntry { timestamp: ts, content: format!("memory {i}"), importance: 0.5 },
+                )
+                .await
+                .expect("write ltm");
+        }
+
+        let entries = store.read_ltm(agent_id, 100).await.expect("read ltm");
+        assert_eq!(entries.len(), 5, "all 5 same-millisecond LTM writes must persist");
     }
 
     #[tokio::test]
