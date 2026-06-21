@@ -1,7 +1,9 @@
 pub mod action_logger;
 pub mod activation;
+pub mod social_world;
 
 use crate::agent::Platform;
+use crate::models::project::python_isoformat_local;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -697,6 +699,17 @@ pub struct SimEngine {
     /// Optional `actions.jsonl` producer (U-028 §5). `None` → `run()` writes no action log.
     /// `Some` → `run()` emits the full `simulation_start` / per-round / `simulation_end` stream.
     producer: Option<RunProducer>,
+    /// Optional social-world substrate (Workstream C). `None` → no post-graph, no
+    /// `{platform}_simulation.db`, no feed-back — every pre-existing caller + teri's generic swarm
+    /// mode is byte-identical. `Some` → `run_with_boost` seeds round-0 posts, snapshots a feed into
+    /// each tick's prompts, applies committed `Action::Social`s into the world ALONGSIDE the
+    /// untouched `actions.jsonl` log, and (with the `sqlite` feature) flushes the world to
+    /// `{sim_dir}/{platform}_simulation.db` per round so `/posts` + `/comments` return real data.
+    ///
+    /// Wrapped in a `Mutex` because `run_with_boost` takes `&self` (the engine is shared by ref
+    /// into the run future) but the world must be mutated (apply / flush) across the run. The lock
+    /// is uncontended — `run_with_boost` is the sole accessor, single-threaded across ticks.
+    social: Option<Mutex<social_world::SocialWorldSet>>,
 }
 
 impl SimEngine {
@@ -719,6 +732,7 @@ impl SimEngine {
             shutdown: None,
             activation: None,
             producer: None,
+            social: None,
         }
     }
 
@@ -740,6 +754,18 @@ impl SimEngine {
     /// COMPLETED. When never called, `run()` writes no action log.
     pub fn with_producer(&mut self, producer: RunProducer) {
         self.producer = Some(producer);
+    }
+
+    /// Install the social-world substrate (Workstream C, additive, opt-in).
+    ///
+    /// When set, `run_with_boost` seeds round-0 initial posts into the world, snapshots a
+    /// recency-ranked feed into each tick's social-agent prompts, applies each committed
+    /// `Action::Social` into the world (ALONGSIDE the untouched `actions.jsonl` producer log), and
+    /// — with the `sqlite` feature — flushes the world to `{sim_dir}/{platform}_simulation.db` each
+    /// round so the `/posts` + `/comments` readers return real data. When never called, the run is
+    /// byte-identical to before this method existed (no post-graph, no DB file, no feed section).
+    pub fn with_social(&mut self, set: social_world::SocialWorldSet) {
+        self.social = Some(Mutex::new(set));
     }
 
     /// Install a cooperative-shutdown flag, checked at the top of every tick in `run()`.
@@ -931,6 +957,16 @@ impl SimEngine {
                             )
                             .map_err(|e| log_err("log_action", e))?;
                         round0_counts.add(platform, 1);
+                        // Workstream C: also seed the social world so round-1 agents SEE these
+                        // posts in their feed and can LIKE/COMMENT/REPOST against them. This closes
+                        // the [≠]U028-OASIS-INTERNALS "no post-graph" gap the round-0 comment above
+                        // anticipated. No-op when no social set is installed.
+                        if let Some(social) = &self.social {
+                            let mut set = social.lock();
+                            if let Some(world) = set.world_mut(platform) {
+                                world.create_post(poster_id, content, &python_isoformat_local());
+                            }
+                        }
                     }
                 }
             }
@@ -1008,6 +1044,32 @@ impl SimEngine {
             // `run()`'s future must be `Send` — i.e. when it is handed to `tokio::spawn`
             // (U-022's `SimulationRunner::start_simulation`). Direct `.await` callers are
             // unaffected.
+            // Workstream C: snapshot a recency-ranked feed per platform ONCE at the top of the
+            // tick — reflecting state through the previous tick — so the concurrent prepare phase
+            // borrows an immutable feed (race-free; the world is only mutated in phase 2). Empty /
+            // absent when no social set is installed ⇒ `feed_for` returns `None` ⇒ prompts are
+            // byte-identical to the no-social path (no-downgrade).
+            let feeds: Vec<(Platform, social_world::FeedSnapshot)> = match &self.social {
+                Some(social) => {
+                    let set = social.lock();
+                    let rank = self
+                        .producer
+                        .as_ref()
+                        .map(|p| social_world::FeedRankParams::from_config(&p.config))
+                        .unwrap_or_default();
+                    set.platforms()
+                        .filter_map(|p| {
+                            set.world(p).map(|w| (p, w.feed_snapshot(rank.top_n, &rank)))
+                        })
+                        .collect()
+                }
+                None => Vec::new(),
+            };
+            let feed_for = |platform: Option<Platform>| -> Option<&social_world::FeedSnapshot> {
+                let platform = platform?;
+                feeds.iter().find(|(p, _)| *p == platform).map(|(_, f)| f)
+            };
+
             let actions: Vec<crate::error::Result<crate::sim::Action>> = {
                 // Borrow scope: the prepared futures borrow `world`/`llm`; they are all driven
                 // to completion by `collect().await` here, releasing those borrows before
@@ -1035,7 +1097,10 @@ impl SimEngine {
                                 Some(crate::agent::Platform::Reddit)
                             );
                         let client: &L = if use_boost { boost_llm.unwrap() } else { llm };
-                        Box::pin(pool.agents[idx].prepare_action(&world, client))
+                        let agent_platform =
+                            pool.agents[idx].persona.social.as_ref().map(|s| s.platform);
+                        let feed = feed_for(agent_platform);
+                        Box::pin(pool.agents[idx].prepare_action(&world, feed, client))
                             as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send + '_>>
                     })
                     .collect();
@@ -1090,6 +1155,21 @@ impl SimEngine {
                         round_counts.add(platform, 1);
                     }
                 }
+                // Workstream C: apply the committed social action into the social world ALONGSIDE
+                // the producer's `actions.jsonl` log above (NOT a replacement — the log stays
+                // intact). Only for an agent carrying a social profile and only for an
+                // `Action::Social`; everything else is untouched (no-downgrade). A bad/unresolved
+                // target id is a fail-closed NoOp inside `apply` (never panics, never invents a
+                // post). The same `created_at` is used for the DB row so it agrees with the log.
+                if let (Some(social), Action::Social(sa)) = (&self.social, &action)
+                    && let Some(profile) = pool.agents[idx].persona.social.as_ref()
+                {
+                    let created_at = python_isoformat_local();
+                    let mut set = social.lock();
+                    if let Some(world) = set.world_mut(profile.platform) {
+                        world.apply(profile.user_id as i64, sa, &created_at);
+                    }
+                }
             }
 
             // Producer: `round_end` with THIS round's per-platform action count, fanned out to ALL
@@ -1103,6 +1183,14 @@ impl SimEngine {
                     logger.log_round_end(round, count).map_err(|e| log_err("round_end", e))?;
                     total_actions.add(*platform, count);
                 }
+            }
+
+            // Workstream C: flush the social world to its `{platform}_simulation.db` at the end of
+            // each round (per-round so `/posts` returns growing data WHILE the sim runs, matching
+            // the mid-run observability the monitor + UI expect). No-op without the `sqlite`
+            // feature, and no-op when no social set is installed.
+            if let Some(social) = &self.social {
+                social.lock().flush_round()?;
             }
 
             // Apply God's-eye injection if configured
@@ -1134,6 +1222,12 @@ impl SimEngine {
                     .log_simulation_end(self.config.max_ticks as i64, total_actions.get(*platform))
                     .map_err(|e| log_err("simulation_end", e))?;
             }
+        }
+
+        // Workstream C: final flush to capture the last tick, then the DB connections drop
+        // (closing the files). No-op without the `sqlite` feature / no social set.
+        if let Some(social) = &self.social {
+            social.lock().flush_final()?;
         }
 
         // Clone history from canonical store; avoids a local Vec running in parallel (6A)

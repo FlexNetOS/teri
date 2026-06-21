@@ -2150,7 +2150,21 @@ async fn build_run_inputs(
         let platform_enum = if platform == "reddit" { Platform::Reddit } else { Platform::Twitter };
         PlatformLoggerSet::single(platform_enum, make_logger(platform)?)
     };
+    // Workstream C: the social-world substrate, one `SocialWorld` per platform present in the run.
+    // Seeds round-0 posts, feeds recent posts back into prompts, applies committed social actions,
+    // and (with `sqlite`) materializes `{sim_dir}/{platform}_simulation.db` so `/posts` +
+    // `/comments` return real data. The platforms are exactly those of the logger set, so the
+    // social DB files line up with the producer's per-platform action logs.
+    let social_platforms: Vec<Platform> = if platform == "parallel" {
+        vec![Platform::Twitter, Platform::Reddit]
+    } else {
+        vec![if platform == "reddit" { Platform::Reddit } else { Platform::Twitter }]
+    };
     engine.with_producer(RunProducer { loggers, config: config.clone() });
+    engine.with_social(
+        crate::sim::social_world::SocialWorldSet::new(social_platforms, &sim_dir)
+            .map_err(ApiError::server)?,
+    );
 
     // pool: profile files → AgentPool (c2).
     let pool = crate::services::oasis_profile_export::load_agent_pool(&sim_dir, platform)
