@@ -34,6 +34,40 @@ World State:
 {% endif %}
 
 ## Available Actions
+{% if is_social %}
+You are an active user on the **{{ platform }}** social network. Choose ONE action that this
+user would realistically take right now, given their personality and what is happening.
+
+{% if platform == "twitter" %}
+1. **CREATE_POST(content=...)** - Write a new public post. Example: CREATE_POST(content=Just read a fascinating paper on swarm intelligence!)
+2. **LIKE_POST(target_id=...)** - Like an existing post. Example: LIKE_POST(target_id=post-12)
+3. **REPOST(post_id=...)** - Reshare a post to your followers. Example: REPOST(post_id=post-12)
+4. **QUOTE_POST(post_id=..., content=...)** - Repost with your own comment. Example: QUOTE_POST(post_id=post-12, content=This is exactly right)
+5. **FOLLOW(user_id=...)** - Follow another user. Example: FOLLOW(user_id=alice_tw)
+6. **DO_NOTHING()** - Take no action this round.
+{% else %}
+1. **CREATE_POST(content=...)** - Submit a new post to the community. Example: CREATE_POST(content=What does everyone think about the new policy?)
+2. **CREATE_COMMENT(post_id=..., content=...)** - Comment on a post. Example: CREATE_COMMENT(post_id=post-7, content=Great point, I agree)
+3. **LIKE_POST(target_id=...)** / **DISLIKE_POST(target_id=...)** - Up/down-vote a post.
+4. **LIKE_COMMENT(target_id=...)** / **DISLIKE_COMMENT(target_id=...)** - Up/down-vote a comment.
+5. **SEARCH_POSTS(query=...)** / **SEARCH_USER(query=...)** - Search the community.
+6. **FOLLOW(user_id=...)** / **MUTE(user_id=...)** - Follow or mute a user.
+7. **TREND()** - Browse what is currently trending.
+8. **DO_NOTHING()** - Take no action this round.
+{% endif %}
+
+The feed may be empty or sparse early in the simulation, so when there is nothing yet to
+react to, prefer **CREATE_POST** to start a conversation that reflects your interests.
+
+## Response Format
+Respond with ONLY the action in this exact format, nothing else:
+ACTION_NAME(args)
+
+Valid examples:
+- CREATE_POST(content=Excited to share my thoughts on this topic today!)
+- LIKE_POST(target_id=post-3)
+- FOLLOW(user_id=some_user)
+{% else %}
 Choose one of the following action types:
 
 1. **Speak(content)** - Say something to others
@@ -56,19 +90,6 @@ Choose one of the following action types:
    - Example: Think(I should introduce myself to the group)
    - Use for: planning, reflecting, considering options
 
-## Guidelines
-1. **Be consistent** with the agent's personality traits and background
-2. **Consider the context** - what's happening in the world right now
-3. **Be realistic** - actions should make sense given the situation
-4. **Stay in character** - maintain the agent's role and personality
-5. **Consider recent events** - respond appropriately to what just happened
-
-## Decision Process
-1. What is the agent's current situation?
-2. What would someone with these traits do?
-3. What action best fits the current context?
-4. Is this action realistic and appropriate?
-
 ## Response Format
 Respond with ONLY the action in this exact format:
 ActionType(content)
@@ -79,5 +100,13 @@ Examples:
 - Interact(with the information display)
 - Observe(the room layout and other agents)
 - Think(This seems like an interesting group to work with)
+{% endif %}
+
+## Guidelines
+1. **Be consistent** with the agent's personality traits and background
+2. **Consider the context** - what's happening in the world right now
+3. **Be realistic** - actions should make sense given the situation
+4. **Stay in character** - maintain the agent's role and personality
+5. **Consider recent events** - respond appropriately to what just happened
 
 Now generate an appropriate action for {{ agent_name }} in the current context:
