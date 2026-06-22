@@ -73,18 +73,27 @@ in spirit; they still govern every change.
   hand-written handoff markdown at repo root is guard-denied workspace-wide (ADR-0004).
 - Full unfiltered test summaries in PR bodies (`cargo test` count, failures verbatim).
 
-## What teri is (state of truth, 2026-06-12)
+## What teri is (state of truth, refreshed 2026-06-21)
 
 A Rust rewrite of MiroFish (AGPL upstream; this is an MIT independent reimplementation — parity by
 spec, never by code copy). The five-stage pipeline mirrors upstream: seed → graph → agents → sim →
-report. **140+ tests green.** Real today: seed ingestion (pdf/md/txt/json/url), LLM adapter layer
-(OpenAI-compatible/Anthropic/Gemini, retry/backoff), persona generation (minijinja), two-phase sim
-loop with bounded tokio concurrency, report generation, redb memory store. Placeholder today:
-`KnowledgeGraph::build` orchestration (P1 keystone), pipeline/API wiring in `main.rs` (both
-subcommands preflight then bail with explicit errors), memory write-back hooks.
+report. **1629 tests green** (was ~140 at the 2026-06-12 snapshot). All five stages and their
+services are implemented and tested, and the **full pipeline runs today via `teri serve` + the
+REST API** (`/api/graph` build → `/api/simulation` prepare/start → `/api/report` generate/chat).
+Real today: seed ingestion (pdf/md/txt/json/url), `KnowledgeGraph::build` orchestration (LLM
+ontology + 2-pass entity/relation extraction), native petgraph graph store, OASIS persona +
+sim-config generation, native in-process `SimEngine` (two-phase ticks, dual Twitter/Reddit,
+graph-memory write-back), ReACT `ReportAgent` + graph tools (InsightForge analog), interview/chat
+endpoints, the axum HTTP server, embeddings + real cosine semantic recall (redb), LLM adapters.
 
-The build order and parity matrix live in `~/Desktop/meta/MIROFISH-PORT-PLAN.md` (P1 wire-the-spine
-→ P2 parity-core → P3 serve+estate → P4 scale+provenance). Do not re-derive scope — extend that plan.
+**The one remaining placeholder is the `teri run` CLI composition** (`main.rs` still bails
+`Pipeline not yet implemented`); plus a short named gap list (provider selection hardcoded to
+OpenAI, Anthropic/Gemini streaming framing, live SSE endpoints, agent LTM write-back from the sim
+loop, i18n en/zh-only). The authoritative parity verification is **`RUNBOOK.md` §12**.
+
+The build order lives in `~/Desktop/meta/MIROFISH-PORT-PLAN.md` (P1 wire-the-spine → P2
+parity-core → P3 serve+estate → P4 scale+provenance) — extend that plan; its **parity matrix is
+stale** (superseded by `RUNBOOK.md` §12).
 
 ## Secrets contract (owner architecture intent)
 

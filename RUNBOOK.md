@@ -34,13 +34,19 @@ adapters with retry/backoff), `embedding.rs` (`EmbeddingClient`, semantic recall
 
 ### Current operational reality (read this before running)
 
+**"Can teri simulate anything?" — yes, today, through the REST API.** Every pipeline stage
+(graph build → environment prep → simulation → report → deep interaction) is implemented and
+tested (**1629 tests**), and reachable by driving `teri serve`'s `/api/*` endpoints in sequence
+(§8). The full MiroFish parity verification is in **§12**.
+
 - **`teri serve`** — **works today.** Preflights the backend (§6), then boots the axum REST
-  server (`/health` + the three `/api/*` blueprints). This is the supported runtime entrypoint.
-- **`teri run`** — **preflights, then bails** with `Pipeline not yet implemented`. It validates
-  config, runs the backend honesty guard (§6), creates the persistence dirs, logs the plan, and
-  returns an error. The end-to-end `seed → … → report` composition is the P1 keystone still
-  landing (see [Known gaps](#11-known-gaps--not-yet-wired)). Use `run` today to validate
-  config/backend, not to get a report.
+  server (`/health` + the three `/api/*` blueprints). **This is the supported way to run a full
+  simulation today**: `POST /api/graph/ontology/generate` → `/build` → `/api/simulation/create`
+  → `/prepare` → `/start` → `/api/report/generate` → `/api/report/chat`.
+- **`teri run`** — **preflights, then bails** with `Pipeline not yet implemented`. The engine
+  stages it would call all exist and are tested; only the **CLI one-shot composition** of them is
+  unwired (see [Known gaps](#13-known-gaps--not-yet-wired) — the last `not implemented`). Use
+  `run` today to validate config/backend; use `serve` + the API to actually simulate.
 - **Both** `run` and `serve` run the **same fail-closed guard** (§6) before doing work — `serve`
   refuses to *boot* against a stub/unreachable backend.
 
@@ -202,7 +208,8 @@ env-ctl run --provider <p> -- teri run \
 ```
 Flags: `-s/--seed <path|url>` (required), `-q/--query <text>` (required),
 `-a/--agents <n>` (default `100`). Today this validates config + backend then returns
-`Pipeline not yet implemented` — see [Known gaps](#11-known-gaps--not-yet-wired).
+`Pipeline not yet implemented` — see [Known gaps](#13-known-gaps--not-yet-wired). To run a full
+simulation now, use `teri serve` + the API sequence (§1, §8).
 
 ---
 
@@ -293,7 +300,7 @@ backgrounding. Launch with the Bash tool's `run_in_background: true` **and**
 | `REFUSING stub inference backend at … (matched "…")` | guard's 1-token probe returned canned stub text (§6) | serve a real GGUF model or repoint `LLM_BASE_URL`; **don't** weaken the guard |
 | `inference backend unreachable at …/models: …` | backend down or wrong `LLM_BASE_URL` (refused fail-closed) | start the backend (`shimmy serve` with a GGUF) or fix `LLM_BASE_URL` |
 | `backend at … lists no models` | backend reachable but serves nothing | load a real model before running/serving |
-| `Pipeline not yet implemented` | expected on `teri run` after the guard passes | use `teri serve`; full pipeline is the P1 keystone (pending) |
+| `Pipeline not yet implemented` | expected on `teri run` after the guard passes | the CLI one-shot composition is unwired (§13) — run the full pipeline via `teri serve` + the API sequence (§1, §8) |
 | `--help` needs a key / fails keyless | regression: config loaded before arg-parse | config must load **inside** the command; fix and re-probe `teri --help` |
 | Server won't bind | port in use / blocking socket | choose a free `--addr`; `pkill -f 'teri serve'` |
 | `ZEP_API_KEY` error under default backend | only Zep needs it | ensure `GRAPH_BACKEND=native` (the keyless default) |
@@ -301,35 +308,141 @@ backgrounding. Launch with the Bash tool's `run_in_background: true` **and**
 
 ---
 
-## 12. Known gaps / not-yet-wired
+## 12. MiroFish parity & capability matrix (verification)
 
-Operate with these in mind (state of `main`, 2026-06):
+**Verdict:** teri **includes or upgrades essentially every MiroFish component.** Of MiroFish's
+five stages and their services, all are implemented and tested in teri (**1629 tests**); several
+are re-architected to be *stronger* (native, keyless, single-binary). The remaining items are a
+short, named list of wiring gaps (§13), none of which block simulating through the REST API.
 
-- **`teri run` end-to-end pipeline** — preflights then bails (`Pipeline not yet implemented`).
-  The `seed → graph → agents → sim → report` composition is the **P1 keystone**.
-- **`KnowledgeGraph::build` orchestration** — placeholder; the graph stage's keystone.
-- **Memory write-back hooks** — redb store implemented; the simulation→memory write-back wiring
-  is pending (MiroFish's `ZepGraphMemoryUpdater` "Episodes" path).
-- **Zep backend** — selectable seam; today it delegates to the native surface (no live Zep HTTP
-  client in the tree). `GRAPH_BACKEND=zep` does not yet talk to Zep Cloud.
-- **README config table** — stale defaults; this runbook's §4 is authoritative.
+**Method:** the authoritative `666ghj/MiroFish` GitHub source (the ground truth DeepWiki is
+generated from) was inventoried component-by-component, then each was located in current teri
+source (`file:line`) and its tests counted. This **supersedes** the 2026-06-12 snapshot in
+`~/Desktop/meta/MIROFISH-PORT-PLAN.md` (which predates the graph/ontology/sim-config/report/server
+work and lists them as "missing" — they are now real).
 
-The phased build order (P1 wire-the-spine → P2 parity-core → P3 serve+estate → P4
-scale+provenance) lives at `~/Desktop/meta/MIROFISH-PORT-PLAN.md` — extend that plan, don't
-re-derive scope.
+**Legend:** ✅ at parity · ⬆️ upgraded beyond MiroFish · ⚠️ gap / partial (see §13).
+
+### Stage 1 — Graph Building
+| MiroFish component | teri | Evidence |
+|---|---|---|
+| Doc ingestion (`FileParser`: pdf/md/txt/markdown) | ⬆️ + **json + url** | `seed/mod.rs` ext-dispatch, pdfium, reqwest+scraper, multi-encoding |
+| 500/50 chunking (`TextProcessor`) | ✅ | `text_processor::split_text`, defaults `config.rs` |
+| Ontology gen (10 entity + 6–10 edge, Pydantic) | ✅ | `services/ontology.rs` (PascalCase/UPPER_SNAKE, Person/Org fallback, cap 10/10) |
+| Entity/relation extraction | ✅ | `graph/mod.rs` 2-pass LLM extract→parse→insert |
+| Graph store (`GraphBuilderService` → **Zep Cloud**) | ⬆️ **native petgraph** | `graph/mod.rs` indexes + BFS subgraph + temporal edges + JSON/bincode — no cloud dependency |
+| Zep Cloud GraphRAG | ⚠️ **façade** | `graph_backend.rs` `ZepGraphBackend` delegates to native; no live Zep HTTP client (keyless by design) |
+
+### Stage 2 — Environment Setup
+| MiroFish component | teri | Evidence |
+|---|---|---|
+| Persona generation | ✅ | `agent/mod.rs` minijinja `persona_gen.jinja` |
+| Persona attrs (age/gender/mbti/country/profession/interests) | ✅ | `SocialProfile` `agent/mod.rs` (all six) |
+| influence / reaction-speed | ⚠️ on **config** not profile | `AgentActivityConfig` (`influence_weight`, `response_delay_min/max`) |
+| individual vs institutional accounts | ⚠️ **behavioral** | `simulation_config.rs` `entity_type` branching, not a stored `account_type` flag |
+| Sim-config gen (time→event→agents→platform; bias/reaction/influence) | ✅ | `simulation_config.rs` LLM stages + per-agent rule fallback |
+| OASIS profile export (twitter CSV / reddit JSON) | ✅ | `oasis_profile_export.rs` (exact 5-col CSV header, reddit JSON) |
+
+### Stage 3 — Simulation
+| MiroFish component | teri | Evidence |
+|---|---|---|
+| OASIS engine (**CAMEL-AI pip, Python subprocess**) | ⬆️ **native in-process** `SimEngine` | `sim/mod.rs`; `simulation_runner.rs` runs `tokio::spawn`, no subprocess, no Python |
+| Two-phase tick loop + bounded LLM concurrency | ✅ | `sim/mod.rs` (concurrent prepare → serial apply, `parallelism`=8) |
+| Action set (CREATE_POST/comment/quote/like/dislike/follow/mute/search/DO_NOTHING) | ✅ | `SocialAction` + `SocialWorld::apply` (`social_world.rs`); mute/search/do-nothing = NoOp by design |
+| Dual Twitter+Reddit platforms (parallel) | ✅ | per-platform loggers + `{platform}_simulation.db`, parallel runs |
+| God's-eye variable injection | ⬆️ | `sim/mod.rs` `with_inject_fn` / `inject_variable` (beyond MiroFish's scheduled events) |
+| Real-time graph memory write-back per round | ✅ | `graph_memory.rs` `GraphMemoryUpdater` → `extend_from_text`, wired in `simulation_runner.rs` monitor |
+| Agent LTM / vector write-back from the sim loop | ⚠️ **unwired** | `memory::write_ltm/write_vec_text/semantic_recall` have no sim-path callers (store is real & tested) |
+
+### Stage 4 — Report
+| MiroFish component | teri | Evidence |
+|---|---|---|
+| ReACT ReportAgent (outline → per-section, ≥3 tool calls) | ✅ | `report/mod.rs` `ReportAgent` (`plan_outline`, `generate_section_react`) |
+| Graph tools: InsightForge, panorama, quick-search, interview | ✅ | `zep_tools.rs` (`insight_forge`, `panorama_search`, `quick_search`, `interview_agents`) |
+| Report streaming variant + key-event extraction | ✅ | `generate_stream`, `extract_key_events` |
+| Persistence + logs (`agent_log.jsonl`, `console_log.txt`) | ✅ | `report/manager.rs` + `logger.rs` + `console_logger.rs` |
+
+### Stage 5 — Deep Interaction
+| MiroFish component | teri | Evidence |
+|---|---|---|
+| Agent interview (live IPC, single/batch/all/history) | ✅ ⬆️ **in-process IPC** | `api/simulation.rs` `/interview[/batch/all/history]`; `simulation_ipc.rs` mpsc/oneshot (vs MiroFish filesystem 2-process dirs) |
+| In-character / report chat | ✅ | `api/report.rs` `/chat` → `ReportAgent::chat` |
+
+### Cross-cutting
+| MiroFish component | teri | Evidence |
+|---|---|---|
+| LLM orchestration (OpenAI-compatible) | ✅ + `max_tokens` sent | `llm.rs` OpenAI/Anthropic/Gemini adapters, retry/backoff, `strip_think`/JSON-fence |
+| — runtime provider selection | ⚠️ **hardcoded OpenAI** | `api/mod.rs` `build_llm` always returns `OpenAiAdapter`; Anthropic/Gemini compile+unit-test but are never selected |
+| — Anthropic/Gemini streaming | ⚠️ assume OpenAI SSE framing | `llm.rs` `stream()` (non-streaming paths fine) |
+| Semantic search (Zep hybrid cross-encoder) | ⬆️ **native** embeddings + cosine | `embedding.rs` `EmbeddingClient` + `memory::query_vec_similarity` real cosine over redb vector store (keyless) |
+| HTTP API (3 blueprints, ~60 routes) | ✅ | `server.rs` axum boot + `api/{graph,simulation,report}.rs`; `/graph/data` uses `edges` (not D3 `links`) ⚠️ |
+| Live SSE log streaming | ⚠️ **placeholder** | `*-log/stream` are one-shot JSON; `api/streaming.rs` + `report/sink.rs` infra unwired |
+| Data structures (project/state/run_state/config json, csv, jsonl, sqlite, report files) | ✅ | `models/project.rs`, `simulation_manager.rs`, `oasis_profile_export.rs`, action loggers |
+| `TaskManager` async tasks | ✅ | `task.rs` (singleton, create/update/complete/fail) |
+| i18n (7 locales: zh,en,es,fr,pt,ru,de) | ⚠️ **en/zh only** | `i18n/mod.rs` (`include_str!` en + zh) |
+| Persistence (Zep Cloud + SQLite) | ⬆️ **redb** (embedded) | `memory/mod.rs` redb; optional `sqlite` feature for OASIS-shape DBs |
+| Backend honesty guard | ⬆️ **teri-only** | `preflight.rs` (MiroFish has none) — see §6 |
+| Dual-LLM "boost" (`LLM_BOOST_*`, Reddit) | ⚠️ single LLM | minor; not implemented |
+
+### Deliberately **not** ported (replaced by the meta estate)
+Flask backend shell, Vue 3 + D3 frontend, Zep Cloud (optional façade only), the CAMEL-AI/OASIS
+pip engine (reimplemented natively), and the Python 2-process subprocess model. Per the port
+plan, the front door is `prompt_hub` and visualization is `n8n`; `/api/graph/data` is the
+D3-shape JSON seam. These are **architecture choices, not gaps**.
+
+### Where teri **upgrades** MiroFish (net)
+1. **Single static binary** — native in-process OASIS engine; no Python, no CAMEL-AI, no subprocess.
+2. **Keyless knowledge graph** — native petgraph + redb; no Zep Cloud dependency (Zep is an optional façade).
+3. **Real embeddings + cosine semantic recall** over an embedded redb vector store (vs cloud hybrid search).
+4. **In-process mpsc/oneshot IPC** (vs filesystem 2-process dir IPC).
+5. **json + url seed ingestion** (MiroFish: pdf/md/txt only); temporal graph edges; JSON+bincode.
+6. **Backend honesty guard** — refuses stub/unreachable backends before any work (MiroFish has none).
+7. **Type-safe, 1629 tests**, fail-closed throughout.
 
 ---
 
-## 13. References
+## 13. Known gaps / not-yet-wired
 
-- **MiroFish** (reference impl, AGPL-3.0): https://github.com/666ghj/MiroFish
-- **MiroFish DeepWiki**: https://deepwiki.com/666ghj/MiroFish — overview, architecture,
-  GraphRAG, OASIS execution, Zep memory, ReportAgent, data structures
+Operate with these in mind (state of `main`, 2026-06). None block simulating via the REST API
+(§1, §8); they are the honest backlog from the §12 verification:
+
+- **`teri run` CLI composition** — the one remaining `Pipeline not yet implemented`. Every engine
+  stage exists and is tested; only the CLI one-shot `seed → graph → agents → sim → report` wiring
+  is unbuilt. The full pipeline already runs via `serve` + the API sequence.
+- **Runtime provider selection** — `api/mod.rs::build_llm` hardcodes `OpenAiAdapter`; the
+  Anthropic/Gemini adapters are dead at runtime until selection is wired (small, high-value).
+- **Anthropic/Gemini streaming** — `stream()` parses OpenAI SSE framing; native event/JSON-array
+  framing is a TODO (non-streaming completion works).
+- **Live SSE endpoints** — `*-log/stream` return one-shot JSON; `api/streaming.rs` + `report/sink.rs`
+  infra is ready but unwired to a `text/event-stream` route.
+- **Agent LTM/vector write-back from the sim loop** — the redb store + cosine recall are real and
+  tested, but no sim-path code calls `write_ltm`/`write_vec_text` (graph-memory write-back *is* wired).
+- **i18n coverage** — `en`/`zh` only vs MiroFish's 7 locales.
+- **`/api/graph/data` shape** — emits `edges`, not D3-conventional `links` (1-line affordance for
+  a D3 consumer).
+- **Persona detail** — influence/reaction live on the sim-config layer, not the profile; individual
+  vs institutional is behavioral (entity-type branching), not a stored `account_type` flag.
+- **README config table** — stale defaults; this runbook's §4 is authoritative.
+
+The phased build order (P1 wire-the-spine → P2 parity-core → P3 serve+estate → P4
+scale+provenance) lives at `~/Desktop/meta/MIROFISH-PORT-PLAN.md`. That file's **parity matrix is
+stale** (2026-06-12); §12 here is the current verification — extend the plan, don't re-derive it.
+
+---
+
+## 14. References
+
+- **MiroFish** (reference impl, AGPL-3.0): https://github.com/666ghj/MiroFish — the authoritative
+  source for the §12 parity verification (`backend/app/{services,api,models}`, README, config).
+- **MiroFish DeepWiki**: https://deepwiki.com/666ghj/MiroFish — overview, architecture, GraphRAG,
+  OASIS execution, Zep memory, ReportAgent, data structures (a derived view of the repo above).
 - **MiroFish demo**: https://mirofish-demo.pages.dev (Vue SPA wizard: graph → env → sim →
-  report → deep-interaction)
-- **OASIS** (simulation design, CAMEL-AI): https://github.com/camel-ai/oasis
-- **teri docs**: `README.md`, `ARCHITECTURE.md`, `CLAUDE.md`, `agent-env.toml`
-- **Port plan**: `~/Desktop/meta/MIROFISH-PORT-PLAN.md`
+  report → deep-interaction).
+- **OASIS** (simulation design, CAMEL-AI): https://github.com/camel-ai/oasis — reimplemented
+  natively in teri (`sim/`, `social_world.rs`), not depended on.
+- **teri docs**: `README.md`, `ARCHITECTURE.md`, `CLAUDE.md`, `docs/adr/`, `agent-env.toml`.
+- **Port plan**: `~/Desktop/meta/MIROFISH-PORT-PLAN.md` (build order valid; its parity matrix is
+  superseded by §12).
 
 ---
 
