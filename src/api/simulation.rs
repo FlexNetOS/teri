@@ -2437,12 +2437,18 @@ async fn get_sim_ticks_sse_route(
     Path(simulation_id): Path<String>,
 ) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let stream = async_stream::stream! {
-        let history = state.sim_runner.snapshot_history(&simulation_id).await;
+        let mut history = state.sim_runner.snapshot_history(&simulation_id).await;
         let mut emitted: usize = 0;
         let mut polls: u32 = 0;
         let mut unknown_polls: u32 = 0;
 
         loop {
+            // The run state is persisted just before the live handle is registered. If a
+            // client connects inside that short window, retry until the handle appears.
+            if history.is_none() {
+                history = state.sim_runner.snapshot_history(&simulation_id).await;
+            }
+
             // 1) Emit any ticks appended since the cursor. Lock, clone the new slice, release
             //    (never hold the parking_lot lock across the yield/await).
             if let Some(h) = &history {
@@ -5316,6 +5322,49 @@ mod tests {
         // The full to_dict carries process_pid (the idle stub does not) and is larger than 8 keys.
         assert!(data.get("process_pid").is_some(), "full to_dict has process_pid");
         assert!(data.as_object().unwrap().len() > 8, "full to_dict > idle stub");
+    }
+
+    /// GET /:id/ticks/sse — terminal persisted state closes immediately with a done event.
+    #[tokio::test]
+    async fn ticks_sse_terminal_state_emits_done_event() {
+        let (state, _tmp) = test_state();
+        seed_run_state(
+            &state,
+            "sim_done",
+            serde_json::json!({
+                "runner_status": "completed",
+                "current_round": 2,
+                "total_rounds": 2,
+                "updated_at": "2025-12-01T10:30:00",
+                "completed_at": "2025-12-01T10:31:00"
+            }),
+        );
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_done/ticks/sse")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type =
+            resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "ticks/sse must return text/event-stream, got {content_type:?}"
+        );
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        assert!(body.contains("event: done"), "must emit a done SSE event: {body}");
+        assert!(
+            body.contains(r#"data: {"status":"completed","ticks":0}"#),
+            "done event must include terminal status and tick count: {body}"
+        );
     }
 
     /// GET /:id/run-status/detail — no run_state → 200 with the 5-key idle stub.
