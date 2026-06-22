@@ -29,7 +29,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::embedding::EmbeddingClient;
-use crate::memory::{MemoryEntry, MemoryStore};
+use crate::memory::{MemoryEntry, MemoryStore, VectorEntry};
 
 /// Fixed teri namespace UUID for deriving per-agent LTM namespaces (UUID v5). Stable across
 /// processes and runs so the same `(simulation, agent)` always maps to the same namespace key,
@@ -72,6 +72,15 @@ impl AgentMemoryWriter {
         Uuid::new_v5(&TERI_AGENT_LTM_NS, format!("{simulation_id}:{agent_id}").as_bytes())
     }
 
+    /// Deterministic SIM-WIDE namespace UUID (v5 over `"sim:{simulation_id}"`). EVERY agent's
+    /// utterance is ALSO written here, so a single `semantic_recall` over this namespace returns
+    /// the whole swarm's discussion regardless of which agent spoke — what the report's
+    /// `recall_agent_discussion` tool queries. The `sim:` prefix can't collide with any
+    /// per-agent `"{sim}:{agent_id}"` key (agent ids are numeric).
+    pub fn sim_namespace(simulation_id: &str) -> Uuid {
+        Uuid::new_v5(&TERI_AGENT_LTM_NS, format!("sim:{simulation_id}").as_bytes())
+    }
+
     /// Extract the human-meaningful memory text from a raw action record, or `None` when the
     /// action carries nothing worth remembering. We remember utterances (posts/comments/quotes
     /// with text), not structural actions (do-nothing, like, follow) which have no content.
@@ -106,36 +115,53 @@ impl AgentMemoryWriter {
 
     /// Persist one action as agent long-term memory (best-effort, never errors out the sim).
     ///
-    /// Always writes the chronological `MemoryEntry` (no network) so the textual memory survives
-    /// offline; additionally embeds + writes the semantic `VectorEntry` when the embedding backend
-    /// is reachable. Failures are logged at `debug` and counted, not propagated.
+    /// Each utterance is written under BOTH the per-agent namespace (one agent's history, for
+    /// per-agent recall) and the sim-wide namespace (the swarm's whole discussion, for the
+    /// report's `recall_agent_discussion`). The chronological `MemoryEntry` is written first (no
+    /// network → survives offline); the semantic `VectorEntry` is embedded ONCE and written to
+    /// both namespaces (cheap KV writes — no double-embedding). Failures are logged at `debug` and
+    /// counted, never propagated.
     pub async fn write_action(&self, simulation_id: &str, action_data: &Value, platform: &str) {
         let Some(text) = Self::action_memory_text(action_data, platform) else {
             self.skipped.fetch_add(1, Ordering::Relaxed);
             return;
         };
         let agent_id = action_data.get("agent_id").and_then(Value::as_i64).unwrap_or(0);
-        let ns = Self::agent_namespace(simulation_id, agent_id);
+        let agent_ns = Self::agent_namespace(simulation_id, agent_id);
+        let sim_ns = Self::sim_namespace(simulation_id);
 
-        // (1) Chronological LTM — no embedding required, so this is the keyless-safe baseline.
+        // (1) Chronological LTM under both namespaces — the keyless-safe baseline (no embedding).
+        // `persisted` counts the action once; the per-agent write is the canonical success signal.
         let entry = MemoryEntry {
             timestamp: chrono::Utc::now(),
             content: text.clone(),
             importance: DEFAULT_IMPORTANCE,
         };
-        match self.store.write_ltm(ns, &entry).await {
-            Ok(()) => {
-                self.persisted.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(e) => {
-                tracing::debug!(agent_id, error = %e, "agent LTM: chronological write failed");
-            }
+        let agent_ltm_ok = self.store.write_ltm(agent_ns, &entry).await.is_ok();
+        if let Err(e) = self.store.write_ltm(sim_ns, &entry).await {
+            tracing::debug!(agent_id, error = %e, "agent LTM: sim-wide chronological write failed");
+        }
+        if agent_ltm_ok {
+            self.persisted.fetch_add(1, Ordering::Relaxed);
         }
 
-        // (2) Semantic vector memory — best-effort; needs the embeddings endpoint.
-        match self.store.write_vec_text(ns, &self.embedder, &text, DEFAULT_IMPORTANCE).await {
-            Ok(()) => {
-                self.embedded.fetch_add(1, Ordering::Relaxed);
+        // (2) Semantic vector — embed ONCE, then write the same `VectorEntry` to both namespaces.
+        // Best-effort: an embeddings-endpoint failure leaves the chronological memory intact.
+        match self.embedder.embed(&text).await {
+            Ok(embedding) => {
+                let ve = VectorEntry {
+                    timestamp: chrono::Utc::now(),
+                    content: text.clone(),
+                    embedding,
+                    importance: DEFAULT_IMPORTANCE,
+                };
+                let agent_vec_ok = self.store.write_vec(agent_ns, &ve).await.is_ok();
+                if let Err(e) = self.store.write_vec(sim_ns, &ve).await {
+                    tracing::debug!(agent_id, error = %e, "agent LTM: sim-wide vector write failed");
+                }
+                if agent_vec_ok {
+                    self.embedded.fetch_add(1, Ordering::Relaxed);
+                }
             }
             Err(e) => {
                 tracing::debug!(
@@ -171,6 +197,25 @@ mod tests {
         assert_eq!(a1, a1_again, "same (sim, agent) → same namespace");
         assert_ne!(a1, a2, "different agent → different namespace");
         assert_ne!(a1, a3, "different simulation → different namespace");
+    }
+
+    #[test]
+    fn sim_namespace_is_deterministic_distinct_per_sim_and_from_agent_ns() {
+        let s1 = AgentMemoryWriter::sim_namespace("sim_1");
+        let s1_again = AgentMemoryWriter::sim_namespace("sim_1");
+        let s2 = AgentMemoryWriter::sim_namespace("sim_2");
+        assert_eq!(s1, s1_again, "same sim → same sim-wide namespace");
+        assert_ne!(s1, s2, "different sim → different sim-wide namespace");
+        // The sim-wide namespace must never collide with any per-agent namespace of that sim
+        // (else one agent's recall would leak the whole swarm's). The `sim:` vs `{sim}:{id}`
+        // key prefixes guarantee this.
+        for agent_id in 0..5 {
+            assert_ne!(
+                s1,
+                AgentMemoryWriter::agent_namespace("sim_1", agent_id),
+                "sim-wide namespace must differ from every per-agent namespace"
+            );
+        }
     }
 
     #[test]
