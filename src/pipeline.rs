@@ -278,19 +278,20 @@ where
 
     // ── Stage 4: simulation (with memory write-back) ─────────────────────────
     let graph_mgr = Arc::new(crate::services::graph_memory::GraphMemoryManager::<L>::new());
-    // Agent LTM write-back: open the shared memory store + embedding client so the monitor
-    // persists each agent utterance as chronological + semantic memory. Best-effort — if the
-    // store can't open (e.g. an unwritable MEMORY_DB_PATH), agent memory is simply disabled
-    // (`None`); the run is otherwise identical (keyless-safe, no-downgrade).
-    let agent_memory = crate::memory::MemoryStore::new(&config.persistence.memory_db_path)
+    // Shared memory store + embedder, used for BOTH the agent-LTM write-back (the monitor
+    // persists each utterance) AND the report's `recall_agent_discussion` lens (stage 5 reads the
+    // SAME store the sim populated). Best-effort — if the store can't open (e.g. an unwritable
+    // MEMORY_DB_PATH), both are disabled (`None`); the run is otherwise identical (keyless-safe).
+    let memory_store = crate::memory::MemoryStore::new(&config.persistence.memory_db_path)
         .ok()
-        .map(|store| {
-            let embedder = Arc::new(crate::embedding::EmbeddingClient::new(&config.llm));
-            Arc::new(crate::services::agent_memory::AgentMemoryWriter::new(
-                Arc::new(store),
-                embedder,
-            ))
-        });
+        .map(Arc::new);
+    let embedder = Arc::new(crate::embedding::EmbeddingClient::new(&config.llm));
+    let agent_memory = memory_store.as_ref().map(|store| {
+        Arc::new(crate::services::agent_memory::AgentMemoryWriter::new(
+            Arc::clone(store),
+            Arc::clone(&embedder),
+        ))
+    });
     let sim_runner = Arc::new(
         crate::services::simulation_runner::SimulationRunner::new(
             std::path::PathBuf::from(&config.oasis_simulation_data_dir),
@@ -366,12 +367,21 @@ where
         "pipeline: generating report over post-simulation graph"
     );
     let mut report_agent = crate::report::ReportAgent::new_react(&graph_id, &simulation_id, query);
+    // Attach the search lens (same store the sim's agent-LTM write-back populated) so the report's
+    // `recall_agent_discussion` tool can surface what the swarm actually said. The lens also
+    // upgrades quick_search/panorama to semantic cosine where graph vectors exist (keyword
+    // fallback otherwise) — no regression when the store is empty.
+    let search_lens =
+        memory_store.as_ref().map(|store| crate::services::zep_tools::GraphSearchLens {
+            embedder: Arc::clone(&embedder),
+            store: Arc::clone(store),
+        });
     let tools = crate::services::zep_tools::ReportTools::with_runner(
         &report_graph,
         &llm,
         Some(sim_runner.as_ref()),
     )
-    .with_search_lens(None);
+    .with_search_lens(search_lens);
     let report_manager = crate::report::manager::ReportManager::new(&config.upload_folder);
     let mut sink = crate::report::sink::NullSink;
     let report: Report = report_agent

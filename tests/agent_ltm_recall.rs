@@ -118,6 +118,52 @@ async fn agent_utterances_are_persisted_and_recallable() {
 }
 
 #[tokio::test]
+async fn sim_wide_namespace_aggregates_all_agents() {
+    // The report's `recall_agent_discussion` queries ONE sim-wide namespace to get the whole
+    // swarm's discussion. Prove that distinct agents' utterances all land there, while each
+    // per-agent namespace stays isolated.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST).path("/embeddings");
+        then.status(200).header("Content-Type", "application/json").body(
+            r#"{"object":"list","data":[{"object":"embedding","embedding":[0.5,0.4,0.3],"index":0}],"model":"m","usage":{"prompt_tokens":1,"total_tokens":1}}"#,
+        );
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemoryStore::new(tmp.path()).unwrap());
+    let embedder = Arc::new(EmbeddingClient::new(&embed_config(&server)));
+    let writer = AgentMemoryWriter::new(store.clone(), embedder.clone());
+
+    let sim = "sim_aggregate";
+    writer
+        .write_action(
+            sim,
+            &json!({"agent_id": 1, "agent_name": "A", "action_type": "create_post", "action_args": {"content": "alpha statement"}}),
+            "reddit",
+        )
+        .await;
+    writer
+        .write_action(
+            sim,
+            &json!({"agent_id": 2, "agent_name": "B", "action_type": "create_comment", "result": "beta rebuttal"}),
+            "reddit",
+        )
+        .await;
+
+    // The sim-wide namespace holds BOTH agents' utterances.
+    let sim_ns = AgentMemoryWriter::sim_namespace(sim);
+    let recalled = store.semantic_recall(sim_ns, &embedder, "anything", 10).await.unwrap();
+    assert_eq!(recalled.len(), 2, "sim-wide namespace aggregates both agents");
+    let texts: Vec<&str> = recalled.iter().map(|e| e.content.as_str()).collect();
+    assert!(texts.iter().any(|t| t.contains("alpha statement")));
+    assert!(texts.iter().any(|t| t.contains("beta rebuttal")));
+
+    // Per-agent namespaces stay isolated (no cross-leak).
+    let a1 = store.read_ltm(AgentMemoryWriter::agent_namespace(sim, 1), 10).await.unwrap();
+    assert_eq!(a1.len(), 1, "agent 1 has only its own utterance");
+}
+
+#[tokio::test]
 async fn embeddings_offline_still_persists_chronological_memory() {
     // No embeddings endpoint (server returns 500) — the vector write fails best-effort, but the
     // chronological LTM must still be written (keyless-safe, no-downgrade).

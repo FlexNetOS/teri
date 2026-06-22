@@ -2606,6 +2606,23 @@ pub const TOOL_DESC_INTERVIEW_AGENTS: &str = "\
 
 【重要】需要OASIS模拟环境正在运行才能使用此功能！";
 
+/// Tool description: recall_agent_discussion (teri-native — no MiroFish analog).
+pub const TOOL_DESC_RECALL_AGENT_DISCUSSION: &str = "\
+【讨论召回 - 智能体真实发言检索】
+对模拟过程中智能体的真实发言（帖子/评论）进行语义检索，召回与查询最相关的原始言论。
+这不是重新提问，而是检索智能体在模拟中实际说过的话（来自智能体长期记忆 / agent-LTM）。
+
+【与 interview_agents 的区别】
+- interview_agents：现在向智能体提出新问题，由 LLM 重新生成回答。
+- recall_agent_discussion：检索模拟时已经发生的真实发言，作为报告的事实依据。
+
+【使用场景】
+- 需要引用智能体在模拟中关于某话题的真实表达
+- 需要用真实言论支撑预测结论，而非事后重新生成
+
+【返回内容】
+- 与查询最相关的智能体真实发言列表（按语义相关性排序）";
+
 // ── Tool enum (report_agent.py:919–954 `_define_tools` + _execute_tool dispatch) ─
 
 /// Closed set of tools the ReACT loop can dispatch.
@@ -2625,6 +2642,10 @@ pub enum ReportTool {
     QuickSearch,
     /// Interview simulation agents.
     InterviewAgents,
+    /// teri-native (no MiroFish analog): recall what the swarm ACTUALLY discussed during the
+    /// simulation, grounded in the agents' real utterances (the agent-LTM write-back). Distinct
+    /// from `InterviewAgents`, which asks agents NEW questions via fresh LLM generation.
+    RecallAgentDiscussion,
     /// Back-compat redirect → `QuickSearch` (`report_agent.py:1025–1028`).
     SearchGraph,
     /// Back-compat legacy tool → calls `get_graph_statistics` directly
@@ -2650,6 +2671,7 @@ impl ReportTool {
             "panorama_search" => Some(Self::PanoramaSearch),
             "quick_search" => Some(Self::QuickSearch),
             "interview_agents" => Some(Self::InterviewAgents),
+            "recall_agent_discussion" => Some(Self::RecallAgentDiscussion),
             // back-compat redirects
             "search_graph" => Some(Self::SearchGraph),
             "get_graph_statistics" => Some(Self::GetGraphStatistics),
@@ -2667,6 +2689,7 @@ impl ReportTool {
             Self::PanoramaSearch => "panorama_search",
             Self::QuickSearch => "quick_search",
             Self::InterviewAgents => "interview_agents",
+            Self::RecallAgentDiscussion => "recall_agent_discussion",
             Self::SearchGraph => "search_graph",
             Self::GetGraphStatistics => "get_graph_statistics",
             Self::GetEntitySummary => "get_entity_summary",
@@ -2695,8 +2718,14 @@ pub struct ToolCall {
 /// Canonical tool names that gate tier-2 and tier-3 bare-JSON parse.
 ///
 /// Port of `VALID_TOOL_NAMES = {"insight_forge", ...}` (`report_agent.py:1065`).
-pub const VALID_TOOL_NAMES: [&str; 4] =
-    ["insight_forge", "panorama_search", "quick_search", "interview_agents"];
+pub const VALID_TOOL_NAMES: [&str; 5] = [
+    "insight_forge",
+    "panorama_search",
+    "quick_search",
+    "interview_agents",
+    // teri-native upgrade (no MiroFish analog): see `ReportTool::RecallAgentDiscussion`.
+    "recall_agent_discussion",
+];
 
 // ── parse_tool_calls (report_agent.py:1067–1112) ────────────────────────────
 
@@ -2865,6 +2894,14 @@ pub fn get_tools_description() -> String {
                 ("max_agents", "最多采访的Agent数量（可选，默认5，最大10）"),
             ],
         ),
+        (
+            "recall_agent_discussion",
+            TOOL_DESC_RECALL_AGENT_DISCUSSION,
+            &[
+                ("query", "想要召回的话题或观点（用于语义相关性排序）"),
+                ("limit", "返回的发言数量（可选，默认10）"),
+            ],
+        ),
     ];
 
     let mut parts = vec!["可用工具：".to_string()];
@@ -3020,6 +3057,18 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
                 ))
             }
 
+            // ── recall_agent_discussion (teri-native) ────────────────────────
+            //
+            // Like interview_agents, this is async-only (semantic recall over the agent-LTM
+            // store). The async dispatcher intercepts it and runs the real body; the SYNC path
+            // (graph-only facades / tests with no lens) returns the honest tolerated error so the
+            // ReACT loop continues.
+            ReportTool::RecallAgentDiscussion => Err(TeriError::Unknown(
+                "recall_agent_discussion requires the async dispatch path (execute_by_name_async) \
+                 with a vector-store search lens"
+                    .into(),
+            )),
+
             // ── back-compat: search_graph → quick_search (report_agent.py:1025–1028) ──
             ReportTool::SearchGraph => {
                 // (g2): redirectToQuickSearch — report_agent.py:1027 logger.info(...)
@@ -3134,6 +3183,44 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
     /// Every other tool name delegates to the sync [`execute_by_name`].
     /// Both async branches mirror `execute`'s logging + `"工具执行失败: {e}"`
     /// error-wrapping so the loop keeps going after a tool failure.
+    /// Recall what the simulated swarm ACTUALLY discussed, grounded in the agents' real
+    /// utterances (the agent-LTM write-back). Semantic-recalls the sim-wide agent-memory namespace
+    /// via the attached search lens's store + embedder. Distinct from `interview_agents` (which
+    /// asks agents NEW questions); this surfaces what they really said during the simulation.
+    ///
+    /// Returns formatted top-`limit` utterances, or a graceful note when the vector store is not
+    /// attached (no lens) or the embeddings backend is unavailable — never errors the ReACT loop.
+    pub async fn recall_agent_discussion(
+        &self,
+        simulation_id: &str,
+        query: &str,
+        limit: i64,
+    ) -> String {
+        let Some(lens) = &self.search_lens else {
+            return "Agent discussion memory is unavailable (no vector store attached to this run)."
+                .to_string();
+        };
+        let top_k = limit.clamp(1, 100) as usize;
+        let ns = crate::services::agent_memory::AgentMemoryWriter::sim_namespace(simulation_id);
+        match lens.store.semantic_recall(ns, &lens.embedder, query, top_k).await {
+            Ok(entries) if !entries.is_empty() => {
+                let mut out = format!(
+                    "Agents said {} thing(s) relevant to \"{query}\" during the simulation \
+                     (most relevant first):\n",
+                    entries.len()
+                );
+                for (i, e) in entries.iter().enumerate() {
+                    out.push_str(&format!("{}. {}\n", i + 1, e.content));
+                }
+                out
+            }
+            Ok(_) => {
+                "No relevant agent discussion was found in the simulation's memory.".to_string()
+            }
+            Err(e) => format!("工具执行失败: {e}"),
+        }
+    }
+
     pub async fn execute_by_name_async(
         &self,
         tool_name: &str,
@@ -3144,6 +3231,25 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
         report_context: &str,
     ) -> String {
         let tool = ReportTool::from_name(tool_name);
+
+        // ── teri-native recall_agent_discussion intercept ────────────────────
+        if tool == Some(ReportTool::RecallAgentDiscussion) {
+            let params_repr = serde_json::to_string(params).unwrap_or_else(|_| "{}".to_string());
+            tracing::info!(
+                target: "teri::report",
+                "{}",
+                t_args(
+                    "report.executingTool",
+                    &[("toolName", &tool_name), ("params", &params_repr)]
+                )
+            );
+            let query = str_param(params, "query");
+            let limit = match coerce_int_param(params, "limit", 10) {
+                Ok(n) => n,
+                Err(e) => return format!("工具执行失败: {}", e),
+            };
+            return self.recall_agent_discussion(simulation_id, &query, limit).await;
+        }
 
         // ── S-315 insight_forge async intercept ──────────────────────────────
         if tool == Some(ReportTool::InsightForge) {
@@ -3688,6 +3794,68 @@ mod tests {
         let result = tools.quick_search("graph1", "anything", 10);
         assert_eq!(result.total_count, 0);
         assert!(result.facts.is_empty());
+    }
+
+    /// teri-native `recall_agent_discussion`: with a lens, it surfaces the swarm's real utterances
+    /// (written to the sim-wide agent-LTM namespace); without a lens it returns a graceful note
+    /// (never errors the ReACT loop).
+    #[tokio::test]
+    async fn recall_agent_discussion_surfaces_swarm_utterances() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/embeddings");
+            then.status(200).header("Content-Type", "application/json").body(
+                r#"{"object":"list","data":[{"object":"embedding","embedding":[0.1,0.2,0.3],"index":0}],"model":"m","usage":{"prompt_tokens":1,"total_tokens":1}}"#,
+            );
+        });
+        let cfg = crate::config::LlmConfig {
+            base_url: server.base_url(),
+            api_key: String::new(),
+            model: "m".to_string(),
+            embed_model: "e".to_string(),
+            timeout_secs: 5,
+            max_retries: 0,
+            max_tokens: 256,
+            provider: crate::config::LlmProvider::Openai,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::memory::MemoryStore::new(tmp.path()).unwrap());
+        let embedder = std::sync::Arc::new(crate::embedding::EmbeddingClient::new(&cfg));
+
+        // Populate the sim-wide agent-LTM namespace via the writer (two agents speak).
+        let writer =
+            crate::services::agent_memory::AgentMemoryWriter::new(store.clone(), embedder.clone());
+        let sim_id = "sim_recall_tool";
+        writer
+            .write_action(
+                sim_id,
+                &serde_json::json!({"agent_id": 1, "agent_name": "Jane", "action_type": "create_post", "action_args": {"content": "The policy will help the market."}}),
+                "reddit",
+            )
+            .await;
+        writer
+            .write_action(
+                sim_id,
+                &serde_json::json!({"agent_id": 2, "agent_name": "Bob", "action_type": "create_comment", "result": "I have concerns about the cost."}),
+                "reddit",
+            )
+            .await;
+
+        let g = KnowledgeGraph::new();
+        let llm = StubLlm;
+        let lens = GraphSearchLens { embedder: embedder.clone(), store: store.clone() };
+        let tools = ReportTools::new(&g, &llm).with_search_lens(Some(lens));
+
+        let out = tools.recall_agent_discussion(sim_id, "policy and cost", 10).await;
+        assert!(out.contains("The policy will help"), "got: {out}");
+        assert!(out.contains("concerns about the cost"), "got: {out}");
+
+        // No lens → graceful note, not an error (the ReACT loop must keep going).
+        let tools_no_lens = ReportTools::new(&g, &llm);
+        let note = tools_no_lens.recall_agent_discussion(sim_id, "anything", 10).await;
+        assert!(note.contains("unavailable"), "expected graceful note, got: {note}");
     }
 
     /// Workstream B no-downgrade: without a search lens, `search_graph_semantic` is identical to

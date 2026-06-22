@@ -1034,8 +1034,13 @@ impl ReportAgent {
 
         // Canonical all_tools order (fixed, for deterministic join) — matches Python's set literal
         // but in insertion order so the unused-hint text is stable across runs.
-        let all_tools: [&str; 4] =
-            ["insight_forge", "panorama_search", "quick_search", "interview_agents"];
+        let all_tools: [&str; 5] = [
+            "insight_forge",
+            "panorama_search",
+            "quick_search",
+            "interview_agents",
+            "recall_agent_discussion",
+        ];
         // used_tools tracks which canonical names have been called.
         let mut used_tools: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
