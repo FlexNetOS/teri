@@ -37,10 +37,11 @@ adapters with retry/backoff), `embedding.rs` (`EmbeddingClient`, semantic recall
 - **`teri serve`** — **works today.** Boots the axum REST server (`/health` + the three
   `/api/*` blueprints). This is the supported runtime entrypoint.
 - **`teri run`** — **preflights, then bails** with `Pipeline not yet implemented`. It validates
-  config, runs the stub-backend guard, creates the persistence dirs, logs the plan, and returns
-  an error. The end-to-end `seed → … → report` composition is the P1 keystone still landing
-  (see [Known gaps](#11-known-gaps--not-yet-wired)). Use `run` today to validate config/backend,
-  not to get a report.
+  config, runs the stub-backend guard (§6), creates the persistence dirs, logs the plan, and
+  returns an error. The end-to-end `seed → … → report` composition is the P1 keystone still
+  landing (see [Known gaps](#11-known-gaps--not-yet-wired)). Use `run` today to validate
+  config/backend, not to get a report. Note: the stub guard runs in `run` only — **`serve` does
+  not preflight** (§6).
 
 ---
 
@@ -148,20 +149,36 @@ contract — keep it that way. Never write a key to a config file or shell profi
 
 ## 6. Backend honesty guard (critical — do not weaken)
 
-Before any simulation work, `run`/`serve` paths preflight the configured backend
-(`src/preflight.rs`):
+A swarm pointed at a stub/canned backend fabricates an entire simulation from cached text, so
+teri refuses stub backends before doing simulation work. **What actually runs today** (verified
+against the binary, `src/lib.rs::preflight_check_backend`) — read this carefully, it differs from
+the stronger design intent (see the box below):
 
-1. **Identity** — `GET {LLM_BASE_URL}/models`. A backend that lists no models is refused.
-2. **Honesty** — a 1-token `POST {LLM_BASE_URL}/chat/completions` probe. If the reply matches a
-   known canned-stub marker, it is refused.
-
-Stub marker currently matched (case-insensitive): **`full transformer inference coming soon`**
-— shimmy's SafeTensors placeholder. A swarm pointed at a stub backend would fabricate an entire
-simulation from canned text, so this guard is mandatory.
+- The guard runs **only in `teri run`** — **`teri serve` does NOT preflight** and will boot
+  against a stub backend.
+- It probes **`GET {LLM_BASE_URL}/health`** and scans the **response body** for canned-text
+  patterns. If `/health` is unreachable (connection error), it falls back to a 1-token
+  **sentinel `POST {LLM_BASE_URL}/chat/completions`** and scans *that* body.
+- Canned-text patterns matched (case-insensitive, `detect_stub_response`): `stub mode`,
+  `stubbed`, `safe tensors`, `full transformer`, `coming soon`, `not implemented`,
+  `placeholder`, `no backend`, `canned text`.
+- A match → **`GGUF/stub backend detected`** (exit 1). An HTTP-client build error →
+  **`Backend probe failed: …`** (exit 1).
+- **Caveat — an unreachable backend is NOT refused.** If both `/health` and the sentinel fail to
+  *connect*, the guard returns "not stub" and the run **proceeds** (today, to the
+  `Pipeline not yet implemented` bail). The guard catches *canned text*, not *absence*.
 
 **If you see `GGUF/stub backend detected`:** serve a real GGUF model (e.g. `shimmy serve` with a
 GGUF registered) or repoint `LLM_BASE_URL` at a real OpenAI-compatible API. **Never weaken the
-guard to make a run proceed.** Extend `STUB_MARKERS` when new stub engines appear.
+guard to make a run proceed.**
+
+> ⚠️ **Intent vs. wired reality (tracked gap).** The repo also contains a *stronger* guard,
+> `src/preflight.rs::verify_backend` — `GET /models` (refuse "lists no models"), then a 1-token
+> `/chat/completions` honesty probe with a tighter `STUB_MARKERS` list. teri's `CLAUDE.md`
+> describes *this* design as the guard for both `run` and `serve`. **It is not wired** —
+> `verify_backend` is referenced only by its own tests; `main.rs` calls the weaker `lib.rs`
+> guard, and `serve` calls neither. Wiring `verify_backend` into `run` + `serve` (and refusing
+> unreachable backends) is an open upgrade — see [Known gaps](#11-known-gaps--not-yet-wired).
 
 ---
 
@@ -278,9 +295,9 @@ backgrounding. Launch with the Bash tool's `run_in_background: true` **and**
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | `teri: configuration unavailable — key may not be set` | `Config::load` hit `ConfigMissing` | inject via `env-ctl run -- teri …`, or set `LLM_API_KEY` / use a keyless local backend |
-| `GGUF/stub backend detected` | guard caught a stub/canned backend | serve a real GGUF model or repoint `LLM_BASE_URL`; **don't** weaken the guard |
-| `backend at … lists no models` | `/models` returned empty | load a model into the backend before running |
-| `REFUSING stub inference backend … (matched "…")` | probe returned canned text | use a real inference engine (shimmy GGUF / ruvllm / hosted) |
+| `GGUF/stub backend detected` | `run` guard found canned text in the `/health` (or sentinel) body | serve a real GGUF model or repoint `LLM_BASE_URL`; **don't** weaken the guard (§6) |
+| `Backend probe failed: …` | guard couldn't build/issue the HTTP probe | check `LLM_BASE_URL` is a valid OpenAI-compatible base, network reachable |
+| `run` proceeds against a dead/unreachable backend | the guard refuses *canned text*, not *absence* — unreachable → "not stub" → proceed (§6 caveat) | confirm the backend is actually up; a hard "unreachable" refusal is a [tracked gap](#11-known-gaps--not-yet-wired) |
 | `Pipeline not yet implemented` | expected on `teri run` today | use `teri serve`; full pipeline is the P1 keystone (pending) |
 | `--help` needs a key / fails keyless | regression: config loaded before arg-parse | config must load **inside** the command; fix and re-probe `teri --help` |
 | Server won't bind | port in use / blocking socket | choose a free `--addr`; `pkill -f 'teri serve'` |
@@ -300,6 +317,12 @@ Operate with these in mind (state of `main`, 2026-06):
   is pending (MiroFish's `ZepGraphMemoryUpdater` "Episodes" path).
 - **Zep backend** — selectable seam; today it delegates to the native surface (no live Zep HTTP
   client in the tree). `GRAPH_BACKEND=zep` does not yet talk to Zep Cloud.
+- **Backend guard is the weaker of two implementations, and `serve` is unguarded.** The wired
+  `run` guard (`lib.rs::preflight_check_backend`) scans the `/health` body and does **not** refuse
+  an unreachable backend; the stronger `preflight.rs::verify_backend` (GET `/models` + honesty
+  probe, as `CLAUDE.md` describes) is **unwired** (tests-only). Open upgrades: wire
+  `verify_backend` into both `run` and `serve`, and refuse unreachable backends. **The runtime
+  truth is §6** — `CLAUDE.md`'s guard description is aspirational until this lands.
 - **README config table** — stale defaults; this runbook's §4 is authoritative.
 
 The phased build order (P1 wire-the-spine → P2 parity-core → P3 serve+estate → P4
