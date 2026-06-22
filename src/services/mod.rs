@@ -3,6 +3,7 @@
 //! Each sub-module is a high-level service that orchestrates LLM calls,
 //! validation, and post-processing to implement a discrete feature.
 
+pub mod agent_memory;
 pub mod entity_reader;
 pub mod graph_backend;
 pub mod graph_builder;

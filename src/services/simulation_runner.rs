@@ -1005,6 +1005,11 @@ pub struct SimulationRunner<L: LlmClient + Send + Sync + 'static> {
     /// Idempotency flag for `cleanup_all` — port of `_cleanup_done` (S-624). Flipped
     /// false→true atomically on the first call (mirrors U-021 `stop_all`'s `compare_exchange`).
     cleanup_done: AtomicBool,
+    /// Agent long-term-memory writer — when present, the monitor persists each content-bearing
+    /// agent action into the vector/LTM store (the "agent LTM write-back" feature). `None`
+    /// disables it (e.g. when no memory store could be opened); the run is byte-identical to
+    /// before, just without agent memory. Independent of `graph_mgr` (graph-fact write-back).
+    agent_memory: Option<Arc<crate::services::agent_memory::AgentMemoryWriter>>,
 }
 
 impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
@@ -1021,7 +1026,19 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
             graph_mgr,
             manager,
             cleanup_done: AtomicBool::new(false),
+            agent_memory: None,
         }
+    }
+
+    /// Attach an [`AgentMemoryWriter`](crate::services::agent_memory::AgentMemoryWriter) so the
+    /// monitor persists each content-bearing agent action as long-term memory. Builder-style so
+    /// existing `new(..)` call-sites are unaffected; `None` leaves the feature disabled.
+    pub fn with_agent_memory(
+        mut self,
+        agent_memory: Option<Arc<crate::services::agent_memory::AgentMemoryWriter>>,
+    ) -> Self {
+        self.agent_memory = agent_memory;
+        self
     }
 
     /// The simulation data directory root (`{SIMULATION_DATA_DIR}`).
@@ -1240,6 +1257,7 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
                 state: Arc::clone(&state_arc),
                 graph_mgr: Arc::clone(&self.graph_mgr),
                 graph_enabled,
+                agent_memory: self.agent_memory.clone(),
             },
             completion_rx,
         );
@@ -2200,6 +2218,9 @@ struct MonitorContext<L: LlmClient + Send + Sync + 'static> {
     graph_mgr: Arc<GraphMemoryManager<L>>,
     /// Whether graph-memory updating is enabled for this run (`_graph_memory_enabled[id]`).
     graph_enabled: bool,
+    /// Agent LTM writer (independent of graph memory) — `Some` persists each content-bearing
+    /// action into the vector/LTM store; `None` disables agent memory for this run.
+    agent_memory: Option<Arc<crate::services::agent_memory::AgentMemoryWriter>>,
 }
 
 /// Spawn the monitor task (`_monitor_threads[id]`, S-605). Returns its `JoinHandle` for storage
@@ -2311,6 +2332,18 @@ async fn monitor_simulation<L: LlmClient + Send + Sync + 'static>(
     if ctx.graph_enabled {
         ctx.graph_mgr.stop_updater(&ctx.simulation_id).await;
         tracing::info!("已停止图谱记忆更新: simulation_id={}", ctx.simulation_id);
+    }
+
+    // Report agent-LTM write-back stats (observability — mirrors the graph updater's end stats).
+    if let Some(writer) = &ctx.agent_memory {
+        let (persisted, embedded, skipped) = writer.stats();
+        tracing::info!(
+            simulation_id = %ctx.simulation_id,
+            persisted,
+            embedded,
+            skipped,
+            "agent LTM write-back finished (persisted=chronological, embedded=semantic-vector)"
+        );
     }
 
     tracing::info!("模拟监控结束: {}", ctx.simulation_id);
@@ -2541,6 +2574,12 @@ async fn apply_log_record<L: LlmClient + Send + Sync + 'static>(
         ctx.graph_mgr
             .fire_activity_from_dict(&ctx.simulation_id, action_data, platform)
             .await;
+    }
+
+    // Fire agent LTM write-back per action when enabled (independent of graph memory). Persists
+    // the utterance as chronological + semantic agent memory; best-effort (never errors the sim).
+    if let Some(writer) = &ctx.agent_memory {
+        writer.write_action(&ctx.simulation_id, action_data, platform).await;
     }
 }
 
@@ -4610,6 +4649,7 @@ mod monitor_tests {
             state: Arc::clone(&state),
             graph_mgr: Arc::clone(&graph_mgr),
             graph_enabled,
+            agent_memory: None,
         };
         (ctx, dir, state, graph_mgr)
     }
@@ -4677,6 +4717,82 @@ mod monitor_tests {
         // Offset advanced to EOF (file size).
         assert_eq!(off, std::fs::metadata(&path).unwrap().len());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end through the REAL monitor path: `read_action_log` → `apply_log_record` →
+    /// `AgentMemoryWriter::write_action`. A content-bearing action is persisted as agent LTM
+    /// (chronological + semantic) and recallable; a structural `DO_NOTHING` is skipped. This is
+    /// the wiring a live `teri run`/`teri serve` monitor exercises per action.
+    #[tokio::test]
+    async fn monitor_persists_agent_ltm_for_content_actions() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/embeddings");
+            then.status(200).header("Content-Type", "application/json").body(
+                r#"{"object":"list","data":[{"object":"embedding","embedding":[0.1,0.2,0.3],"index":0}],"model":"m","usage":{"prompt_tokens":1,"total_tokens":1}}"#,
+            );
+        });
+        let cfg = crate::config::LlmConfig {
+            base_url: server.base_url(),
+            api_key: String::new(),
+            model: "m".to_string(),
+            embed_model: "e".to_string(),
+            timeout_secs: 5,
+            max_retries: 0,
+            max_tokens: 256,
+            provider: crate::config::LlmProvider::Openai,
+        };
+
+        let mem_dir = temp_dir("agent_ltm_mem");
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        let store = Arc::new(crate::memory::MemoryStore::new(&mem_dir).unwrap());
+        let embedder = Arc::new(crate::embedding::EmbeddingClient::new(&cfg));
+        let writer = Arc::new(crate::services::agent_memory::AgentMemoryWriter::new(
+            store.clone(),
+            embedder.clone(),
+        ));
+
+        let sim_id = "ltm-monitor";
+        let dir = temp_dir("agent_ltm_sim");
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(tokio::sync::Mutex::new(SimulationRunState::new(sim_id.to_string())));
+        let ctx = MonitorContext {
+            simulation_id: sim_id.to_string(),
+            sim_data_dir: dir.clone(),
+            state,
+            graph_mgr: Arc::new(GraphMemoryManager::<MockLlm>::new()),
+            graph_enabled: false,
+            agent_memory: Some(writer.clone()),
+        };
+
+        // A CREATE_POST (content="hello" per `action_value`) and a contentless DO_NOTHING.
+        append_line(&dir, sim_id, "reddit", &action_value(1, 5, "CREATE_POST"));
+        append_line(
+            &dir,
+            sim_id,
+            "reddit",
+            &serde_json::json!({
+                "round": 1, "agent_id": 5, "agent_name": "agent-5",
+                "action_type": "DO_NOTHING", "action_args": {}, "success": true
+            }),
+        );
+        let path = log_path(&dir, sim_id, "reddit");
+        let _ = read_action_log(&path, 0, &ctx, "reddit").await;
+
+        let (persisted, embedded, skipped) = writer.stats();
+        assert_eq!(persisted, 1, "CREATE_POST persisted as chronological LTM");
+        assert_eq!(embedded, 1, "CREATE_POST embedded into the vector store");
+        assert_eq!(skipped, 1, "DO_NOTHING skipped (no content)");
+
+        let ns = crate::services::agent_memory::AgentMemoryWriter::agent_namespace(sim_id, 5);
+        let recalled = store.semantic_recall(ns, &embedder, "hello", 5).await.unwrap();
+        assert_eq!(recalled.len(), 1, "the post is semantically recallable");
+        assert!(recalled[0].content.contains("hello"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&mem_dir);
     }
 
     #[tokio::test]

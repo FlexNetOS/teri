@@ -278,11 +278,27 @@ where
 
     // ── Stage 4: simulation (with memory write-back) ─────────────────────────
     let graph_mgr = Arc::new(crate::services::graph_memory::GraphMemoryManager::<L>::new());
-    let sim_runner = Arc::new(crate::services::simulation_runner::SimulationRunner::new(
-        std::path::PathBuf::from(&config.oasis_simulation_data_dir),
-        Arc::clone(&graph_mgr),
-        Arc::clone(&sim_manager),
-    ));
+    // Agent LTM write-back: open the shared memory store + embedding client so the monitor
+    // persists each agent utterance as chronological + semantic memory. Best-effort — if the
+    // store can't open (e.g. an unwritable MEMORY_DB_PATH), agent memory is simply disabled
+    // (`None`); the run is otherwise identical (keyless-safe, no-downgrade).
+    let agent_memory = crate::memory::MemoryStore::new(&config.persistence.memory_db_path)
+        .ok()
+        .map(|store| {
+            let embedder = Arc::new(crate::embedding::EmbeddingClient::new(&config.llm));
+            Arc::new(crate::services::agent_memory::AgentMemoryWriter::new(
+                Arc::new(store),
+                embedder,
+            ))
+        });
+    let sim_runner = Arc::new(
+        crate::services::simulation_runner::SimulationRunner::new(
+            std::path::PathBuf::from(&config.oasis_simulation_data_dir),
+            Arc::clone(&graph_mgr),
+            Arc::clone(&sim_manager),
+        )
+        .with_agent_memory(agent_memory),
+    );
 
     tracing::info!(simulation_id = %simulation_id, "pipeline: starting simulation");
     let (inputs, graph_for_updater) =
