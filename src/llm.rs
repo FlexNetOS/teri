@@ -312,6 +312,9 @@ pub struct OpenAiAdapter {
     client: reqwest::Client,
     timeout_secs: u64,
     max_retries: u32,
+    /// FIX-4: explicit completion token cap for `complete`/`complete_json`. `0` means
+    /// "omit `max_tokens`" (fall back to the server default — the prior behavior).
+    max_tokens: u32,
 }
 
 impl OpenAiAdapter {
@@ -324,6 +327,7 @@ impl OpenAiAdapter {
             client,
             timeout_secs: config.timeout_secs,
             max_retries: config.max_retries,
+            max_tokens: config.max_tokens,
         }
     }
 
@@ -372,7 +376,7 @@ impl OpenAiAdapter {
 #[async_trait]
 impl LlmClient for OpenAiAdapter {
     async fn complete(&self, prompt: &str) -> Result<String> {
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "model": self.model,
             "messages": [
                 {
@@ -382,6 +386,11 @@ impl LlmClient for OpenAiAdapter {
             ],
             "temperature": 0.7,
         });
+        // FIX-4: send an explicit max_tokens so the backend (shimmy default 256) does not
+        // truncate persona generation / graph extraction. `0` opts out (server default).
+        if self.max_tokens > 0 {
+            payload["max_tokens"] = serde_json::json!(self.max_tokens);
+        }
 
         let response = self.call_api(payload).await?;
 
@@ -398,7 +407,7 @@ impl LlmClient for OpenAiAdapter {
     }
 
     async fn complete_json<T: DeserializeOwned>(&self, prompt: &str) -> Result<T> {
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "model": self.model,
             "messages": [
                 {
@@ -411,6 +420,10 @@ impl LlmClient for OpenAiAdapter {
                 "type": "json_object"
             }
         });
+        // FIX-4: explicit max_tokens (see complete()). `0` opts out (server default).
+        if self.max_tokens > 0 {
+            payload["max_tokens"] = serde_json::json!(self.max_tokens);
+        }
 
         let response = self.call_api(payload).await?;
 
@@ -577,6 +590,7 @@ impl LlmClient for OpenAiAdapter {
 
 /// Adapter for Anthropic Claude API (non-OpenAI-compatible).
 /// Uses Anthropic's Messages API format.
+#[derive(Clone)]
 pub struct AnthropicAdapter {
     base_url: String,
     api_key: String,
@@ -584,10 +598,39 @@ pub struct AnthropicAdapter {
     client: reqwest::Client,
     timeout_secs: u64,
     max_retries: u32,
+    /// FIX-4: completion token cap (Anthropic REQUIRES `max_tokens`). Defaults to 4096
+    /// (the historical hardcode) when constructed without an explicit value.
+    max_tokens: u32,
 }
 
 impl AnthropicAdapter {
     pub fn new(api_key: String, model: String) -> Self {
+        Self::with_max_tokens(api_key, model, 4096)
+    }
+
+    /// FIX-3/FIX-4: construct from a [`LlmConfig`] so the provider selection in
+    /// `build_provider_llm` can honor the configured model / key / `max_tokens`.
+    pub fn from_config(config: &LlmConfig) -> Self {
+        let max_tokens = if config.max_tokens > 0 { config.max_tokens } else { 4096 };
+        Self {
+            // Anthropic uses its own host; an explicitly-set non-default base_url is
+            // honored (proxies), otherwise the canonical endpoint.
+            base_url: if config.base_url.is_empty() {
+                "https://api.anthropic.com".to_string()
+            } else {
+                config.base_url.clone()
+            },
+            api_key: config.api_key.clone(),
+            model: config.model.clone(),
+            client: reqwest::Client::new(),
+            timeout_secs: config.timeout_secs,
+            max_retries: config.max_retries,
+            max_tokens,
+        }
+    }
+
+    /// Construct with an explicit `max_tokens` cap (Anthropic requires one).
+    pub fn with_max_tokens(api_key: String, model: String, max_tokens: u32) -> Self {
         Self {
             base_url: "https://api.anthropic.com".to_string(),
             api_key,
@@ -595,6 +638,7 @@ impl AnthropicAdapter {
             client: reqwest::Client::new(),
             timeout_secs: 30,
             max_retries: 3,
+            max_tokens: if max_tokens > 0 { max_tokens } else { 4096 },
         }
     }
 
@@ -607,6 +651,7 @@ impl AnthropicAdapter {
             client: reqwest::Client::new(),
             timeout_secs: 30,
             max_retries: 0,
+            max_tokens: 4096,
         }
     }
 
@@ -664,7 +709,8 @@ impl LlmClient for AnthropicAdapter {
                     "content": prompt
                 }
             ],
-            "max_tokens": 4096,
+            // FIX-4: honor the configured cap (Anthropic requires max_tokens).
+            "max_tokens": self.max_tokens,
         });
 
         let response = self.call_api(payload).await?;
@@ -696,8 +742,17 @@ impl LlmClient for AnthropicAdapter {
         &self,
         prompt: &str,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
-        // Simplified streaming - for now just return complete response as single chunk
-        // TODO: Implement proper SSE streaming with Anthropic's streaming API
+        // FIX-5: real Anthropic Messages streaming SSE framing.
+        //
+        // Anthropic does NOT use OpenAI's `data: {...}` / `data: [DONE]` framing. Its
+        // stream is a sequence of *named* SSE events — each event is an `event: <type>`
+        // line followed by a `data: {...}` line. Text deltas arrive as
+        // `event: content_block_delta` whose `data.delta.text` carries the token; the
+        // stream terminates with `event: message_stop` (there is NO `[DONE]` sentinel).
+        // The previous implementation parsed OpenAI framing and waited for `[DONE]`, so it
+        // emitted nothing against a real Anthropic endpoint. We now track the current
+        // event type and only yield text from `content_block_delta` events, stopping on
+        // `message_stop`. `error` events surface as a stream error.
         let payload = serde_json::json!({
             "model": self.model,
             "messages": [
@@ -706,7 +761,7 @@ impl LlmClient for AnthropicAdapter {
                     "content": prompt
                 }
             ],
-            "max_tokens": 4096,
+            "max_tokens": self.max_tokens,
             "stream": true,
         });
 
@@ -736,6 +791,8 @@ impl LlmClient for AnthropicAdapter {
         let mut byte_stream = resp.bytes_stream();
         let sse_stream = try_stream! {
             let mut buffer = String::new();
+            // The SSE event type carried by the most recent `event:` line.
+            let mut current_event = String::new();
             while let Some(chunk) = byte_stream.next().await {
                 let chunk = chunk.map_err(|e| TeriError::Http(e.to_string()))?;
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
@@ -744,21 +801,49 @@ impl LlmClient for AnthropicAdapter {
                     let line = buffer[..idx].trim_end_matches('\r').to_string();
                     buffer = buffer[idx + 1..].to_string();
 
-                    if line.is_empty() || !line.starts_with("data: ") {
+                    if line.is_empty() {
+                        // Blank line = end of one SSE event; reset event type.
+                        current_event.clear();
                         continue;
                     }
 
-                    let data = line.trim_start_matches("data: ").trim();
-                    if data == "[DONE]" {
-                        return;
+                    if let Some(rest) = line.strip_prefix("event:") {
+                        current_event = rest.trim().to_string();
+                        continue;
                     }
 
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data)
-                        && let Some(content) = json
-                            .get("delta")
-                            .and_then(|d| d.get("text"))
-                            .and_then(|t| t.as_str()) {
+                    let Some(data_raw) = line.strip_prefix("data:") else {
+                        continue;
+                    };
+                    let data = data_raw.trim();
+
+                    match current_event.as_str() {
+                        "message_stop" => return,
+                        "content_block_delta" => {
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data)
+                                && let Some(content) = json
+                                    .get("delta")
+                                    .and_then(|d| d.get("text"))
+                                    .and_then(|t| t.as_str())
+                            {
                                 yield content.to_string();
+                            }
+                        }
+                        "error" => {
+                            let msg = serde_json::from_str::<serde_json::Value>(data)
+                                .ok()
+                                .and_then(|j| {
+                                    j.get("error")
+                                        .and_then(|e| e.get("message"))
+                                        .and_then(|m| m.as_str())
+                                        .map(str::to_string)
+                                })
+                                .unwrap_or_else(|| data.to_string());
+                            Err(TeriError::Llm(format!("Anthropic stream error: {msg}")))?;
+                        }
+                        // message_start / content_block_start / content_block_stop /
+                        // message_delta / ping — no text payload to surface.
+                        _ => {}
                     }
                 }
             }
@@ -851,6 +936,7 @@ impl LlmClient for AnthropicAdapter {
 
 /// Adapter for Google Gemini API (non-OpenAI-compatible).
 /// Uses Google's generateContent API format.
+#[derive(Clone)]
 pub struct GeminiAdapter {
     base_url: String,
     api_key: String,
@@ -869,6 +955,24 @@ impl GeminiAdapter {
             client: reqwest::Client::new(),
             timeout_secs: 30,
             max_retries: 3,
+        }
+    }
+
+    /// FIX-3: construct from a [`LlmConfig`] so provider selection can honor the
+    /// configured model / key / timeout. An explicitly-set non-default `base_url` is
+    /// honored (proxies / Vertex gateways); otherwise the canonical endpoint is used.
+    pub fn from_config(config: &LlmConfig) -> Self {
+        Self {
+            base_url: if config.base_url.is_empty() {
+                "https://generativelanguage.googleapis.com".to_string()
+            } else {
+                config.base_url.clone()
+            },
+            api_key: config.api_key.clone(),
+            model: config.model.clone(),
+            client: reqwest::Client::new(),
+            timeout_secs: config.timeout_secs,
+            max_retries: config.max_retries,
         }
     }
 
@@ -979,8 +1083,16 @@ impl LlmClient for GeminiAdapter {
             }]
         });
 
+        // FIX-5: real Gemini streaming SSE framing.
+        //
+        // `streamGenerateContent` returns a streamed JSON ARRAY by default (chunks of
+        // `[{...},{...}]`), NOT OpenAI `data:` SSE — so the previous parser (which required
+        // a `data: ` prefix and a `[DONE]` sentinel) yielded nothing. Adding `?alt=sse`
+        // switches Gemini to genuine SSE framing: each chunk is a `data: {...}` line
+        // carrying one `GenerateContentResponse`, with NO `[DONE]` terminator (the stream
+        // simply ends). We extract `candidates[0].content.parts[0].text` per `data:` line.
         let url = format!(
-            "{}/v1beta/models/{}:streamGenerateContent?key={}",
+            "{}/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
             self.base_url, self.model, self.api_key
         );
 
@@ -1014,13 +1126,13 @@ impl LlmClient for GeminiAdapter {
                     let line = buffer[..idx].trim_end_matches('\r').to_string();
                     buffer = buffer[idx + 1..].to_string();
 
-                    if line.is_empty() || !line.starts_with("data: ") {
+                    // Gemini SSE: only `data:` lines carry payload; there is no `[DONE]`.
+                    let Some(data_raw) = line.strip_prefix("data:") else {
                         continue;
-                    }
-
-                    let data = line.trim_start_matches("data: ").trim();
-                    if data == "[DONE]" {
-                        return;
+                    };
+                    let data = data_raw.trim();
+                    if data.is_empty() {
+                        continue;
                     }
 
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(data)
@@ -1182,6 +1294,110 @@ impl LlmClient for GeminiAdapter {
     }
 }
 
+// ============================================================================
+// ProviderAdapter — FIX-3 enum-dispatch over the concrete adapters
+// ============================================================================
+//
+// DECISION-U025-1 establishes that `LlmClient` is NOT dyn-compatible (it has generic
+// methods `complete_json<T>` / `chat_json<T>`), so the codebase monomorphizes the
+// pipeline over a single CONCRETE adapter type rather than `Box<dyn LlmClient>`.
+//
+// Provider selection (`config.llm.provider`) therefore cannot be done with a trait
+// object. Instead, `ProviderAdapter` is a single concrete enum that implements
+// `LlmClient` by static dispatch to whichever real adapter the config selected. It is
+// `Clone` (all three variants are `Clone`), so it satisfies the `L: LlmClient + Clone`
+// bound the graph builder / simulation pipeline require — without relaxing the no-`dyn`
+// architecture. `build_provider_llm` (api/mod.rs) constructs it from config.
+
+/// A concrete, `Clone`-able `LlmClient` that statically dispatches to the configured
+/// provider's adapter (FIX-3). Lets the run pipeline pick OpenAI-compatible / Anthropic /
+/// Gemini at runtime while staying a single monomorphized type (no `dyn`).
+#[derive(Clone)]
+pub enum ProviderAdapter {
+    /// OpenAI-compatible (OpenAI / Ollama / LM Studio / vLLM / shimmy).
+    Openai(OpenAiAdapter),
+    /// Anthropic Messages API.
+    Anthropic(AnthropicAdapter),
+    /// Google Gemini generateContent API.
+    Gemini(GeminiAdapter),
+}
+
+impl ProviderAdapter {
+    /// Build the adapter selected by `config.llm.provider` from teri config.
+    pub fn from_config(config: &LlmConfig) -> Self {
+        match config.provider {
+            crate::config::LlmProvider::Openai => {
+                ProviderAdapter::Openai(OpenAiAdapter::new(config))
+            }
+            crate::config::LlmProvider::Anthropic => {
+                ProviderAdapter::Anthropic(AnthropicAdapter::from_config(config))
+            }
+            crate::config::LlmProvider::Gemini => {
+                ProviderAdapter::Gemini(GeminiAdapter::from_config(config))
+            }
+        }
+    }
+
+    /// The provider this adapter dispatches to (for logging/diagnostics).
+    pub fn provider(&self) -> crate::config::LlmProvider {
+        match self {
+            ProviderAdapter::Openai(_) => crate::config::LlmProvider::Openai,
+            ProviderAdapter::Anthropic(_) => crate::config::LlmProvider::Anthropic,
+            ProviderAdapter::Gemini(_) => crate::config::LlmProvider::Gemini,
+        }
+    }
+}
+
+#[async_trait]
+impl LlmClient for ProviderAdapter {
+    async fn complete(&self, prompt: &str) -> Result<String> {
+        match self {
+            ProviderAdapter::Openai(a) => a.complete(prompt).await,
+            ProviderAdapter::Anthropic(a) => a.complete(prompt).await,
+            ProviderAdapter::Gemini(a) => a.complete(prompt).await,
+        }
+    }
+
+    async fn complete_json<T: DeserializeOwned>(&self, prompt: &str) -> Result<T> {
+        match self {
+            ProviderAdapter::Openai(a) => a.complete_json(prompt).await,
+            ProviderAdapter::Anthropic(a) => a.complete_json(prompt).await,
+            ProviderAdapter::Gemini(a) => a.complete_json(prompt).await,
+        }
+    }
+
+    async fn stream(
+        &self,
+        prompt: &str,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+        match self {
+            ProviderAdapter::Openai(a) => a.stream(prompt).await,
+            ProviderAdapter::Anthropic(a) => a.stream(prompt).await,
+            ProviderAdapter::Gemini(a) => a.stream(prompt).await,
+        }
+    }
+
+    async fn chat(&self, messages: &[ChatMessage], opts: &ChatOptions) -> Result<String> {
+        match self {
+            ProviderAdapter::Openai(a) => a.chat(messages, opts).await,
+            ProviderAdapter::Anthropic(a) => a.chat(messages, opts).await,
+            ProviderAdapter::Gemini(a) => a.chat(messages, opts).await,
+        }
+    }
+
+    async fn chat_json<T: DeserializeOwned>(
+        &self,
+        messages: &[ChatMessage],
+        opts: &ChatOptions,
+    ) -> Result<T> {
+        match self {
+            ProviderAdapter::Openai(a) => a.chat_json(messages, opts).await,
+            ProviderAdapter::Anthropic(a) => a.chat_json(messages, opts).await,
+            ProviderAdapter::Gemini(a) => a.chat_json(messages, opts).await,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1198,6 +1414,8 @@ mod tests {
             embed_model: "text-embedding-3-small".to_string(),
             timeout_secs: 5,
             max_retries,
+            max_tokens: 2048,
+            provider: crate::config::LlmProvider::Openai,
         }
     }
 
@@ -1276,6 +1494,8 @@ mod tests {
             embed_model: "text-embedding-3-small".to_string(),
             timeout_secs: 30,
             max_retries: 3,
+            max_tokens: 2048,
+            provider: crate::config::LlmProvider::Openai,
         };
         let _client = OpenAiAdapter::new(&config);
     }
@@ -1294,6 +1514,105 @@ mod tests {
         let resp = client.complete("hi").await.unwrap();
         assert_eq!(resp, "Hello from mock");
         mock.assert();
+    }
+
+    /// FIX-4: `complete()` must send an explicit `max_tokens` (default 2048) so the
+    /// shimmy backend does not truncate at its 256-token default. The mock matches ONLY
+    /// when the request body carries `"max_tokens": 2048`.
+    #[tokio::test]
+    async fn test_openai_complete_sends_max_tokens() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .json_body_partial(r#"{"max_tokens": 2048}"#);
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+        });
+
+        // openai_config sets max_tokens: 2048 (see helper).
+        let client = OpenAiAdapter::new(&openai_config(&server, 0));
+        let resp = client.complete("hi").await.unwrap();
+        assert_eq!(resp, "ok");
+        mock.assert(); // fails if max_tokens was absent from the body
+    }
+
+    /// FIX-4: `complete_json()` must also send `max_tokens`.
+    #[tokio::test]
+    async fn test_openai_complete_json_sends_max_tokens() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .json_body_partial(r#"{"max_tokens": 2048}"#);
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"choices":[{"message":{"content":"{\"k\":1}"}}]}"#);
+        });
+
+        let client = OpenAiAdapter::new(&openai_config(&server, 0));
+        let v: serde_json::Value = client.complete_json("hi").await.unwrap();
+        assert_eq!(v["k"], 1);
+        mock.assert();
+    }
+
+    /// FIX-4: `max_tokens: 0` opts out — the cap key must be omitted (server default).
+    #[tokio::test]
+    async fn test_openai_complete_max_tokens_zero_omits_key() {
+        let server = MockServer::start();
+        let mut cfg = openai_config(&server, 0);
+        cfg.max_tokens = 0;
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/chat/completions").matches(|req| {
+                let body = String::from_utf8_lossy(req.body.as_deref().unwrap_or_default());
+                !body.contains("max_tokens")
+            });
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+        });
+
+        let client = OpenAiAdapter::new(&cfg);
+        let resp = client.complete("hi").await.unwrap();
+        assert_eq!(resp, "ok");
+        mock.assert();
+    }
+
+    /// FIX-3: `ProviderAdapter::from_config` selects the adapter by `provider`.
+    #[test]
+    fn test_provider_adapter_selection() {
+        use crate::config::LlmProvider;
+
+        let mut cfg = openai_config(&MockServer::start(), 0);
+
+        cfg.provider = LlmProvider::Openai;
+        assert!(matches!(ProviderAdapter::from_config(&cfg), ProviderAdapter::Openai(_)));
+        assert_eq!(ProviderAdapter::from_config(&cfg).provider(), LlmProvider::Openai);
+
+        cfg.provider = LlmProvider::Anthropic;
+        assert!(matches!(ProviderAdapter::from_config(&cfg), ProviderAdapter::Anthropic(_)));
+        assert_eq!(ProviderAdapter::from_config(&cfg).provider(), LlmProvider::Anthropic);
+
+        cfg.provider = LlmProvider::Gemini;
+        assert!(matches!(ProviderAdapter::from_config(&cfg), ProviderAdapter::Gemini(_)));
+        assert_eq!(ProviderAdapter::from_config(&cfg).provider(), LlmProvider::Gemini);
+    }
+
+    /// FIX-3: `LlmProvider::from_env_str` maps OpenAI-compatible aliases to Openai and
+    /// recognizes anthropic/gemini.
+    #[test]
+    fn test_llm_provider_from_env_str() {
+        use crate::config::LlmProvider;
+        assert_eq!(LlmProvider::from_env_str("openai"), LlmProvider::Openai);
+        assert_eq!(LlmProvider::from_env_str("ollama"), LlmProvider::Openai);
+        assert_eq!(LlmProvider::from_env_str("lmstudio"), LlmProvider::Openai);
+        assert_eq!(LlmProvider::from_env_str("vllm"), LlmProvider::Openai);
+        assert_eq!(LlmProvider::from_env_str("unknown-backend"), LlmProvider::Openai);
+        assert_eq!(LlmProvider::from_env_str("anthropic"), LlmProvider::Anthropic);
+        assert_eq!(LlmProvider::from_env_str("CLAUDE"), LlmProvider::Anthropic);
+        assert_eq!(LlmProvider::from_env_str(" Gemini "), LlmProvider::Gemini);
+        assert_eq!(LlmProvider::from_env_str("google"), LlmProvider::Gemini);
     }
 
     #[tokio::test]
@@ -1496,6 +1815,8 @@ mod tests {
             embed_model: "e".to_string(),
             timeout_secs: 5,
             max_retries: 1, // 1 retry → 2 total attempts; both 503 → Err
+            max_tokens: 2048,
+            provider: crate::config::LlmProvider::Openai,
         };
         let client = OpenAiAdapter::new(&config);
         let result = client.complete("q").await;
@@ -1526,6 +1847,8 @@ mod tests {
             embed_model: "e".to_string(),
             timeout_secs: 5,
             max_retries: 2, // 2 retries → 3 total attempts
+            max_tokens: 2048,
+            provider: crate::config::LlmProvider::Openai,
         };
         let client = OpenAiAdapter::new(&config);
         let result = client.complete("q").await;
@@ -1612,15 +1935,37 @@ data: [DONE]\n",
         mock.assert();
     }
 
+    /// FIX-5: Anthropic streaming uses REAL Messages-API SSE framing — `event:`-typed
+    /// events (`content_block_delta` carries `delta.text`), terminating on
+    /// `message_stop`, with NO `[DONE]` sentinel. The mock emits that exact framing
+    /// (including `message_start` / `content_block_start` / `ping` events that must be
+    /// ignored), and the adapter must extract only the deltas and stop at `message_stop`.
     #[tokio::test]
     async fn test_anthropic_adapter_stream() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/messages");
             then.status(200).header("Content-Type", "text/event-stream").body(
-                "data: {\"delta\":{\"text\":\"Hello\"}}\n\
-data: {\"delta\":{\"text\":\" Claude\"}}\n\
-data: [DONE]\n",
+                "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\
+\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0}\n\
+\n\
+event: ping\n\
+data: {\"type\":\"ping\"}\n\
+\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\
+\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" Claude\"}}\n\
+\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\
+\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n",
             );
         });
 
@@ -1736,15 +2081,19 @@ data: [DONE]\n",
         assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 2, "must have been called exactly twice");
     }
 
+    /// FIX-5: Gemini streaming requests `?alt=sse` (real SSE framing) and parses each
+    /// `data: {...}` line — Gemini emits NO `[DONE]` sentinel (the stream just ends), so
+    /// the mock omits it and the test asserts the `alt=sse` query is sent.
     #[tokio::test]
     async fn test_gemini_adapter_stream() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
-            when.method(POST).path("/v1beta/models/gemini-1.5-pro:streamGenerateContent");
+            when.method(POST)
+                .path("/v1beta/models/gemini-1.5-pro:streamGenerateContent")
+                .query_param("alt", "sse");
             then.status(200).header("Content-Type", "text/event-stream").body(
                 "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"}]}}]}\n\
-data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" Gemini\"}]}}]}\n\
-data: [DONE]\n",
+data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" Gemini\"}]}}]}\n",
             );
         });
 

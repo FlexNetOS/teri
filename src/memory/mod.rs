@@ -1095,6 +1095,8 @@ mod tests {
             embed_model: "all-MiniLM-L6-v2".to_string(),
             timeout_secs: 5,
             max_retries: 0,
+            max_tokens: 2048,
+            provider: crate::config::LlmProvider::Openai,
         };
         let embedder = EmbeddingClient::new(&cfg);
 
