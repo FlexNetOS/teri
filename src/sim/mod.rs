@@ -816,6 +816,21 @@ impl SimEngine {
         (self.snapshot_tx.subscribe(), Arc::clone(&self.snapshot_history))
     }
 
+    /// Clone the canonical snapshot-history handle (the complete, lossless tick record).
+    ///
+    /// This is the source the HTTP `/ticks/sse` feed tails. Unlike a [`TickBuffer`] ring
+    /// (bounded — drops old ticks under backpressure) or the broadcast `Receiver` (lossy if
+    /// subscribed after a tick was sent), `snapshot_history` is the **single canonical**
+    /// in-memory store (every `tick` pushes into it) and grows monotonically for the run's
+    /// lifetime — so a consumer polling its length sees every tick exactly once, in order,
+    /// no dedup needed. The `Arc` keeps the history alive for the consumer even after the
+    /// engine itself is dropped at run end.
+    ///
+    /// [`TickBuffer`]: crate::api::streaming::TickBuffer
+    pub fn snapshot_history_handle(&self) -> Arc<Mutex<Vec<WorldSnapshot>>> {
+        Arc::clone(&self.snapshot_history)
+    }
+
     /// Subscribe to the terminal completion signal.
     ///
     /// Returns a `watch::Receiver<Option<SimCompletion>>`. The receiver starts at `None` and

@@ -1835,6 +1835,8 @@ mod updater_tests {
                 embed_model: "e".into(),
                 timeout_secs: 5,
                 max_retries: 0,
+                max_tokens: 2048,
+                provider: crate::config::LlmProvider::Openai,
             },
         ));
         let tmp = tempfile::TempDir::new().unwrap();

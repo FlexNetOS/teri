@@ -249,6 +249,25 @@ pub(crate) fn build_llm(config: &crate::Config) -> crate::llm::OpenAiAdapter {
     crate::llm::OpenAiAdapter::new(&config.llm)
 }
 
+/// FIX-3 (provider selection): build the LLM adapter selected by `config.llm.provider`,
+/// returning the enum-dispatch [`crate::llm::ProviderAdapter`] (OpenAI-compatible /
+/// Anthropic / Gemini). This is the selection seam used by the in-process `run` pipeline
+/// (`teri::pipeline::run_pipeline`), where the whole graph→persona→sim→report chain is
+/// monomorphized over one concrete `L`.
+///
+/// Why this is separate from [`build_llm`]: `ApiState`/`serve` are monomorphized over the
+/// concrete `OpenAiAdapter` (DECISION-U025-1 — `LlmClient` is not dyn-compatible and axum
+/// state cannot be generic), so the long-lived server path stays OpenAI-compatible. The
+/// `run` pipeline has no such constraint, so it picks the real provider here. For the
+/// OpenAI-compatible providers (openai/ollama/lmstudio/vllm — distinguished by `base_url`)
+/// the two functions produce the identical OpenAI adapter; only `anthropic`/`gemini`
+/// diverge, and those genuinely require their own wire format.
+pub fn build_provider_llm(config: &crate::Config) -> crate::llm::ProviderAdapter {
+    let adapter = crate::llm::ProviderAdapter::from_config(&config.llm);
+    tracing::info!(provider = ?adapter.provider(), "LLM provider selected for run pipeline");
+    adapter
+}
+
 /// Build the optional "boost" LLM client — port of `create_model(config, use_boost=True)`
 /// (`run_parallel_simulation.py:984-1037`). The dual-LLM optimization lets a parallel run drive
 /// each platform's agents against a DIFFERENT API provider (twitter → the general LLM, reddit →
@@ -343,14 +362,26 @@ impl ApiState {
         let graph_mgr = std::sync::Arc::new(crate::services::graph_memory::GraphMemoryManager::<
             crate::llm::OpenAiAdapter,
         >::with_vector_index(vector_index));
+        // Agent LTM write-back: reuse the shared graph-vector store + embedder so the monitor
+        // persists each agent utterance as chronological + semantic memory (per-agent namespace,
+        // distinct from the graph-fact namespace). `None` when the store is unavailable — agent
+        // memory is then disabled, byte-identical to before (keyless-safe, no-downgrade).
+        let agent_memory = graph_vectors.as_ref().map(|store| {
+            std::sync::Arc::new(crate::services::agent_memory::AgentMemoryWriter::new(
+                store.clone(),
+                embedder.clone(),
+            ))
+        });
         // Shared runner (U-022) — shares the SAME manager Arc (so state.json writes are
         // consistent) and uses the same sim-data dir as the manager.
-        let sim_runner =
-            std::sync::Arc::new(crate::services::simulation_runner::SimulationRunner::new(
+        let sim_runner = std::sync::Arc::new(
+            crate::services::simulation_runner::SimulationRunner::new(
                 std::path::PathBuf::from(&config.oasis_simulation_data_dir),
                 graph_mgr,
                 sim_manager.clone(),
-            ));
+            )
+            .with_agent_memory(agent_memory),
+        );
 
         Self { config, sim_manager, sim_runner, graph_vectors, embedder }
     }

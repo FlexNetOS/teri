@@ -15,6 +15,9 @@ data/
 *.redb
 *.rocksdb
 
+# Runtime simulation/report output (created by `teri run`/serve + lib tests)
+uploads/
+
 # Logs
 logs/
 *.log

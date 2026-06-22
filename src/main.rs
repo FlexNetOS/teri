@@ -18,6 +18,9 @@ enum Commands {
         query: String,
         #[arg(short, long, default_value_t = 100)]
         agents: usize,
+        /// FIX-2: write a verdict.json summary of the run to this path on completion.
+        #[arg(short, long)]
+        out: Option<String>,
     },
     /// Start the REST API server
     Serve {
@@ -44,7 +47,7 @@ async fn main() -> Result<()> {
 async fn run_cmd() -> Result<()> {
     // Lazy config load — only when actually needed (FIX-1.2: envctl injection seam).
     let cli = Cli::parse();
-    let Commands::Run { seed, query, agents } = cli.command else { unreachable!() };
+    let Commands::Run { seed, query, agents, out } = cli.command else { unreachable!() };
 
     let config = match Config::load() {
         Ok(c) => c,
@@ -78,9 +81,52 @@ async fn run_cmd() -> Result<()> {
         .map_err(|e| TeriError::Config(format!("Failed to create graph dir: {e}")))?;
 
     tracing::info!("Starting simulation: seed={seed}, agents={agents}, query={query}");
-    tracing::info!("Query: {query}");
-    tracing::info!("Configuration loaded successfully");
-    Err(TeriError::Unknown("Pipeline not yet implemented".to_string()))
+
+    // FIX-3: select the LLM adapter by config.llm.provider (openai-compatible / anthropic /
+    // gemini). The whole in-process pipeline is monomorphized over this one concrete adapter.
+    let llm = teri::api::build_provider_llm(&config);
+
+    // FIX-1 (keystone): compose the full pipeline in-process —
+    //   seed → graph build (real LLM extraction) → persona → sim (write-back) → report.
+    // Reuses the exact service-layer functions the HTTP handlers call (see src/pipeline.rs).
+    let outcome = teri::pipeline::run_pipeline(&config, llm, &seed, &query, agents).await?;
+
+    tracing::info!(
+        report_id = %outcome.report_id,
+        graph_nodes = outcome.graph_node_count,
+        graph_edges = outcome.graph_edge_count,
+        agents = outcome.agents_generated,
+        sim_status = outcome.sim_runner_status.as_str(),
+        "Pipeline complete"
+    );
+
+    // FIX-2: write verdict.json summarizing the run.
+    if let Some(out_path) = out {
+        let verdict = outcome.to_verdict_json();
+        let json = serde_json::to_string_pretty(&verdict)
+            .map_err(|e| TeriError::Unknown(format!("failed to serialize verdict.json: {e}")))?;
+        if let Some(parent) = std::path::Path::new(&out_path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                TeriError::Config(format!("failed to create verdict.json dir: {e}"))
+            })?;
+        }
+        std::fs::write(&out_path, json.as_bytes())
+            .map_err(|e| TeriError::Config(format!("failed to write verdict.json: {e}")))?;
+        tracing::info!(out = %out_path, "Wrote verdict.json");
+        println!("Wrote verdict.json to {out_path}");
+    }
+
+    println!(
+        "teri run complete: report={} graph=({} nodes, {} edges) agents={} sim={}",
+        outcome.report_id,
+        outcome.graph_node_count,
+        outcome.graph_edge_count,
+        outcome.agents_generated,
+        outcome.sim_runner_status.as_str()
+    );
+    Ok(())
 }
 
 async fn serve_cmd() -> Result<()> {

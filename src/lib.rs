@@ -17,9 +17,12 @@ pub mod services;
 pub mod sim;
 pub mod task;
 
-pub use config::{Config, GraphBackendKind};
+pub mod pipeline;
+
+pub use config::{Config, GraphBackendKind, LlmProvider};
 pub use error::{Result, TeriError};
 pub use llm::{
     AnthropicAdapter, ChatMessage, ChatOptions, ChatRole, GeminiAdapter, LlmClient, OpenAiAdapter,
+    ProviderAdapter,
 };
 pub use logging::init_logging;

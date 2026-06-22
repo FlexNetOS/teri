@@ -135,6 +135,52 @@ pub struct LlmConfig {
     pub embed_model: String,
     pub timeout_secs: u64,
     pub max_retries: u32,
+    /// FIX-4 (max_tokens): the explicit completion token cap sent on the legacy
+    /// `complete()` / `complete_json()` paths (env `LLM_MAX_TOKENS`, default 2048).
+    ///
+    /// Without this, those requests omitted `max_tokens` entirely and inherited the
+    /// shimmy backend's 256-token default, silently truncating persona generation
+    /// (`agent/mod.rs` `generate_social`) and graph entity/relation extraction
+    /// (`graph/mod.rs` `extract_and_merge_into`). 2048 is a sensible default for the
+    /// JSON-shaped extraction/persona outputs; the parameterized `chat`/`chat_json`
+    /// paths continue to honor their per-call `ChatOptions.max_tokens` and are
+    /// unaffected.
+    pub max_tokens: u32,
+    /// FIX-3 (provider selection): which adapter `build_llm` / the run pipeline select.
+    /// `openai` (the default; also covers ollama/lmstudio/vllm — all OpenAI-compatible,
+    /// distinguished by `base_url`), `anthropic`, or `gemini` (env `LLM_PROVIDER`).
+    pub provider: LlmProvider,
+}
+
+/// FIX-3: the LLM provider selector. OpenAI-compatible backends (OpenAI, Ollama,
+/// LM Studio, vLLM, Together, Groq, shimmy) all map to [`LlmProvider::Openai`] and are
+/// distinguished by `base_url`; Anthropic and Gemini use their own (non-OpenAI) wire
+/// formats and adapters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LlmProvider {
+    /// OpenAI chat-completions wire format (also Ollama / LM Studio / vLLM / shimmy).
+    #[default]
+    Openai,
+    /// Anthropic Messages API.
+    Anthropic,
+    /// Google Gemini generateContent API.
+    Gemini,
+}
+
+impl LlmProvider {
+    /// Parse a provider name from an env-var string. Recognizes the OpenAI-compatible
+    /// aliases (`openai`, `ollama`, `lmstudio`/`lm_studio`/`lm-studio`, `vllm`) plus
+    /// `anthropic` and `gemini`/`google`. Unknown values fall back to `Openai`
+    /// (keyless-safe default; the base_url still drives the actual endpoint).
+    pub fn from_env_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "anthropic" | "claude" => LlmProvider::Anthropic,
+            "gemini" | "google" => LlmProvider::Gemini,
+            // openai / ollama / lmstudio / vllm / together / groq / shimmy / unknown
+            _ => LlmProvider::Openai,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,6 +310,17 @@ impl Config {
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(3),
+                // FIX-4: explicit completion token cap for complete()/complete_json().
+                // Default 2048 (vs shimmy's truncating 256 default). 0 is treated as
+                // "omit the cap" downstream (server default), so a user can opt out.
+                max_tokens: std::env::var("LLM_MAX_TOKENS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(2048),
+                // FIX-3: provider selector (default OpenAI-compatible).
+                provider: std::env::var("LLM_PROVIDER")
+                    .map(|v| LlmProvider::from_env_str(&v))
+                    .unwrap_or_default(),
             },
             sim: SimConfig {
                 default_agent_count: std::env::var("DEFAULT_AGENT_COUNT")

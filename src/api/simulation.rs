@@ -67,7 +67,10 @@ use axum::{
     body::Bytes,
     extract::{Path, Query, State},
     http::{HeaderValue, StatusCode, header},
-    response::{Json, Response},
+    response::{
+        Json, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, post},
 };
 use serde_json::Value;
@@ -156,6 +159,8 @@ pub fn simulation_router(state: Arc<ApiState>) -> Router {
         // is distinct from the 2-segment `/run-status` by full-path match (axum 0.7).
         .route("/:simulation_id/run-status", get(run_status))
         .route("/:simulation_id/run-status/detail", get(run_status_detail))
+        // Live SSE tick feed (teri UPGRADE; additive). 3-seg /ticks/sse — distinct static tail.
+        .route("/:simulation_id/ticks/sse", get(get_sim_ticks_sse_route))
         // Sub-cycle (i): world-state read routes (actions/timeline/agent-stats). Distinct static
         // 2nd segments under /:simulation_id; no capture conflicts.
         .route("/:simulation_id/actions", get(get_simulation_actions))
@@ -2390,6 +2395,126 @@ async fn start_simulation(
         "success": true,
         "data": Value::Object(response_data)
     })))
+}
+
+// ===========================================================================
+// Live SSE tick feed (teri UPGRADE, additive) — GET /:simulation_id/ticks/sse
+//
+// The source has NO streaming route (architect findings/u026-architecture.md §"No route
+// in U-026 streams"); run progress is poll-only via `/run-status`. This adds the genuine
+// live `text/event-stream` tick feed the `api/streaming.rs` TickBuffer reserved, ADDITIVE
+// (the poll route is untouched — no downgrade).
+//
+// Source of truth: the engine's CANONICAL `snapshot_history` Vec (every tick pushes into
+// it), handed to the runner's `RunHandle` before the engine moves into the spawned task and
+// reached via `SimulationRunner::snapshot_history`. The history is lossless and monotonic —
+// polling its length yields every WorldSnapshot exactly once, in order, no dedup — which is
+// why it is the source rather than the bounded (lossy) `TickBuffer` ring or the late-lossy
+// broadcast `Receiver`. The `Arc` keeps ticks streamable even after the engine drops at run
+// end, so a late subscriber still replays the full run then sees `done`.
+//
+// Frame contract (per SSE event):
+//   event: tick   data: a WorldSnapshot {tick, agents, events, variables} — one per new tick.
+//   event: done   data: {status, ticks}  — run reached a terminal runner_status; stream closes.
+//   event: error  data: {error}          — simulation id never materialized (after a grace).
+//
+// Terminal: `runner_status` ∈ {completed, stopped, failed} via `get_run_state` (the same
+// signal `/run-status` exposes). Bounds mirror the report log-tail seam.
+// ===========================================================================
+
+/// Tick-feed poll cadence. 250ms — ticks can be frequent, so tighter than the 500ms log tail.
+const TICK_SSE_POLL: Duration = Duration::from_millis(250);
+/// Upper bound on tick polls before self-closing with a `timeout` done-event (2400 × 250ms = 10 min).
+const MAX_TICK_SSE_POLLS: u32 = 2400;
+/// Zero-evidence polls tolerated before declaring the sim id unknown (12 × 250ms = ~3s).
+const TICK_UNKNOWN_GRACE: u32 = 12;
+
+/// GET /:simulation_id/ticks/sse — live `text/event-stream` feed of the run's WorldSnapshots.
+/// Replays the full tick history on connect, then streams new ticks until the run reaches a
+/// terminal `runner_status`, then `done` + close.
+async fn get_sim_ticks_sse_route(
+    State(state): State<Arc<ApiState>>,
+    Path(simulation_id): Path<String>,
+) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let stream = async_stream::stream! {
+        let mut history = state.sim_runner.snapshot_history(&simulation_id).await;
+        let mut emitted: usize = 0;
+        let mut polls: u32 = 0;
+        let mut unknown_polls: u32 = 0;
+
+        loop {
+            // The run state is persisted just before the live handle is registered. If a
+            // client connects inside that short window, retry until the handle appears.
+            if history.is_none() {
+                history = state.sim_runner.snapshot_history(&simulation_id).await;
+            }
+
+            // 1) Emit any ticks appended since the cursor. Lock, clone the new slice, release
+            //    (never hold the parking_lot lock across the yield/await).
+            if let Some(h) = &history {
+                let fresh: Vec<crate::sim::WorldSnapshot> = {
+                    let guard = h.lock();
+                    if guard.len() > emitted { guard[emitted..].to_vec() } else { Vec::new() }
+                };
+                for snap in fresh {
+                    let ev = Event::default()
+                        .event("tick")
+                        .json_data(&snap)
+                        .unwrap_or_else(|_| Event::default().event("tick").data(snap.tick.to_string()));
+                    yield Ok(ev);
+                    emitted += 1;
+                }
+            }
+
+            // 2) Terminal runner_status → flush done-frame and close.
+            let run_state = state.sim_runner.get_run_state(&simulation_id).await.ok().flatten();
+            let status = run_state.as_ref().map(|rs| rs.runner_status.clone());
+            let terminal = matches!(
+                status,
+                Some(RunnerStatus::Completed | RunnerStatus::Stopped | RunnerStatus::Failed)
+            );
+            if terminal {
+                let label = status.map(|s| s.as_str()).unwrap_or("completed");
+                let done = Event::default()
+                    .event("done")
+                    .json_data(serde_json::json!({ "status": label, "ticks": emitted }))
+                    .unwrap_or_else(|_| Event::default().event("done").data(label));
+                yield Ok(done);
+                break;
+            }
+
+            // 3) Unknown id (no run handle AND no persisted state) after a grace → error.
+            let exists = history.is_some() || run_state.is_some();
+            if exists {
+                unknown_polls = 0;
+            } else {
+                unknown_polls += 1;
+                if unknown_polls >= TICK_UNKNOWN_GRACE {
+                    let err = Event::default()
+                        .event("error")
+                        .json_data(serde_json::json!({ "error": "simulationNotFound" }))
+                        .unwrap_or_else(|_| Event::default().event("error").data("simulationNotFound"));
+                    yield Ok(err);
+                    break;
+                }
+            }
+
+            // 4) Safety ceiling so a wedged run cannot stream forever.
+            polls += 1;
+            if polls >= MAX_TICK_SSE_POLLS {
+                let done = Event::default()
+                    .event("done")
+                    .json_data(serde_json::json!({ "status": "timeout", "ticks": emitted }))
+                    .unwrap_or_else(|_| Event::default().event("done").data("timeout"));
+                yield Ok(done);
+                break;
+            }
+
+            tokio::time::sleep(TICK_SSE_POLL).await;
+        }
+    };
+
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
 
 // ---------------------------------------------------------------------------
@@ -5197,6 +5322,49 @@ mod tests {
         // The full to_dict carries process_pid (the idle stub does not) and is larger than 8 keys.
         assert!(data.get("process_pid").is_some(), "full to_dict has process_pid");
         assert!(data.as_object().unwrap().len() > 8, "full to_dict > idle stub");
+    }
+
+    /// GET /:id/ticks/sse — terminal persisted state closes immediately with a done event.
+    #[tokio::test]
+    async fn ticks_sse_terminal_state_emits_done_event() {
+        let (state, _tmp) = test_state();
+        seed_run_state(
+            &state,
+            "sim_done",
+            serde_json::json!({
+                "runner_status": "completed",
+                "current_round": 2,
+                "total_rounds": 2,
+                "updated_at": "2025-12-01T10:30:00",
+                "completed_at": "2025-12-01T10:31:00"
+            }),
+        );
+        let app = crate::server::create_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_done/ticks/sse")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type =
+            resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "ticks/sse must return text/event-stream, got {content_type:?}"
+        );
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        assert!(body.contains("event: done"), "must emit a done SSE event: {body}");
+        assert!(
+            body.contains(r#"data: {"status":"completed","ticks":0}"#),
+            "done event must include terminal status and tick count: {body}"
+        );
     }
 
     /// GET /:id/run-status/detail — no run_state → 200 with the 5-key idle stub.
