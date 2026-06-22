@@ -44,7 +44,7 @@ Teri turns seed materials (news articles, policy drafts, financial signals, nove
 | Type safety | Runtime errors | Compile-time guarantees |
 | Async LLM calls | `asyncio` | `tokio` native |
 
-1. **LLM API Key** — one of:
+1. **LLM API Key** — required for hosted providers, optional for keyless local backends:
    ```bash
    # Direct (manual):
    export LLM_API_KEY=sk-...
@@ -55,8 +55,8 @@ Teri turns seed materials (news articles, policy drafts, financial signals, nove
 
 2. **Optional backend config**:
    ```bash
-   export LLM_BASE_URL=https://api.openai.com/v1  # default
-   export LLM_MODEL=gpt-4o                          # default
+   export LLM_BASE_URL=http://127.0.0.1:11435/v1  # default shimmy/OpenAI-compatible endpoint
+   export LLM_MODEL=OpenThinker3-7B                # default model name
    ```
 
 ### Run a Simulation
@@ -69,6 +69,9 @@ envctl run -- teri run \
 
 # Or directly:
 LLM_API_KEY=sk-... cargo run --release -- run \
+  --seed ./examples/seed.txt \
+  --query "How will this policy affect public sentiment in 30 days?"
+
 # CLI surface works without any secrets:
 cargo run --release -- --help
 
@@ -78,7 +81,7 @@ cargo run --release -- --help
 # For local development only, a .env file (gitignored) is accepted:
 cp .env.example .env
 
-# Run a simulation (preflights the inference backend, then runs the pipeline*)
+# Run a simulation (preflights the inference backend, then runs the pipeline)
 cargo run --release -- run \
   --seed ./examples/seed.txt \
   --query "How will this policy affect public sentiment in 30 days?"
@@ -88,7 +91,7 @@ cargo run --release -- run \
 
 ```bash
 envctl run -- teri serve --addr 0.0.0.0:8080
-# Start REST API server (*see Status — server wiring is the serve-phase milestone)
+# Start REST API server
 cargo run --release -- serve --addr 0.0.0.0:8080
 ```
 
@@ -103,10 +106,10 @@ All configuration via environment variables (no config files required):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LLM_BASE_URL` | `https://api.openai.com/v1` | LLM API endpoint |
-| `LLM_API_KEY` | *(required)* | API key for the LLM backend |
-| `LLM_MODEL` | `gpt-4o` | Model name for completions |
-| `EMBED_MODEL` | `text-embedding-3-small` | Embedding model |
+| `LLM_BASE_URL` | `http://127.0.0.1:11435/v1` | OpenAI-compatible LLM API endpoint |
+| `LLM_API_KEY` | *(optional for keyless local)* | API key for hosted LLM backends |
+| `LLM_MODEL_NAME` / `LLM_MODEL` | `OpenThinker3-7B` | Model name for completions (`LLM_MODEL_NAME` wins) |
+| `EMBED_MODEL` | `all-MiniLM-L6-v2` | Embedding model |
 | `DEFAULT_AGENT_COUNT` | `100` | Default number of agents per simulation |
 | `SIM_MAX_TICKS` | `50` | Maximum ticks per simulation run |
 | `RUST_LOG` | `teri=debug,tower_http=info` | Logging level |
@@ -164,13 +167,13 @@ teri/
 │   ├── config.rs         # Lazy Config loading (FIX-1.2: envctl seam)
 │   ├── error.rs          # Error types (includes TeriError::ConfigMissing)
 │   ├── agent/            # Agent pool, personas, memory structures
-│   ├── api/              # HTTP server scaffold + SSE streaming
+│   ├── api/              # HTTP server routes + SSE stream infrastructure
 │   ├── graph/            # Knowledge graph (petgraph) structure
-│   ├── llm.rs            # LlmClient trait + 3 adapter stubs (OpenAI, Anthropic, Gemini)
+│   ├── llm.rs            # LlmClient trait + OpenAI, Anthropic, Gemini adapters
 │   ├── memory/           # Persistent memory (redb) structures
 │   ├── report/           # Report generation scaffold
 │   ├── seed/             # Seed file parsing structure
-│   └── sim/              # Simulation loop scaffold
+│   └── sim/              # Simulation loop
 ```
 
 ---
@@ -188,7 +191,7 @@ teri/
     ├── sim/             # Simulation engine (two-phase tick loop, tokio)
     ├── report/          # Report generation & world interaction
     ├── memory/          # Persistent memory (redb)
-    └── api/             # DTOs + SSE stream types (server wiring = serve phase)
+    └── api/             # DTOs, REST routes, and SSE stream types
 ```
 
 ---
@@ -212,8 +215,8 @@ Teri uses an adapter pattern — the core simulation logic never depends on a sp
 ### GGUF/Stub Backend Guard (FIX-1.3)
 
 Before any simulation runs, Teri preflight-checks the backend:
-- Health probe (`/health` endpoint) if available
-- Sentinel completion request as fallback
+- Model identity probe (`/models`) before work starts
+- 1-token chat completion honesty probe
 - Detects stub/canned-text backends and refuses to proceed (prevents meaningless simulations on deterministic cached responses)
 - **Anthropic** (Claude) - `AnthropicAdapter`
 - **Google** (Gemini) - `GeminiAdapter`
@@ -235,15 +238,17 @@ swarm simulated on canned text is fabrication, not prediction. Serve a real GGUF
 
 ## Status
 
-🚧 **Pre-alpha — core infrastructure built.**
-Module interfaces defined, config/CLI/adapter layers wired. Pipeline and persistence implementation pending.
+**Pre-alpha, source-wired.**
+The one-shot `teri run` path preflights the backend and composes seed -> graph -> agents -> sim -> report through `pipeline::run_pipeline`. The `teri serve` path preflights before binding and exposes the REST graph, simulation, and report surfaces.
+
+Teri is a broad agentic scenario engine, not an oracle. It can simulate and forecast scenarios that fit its seed-data, ontology, persona, action, memory, and report model. It does not prove causal truth, and report `confidence` is synthesized report metadata rather than calibrated probability unless a separate evaluation/calibration loop is added.
 
 ---
 
 ## Development
 
 ```bash
-# Check compilation (requires LLM_API_KEY for Config::load verification)
+# Check compilation
 cargo check
 
 # Run tests
@@ -252,7 +257,7 @@ cargo test
 # Build release binary
 cargo build --release
 ```
-🚧 **Skeleton with real organs — 140+ tests green.**
+**Large Rust test suite; run `cargo test` for the current count.**
 
 | Layer | State |
 | --- | --- |
@@ -261,9 +266,9 @@ cargo build --release
 | persona generation (minijinja) | implemented + tested |
 | sim loop (two-phase ticks, God-events) | implemented + tested |
 | report generation (+ streaming variant) | implemented + tested |
-| memory store (redb) | implemented; write-back wiring pending |
-| graph build orchestration | **placeholder — the P1 keystone** |
-| pipeline composition (`run`) / HTTP server (`serve`) | preflight + explicit bail; wiring pending |
+| memory store (redb) | implemented; graph-memory write-back wired, agent LTM/vector sim write-back pending |
+| graph build orchestration | implemented + tested |
+| pipeline composition (`run`) / HTTP server (`serve`) | implemented; server provider path is narrower than the run path |
 
 The phased plan (P1 wire-the-spine → P2 parity-core → P3 serve → P4 scale) lives in the meta
 workspace: `MIROFISH-PORT-PLAN.md`.
