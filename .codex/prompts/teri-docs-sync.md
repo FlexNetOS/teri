@@ -7,6 +7,8 @@ Refresh teri documentation against the current code before making any operationa
 
 Scope: $SCOPE
 
+Codex command rule: run repo commands through `rtk` (`rtk rg`, `rtk cargo`, `rtk git`, `rtk bash -lc`, etc.).
+
 Required source scan:
 
 - `src/main.rs`: confirm how `teri run` and `teri serve` load config, preflight, select providers, and dispatch work.
@@ -18,7 +20,7 @@ Required source scan:
 Search for stale phrases before finishing:
 
 ```bash
-rg -n "Pipeline not yet implemented|preflights, then bails|Skeleton with real organs|1629 tests|hardcoded OpenAI" README.md RUNBOOK.md CLAUDE.md
+rtk rg -n "Pipeline not yet implemented|preflights, then bails|Skeleton with real organs|1629 tests|hardcoded OpenAI" README.md RUNBOOK.md CLAUDE.md
 ```
 
 Rules:
@@ -27,6 +29,6 @@ Rules:
 - Do not call Teri an oracle, causal proof engine, or literally unbounded predictor.
 - If a doc says "simulate anything" or "predict anything", qualify it with representability, seed quality, ontology extraction, finite action grammar, LLM/backend quality, and missing specialized solvers.
 - Record the counterargument next to the strong claim, not hidden in a later caveat.
-- Validate with the smallest meaningful Rust gate, then run broader gates when code changed.
+- Validate with the smallest meaningful `rtk cargo ...` Rust gate, then run broader gates when code changed.
 
 Finish by reporting changed files, stale-phrase check, and validation commands.

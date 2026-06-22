@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "root=$(git rev-parse --show-toplevel) && \"$root/.codex/hooks/teri-context-session-start.sh\"",
+            "command": "rtk bash -lc 'root=$(rtk git rev-parse --show-toplevel) && \"$root/.codex/hooks/teri-context-session-start.sh\"'",
             "timeout": 10,
             "statusMessage": "Checking teri simulation truth"
           }
@@ -20,7 +20,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "root=$(git rev-parse --show-toplevel) && \"$root/.codex/hooks/teri-context-session-start.sh\"",
+            "command": "rtk bash -lc 'root=$(rtk git rev-parse --show-toplevel) && \"$root/.codex/hooks/teri-context-session-start.sh\"'",
             "timeout": 10,
             "statusMessage": "Refreshing teri truth context"
           }
