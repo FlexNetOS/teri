@@ -78,6 +78,9 @@ pub fn report_router(state: Arc<ApiState>) -> Router {
         // These are genuine `text/event-stream` tails (not one-shot) — see the SSE-SEAM note.
         .route("/:report_id/agent-log/sse", get(get_agent_log_sse_route))
         .route("/:report_id/console-log/sse", get(get_console_log_sse_route))
+        // ── Sub-cycle (b''): live report-generation event feed (teri UPGRADE; additive) ──
+        // 2-seg /:report_id/events — the progress+section push feed the sink seam reserved.
+        .route("/:report_id/events", get(get_report_events_sse_route))
         // ── Sub-cycle (c): sections + download ──
         .route("/:report_id/download", get(download_report_route))
         .route("/:report_id/sections", get(get_sections_route))
@@ -554,6 +557,135 @@ async fn get_console_log_sse_route(
 ) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let from_line = params.get("from_line").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
     log_sse_response(state, report_id, LogKind::Console, from_line)
+}
+
+// ===========================================================================
+// Sub-cycle (b'') — live report-generation event feed (teri UPGRADE, additive)
+//
+// `/:report_id/events` is the push feed `report/sink.rs` reserved as the `SseSink`
+// seam (`[~] U027-SSE-SEAM` for report PROGRESS). Rather than wire an in-memory
+// `broadcast<ReportEvent>` registry through the detached `!Send` generation worker
+// (extra shared-state lifecycle + a race window + only observable mid-LLM-run), this
+// tails the SAME artifacts the worker already writes LIVE to disk and that the
+// frontend already polls: `progress.json` (each `update_progress` stage transition)
+// and `section_NN.md` (each section the ReACT loop completes, written via `save_section`).
+//
+// This is the deliberate "engineered-enough" call: 500ms granularity is imperceptible
+// for a human watching a report build, the feed delivers the seam's full value (live
+// progress + each section's markdown the moment it lands), it needs ZERO ApiState
+// surgery, and — decisively — it is verifiable end-to-end at the HTTP surface without a
+// live LLM (write the artifacts, curl, watch). The in-memory `ReportEvent` broadcast
+// stays reserved for a future sub-500ms-latency need; the disk is the source of truth.
+//
+// Frame contract (per SSE event):
+//   event: progress  data: the progress.json map  — emitted on first sight + every change.
+//   event: section   data: {filename, section_index, content}  — once per NEW section file.
+//   event: done      data: {status, sections}  — terminal stage reached; stream closes.
+//   event: error     data: {error}  — report id never materialized (closed after a grace).
+//
+// Terminal/bounds reuse the log-tail seam exactly (`live_report_status`, `UNKNOWN_GRACE`,
+// `MAX_SSE_POLLS`, `LOG_SSE_POLL`) — one streaming discipline for both feeds.
+// ===========================================================================
+
+/// Build the SSE response for the live report-generation event feed (progress + sections).
+fn report_events_response(
+    state: Arc<ApiState>,
+    report_id: String,
+) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let stream = async_stream::stream! {
+        let mgr = report_manager(&state);
+        // Signature of the last-emitted progress (status, progress, message, current_section)
+        // — EXCLUDES updated_at so a re-write with no semantic change doesn't spam the client.
+        let mut last_progress_sig: Option<String> = None;
+        let mut sections_emitted: usize = 0;
+        let mut polls: u32 = 0;
+        let mut unknown_polls: u32 = 0;
+
+        loop {
+            // 1) progress.json change → `progress` event.
+            let progress = mgr.get_progress(&report_id);
+            if let Some(p) = &progress {
+                let sig = format!(
+                    "{}|{}|{}|{}",
+                    p.get("status").and_then(|v| v.as_str()).unwrap_or(""),
+                    p.get("progress").map(|v| v.to_string()).unwrap_or_default(),
+                    p.get("message").and_then(|v| v.as_str()).unwrap_or(""),
+                    p.get("current_section").and_then(|v| v.as_str()).unwrap_or(""),
+                );
+                if last_progress_sig.as_deref() != Some(sig.as_str()) {
+                    let ev = Event::default()
+                        .event("progress")
+                        .json_data(Value::Object(p.clone()))
+                        .unwrap_or_else(|_| Event::default().event("progress").data(sig.clone()));
+                    yield Ok(ev);
+                    last_progress_sig = Some(sig);
+                }
+            }
+
+            // 2) New section files → one `section` event each, in filename order.
+            let sections = mgr.get_generated_sections(&report_id);
+            while sections_emitted < sections.len() {
+                let sec = &sections[sections_emitted];
+                let ev = Event::default()
+                    .event("section")
+                    .json_data(Value::Object(sec.clone()))
+                    .unwrap_or_else(|_| Event::default().event("section").data(""));
+                yield Ok(ev);
+                sections_emitted += 1;
+            }
+
+            // 3) Terminal stage → done-frame and close.
+            let status = live_report_status(&mgr, &report_id);
+            if let Some(s) = status.as_deref().filter(|s| *s == "completed" || *s == "failed") {
+                let done = Event::default()
+                    .event("done")
+                    .json_data(serde_json::json!({ "status": s, "sections": sections_emitted }))
+                    .unwrap_or_else(|_| Event::default().event("done").data(s));
+                yield Ok(done);
+                break;
+            }
+
+            // 4) Unknown id (no progress, no sections, no report meta) after a grace → error.
+            let exists = progress.is_some() || !sections.is_empty() || status.is_some();
+            if exists {
+                unknown_polls = 0;
+            } else {
+                unknown_polls += 1;
+                if unknown_polls >= UNKNOWN_GRACE {
+                    let err = Event::default()
+                        .event("error")
+                        .json_data(serde_json::json!({ "error": "reportNotFound" }))
+                        .unwrap_or_else(|_| Event::default().event("error").data("reportNotFound"));
+                    yield Ok(err);
+                    break;
+                }
+            }
+
+            // 5) Safety ceiling so a wedged report cannot stream forever.
+            polls += 1;
+            if polls >= MAX_SSE_POLLS {
+                let done = Event::default()
+                    .event("done")
+                    .json_data(serde_json::json!({ "status": "timeout", "sections": sections_emitted }))
+                    .unwrap_or_else(|_| Event::default().event("done").data("timeout"));
+                yield Ok(done);
+                break;
+            }
+
+            tokio::time::sleep(LOG_SSE_POLL).await;
+        }
+    };
+
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+}
+
+/// GET /:report_id/events  — live `text/event-stream` feed of report-generation progress
+/// and each section's markdown the moment it is written. Closes on the terminal stage.
+async fn get_report_events_sse_route(
+    State(state): State<Arc<ApiState>>,
+    Path(report_id): Path<String>,
+) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    report_events_response(state, report_id)
 }
 
 // ===========================================================================
@@ -1846,6 +1978,67 @@ mod tests {
         let (status, ct, _body) = sse_body(app2, "/api/report/report_sse_d/agent-log/sse").await;
         assert_eq!(status, StatusCode::OK);
         assert!(ct.starts_with("text/event-stream"), "sse is event-stream, not JSON: {ct}");
+    }
+
+    // ---- live report-generation event feed (sub-cycle b'') -----------------
+
+    /// A terminal report's /events feed emits a `progress` frame, one `section` frame per
+    /// generated section file (in order), then a `done` carrying the terminal status + count.
+    #[tokio::test]
+    async fn report_events_streams_progress_and_sections_then_done() {
+        let (state, _t) = test_state();
+        report_manager(&state)
+            .update_progress("report_ev", "completed", 100, "all done", None, None)
+            .unwrap();
+        seed_section(&state, "report_ev", 0, "## Overview\n\nFirst.");
+        seed_section(&state, "report_ev", 1, "## Outcome\n\nSecond.");
+        let app = crate::server::create_app(state);
+        let (status, ct, body) = sse_body(app, "/api/report/report_ev/events").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ct.starts_with("text/event-stream"), "content-type: {ct}");
+        assert!(body.contains("event: progress"), "progress frame expected; body:\n{body}");
+        assert!(body.contains("all done"), "progress message streamed; body:\n{body}");
+        assert!(body.contains("event: section"), "section frames expected; body:\n{body}");
+        assert!(body.contains("First."), "section 0 content; body:\n{body}");
+        assert!(body.contains("Second."), "section 1 content; body:\n{body}");
+        assert!(body.contains("event: done"));
+        assert!(body.contains("\"status\":\"completed\""), "done carries status; body:\n{body}");
+        assert!(body.contains("\"sections\":2"), "done carries section count; body:\n{body}");
+        // section frames carry the structured payload (filename/index), in order.
+        let s0 = body.find("section_00.md").expect("section_00 frame");
+        let s1 = body.find("section_01.md").expect("section_01 frame");
+        assert!(s0 < s1, "sections must stream in filename order");
+    }
+
+    /// Unknown report id can't hang: after the zero-evidence grace, `error` + close.
+    #[tokio::test]
+    async fn report_events_unknown_id_closes_with_error() {
+        let (state, _t) = test_state();
+        let app = crate::server::create_app(state);
+        let (status, _ct, body) = sse_body(app, "/api/report/report_ev_ghost/events").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("event: error"), "error frame expected; body:\n{body}");
+        assert!(body.contains("reportNotFound"));
+    }
+
+    /// /events (SSE) and /progress (one-shot JSON) are distinct surfaces — no downgrade of
+    /// the existing poll route.
+    #[tokio::test]
+    async fn report_events_vs_progress_route_distinct() {
+        let (state, _t) = test_state();
+        report_manager(&state)
+            .update_progress("report_ev_d", "completed", 100, "done", None, None)
+            .unwrap();
+        // /progress → one-shot JSON
+        let app = crate::server::create_app(state.clone());
+        let (s, j) = req(app, "GET", "/api/report/report_ev_d/progress").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(j.get("data").is_some() || j.get("success").is_some(), "progress stays JSON");
+        // /events → text/event-stream
+        let app2 = crate::server::create_app(state);
+        let (status, ct, _body) = sse_body(app2, "/api/report/report_ev_d/events").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ct.starts_with("text/event-stream"), "events is event-stream: {ct}");
     }
 
     // =======================================================================
