@@ -33,10 +33,14 @@ use axum::{
     body::Bytes,
     extract::{Path, Query, State},
     http::{HeaderValue, StatusCode, header},
-    response::{Json, Response},
+    response::{
+        Json, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, post},
 };
 use serde_json::Value;
+use std::time::Duration;
 
 use crate::api::simulation::load_entity_reader_graph;
 use crate::api::{ApiError, ApiState};
@@ -69,6 +73,11 @@ pub fn report_router(state: Arc<ApiState>) -> Router {
         .route("/:report_id/agent-log/stream", get(get_agent_log_stream_route))
         .route("/:report_id/console-log", get(get_console_log_route))
         .route("/:report_id/console-log/stream", get(get_console_log_stream_route))
+        // ── Sub-cycle (b'): live SSE log tails (teri UPGRADE beyond source; additive) ──
+        // 3-seg /agent-log/sse vs /agent-log/stream: distinct static tails, no route conflict.
+        // These are genuine `text/event-stream` tails (not one-shot) — see the SSE-SEAM note.
+        .route("/:report_id/agent-log/sse", get(get_agent_log_sse_route))
+        .route("/:report_id/console-log/sse", get(get_console_log_sse_route))
         // ── Sub-cycle (c): sections + download ──
         .route("/:report_id/download", get(download_report_route))
         .route("/:report_id/sections", get(get_sections_route))
@@ -271,8 +280,18 @@ async fn check_report_status_route(
 // NOT SSE — the source (report.py:817-852, 899-934) returns a one-shot JSON
 // `{logs, count}` full-dump. The "stream" name means "get the whole stream at
 // once"; incremental tailing is the `from_line` param on the NON-`/stream` routes.
-// So all four port as ordinary JSON handlers. `[~] U027-SSE-SEAM-DORMANT`: the
-// U-024 sink.rs SseSink seam stays reserved (no source route maps to live SSE).
+// So all four `/stream` + non-`/stream` routes port as ordinary JSON handlers —
+// PARITY PRESERVED, untouched.
+//
+// `[x] U027-SSE-SEAM-ACTIVE` (teri UPGRADE, additive — sub-cycle b'): the genuine
+// live `text/event-stream` surface the source never had now lands as SIBLING routes
+// `/{agent,console}-log/sse`. They reuse the SAME `from_line` tail seam (the manager's
+// `total_lines` cursor) but, instead of one-shot, poll the on-disk log every
+// `LOG_SSE_POLL` and push each NEW line as an SSE `log` event until the report reaches
+// a terminal stage (`completed`/`failed` in `progress.json`, written live by the
+// generation worker via `update_progress`), then emit a final `done` event and close.
+// The parity JSON routes above are NOT modified (no-downgrade): a client choosing the
+// one-shot contract keeps it; a client wanting live tailing opts into `/sse`.
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -340,6 +359,201 @@ async fn get_console_log_stream_route(
         "success": true,
         "data": { "logs": logs, "count": count }
     })))
+}
+
+// ===========================================================================
+// Sub-cycle (b') — live SSE log tails (teri UPGRADE, additive)
+//
+// `/{agent,console}-log/sse` stream the report's log file LIVE as `text/event-stream`,
+// reusing the same `from_line` cursor the one-shot routes expose. Engineered to be a
+// strict superset, never a downgrade: the parity JSON routes are untouched.
+//
+// Frame contract (per SSE event):
+//   event: log    data: <one log record>   — a NEW line since the client's cursor.
+//                                             agent-log → the JSON entry; console-log → the raw text line.
+//   event: done   data: {"status","total_lines"} — report reached a terminal stage; stream closes.
+//   event: error  data: {"error"}          — report id never materialized (closed after a short grace).
+//
+// Tailing: poll the on-disk log every `LOG_SSE_POLL`; advance the cursor by the manager's
+// `total_lines` (PHYSICAL line count) so skipped/unparseable agent-log lines don't desync it.
+// Terminal: `progress.json` `status` (written live by the generation worker via
+// `update_progress`) hitting `completed`/`failed`; fall back to the persisted report meta.
+// Bounds: `UNKNOWN_GRACE` polls of zero evidence → `error` + close (typo'd id can't hang);
+// `MAX_SSE_POLLS` ceiling → `done{status:"timeout"}` + close (a wedged report can't stream forever).
+// ===========================================================================
+
+/// Poll cadence for the live log tail. 500ms mirrors the project's file-watch debounce
+/// feel — responsive without busy-spinning the disk.
+const LOG_SSE_POLL: Duration = Duration::from_millis(500);
+
+/// Upper bound on tail polls before the stream self-closes with a `timeout` done-event.
+/// 1200 × 500ms = 10 min — generous for a real report, but never an unbounded connection.
+const MAX_SSE_POLLS: u32 = 1200;
+
+/// Consecutive zero-evidence polls (no progress.json, no report meta, empty log) tolerated
+/// before declaring the id unknown. 6 × 500ms = ~3s — absorbs the detached worker being a
+/// hair behind the `/generate` response without hanging a genuinely bad id.
+const UNKNOWN_GRACE: u32 = 6;
+
+/// Which report log a live SSE tail is following.
+#[derive(Clone, Copy)]
+enum LogKind {
+    Agent,
+    Console,
+}
+
+impl LogKind {
+    /// Read log records at/after `from_line`, returning the new-line SSE events and the
+    /// PHYSICAL line count (the cursor to resume from — robust to skipped agent-log lines).
+    fn read_events(
+        self,
+        mgr: &ReportManager,
+        report_id: &str,
+        from_line: usize,
+    ) -> (Vec<Event>, usize) {
+        match self {
+            LogKind::Agent => {
+                let m = mgr.get_agent_log(report_id, from_line);
+                let total = m.get("total_lines").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let events = m
+                    .get("logs")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .map(|entry| {
+                                // json_data only fails on non-serializable values; a parsed
+                                // Value always serializes, but fall back to a string frame.
+                                Event::default().event("log").json_data(entry).unwrap_or_else(
+                                    |_| Event::default().event("log").data(entry.to_string()),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (events, total)
+            }
+            LogKind::Console => {
+                let m = mgr.get_console_log(report_id, from_line);
+                let total = m.get("total_lines").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let events = m
+                    .get("logs")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .map(|line| Event::default().event("log").data(line))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (events, total)
+            }
+        }
+    }
+}
+
+/// Live status of a report: the in-flight `progress.json` `status` (written by the
+/// generation worker) preferred over the persisted report meta. `None` ⇒ no evidence yet.
+fn live_report_status(mgr: &ReportManager, report_id: &str) -> Option<String> {
+    if let Some(s) = mgr
+        .get_progress(report_id)
+        .and_then(|p| p.get("status").and_then(|v| v.as_str()).map(|s| s.to_string()))
+    {
+        return Some(s);
+    }
+    mgr.get_report(report_id).and_then(|r| {
+        serde_json::to_value(&r.status)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+    })
+}
+
+/// Build the SSE response for a live log tail. Shared by the agent + console routes.
+fn log_sse_response(
+    state: Arc<ApiState>,
+    report_id: String,
+    kind: LogKind,
+    from_line: usize,
+) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let stream = async_stream::stream! {
+        let mgr = report_manager(&state);
+        let mut cursor = from_line;
+        let mut polls: u32 = 0;
+        let mut unknown_polls: u32 = 0;
+
+        loop {
+            // Emit any lines that appeared since the cursor.
+            let (events, total) = kind.read_events(&mgr, &report_id, cursor);
+            for ev in events {
+                yield Ok(ev);
+            }
+            cursor = cursor.max(total);
+
+            let status = live_report_status(&mgr, &report_id);
+            let exists = status.is_some() || total > 0;
+
+            // Terminal stage → flush done-frame and close.
+            if let Some(s) = status.as_deref().filter(|s| *s == "completed" || *s == "failed") {
+                let done = Event::default()
+                    .event("done")
+                    .json_data(serde_json::json!({ "status": s, "total_lines": cursor }))
+                    .unwrap_or_else(|_| Event::default().event("done").data(s));
+                yield Ok(done);
+                break;
+            }
+
+            // Unknown id (no evidence after a short grace) → error-frame and close.
+            if exists {
+                unknown_polls = 0;
+            } else {
+                unknown_polls += 1;
+                if unknown_polls >= UNKNOWN_GRACE {
+                    let err = Event::default()
+                        .event("error")
+                        .json_data(serde_json::json!({ "error": "reportNotFound" }))
+                        .unwrap_or_else(|_| Event::default().event("error").data("reportNotFound"));
+                    yield Ok(err);
+                    break;
+                }
+            }
+
+            // Safety ceiling so a wedged report cannot stream forever.
+            polls += 1;
+            if polls >= MAX_SSE_POLLS {
+                let done = Event::default()
+                    .event("done")
+                    .json_data(serde_json::json!({ "status": "timeout", "total_lines": cursor }))
+                    .unwrap_or_else(|_| Event::default().event("done").data("timeout"));
+                yield Ok(done);
+                break;
+            }
+
+            tokio::time::sleep(LOG_SSE_POLL).await;
+        }
+    };
+
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+}
+
+/// GET /:report_id/agent-log/sse  — live `text/event-stream` tail of `agent_log.jsonl`.
+///   ?from_line (default 0) → resume cursor for a reconnecting client.
+async fn get_agent_log_sse_route(
+    State(state): State<Arc<ApiState>>,
+    Path(report_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let from_line = params.get("from_line").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+    log_sse_response(state, report_id, LogKind::Agent, from_line)
+}
+
+/// GET /:report_id/console-log/sse  — live `text/event-stream` tail of `console_log.txt`.
+///   ?from_line (default 0) → resume cursor for a reconnecting client.
+async fn get_console_log_sse_route(
+    State(state): State<Arc<ApiState>>,
+    Path(report_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let from_line = params.get("from_line").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+    log_sse_response(state, report_id, LogKind::Console, from_line)
 }
 
 // ===========================================================================
@@ -1489,6 +1703,149 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["data"]["count"], 3);
         assert_eq!(json["data"]["logs"].as_array().unwrap().len(), 3);
+    }
+
+    // ---- live SSE log tails (sub-cycle b') ---------------------------------
+
+    /// Drive an SSE route to completion and return (status, content-type, full body text).
+    /// The tails self-terminate (terminal status or unknown-grace), so `to_bytes` collects
+    /// the whole `text/event-stream` body.
+    async fn sse_body(app: axum::Router, uri: &str) -> (StatusCode, String, String) {
+        let resp = app
+            .oneshot(Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, ct, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    /// A terminal report's agent-log SSE streams every entry as a `log` event then a
+    /// `done` event carrying the terminal status — and closes.
+    #[tokio::test]
+    async fn agent_log_sse_streams_entries_then_done() {
+        let (state, _t) = test_state();
+        seed_agent_log(
+            &state,
+            "report_sse_a",
+            &[
+                serde_json::json!({"action": "report_start"}),
+                serde_json::json!({"action": "report_complete"}),
+            ],
+        );
+        // progress.json status=completed → the live terminal signal the tail watches.
+        report_manager(&state)
+            .update_progress("report_sse_a", "completed", 100, "done", None, None)
+            .unwrap();
+        let app = crate::server::create_app(state);
+        let (status, ct, body) = sse_body(app, "/api/report/report_sse_a/agent-log/sse").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ct.starts_with("text/event-stream"), "content-type: {ct}");
+        assert!(body.contains("event: log"), "log events expected; body:\n{body}");
+        assert!(body.contains("report_start"), "first entry streamed; body:\n{body}");
+        assert!(body.contains("report_complete"), "second entry streamed; body:\n{body}");
+        assert!(body.contains("event: done"), "done frame expected; body:\n{body}");
+        assert!(body.contains("\"status\":\"completed\""), "done carries status; body:\n{body}");
+    }
+
+    /// A failed report's console-log SSE streams raw lines then a `done{status:"failed"}`.
+    #[tokio::test]
+    async fn console_log_sse_streams_lines_then_done() {
+        let (state, _t) = test_state();
+        seed_console_log(&state, "report_sse_c", &["[t] INFO: alpha", "[t] INFO: beta"]);
+        report_manager(&state)
+            .update_progress("report_sse_c", "failed", -1, "boom", None, None)
+            .unwrap();
+        let app = crate::server::create_app(state);
+        let (status, ct, body) = sse_body(app, "/api/report/report_sse_c/console-log/sse").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ct.starts_with("text/event-stream"), "content-type: {ct}");
+        assert!(body.contains("data: [t] INFO: alpha"), "line 1 streamed; body:\n{body}");
+        assert!(body.contains("data: [t] INFO: beta"), "line 2 streamed; body:\n{body}");
+        assert!(body.contains("event: done"));
+        assert!(body.contains("\"status\":\"failed\""), "done carries failed; body:\n{body}");
+    }
+
+    /// `?from_line=N` resumes the cursor: lines before N are NOT re-streamed.
+    #[tokio::test]
+    async fn console_log_sse_from_line_resumes_cursor() {
+        let (state, _t) = test_state();
+        seed_console_log(&state, "report_sse_r", &["one", "two", "three"]);
+        report_manager(&state)
+            .update_progress("report_sse_r", "completed", 100, "done", None, None)
+            .unwrap();
+        let app = crate::server::create_app(state);
+        let (status, _ct, body) =
+            sse_body(app, "/api/report/report_sse_r/console-log/sse?from_line=2").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.contains("data: one"), "pre-cursor line must not stream; body:\n{body}");
+        assert!(!body.contains("data: two"), "pre-cursor line must not stream; body:\n{body}");
+        assert!(body.contains("data: three"), "cursor line streamed; body:\n{body}");
+        assert!(body.contains("event: done"));
+    }
+
+    /// Unparseable agent-log lines are skipped, but the cursor advances by the PHYSICAL
+    /// line count — so `done.total_lines` is 3 even though only 2 entries parsed. This is
+    /// the invariant that keeps a reconnecting `?from_line` cursor aligned with the file.
+    #[tokio::test]
+    async fn agent_log_sse_skips_unparseable_keeps_cursor_aligned() {
+        let (state, _t) = test_state();
+        let folder = report_manager(&state).ensure_report_folder("report_sse_skip").unwrap();
+        std::fs::write(
+            folder.join("agent_log.jsonl"),
+            "{\"action\":\"first\"}\nNOT JSON HERE\n{\"action\":\"third\"}\n",
+        )
+        .unwrap();
+        report_manager(&state)
+            .update_progress("report_sse_skip", "completed", 100, "done", None, None)
+            .unwrap();
+        let app = crate::server::create_app(state);
+        let (status, _ct, body) = sse_body(app, "/api/report/report_sse_skip/agent-log/sse").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("first"), "first entry streamed; body:\n{body}");
+        assert!(body.contains("third"), "third entry streamed; body:\n{body}");
+        assert!(
+            body.contains("\"total_lines\":3"),
+            "cursor must advance by physical line count (3), not parsed count (2); body:\n{body}"
+        );
+    }
+
+    /// An unknown report id can't hang the connection: after the zero-evidence grace the
+    /// tail emits an `error` frame and closes.
+    #[tokio::test]
+    async fn agent_log_sse_unknown_id_closes_with_error() {
+        let (state, _t) = test_state();
+        let app = crate::server::create_app(state);
+        let (status, _ct, body) = sse_body(app, "/api/report/report_ghost/agent-log/sse").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("event: error"), "error frame expected; body:\n{body}");
+        assert!(body.contains("reportNotFound"), "error names the cause; body:\n{body}");
+    }
+
+    /// ROUTE-ORDER: /agent-log/sse (3-seg) vs /agent-log/stream (3-seg) vs /agent-log
+    /// (2-seg) all resolve to distinct handlers — sse is genuine event-stream, stream is JSON.
+    #[tokio::test]
+    async fn agent_log_sse_vs_stream_distinct_surfaces() {
+        let (state, _t) = test_state();
+        seed_agent_log(&state, "report_sse_d", &[serde_json::json!({"action": "x"})]);
+        report_manager(&state)
+            .update_progress("report_sse_d", "completed", 100, "done", None, None)
+            .unwrap();
+        // /stream → JSON {logs,count}
+        let app = crate::server::create_app(state.clone());
+        let (_s, j) = req(app, "GET", "/api/report/report_sse_d/agent-log/stream").await;
+        assert!(j["data"].get("count").is_some(), "stream stays JSON");
+        // /sse → text/event-stream
+        let app2 = crate::server::create_app(state);
+        let (status, ct, _body) = sse_body(app2, "/api/report/report_sse_d/agent-log/sse").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ct.starts_with("text/event-stream"), "sse is event-stream, not JSON: {ct}");
     }
 
     // =======================================================================
