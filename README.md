@@ -159,7 +159,8 @@ teri/
 ├── agent-env.toml        # envctl auto-injection manifest
 ├── src/
 │   ├── main.rs           # CLI entry point (clap, arg-parse before config)
-│   ├── lib.rs            # Module declarations + preflight_check_backend
+│   ├── lib.rs            # Module declarations + public re-exports
+│   ├── preflight.rs      # Backend honesty guard (verify_backend; wired into run + serve)
 │   ├── config.rs         # Lazy Config loading (FIX-1.2: envctl seam)
 │   ├── error.rs          # Error types (includes TeriError::ConfigMissing)
 │   ├── agent/            # Agent pool, personas, memory structures

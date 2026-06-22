@@ -60,19 +60,11 @@ async fn run_cmd() -> Result<()> {
         Err(e) => return Err(e),
     };
 
-    // FIX-1.3: GGUF/stub backend guard — preflight before sim run.
-    let is_stub = teri::preflight_check_backend(&config.llm)
-        .await
-        .map_err(|e| TeriError::Config(format!("Backend probe failed: {e}")))?;
-    if is_stub {
-        return Err(TeriError::Config(
-            "GGUF/stub backend detected — simulation would produce canned text, not intelligence.\n\
-             Set a real LLM endpoint (LLM_BASE_URL with an OpenAI-compatible API) to run simulations."
-                .to_string(),
-        ));
-    }
-
     init_logging(&config.logging.level)?;
+
+    // Backend honesty guard — fail-closed before any sim work. Refuses
+    // unreachable backends, empty model lists, and canned stub output.
+    preflight_backend(&config).await?;
 
     // Create data directories for persistence layer
     let memory_dir = std::path::Path::new(&config.persistence.memory_db_path)
@@ -113,6 +105,24 @@ async fn serve_cmd() -> Result<()> {
     // once at app-factory time; teri does it in the entrypoint instead).
     init_logging(&config.logging.level)?;
 
+    // Backend honesty guard — serve refuses to BOOT against a stub/unreachable
+    // backend. The API handlers drive the LLM, so a stub backend would make the
+    // whole server fabricate output. Fail-closed, same guard as `run`.
+    preflight_backend(&config).await?;
+
     // Delegate to teri::server::serve which carries the full U-002/U-003 logic.
     teri::server::serve(config, addr.as_deref()).await
+}
+
+/// Backend honesty guard shared by `run` and `serve`. Drives the configured
+/// backend through `preflight::verify_backend` (GET /models → 1-token probe),
+/// refusing unreachable backends, empty model lists, and canned stub output.
+/// Never weakened — a swarm on canned text fabricates predictions, not insight.
+async fn preflight_backend(config: &Config) -> Result<()> {
+    let identity = teri::preflight::verify_backend(&config.llm).await?;
+    tracing::info!(
+        models = ?identity.models,
+        "Backend honesty guard passed — real inference backend confirmed."
+    );
+    Ok(())
 }

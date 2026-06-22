@@ -13,9 +13,28 @@ use crate::{Result, TeriError};
 
 /// Known canned-output markers emitted by stub engines (matched
 /// case-insensitively against the probe completion).
+///
+/// These match only stub engines that ignore `max_tokens` and return a fixed
+/// placeholder string — a real backend honoring the 1-token probe returns a
+/// single token that cannot contain a multi-word marker, so a false positive is
+/// structurally impossible here. The list is the union of every stub phrase teri
+/// has seen (formerly split across two guards); fold new stub engines in rather
+/// than weakening it.
 const STUB_MARKERS: &[&str] = &[
-    // shimmy SafeTensors placeholder engine
+    // shimmy SafeTensors placeholder engine (src/engine/safetensors_native.rs)
     "full transformer inference coming soon",
+    "full transformer",
+    "coming soon",
+    // NOTE: shimmy spells it "SafeTensors" (no space); the lowercased marker must
+    // be "safetensors" — the old "safe tensors" with a space never matched.
+    "safetensors",
+    // generic stub / placeholder engine signatures
+    "stub mode",
+    "stubbed",
+    "not implemented",
+    "placeholder",
+    "no backend",
+    "canned text",
 ];
 
 /// What the preflight learned about the backend.
@@ -157,6 +176,109 @@ pub async fn verify_backend(llm: &LlmConfig) -> Result<BackendIdentity> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use httpmock::prelude::*;
+
+    fn probe_config(server: &MockServer) -> LlmConfig {
+        LlmConfig {
+            base_url: server.base_url(),
+            api_key: "test-key".to_string(),
+            model: "m".to_string(),
+            embed_model: "all-MiniLM-L6-v2".to_string(),
+            timeout_secs: 5,
+            max_retries: 0,
+        }
+    }
+
+    // ── verify_backend (end-to-end over a mock OpenAI surface) ──
+
+    /// A backend that serves the configured model and answers the probe with
+    /// real text passes, returning its served model list.
+    #[tokio::test]
+    async fn verify_backend_passes_real_backend() {
+        let server = MockServer::start();
+        let models = server.mock(|when, then| {
+            when.method(GET).path("/models");
+            then.status(200)
+                .body(r#"{"object":"list","data":[{"id":"m","object":"model"}]}"#);
+        });
+        let chat = server.mock(|when, then| {
+            when.method(POST).path("/chat/completions");
+            then.status(200)
+                .body(r#"{"choices":[{"message":{"role":"assistant","content":"Pong!"}}]}"#);
+        });
+
+        let identity = verify_backend(&probe_config(&server)).await.expect("real backend passes");
+        assert_eq!(identity.models, vec!["m".to_string()]);
+        assert_eq!(identity.probe_text, "Pong!");
+        models.assert();
+        chat.assert();
+    }
+
+    /// A backend listing no models is refused before any probe.
+    #[tokio::test]
+    async fn verify_backend_refuses_empty_model_list() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/models");
+            then.status(200).body(r#"{"object":"list","data":[]}"#);
+        });
+
+        let err = verify_backend(&probe_config(&server)).await.unwrap_err();
+        assert!(matches!(err, TeriError::Config(_)));
+        assert!(err.to_string().contains("lists no models"), "got: {err}");
+    }
+
+    /// A backend whose probe returns canned stub text is refused.
+    #[tokio::test]
+    async fn verify_backend_refuses_canned_probe() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/models");
+            then.status(200)
+                .body(r#"{"object":"list","data":[{"id":"m","object":"model"}]}"#);
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/chat/completions");
+            then.status(200).body(
+                r#"{"choices":[{"message":{"role":"assistant","content":"SafeTensors model loaded successfully! Full transformer inference coming soon!"}}]}"#,
+            );
+        });
+
+        let err = verify_backend(&probe_config(&server)).await.unwrap_err();
+        assert!(matches!(err, TeriError::Config(_)));
+        assert!(err.to_string().contains("REFUSING stub"), "got: {err}");
+    }
+
+    /// A non-2xx from `/models` is refused (not silently treated as healthy).
+    #[tokio::test]
+    async fn verify_backend_refuses_non_success_models() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/models");
+            then.status(503).body("service unavailable");
+        });
+
+        let err = verify_backend(&probe_config(&server)).await.unwrap_err();
+        assert!(matches!(err, TeriError::Config(_)));
+    }
+
+    /// An unreachable backend is refused — the guard catches absence, not just
+    /// canned text. (This is the regression the weak `/health` guard allowed.)
+    #[tokio::test]
+    async fn verify_backend_refuses_unreachable() {
+        // Port 1 is privileged and never listening in CI → connection refused.
+        let cfg = LlmConfig {
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            api_key: String::new(),
+            model: "m".to_string(),
+            embed_model: "all-MiniLM-L6-v2".to_string(),
+            timeout_secs: 2,
+            max_retries: 0,
+        };
+        let err = verify_backend(&cfg).await.unwrap_err();
+        assert!(matches!(err, TeriError::Config(_)));
+        assert!(err.to_string().contains("unreachable"), "got: {err}");
+    }
 
     // ── detect_stub_text ───────────────────────────────
 
@@ -177,6 +299,27 @@ mod tests {
     fn real_completions_pass() {
         assert!(detect_stub_text("Pong! How can I help?").is_none());
         assert!(detect_stub_text("").is_none());
+    }
+
+    #[test]
+    fn detects_safetensors_no_space() {
+        // shimmy writes "SafeTensors" (no space); the lowercased marker is
+        // "safetensors". The old "safe tensors" with a space would have missed this.
+        assert!(detect_stub_text("SafeTensors model loaded").is_some());
+    }
+
+    #[test]
+    fn detects_generic_stub_signatures() {
+        for canned in [
+            "stub mode active",
+            "this endpoint is stubbed",
+            "not implemented yet",
+            "placeholder response",
+            "no backend configured",
+            "canned text reply",
+        ] {
+            assert!(detect_stub_text(canned).is_some(), "should flag stub: {canned:?}");
+        }
     }
 
     // ── parse_model_ids ────────────────────────────────

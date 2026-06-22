@@ -34,10 +34,13 @@ The `agent-env.toml` file declares teri's required secrets.
 
 ## Stub Backend Guard
 
-Before running simulations, verify the backend is not stubby:
-- Run with `--help` first (keyless) to confirm CLI works
-- Check shimmy/inference endpoint reports non-stub mode via `/health` probe
-- Look for "GGUF/stub backend detected" error if guard triggers
+Both `teri run` and `teri serve` fail-closed through `preflight::verify_backend` before any
+work (`run` before the pipeline, `serve` before binding). The guard:
+- `GET {LLM_BASE_URL}/models` — refuses an unreachable backend or an empty model list
+- 1-token `/chat/completions` probe — refuses canned stub text (`STUB_MARKERS`)
+- on refusal, errors `inference backend unreachable …` / `backend … lists no models` /
+  `REFUSING stub inference backend …`; never weaken it to make a run proceed
+- `--help`/`--version` stay keyless (config + guard load only inside `run`/`serve`)
 
 ## Coding Conventions
 
