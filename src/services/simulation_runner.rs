@@ -927,9 +927,19 @@ pub struct RunHandle {
     monitor: Option<JoinHandle<()>>,
     /// Whether graph-memory updating is enabled for this run (S-608 `_graph_memory_enabled[id]`).
     graph_enabled: bool,
+    /// Clone of the engine's canonical snapshot-history handle (the complete, lossless tick
+    /// record). Extracted before the engine moves into the spawned task so the HTTP
+    /// `/ticks/sse` feed can tail every `WorldSnapshot` the run produces. The `Arc` keeps the
+    /// history alive for streaming consumers even after the engine is dropped at run end.
+    snapshot_history: Arc<parking_lot::Mutex<Vec<crate::sim::WorldSnapshot>>>,
 }
 
 impl RunHandle {
+    /// Clone the snapshot-history handle for streaming this run's ticks.
+    pub fn snapshot_history(&self) -> Arc<parking_lot::Mutex<Vec<crate::sim::WorldSnapshot>>> {
+        Arc::clone(&self.snapshot_history)
+    }
+
     /// Borrow the IPC client (used by interview wiring in sub-cycle e/f).
     pub fn ipc_client(&self) -> &SimulationIPCClient {
         &self.ipc_client
@@ -1070,6 +1080,20 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
         }
         // Not in memory — load from disk (S-610).
         load_run_state(&self.sim_data_dir, simulation_id)
+    }
+
+    /// Clone the canonical snapshot-history handle for a registered run (the source the HTTP
+    /// `/ticks/sse` feed tails). `None` if no live/recent run handle exists for
+    /// `simulation_id` (never started, or already cleaned up) — the caller then has no ticks
+    /// to stream (it can still report the persisted terminal state via [`get_run_state`]).
+    ///
+    /// [`get_run_state`]: Self::get_run_state
+    pub async fn snapshot_history(
+        &self,
+        simulation_id: &str,
+    ) -> Option<Arc<parking_lot::Mutex<Vec<crate::sim::WorldSnapshot>>>> {
+        let runs = self.runs.lock().await;
+        runs.get(simulation_id).map(|h| h.snapshot_history())
     }
 
     /// Start a simulation — port of `start_simulation` (S-612).
@@ -1222,6 +1246,11 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
         // the run finishes before the monitor first polls, the monitor still observes `Some(..)`.
         let completion_rx = engine.subscribe_completion();
 
+        // Clone the canonical snapshot-history handle BEFORE the engine moves into the spawned
+        // task — the HTTP `/ticks/sse` feed tails this to stream every WorldSnapshot the run
+        // emits (the `Arc` outlives the engine, so the ticks remain streamable post-run).
+        let snapshot_history = engine.snapshot_history_handle();
+
         // Parallel run ⇒ dual-platform interview dispatch (ParallelIPCHandler analog). Anything
         // other than "twitter"/"reddit" is parallel — same predicate as the (6) platform flags.
         let parallel = !matches!(platform, "twitter" | "reddit");
@@ -1269,6 +1298,7 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
             ipc_client,
             monitor: Some(monitor),
             graph_enabled,
+            snapshot_history,
         };
 
         {
