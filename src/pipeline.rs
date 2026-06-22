@@ -287,6 +287,14 @@ where
     tracing::info!(simulation_id = %simulation_id, "pipeline: starting simulation");
     let (inputs, graph_for_updater) =
         build_run_inputs(&sim_manager, llm.clone(), &simulation_id, RUN_PLATFORM, &graph)?;
+    // Retain a handle to the graph the memory write-back mutates DURING the run. The updater
+    // (`GraphMemoryUpdater`) writes the entities/relations the swarm's activity teaches into
+    // this shared `Arc<Mutex<KnowledgeGraph>>`; the report (stage 5) must then run over THAT
+    // post-simulation graph — what the simulation learned — not the pre-sim one. Without this
+    // clone the only handle is moved into `start_simulation` and dropped here, so the
+    // write-back wrote into a graph nobody reads (the "agent LTM write-back unwired" gap).
+    // Cloning an `Option<Arc<_>>` is a refcount bump, not a graph copy.
+    let updater_handle = graph_for_updater.clone();
     let run_state = sim_runner
         .start_simulation(
             &simulation_id,
@@ -324,11 +332,26 @@ where
         "pipeline: simulation finished"
     );
 
+    // The graph the report reads. If the memory write-back produced an updated graph during
+    // the run, the report runs over THAT (the entities/edges the swarm taught it); otherwise
+    // it falls back to the pre-sim graph. This is what makes the LTM write-back observable in
+    // the verdict instead of being silently discarded.
+    let report_graph = resolve_report_graph(&graph, &updater_handle).await;
+    // Recompute the verdict's graph stats from the post-sim graph so a write-back that grows
+    // the graph is reflected in `verdict.json` (these shadow the pre-sim counts used above for
+    // the TaskManager registration, which intentionally records the as-built graph).
+    let graph_node_count = report_graph.entity_count();
+    let graph_edge_count = report_graph.relation_count();
+
     // ── Stage 5: report (ReACT over the graph tools) ─────────────────────────
-    tracing::info!("pipeline: generating report");
+    tracing::info!(
+        nodes = graph_node_count,
+        edges = graph_edge_count,
+        "pipeline: generating report over post-simulation graph"
+    );
     let mut report_agent = crate::report::ReportAgent::new_react(&graph_id, &simulation_id, query);
     let tools = crate::services::zep_tools::ReportTools::with_runner(
-        &graph,
+        &report_graph,
         &llm,
         Some(sim_runner.as_ref()),
     )
@@ -370,6 +393,23 @@ where
 /// `true` if the runner has reached a terminal lifecycle state.
 fn is_terminal(status: &RunnerStatus) -> bool {
     matches!(status, RunnerStatus::Completed | RunnerStatus::Stopped | RunnerStatus::Failed)
+}
+
+/// Resolve the graph the report should read.
+///
+/// The graph-memory write-back (`GraphMemoryUpdater`) mutates a shared
+/// `Arc<Mutex<KnowledgeGraph>>` handle *during* the simulation — the entities and relations the
+/// agents' activity teaches the graph. The report must run over THAT post-simulation graph so
+/// the simulation's learning reaches the verdict. Returns a clone of the updated graph when the
+/// write-back handle is present (graph-memory enabled), else a clone of the pre-sim `original`.
+async fn resolve_report_graph(
+    original: &KnowledgeGraph,
+    updater_handle: &Option<Arc<Mutex<KnowledgeGraph>>>,
+) -> KnowledgeGraph {
+    match updater_handle {
+        Some(handle) => handle.lock().await.clone(),
+        None => original.clone(),
+    }
 }
 
 /// Build the `RunInputs` for a single-platform run, in-process. This replicates the
@@ -426,4 +466,51 @@ where
         },
         Some(updater_handle),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::{Entity, EntityKind, KnowledgeGraph};
+    use uuid::Uuid;
+
+    fn entity(name: &str) -> Entity {
+        Entity { id: Uuid::new_v4(), name: name.to_string(), kind: EntityKind::Person }
+    }
+
+    /// When the write-back handle is present, the report graph is the POST-simulation graph
+    /// (the one the updater mutated), NOT the pre-sim original — proving the LTM write-back is
+    /// observable by the report rather than discarded.
+    #[tokio::test]
+    async fn resolve_report_graph_uses_post_sim_graph_when_handle_present() {
+        // Pre-sim graph: a single entity (what was extracted from the seed).
+        let mut original = KnowledgeGraph::new();
+        original.add_entity(entity("Jane Doe")).unwrap();
+        assert_eq!(original.entity_count(), 1);
+
+        // The shared handle the updater writes into — start it as a clone of `original`, then
+        // simulate the write-back teaching the graph two NEW entities during the run.
+        let handle: Arc<Mutex<KnowledgeGraph>> = Arc::new(Mutex::new(original.clone()));
+        {
+            let mut g = handle.lock().await;
+            g.add_entity(entity("Acme Corp")).unwrap();
+            g.add_entity(entity("Climate Policy")).unwrap();
+        }
+
+        let report_graph = resolve_report_graph(&original, &Some(Arc::clone(&handle))).await;
+        // The report sees the 3-entity post-sim graph, not the 1-entity pre-sim one.
+        assert_eq!(report_graph.entity_count(), 3, "report must read the post-sim graph");
+        // The original is untouched (we cloned out of the handle, not aliased it).
+        assert_eq!(original.entity_count(), 1, "pre-sim graph must be unchanged");
+    }
+
+    /// When graph-memory is disabled (no handle), the report falls back to the pre-sim graph.
+    #[tokio::test]
+    async fn resolve_report_graph_falls_back_to_original_when_no_handle() {
+        let mut original = KnowledgeGraph::new();
+        original.add_entity(entity("Jane Doe")).unwrap();
+
+        let report_graph = resolve_report_graph(&original, &None).await;
+        assert_eq!(report_graph.entity_count(), 1, "must fall back to the pre-sim graph");
+    }
 }
