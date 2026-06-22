@@ -96,11 +96,23 @@ only; envctl's data-plane phase). Until that phase lands, the vault registration
 
 ## Inference backend guard
 
-`teri run`/`serve` preflight the backend (`src/preflight.rs`): list `/models`, then a 1-token
-completion probe. Stub/canned backends are REFUSED — shimmy's SafeTensors engine returns
-"Full transformer inference coming soon!" and a swarm pointed at it would fabricate an entire
-simulation from canned text. Only GGUF-served (or real) backends pass. Extend `STUB_MARKERS` when
-new stub engines appear; never weaken the guard to make a run proceed.
+Both `teri run` **and** `teri serve` preflight the backend **fail-closed** through the single
+guard `preflight::verify_backend` (`src/main.rs::preflight_backend` is the shared call site) —
+`run` before the pipeline, `serve` before binding the socket. There is **one** guard; the former
+weaker `lib.rs::preflight_check_backend` (a `/health`-body scan that silently accepted unreachable
+backends and never guarded `serve`) was deleted — see [ADR-0004.1](docs/adr/adr-0004.1-backend-honesty-guard.md).
+
+The guard:
+1. `GET {LLM_BASE_URL}/models` — REFUSES an **unreachable** backend or one that **lists no models**.
+2. 1-token `/chat/completions` probe — REFUSES canned stub text (matched against `STUB_MARKERS`).
+   shimmy's SafeTensors engine returns "Full transformer inference coming soon!", and a swarm on
+   canned text fabricates an entire simulation. Markers only match engines that ignore `max_tokens`
+   (a real 1-token reply can't contain a multi-word marker), so false positives are impossible.
+
+Refusals exit 1 before any work: `inference backend unreachable …` / `backend … lists no models` /
+`REFUSING stub inference backend …`. `teri serve` therefore **refuses to boot** against a
+stub/unreachable backend. Extend `STUB_MARKERS` when a new stub engine appears; **never weaken the
+guard** to make a run proceed.
 
 ## Build, test, verify
 
