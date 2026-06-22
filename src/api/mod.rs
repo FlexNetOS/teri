@@ -362,14 +362,26 @@ impl ApiState {
         let graph_mgr = std::sync::Arc::new(crate::services::graph_memory::GraphMemoryManager::<
             crate::llm::OpenAiAdapter,
         >::with_vector_index(vector_index));
+        // Agent LTM write-back: reuse the shared graph-vector store + embedder so the monitor
+        // persists each agent utterance as chronological + semantic memory (per-agent namespace,
+        // distinct from the graph-fact namespace). `None` when the store is unavailable — agent
+        // memory is then disabled, byte-identical to before (keyless-safe, no-downgrade).
+        let agent_memory = graph_vectors.as_ref().map(|store| {
+            std::sync::Arc::new(crate::services::agent_memory::AgentMemoryWriter::new(
+                store.clone(),
+                embedder.clone(),
+            ))
+        });
         // Shared runner (U-022) — shares the SAME manager Arc (so state.json writes are
         // consistent) and uses the same sim-data dir as the manager.
-        let sim_runner =
-            std::sync::Arc::new(crate::services::simulation_runner::SimulationRunner::new(
+        let sim_runner = std::sync::Arc::new(
+            crate::services::simulation_runner::SimulationRunner::new(
                 std::path::PathBuf::from(&config.oasis_simulation_data_dir),
                 graph_mgr,
                 sim_manager.clone(),
-            ));
+            )
+            .with_agent_memory(agent_memory),
+        );
 
         Self { config, sim_manager, sim_runner, graph_vectors, embedder }
     }
