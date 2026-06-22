@@ -61,3 +61,7 @@ perf.data.old
 .harness-mem/
 Plans.md
 out/
+
+# Copilot Superpowers - installed skills (local only, not tracked by git)
+.agent/skills/
+.agent/skills-catalog.md
