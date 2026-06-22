@@ -7,6 +7,8 @@ Audit Teri's simulation/prediction capability claim for:
 
 QUESTION: $QUESTION
 
+Codex command rule: run repo commands through `rtk` (`rtk rg`, `rtk cargo`, `rtk git`, `rtk bash -lc`, etc.).
+
 Use this structure:
 
 1. Source truth
@@ -26,6 +28,6 @@ Use this structure:
    - Do not paper over limits with wording. Either implement a capability or document the boundary.
 
 5. Verification
-   - Run `rg` for stale docs, plus `cargo check`/targeted tests or explain why they were not run.
+   - Run `rtk rg` for stale docs, plus `rtk cargo check`/targeted tests or explain why they were not run.
 
 Never present report `confidence` as calibrated probability unless a calibration/evaluation implementation is present and cited.

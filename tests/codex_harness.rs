@@ -6,6 +6,8 @@
 
 use serde_json::Value;
 use std::collections::HashSet;
+use std::ffi::OsString;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -17,12 +19,38 @@ fn read_repo(path: &str) -> String {
     std::fs::read_to_string(repo_root().join(path)).expect(path)
 }
 
+fn host_rtk_available() -> bool {
+    Command::new("rtk").arg("--version").output().is_ok()
+}
+
+fn rtk_path_env() -> Option<(tempfile::TempDir, OsString)> {
+    if host_rtk_available() {
+        return None;
+    }
+
+    let tmp = tempfile::tempdir().expect("rtk shim tempdir");
+    let shim = tmp.path().join("rtk");
+    std::fs::write(&shim, "#!/usr/bin/env bash\nexec \"$@\"\n").expect("write rtk shim");
+    let mut perms = std::fs::metadata(&shim).expect("rtk shim metadata").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&shim, perms).expect("chmod rtk shim");
+
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![tmp.path().to_path_buf()];
+    paths.extend(std::env::split_paths(&old_path));
+    let path = std::env::join_paths(paths).expect("join PATH with rtk shim");
+    Some((tmp, path))
+}
+
 fn run_truth_hook(root: &Path) -> Value {
-    let output = Command::new("bash")
-        .arg(".codex/hooks/teri-context-session-start.sh")
-        .current_dir(root)
-        .output()
-        .expect("run teri truth hook");
+    let rtk_env = rtk_path_env();
+    let mut command = Command::new("rtk");
+    command.arg("bash").arg(".codex/hooks/teri-context-session-start.sh");
+    if let Some((_tmp, path)) = &rtk_env {
+        command.env("PATH", path);
+    }
+
+    let output = command.current_dir(root).output().expect("run teri truth hook");
 
     assert!(
         output.status.success(),
@@ -54,9 +82,34 @@ fn hooks_json_wires_truth_hook_for_session_and_compaction() {
             "{event_name} should run the teri truth hook, got {command:?}"
         );
         assert!(
+            command.starts_with("rtk bash -lc "),
+            "{event_name} should route through rtk bash, got {command:?}"
+        );
+        assert!(
+            command.contains("rtk git rev-parse --show-toplevel"),
+            "{event_name} should resolve the repo through rtk git, got {command:?}"
+        );
+        assert!(
             !command.contains("/home/"),
             "hook command should be repo-relative, got {command:?}"
         );
+    }
+}
+
+#[test]
+fn codex_runtime_files_route_commands_through_rtk() {
+    let hooks_script = read_repo(".codex/hooks/teri-context-session-start.sh");
+    assert!(hooks_script.contains("rtk git rev-parse --show-toplevel"));
+    assert!(hooks_script.contains("rtk python3 - <<'PY'"));
+    assert!(!hooks_script.contains("$(git rev-parse"));
+    assert!(!hooks_script.contains("\npython3 -"));
+
+    for path in [".codex/prompts/teri-docs-sync.md", ".codex/prompts/teri-simulation-truth.md"] {
+        let prompt = read_repo(path);
+        assert!(prompt.contains("Codex command rule: run repo commands through `rtk`"));
+        assert!(!prompt.contains("\nrg -n "), "{path} should use rtk rg");
+        assert!(!prompt.contains("`cargo "), "{path} should use rtk cargo");
+        assert!(!prompt.contains(" plus `cargo "), "{path} should use rtk cargo");
     }
 }
 

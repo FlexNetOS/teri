@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+root="$(rtk git rev-parse --show-toplevel 2>/dev/null || printf '%s\n' "$PWD")"
 cd "$root"
 
-python3 - <<'PY'
+rtk python3 - <<'PY'
 import json
 from pathlib import Path
 
