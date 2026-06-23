@@ -213,8 +213,15 @@ Status: ☑ done · ☐ open. Priority groups top→bottom.
   (`pebesen` binary, `/health` verified live). The loop is LIVE end-to-end over HTTP.
   *(Follow-on: mount the DB-backed `pebesen-api` routes alongside it once that crate exposes a
   `Router` + `DATABASE_URL`.)*
-- ☐ **TASK-SEAM-2** — sqlx/postgres-backed `IntelligenceStore` (make it a trait, in-memory + Postgres
-  impls; tables `predictions`, `prediction_actions` per the inline `// SQLX SLOT:` markers).
+- ☑ **TASK-SEAM-2** — `PredictionStore` async trait (`async-trait`) with two impls: the existing
+  in-memory `IntelligenceStore` (additive — its sync API and all current callers, incl. the http
+  router + teri E2E, are untouched) and a new feature-gated `pg::PgStore` (sqlx 0.8) over tables
+  `predictions` + `prediction_actions` (DDL = `pg::SCHEMA`, per the `// SQLX SLOT:` markers). The
+  `accuracy`/`confidence_adjustment` math is factored into `SpaceCalibration::from_counts` so the SQL
+  aggregate and the in-memory fold can't diverge. Queries are sqlx **runtime** queries (no `query!`
+  macro) → compiles in CI under `--all-features` with **no** live DB / `.sqlx` cache. One shared
+  `tests/store_behavior.rs` contract runs against in-memory (always) and `PgStore` (gated on
+  `TEST_DATABASE_URL`). 8 lib + 2 behavior tests green; clippy `--all-features --all-targets` clean. *(S4)*
 - 🟡 **TASK-SEAM-3** — loop E2E: feedback half DONE (`tests/community_loop_e2e.rs` — teri feedback →
   real receiver → store → action → calibration, over real HTTP; ingest via mocked pebesen read API).
   Remaining: the LLM-backed pipeline middle (signal → seed → …pipeline… → report → feedback) as a

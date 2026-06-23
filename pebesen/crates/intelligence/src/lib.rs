@@ -33,6 +33,10 @@ use uuid::Uuid;
 
 pub mod http;
 
+/// sqlx/Postgres-backed [`PredictionStore`] (feature `postgres`).
+#[cfg(feature = "postgres")]
+pub mod pg;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Payload types — mirror teri's pushed predictions (no teri dependency)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -157,6 +161,41 @@ pub struct SpaceCalibration {
     pub confidence_adjustment: f64,
 }
 
+impl SpaceCalibration {
+    /// Build a [`SpaceCalibration`] from raw counts. The `accuracy` and
+    /// `confidence_adjustment` derivation lives here so every store impl
+    /// (in-memory, Postgres) produces byte-identical calibration from the same
+    /// counts — the SQL aggregate and the in-memory fold must never diverge.
+    pub fn from_counts(
+        domain_id: &str,
+        total_predictions: usize,
+        actioned: usize,
+        scored: usize,
+        accurate: usize,
+    ) -> Self {
+        let accuracy = if scored > 0 {
+            Some(accurate as f64 / scored as f64)
+        } else {
+            None
+        };
+        // Confidence adjustment: 0.5 + accuracy, clamped to [0.5, 1.5]. No
+        // evidence (no scored outcomes) → neutral 1.0.
+        let confidence_adjustment = match accuracy {
+            Some(acc) => (0.5 + acc).clamp(0.5, 1.5),
+            None => 1.0,
+        };
+        Self {
+            domain_id: domain_id.to_string(),
+            total_predictions,
+            actioned,
+            scored,
+            accurate,
+            accuracy,
+            confidence_adjustment,
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Errors
 // ─────────────────────────────────────────────────────────────────────────────
@@ -170,6 +209,10 @@ pub enum IntelligenceError {
     /// re-panicking so callers (e.g. axum handlers) can map it to a 500.
     #[error("intelligence store lock poisoned")]
     LockPoisoned,
+    /// A storage-backend error (e.g. Postgres/sqlx failure or a payload that
+    /// failed to (de)serialize). Carries the underlying message; mapped to a 500.
+    #[error("storage backend error: {0}")]
+    Storage(String),
 }
 
 type Result<T> = std::result::Result<T, IntelligenceError>;
@@ -341,28 +384,79 @@ impl IntelligenceStore {
             }
         }
 
-        let accuracy = if scored > 0 {
-            Some(accurate as f64 / scored as f64)
-        } else {
-            None
-        };
-
-        // Confidence adjustment: 0.5 + accuracy, clamped to [0.5, 1.5]. No
-        // evidence (no scored outcomes) → neutral 1.0.
-        let confidence_adjustment = match accuracy {
-            Some(acc) => (0.5 + acc).clamp(0.5, 1.5),
-            None => 1.0,
-        };
-
-        Ok(SpaceCalibration {
-            domain_id: domain_id.to_string(),
+        Ok(SpaceCalibration::from_counts(
+            domain_id,
             total_predictions,
             actioned,
             scored,
             accurate,
-            accuracy,
-            confidence_adjustment,
-        })
+        ))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Async store trait — one contract, two backends (in-memory + Postgres)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The prediction-receiver storage contract, async so it covers both the
+/// in-memory [`IntelligenceStore`] and the sqlx/Postgres [`pg::PgStore`]
+/// (feature `postgres`). The receiver loop programs against this trait so the
+/// backing store is swappable without touching the HTTP layer or teri's seam.
+///
+/// The method set mirrors [`IntelligenceStore`]'s inherent methods exactly; the
+/// in-memory impl just awaits ready futures over the same sync logic, so the two
+/// backends are behaviorally identical (verified by the shared behavior test).
+#[async_trait::async_trait]
+pub trait PredictionStore: Send + Sync {
+    /// Ingest one prediction (assigns id + ingest time).
+    async fn ingest(&self, payload: PredictionKind) -> Result<Prediction>;
+
+    /// Ingest a batch; default folds over [`ingest`](Self::ingest).
+    async fn ingest_batch(&self, payloads: Vec<PredictionKind>) -> Result<Vec<Prediction>> {
+        let mut out = Vec::with_capacity(payloads.len());
+        for p in payloads {
+            out.push(self.ingest(p).await?);
+        }
+        Ok(out)
+    }
+
+    /// All predictions scoped to a space, newest first.
+    async fn list_by_space(&self, domain_id: &str) -> Result<Vec<Prediction>>;
+
+    /// All topic-signal predictions for a topic, newest first.
+    async fn list_by_topic(&self, topic_id: &str) -> Result<Vec<Prediction>>;
+
+    /// Record an actioned outcome; fail-closed on an unknown prediction id.
+    async fn record_action(
+        &self,
+        prediction_id: Uuid,
+        accurate: Option<bool>,
+    ) -> Result<PredictionAction>;
+
+    /// Compute the [`SpaceCalibration`] for a space.
+    async fn calibration(&self, domain_id: &str) -> Result<SpaceCalibration>;
+}
+
+#[async_trait::async_trait]
+impl PredictionStore for IntelligenceStore {
+    async fn ingest(&self, payload: PredictionKind) -> Result<Prediction> {
+        IntelligenceStore::ingest(self, payload)
+    }
+    async fn list_by_space(&self, domain_id: &str) -> Result<Vec<Prediction>> {
+        IntelligenceStore::list_by_space(self, domain_id)
+    }
+    async fn list_by_topic(&self, topic_id: &str) -> Result<Vec<Prediction>> {
+        IntelligenceStore::list_by_topic(self, topic_id)
+    }
+    async fn record_action(
+        &self,
+        prediction_id: Uuid,
+        accurate: Option<bool>,
+    ) -> Result<PredictionAction> {
+        IntelligenceStore::record_action(self, prediction_id, accurate)
+    }
+    async fn calibration(&self, domain_id: &str) -> Result<SpaceCalibration> {
+        IntelligenceStore::calibration(self, domain_id)
     }
 }
 
