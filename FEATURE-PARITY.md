@@ -1,0 +1,174 @@
+# Teri ↔ MiroFish Feature Parity Ledger
+
+**Ground truth:** MiroFish (`/meta-yard/MiroFish`, Python + Vue, AGPL-3.0).
+**Target:** teri (this repo, Rust). Teri is the *upgrade* — every MiroFish capability is a
+requirement; teri must match or exceed it.
+
+This ledger is the authoritative parity surface (supersedes the stale `MIROFISH-PORT-PLAN.md`
+matrix; complements `RUNBOOK.md` §12). It was produced by a per-area audit reading both repos with
+file:line evidence on each side. Status legend: ✅ full · 🟡 partial · ❌ missing · ➕ teri exceeds.
+
+## Verdict
+
+| Area | Result |
+|---|---|
+| **Backend HTTP API + persistence** | ✅ **100% parity** — every MiroFish route (10 graph + 31 simulation + 18 report + `/health`) has a teri equivalent. ➕ teri adds 4 SSE routes MiroFish lacks. |
+| **Stage 1-2: Graph build + Environment setup** | 🟡 Structurally full; **simulation-quality gaps** in persona generation (memory injection, randomization, bilingual two-prompt strategy). |
+| **Stage 3: Simulation** | ✅ Full + ➕ exceeds (per-tick God's-eye injection). 3 real gaps (action-split, enriched action args, shutdown hook). |
+| **Stage 4-5: Report + Deep interaction** | ✅ Full + ➕ exceeds (5th tool, semantic insight_forge, SSE). Residual = shared/serve-provider items. |
+| **Web UI** | ❌ **MISSING ENTIRELY** — the one structural downgrade vs MiroFish. Backend endpoints to drive it already exist. |
+
+**Bottom line:** the backend is a real, near-complete port (the "port complete" claim was honest at
+the *engine* layer). The bluff was the **missing UI** and the fabricated-looking community docs (now
+resolved: pebesen is vendored in). The headline remaining work is the **Vue 3 frontend**.
+
+---
+
+## 1. Backend API + Persistence — ✅ 100%
+
+Flask blueprints (`/api/{graph,simulation,report}` + `/health`) → axum routers
+(`src/server.rs:194-205`). All 59 routes matched by purpose and shape. No ❌, no 🟡.
+
+➕ **Teri exceeds** with real Server-Sent-Events (MiroFish only chunked-polls):
+- `GET /api/report/:id/agent-log/sse` (`report.rs:79`)
+- `GET /api/report/:id/console-log/sse` (`report.rs:80`)
+- `GET /api/report/:id/events` (`report.rs:83`)
+- `GET /api/simulation/:id/ticks/sse` (`simulation.rs:163`, backed by `api/streaming.rs:33-140`)
+
+*Caveat:* route presence/purpose confirmed; field-level request/response byte-parity for the heavy
+handlers (`graph/build`, `simulation/prepare`, `simulation/start`, `report/generate`, `report/chat`)
+is covered by the stage audits below, not byte-diffed here.
+
+---
+
+## 2. Stage 1-2: Graph Building + Environment Setup — 🟡
+
+Pipeline is wired end-to-end (ontology → graph build → entity read → persona → sim-config) and the
+config-generation layer is value-exact. Gaps are concentrated in **persona generation quality**.
+
+### Teri must build
+1. **Persona memory injection** *(highest sim-quality impact)* — teri's English persona prompt
+   (`agent/mod.rs:1404-1426`) omits the 个人记忆/机构记忆 section that ties each agent to the event
+   and its prior actions/reactions (`oasis_profile_generator.py:710,759`). This *is* the stage-1
+   "individual/collective memory injection."
+2. **Bilingual two-prompt persona strategy** — individual-vs-group prompt selection, system prompt,
+   `response_format=json_object`, temperature ramp (0.7−attempt×0.1), 3-attempt loop,
+   `finish_reason=="length"` truncation detection (`oasis_profile_generator.py:497-772`). Teri does
+   a single English single-shot prompt.
+3. **Persona randomization** — restore random counter ranges (karma 500-5000, etc.) and random
+   age/gender/mbti/country in rule-based branches (`oasis_profile_generator.py:262-265,786-845`).
+   Teri uses fixed/deterministic values → profiles aren't varied.
+4. **Constants + missing branches** — `MBTI_TYPES`/`COUNTRIES`/`INDIVIDUAL`/`GROUP_ENTITY_TYPES`
+   (`oasis_profile_generator.py:156-179`); add `socialmediaplatform` arm, split `mediaoutlet`.
+5. **Per-entity context search enrichment** (`_search_zep_for_entity`,
+   `oasis_profile_generator.py:286-412`) — wire teri's semantic-recall/graph-search to enrich
+   persona context (fact dedup in `_build_entity_context`).
+6. **`set_ontology` reserved-names remap + source_targets edge constraints**
+   (`graph_builder.py:216-285`) — teri registers type names only.
+7. **`json_object`/`finish_reason` request shape** in `_call_llm_with_retry`
+   (`simulation_config.rs:1221-1270` + persona path) — `LlmClient` can't yet request structured
+   output; output-equivalent via salvage today.
+
+*Intentional non-gaps (`[≠]`, do not build):* `create_graph`/`delete_graph`/`add_text_batches`/
+`_wait_for_episodes`/`generate_python_code`/pagination/backoff — Zep-server artifacts inapplicable to
+teri's in-process petgraph substrate.
+
+---
+
+## 3. Stage 3: Simulation — ✅ + ➕
+
+Tick loop, time-of-day activation policy, dual-platform parallelism, dual-LLM (boost) routing,
+graph-memory write-back, IPC/interview surface, and temporal feed-back all full. ➕ teri **exceeds**
+with a per-tick God's-eye `inject_fn` MiroFish lacks.
+
+### Teri must build
+1. **Per-platform action availability split** — MiroFish gates `TWITTER_ACTIONS` (6) vs
+   `REDDIT_ACTIONS` (13) at graph build (`run_parallel_simulation.py:178-202,1141,1332`). Teri's
+   `SocialAction` enum (`sim/mod.rs:43-69`) is platform-agnostic with no decision-time gate → a
+   Twitter agent could emit Reddit-only actions. Add an allowed-action set per platform.
+2. **Enriched `action_args` in actions.jsonl** — MiroFish enriches records with
+   `post_content`/`author_name`/`quote_content`/`comment_content`/`target_user_name`
+   (`run_parallel_simulation.py:749-981`). Teri emits structural args only (`sim/mod.rs:136-156`).
+   Teri already holds posts/comments/users in `social_world.rs` — resolve these at log time so
+   episode-text fidelity and UI consumers match (real downgrade, not just substrate).
+3. **`register_cleanup` shutdown hook** — MiroFish registers SIGTERM/SIGINT/SIGHUP + atexit →
+   `cleanup_all_simulations` (`simulation_runner.py:1287-1358`). Teri has `cleanup_all`
+   (`simulation_runner.rs:1413`) but no signal registration → orphaned sims on `teri serve`
+   shutdown. Add a tokio signal / axum graceful-shutdown hook.
+
+---
+
+## 4. Stage 4-5: Report + Deep Interaction — ✅ + ➕
+
+Every ReportAgent tool (insight_forge, panorama_search, quick_search, interview_agents) + the ReACT
+loop + report persistence + all interview/chat flows are full. ➕ teri exceeds: a 5th native tool
+`recall_agent_discussion`, a semantic (cosine) insight_forge variant over the redb embedding store,
+and SSE progress streams.
+
+### Teri must build
+1. **Social-DB writer (shared gap)** — `/interview/history`, `/posts`, `/comments` read logic is
+   ported but populated results need the `sqlite` feature + the OASIS-equivalent social-DB
+   *producer* (GAP-U026-SOCIALDB). MiroFish has the same dependency. Land the producer; ship serve
+   with `sqlite` enabled.
+2. **Provider-agnostic `serve` path** — the live report-interview IPC seam is wired but typed
+   `SimulationRunner<OpenAiAdapter>` (`api/report.rs:1178`). Matches the known CLAUDE.md gap
+   (serve's `ApiState` is OpenAI-concrete while `teri run` is provider-selected). Generalize so
+   Anthropic/Gemini-backed sims support deep interaction under `serve`.
+
+---
+
+## 5. Web UI — ❌ MISSING (the headline gap)
+
+Teri has **no `frontend/`**. MiroFish ships a Vue 3 SPA (`frontend/`, vue-router + vue-i18n + d3 +
+axios) — a guided 5-step prediction studio. **Teri's backend already exposes the full endpoint
+surface the UI needs** (incl. SSE), so this is a near-pure frontend build.
+
+### Teri must build (UI)
+**A. Scaffold/tooling** — Vue 3 + Vite project under `frontend/`; deps `vue@^3.5`, `vue-router@^4`,
+`vue-i18n@^11`, `axios@^1`, `d3@^7`; `vite.config` aliases + dev proxy `/api → teri serve`;
+`index.html` + `main.js` + `App.vue`.
+
+**B. Router** — 6 named routes: Home `/`, Process `/process/:projectId`,
+Simulation `/simulation/:simulationId`, SimulationRun `/simulation/:simulationId/start`,
+Report `/report/:reportId`, Interaction `/interaction/:reportId` (`createWebHistory`, `props:true`).
+
+**C. API layer** — axios instance with `Accept-Language` interceptor, `{success,data,error}`
+envelope unwrap, `requestWithRetry`; modules `api/{graph,simulation,report}.js` (~30 fns).
+**Verify teri returns the `{success,data,error}` envelope**; adapt interceptor if not.
+
+**D. Store** — `pendingUpload` (carry files+requirement Home→Process).
+
+**E. i18n** — vue-i18n; reuse MiroFish `locales/{languages.json,en.json,zh.json}` as spec (en/zh).
+
+**F. Views (6)** — Home, MainView(Process), SimulationView, SimulationRunView, ReportView,
+InteractionView — 3-mode layout switcher + step header + GraphPanel host + polling per element.
+
+**G. Components (8)**
+- **`GraphPanel.vue` — the d3 force-directed graph viz (highest-effort item):** forceSimulation
+  (link/charge/center/collision), zoom/pan (scaleExtent 0.2–4), node drag, entity-type color scale,
+  edge labels, node/edge detail panel (attributes/summary/labels/facts/episodes/self-loop grouping),
+  legend, live-update hints, refresh/maximize emits. (Source D3 from `Process.vue` + `GraphPanel.vue`.)
+- `HistoryDatabase.vue` (history card gallery + replay modal),
+  `Step1GraphBuild`, `Step2EnvSetup` (realtime persona/config preview),
+  `Step3Simulation` (start/stop + run-status detail + trigger report),
+  `Step4Report` (incremental log tail), `Step5Interaction` (chat + batch interview),
+  `LanguageSwitcher`.
+
+**H. ➕ Adopt teri's SSE upgrades** — replace MiroFish's `from_line` log polling (Step4/Step5) and
+30s graph re-polling (SimulationRun) with teri's EventSource SSE endpoints (`/agent-log/sse`,
+`/console-log/sse`, `/events`, `/ticks/sse`).
+
+---
+
+## Consolidated build backlog (priority order)
+
+1. **Web UI** — Vue 3 SPA (scaffold → router/api/i18n → GraphPanel d3 viz → 6 views + 8 components).
+   *Biggest gap, backend-ready.*
+2. **Persona memory injection + bilingual two-prompt strategy + randomization** (Stage 1-2 #1-3) —
+   biggest simulation-fidelity gap.
+3. **Per-platform action split** + **enriched action_args** (Stage 3 #1-2) — sim correctness/fidelity.
+4. **Social-DB producer + `sqlite`-default serve** (Stage 4-5 #1) — unlocks posts/comments/history.
+5. **Provider-agnostic `serve` ApiState** (Stage 4-5 #2) — Anthropic/Gemini under serve.
+6. **`register_cleanup` shutdown hook** (Stage 3 #3) — no orphaned sims.
+7. **Persona/config `json_object`+`finish_reason`, ontology reserved-names/edge constraints,
+   per-entity search enrichment** (Stage 1-2 #4-7) — refinements.
