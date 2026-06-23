@@ -192,8 +192,12 @@ Status: ☑ done · ☐ open. Priority groups top→bottom.
   scoped to `/api/*` (not `/health`), `Accept-Language` (en/zh) honored, teri-branded `/health`. All
   assertions pass against the running engine on the first run (no mismatch found); the one-time manual
   smoke is now a regression gate. *(S1)*
-- ☐ **TASK-UI-2** — adopt teri's SSE endpoints in the UI (EventSource for `/agent-log/sse`,
-  `/console-log/sse`, `/events`, `/ticks/sse`) replacing MiroFish's `from_line`/30s polling.
+- ☑ **TASK-UI-2** — UI adopts teri's SSE endpoints via a shared `api/sse.js` (`openSse` helper with
+  named-event handlers + automatic polling fallback on connection failure). `Step4Report.vue` now
+  streams `/agent-log/sse` + `/console-log/sse` (the per-log handlers were extracted so SSE and the
+  polling fallback share one code path); `SimulationRunView.vue` streams `/ticks/sse` to refresh the
+  graph per tick instead of MiroFish's blind 30s poll. Each stream falls back to the original
+  `from_line`/30s polling if SSE can't connect (no-downgrade). `npm run build` green. *(S2)*
 - ☐ **TASK-UI-3** — teri-native branding pass (replace the renamed MiroFish logo with a teri mark);
   split the large d3 chunk; resolve the `pendingUpload.js` dual-import warning.
 
