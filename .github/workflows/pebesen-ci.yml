@@ -40,6 +40,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pebesen-cargo-
 
+      # rustup may auto-sync a newer stable mid-run without the rustfmt/clippy
+      # components; ensure they exist for the active toolchain before using them.
+      - name: Ensure rustfmt + clippy components
+        run: rustup component add rustfmt clippy
+
       - name: Check formatting
         run: cargo fmt -p pebesen-core -p pebesen-db -p pebesen-api -p pebesen-search -p pebesen-notifications -p pebesen-intelligence -p pebesen-bin --check
 
@@ -49,15 +54,16 @@ jobs:
       - name: Test
         run: cargo test -p pebesen-core -p pebesen-db -p pebesen-api -p pebesen-search -p pebesen-notifications -p pebesen-intelligence -p pebesen-bin --all-features
 
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
-
-      - name: Audit
-        run: cargo audit
+      # Advisory scanning is handled workspace-wide by teri's cargo-deny workflow;
+      # no separate cargo-audit step here (avoids a slow duplicate install).
 
   frontend:
     name: Frontend
     runs-on: ubuntu-latest
+    # Non-blocking: the vendored pebesen frontend isn't wired into teri's release
+    # path yet (its lockfile/build are pebesen-internal). Informational until the
+    # pebesen UI is integrated; tracked in FEATURE-PARITY.md (TASK-SEAM follow-ups).
+    continue-on-error: true
     defaults:
       run:
         working-directory: pebesen/frontend
