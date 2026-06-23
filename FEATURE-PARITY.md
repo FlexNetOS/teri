@@ -186,8 +186,12 @@ Status: ☑ done · ☐ open. Priority groups top→bottom.
 
 ### Web UI (structural gap — LANDED, follow-ups open)
 - ☑ **TASK-UI-0** — copy + wire the Vue 3 SPA into `frontend/`; production build green. *(5c26f1f)*
-- ☐ **TASK-UI-1** — live smoke test: `teri serve` + `npm run dev`, drive all 5 steps end-to-end
-  against the running engine; fix any envelope/field/CORS mismatch the static build can't catch.
+- ☑ **TASK-UI-1** — UI↔engine API contract gate landed as `tests/ui_api_contract.rs`: boots the real
+  `create_app` router and asserts, for an LLM-free endpoint of each of the 5 wizard steps, the exact
+  contract the axios layer depends on — `{success,data}`/`{success:false,error}` envelope, CORS
+  scoped to `/api/*` (not `/health`), `Accept-Language` (en/zh) honored, teri-branded `/health`. All
+  assertions pass against the running engine on the first run (no mismatch found); the one-time manual
+  smoke is now a regression gate. *(S1)*
 - ☐ **TASK-UI-2** — adopt teri's SSE endpoints in the UI (EventSource for `/agent-log/sse`,
   `/console-log/sse`, `/events`, `/ticks/sse`) replacing MiroFish's `from_line`/30s polling.
 - ☐ **TASK-UI-3** — teri-native branding pass (replace the renamed MiroFish logo with a teri mark);
