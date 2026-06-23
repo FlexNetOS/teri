@@ -71,7 +71,9 @@ impl IntoResponse for IntelligenceError {
     fn into_response(self) -> Response {
         let status = match self {
             IntelligenceError::UnknownPrediction(_) => StatusCode::NOT_FOUND,
-            IntelligenceError::LockPoisoned => StatusCode::INTERNAL_SERVER_ERROR,
+            IntelligenceError::LockPoisoned | IntelligenceError::Storage(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         };
         let body = Json(serde_json::json!({ "success": false, "error": self.to_string() }));
         (status, body).into_response()
