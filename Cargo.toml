@@ -104,6 +104,10 @@ tokio-test = "0.4"
 pretty_assertions = "1"
 tempfile = "3"
 httpmock = "0.7"
+# Dev-only: drive the REAL pebesen intelligence receiver in-process for the
+# teri<->pebesen end-to-end loop test (tests/community_loop_e2e.rs). This is a
+# TEST dependency only — the runtime seam stays HTTP-decoupled (no prod dep).
+pebesen-intelligence = { path = "pebesen/crates/intelligence" }
 
 [profile.release]
 opt-level = 3

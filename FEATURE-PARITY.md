@@ -196,13 +196,17 @@ Status: ☑ done · ☐ open. Priority groups top→bottom.
 ### teri↔pebesen community seam (structural gap — LANDED, follow-ups open)
 - ☑ **TASK-SEAM-0** — `CommunityAdapter`/`CommunityFeedback` + `PebesenAdapter`/`PebesenFeedback`
   in teri; pebesen `intelligence` prediction receiver (`IntelligenceStore` + calibration). *(398ea9d)*
-- ☐ **TASK-SEAM-1** — wire pebesen's router: `bin/main.rs` is still "Hello world" with no `Router`;
-  mount the `api` crate + the new `/api/intelligence/*` receiver endpoints so feedback actually lands.
-  (The adapter's route paths are inferred — reconcile once the router exists.)
+- ☑ **TASK-SEAM-1** — pebesen router wired: `pebesen_intelligence::http::router` mounts the
+  `/api/intelligence/*` receiver + read endpoints; `pebesen-bin` is now a real axum server
+  (`pebesen` binary, `/health` verified live). The loop is LIVE end-to-end over HTTP.
+  *(Follow-on: mount the DB-backed `pebesen-api` routes alongside it once that crate exposes a
+  `Router` + `DATABASE_URL`.)*
 - ☐ **TASK-SEAM-2** — sqlx/postgres-backed `IntelligenceStore` (make it a trait, in-memory + Postgres
   impls; tables `predictions`, `prediction_actions` per the inline `// SQLX SLOT:` markers).
-- ☐ **TASK-SEAM-3** — end-to-end loop test: pebesen signal → teri `CommunityAdapter` → pipeline →
-  report → `CommunityFeedback` → pebesen receiver → `report_actioned` → calibration delta.
+- 🟡 **TASK-SEAM-3** — loop E2E: feedback half DONE (`tests/community_loop_e2e.rs` — teri feedback →
+  real receiver → store → action → calibration, over real HTTP; ingest via mocked pebesen read API).
+  Remaining: the LLM-backed pipeline middle (signal → seed → …pipeline… → report → feedback) as a
+  gated integration test against a mock inference backend.
 
 ### Autonomy (L2–L5, see docs/AGENTIC-STORY.md)
 - ☐ **TASK-AUTO-1** — autonomy orchestrator (DECIDE layer): watch adapters, debounce signal deltas

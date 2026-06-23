@@ -31,6 +31,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
+pub mod http;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Payload types — mirror teri's pushed predictions (no teri dependency)
 // ─────────────────────────────────────────────────────────────────────────────
