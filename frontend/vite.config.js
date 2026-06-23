@@ -23,5 +23,18 @@ export default defineConfig({
         secure: false
       }
     }
+  },
+  build: {
+    rollupOptions: {
+      output: {
+        // Split heavy vendor libs into their own chunks so d3 (only used by GraphPanel) and the
+        // Vue framework are cached separately instead of inflating the main entry chunk — resolves
+        // the ">500 kB chunk" warning by giving the bundler explicit split points.
+        manualChunks: {
+          d3: ['d3'],
+          vue: ['vue', 'vue-router', 'vue-i18n']
+        }
+      }
+    }
   }
 })
