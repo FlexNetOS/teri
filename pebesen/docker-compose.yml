@@ -1,0 +1,106 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: pebesen_postgres
+    environment:
+      POSTGRES_DB: pebesen
+      POSTGRES_USER: pebesen
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pebesen_dev_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - pebesen_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pebesen -d pebesen"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: pebesen_redis
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - pebesen_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  meilisearch:
+    image: getmeili/meilisearch:latest
+    container_name: pebesen_meilisearch
+    environment:
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-pebesen_dev_master_key}
+      MEILI_ENV: development
+    ports:
+      - "7701:7700"
+    volumes:
+      - meilisearch_data:/meili_data
+    networks:
+      - pebesen_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # caddy:
+  #   image: caddy:alpine
+  #   container_name: pebesen_caddy
+  #   ports:
+  #     - "3000:3000"
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - ./Caddyfile:/etc/caddy/Caddyfile:ro
+  #     - caddy_data:/data
+  #     - caddy_config:/config
+  #   networks:
+  #     - pebesen_net
+  #   depends_on:
+  #     - postgres
+  #     - redis
+  #     - meilisearch
+
+  # Application service (commented out until Phase 0 build)
+  # app:
+  #   build: .
+  #   container_name: pebesen_app
+  #   environment:
+  #     DATABASE_URL: ${DATABASE_URL}
+  #     REDIS_URL: redis://redis:6379
+  #     MEILISEARCH_URL: http://meilisearch:7700
+  #     MEILISEARCH_MASTER_KEY: ${MEILI_MASTER_KEY}
+  #     JWT_SECRET: ${JWT_SECRET}
+  #     SERVER_HOST: 0.0.0.0
+  #     SERVER_PORT: 3000
+  #     FRONTEND_URL: http://localhost:3000
+  #   ports:
+  #     - "3000:3000"
+  #   networks:
+  #     - pebesen_net
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #     meilisearch:
+  #       condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
+  meilisearch_data:
+  caddy_data:
+  caddy_config:
+
+networks:
+  pebesen_net:
+    driver: bridge
