@@ -1,0 +1,18 @@
+# Clippy configuration
+# These are project-specific rules that override default clippy behavior
+
+# Cognitive complexity limit
+cognitive-complexity-threshold = 30
+
+# Type complexity limit
+type-complexity-threshold = 250
+
+# Too many arguments threshold
+too-many-arguments-threshold = 7
+
+# Too many lines threshold
+too-many-lines-threshold = 100
+
+# Avoid certain pedantic lints that are too noisy for this project
+avoid-breaking-exported-api = true
+allowed-prefixes = ["to", "as", "into", "from", "with", "without"]

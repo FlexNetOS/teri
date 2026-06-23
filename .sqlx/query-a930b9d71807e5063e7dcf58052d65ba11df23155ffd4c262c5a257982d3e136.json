@@ -1,0 +1,61 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO users (email, username, display_name, password_hash, settings)\n        VALUES ($1, $2, $3, $4, '{}')\n        RETURNING id, username, display_name, email, password_hash, created_at, settings\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "username",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "display_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "email",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "password_hash",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "settings",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "a930b9d71807e5063e7dcf58052d65ba11df23155ffd4c262c5a257982d3e136"
+}

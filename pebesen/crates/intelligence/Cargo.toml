@@ -1,0 +1,16 @@
+[package]
+name = "pebesen-intelligence"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Prediction-receiver types + in-memory store. Mirrors teri's pushed payloads
+# WITHOUT depending on teri (the seam is HTTP/JSON; this crate owns its own types).
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.0", features = ["serde", "v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1.0"
+# HTTP receiver router (the pebesen-side half of the live teri<->pebesen loop).
+axum = "0.7"

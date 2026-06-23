@@ -104,6 +104,10 @@ tokio-test = "0.4"
 pretty_assertions = "1"
 tempfile = "3"
 httpmock = "0.7"
+# Dev-only: drive the REAL pebesen intelligence receiver in-process for the
+# teri<->pebesen end-to-end loop test (tests/community_loop_e2e.rs). This is a
+# TEST dependency only — the runtime seam stays HTTP-decoupled (no prod dep).
+pebesen-intelligence = { path = "pebesen/crates/intelligence" }
 
 [profile.release]
 opt-level = 3
@@ -115,3 +119,16 @@ default = []
 sqlite = ["rusqlite"]
 
 [workspace]
+# teri is the root package; the pebesen community-platform crates are vendored members.
+# `default-members` keeps bare `cargo build`/`test`/`clippy` scoped to teri so the engine's
+# normal workflow and CI stay unaffected — the pebesen crates (which need postgres/redis) build
+# explicitly via `-p pebesen-*` or `--workspace`.
+resolver = "2"
+members = ["pebesen/crates/*"]
+default-members = ["."]
+
+# Shared metadata inherited by pebesen crates that use `edition.workspace`/`rust-version.workspace`
+# (e.g. pebesen-intelligence). Mirrors the values from pebesen's former workspace root.
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
