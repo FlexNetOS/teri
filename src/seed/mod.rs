@@ -1,3 +1,4 @@
+pub mod community;
 pub mod text_processor;
 
 use crate::error::{Result, TeriError};
