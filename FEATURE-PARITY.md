@@ -222,10 +222,14 @@ Status: ☑ done · ☐ open. Priority groups top→bottom.
   macro) → compiles in CI under `--all-features` with **no** live DB / `.sqlx` cache. One shared
   `tests/store_behavior.rs` contract runs against in-memory (always) and `PgStore` (gated on
   `TEST_DATABASE_URL`). 8 lib + 2 behavior tests green; clippy `--all-features --all-targets` clean. *(S4)*
-- 🟡 **TASK-SEAM-3** — loop E2E: feedback half DONE (`tests/community_loop_e2e.rs` — teri feedback →
-  real receiver → store → action → calibration, over real HTTP; ingest via mocked pebesen read API).
-  Remaining: the LLM-backed pipeline middle (signal → seed → …pipeline… → report → feedback) as a
-  gated integration test against a mock inference backend.
+- ☑ **TASK-SEAM-3** — loop E2E complete. The feedback + ingest ends were already covered by
+  `tests/community_loop_e2e.rs`; the **middle** is now covered by `tests/community_pipeline_e2e.rs`:
+  a pebesen signal → `signal_to_seed_document` → temp seed file → real `pipeline::run_pipeline`
+  (seed→graph→persona→sim→report, injected mock `LlmClient`) → a `TopicSignal` derived from the
+  report → `PebesenFeedback` push → live in-process receiver → asserted to land scoped to the
+  originating space. Proves the whole loop in one pass; runs offline+deterministic (the injected
+  adapter bypasses no guard — the backend-honesty guard only gates real `teri run`/`serve`). Passes
+  (full pipeline, ~36s). *(S5)*
 
 ### Autonomy (L2–L5, see docs/AGENTIC-STORY.md)
 - ☐ **TASK-AUTO-1** — autonomy orchestrator (DECIDE layer): watch adapters, debounce signal deltas
