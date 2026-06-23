@@ -16,11 +16,31 @@ file:line evidence on each side. Status legend: ✅ full · 🟡 partial · ❌ 
 | **Stage 1-2: Graph build + Environment setup** | 🟡 Structurally full; **simulation-quality gaps** in persona generation (memory injection, randomization, bilingual two-prompt strategy). |
 | **Stage 3: Simulation** | ✅ Full + ➕ exceeds (per-tick God's-eye injection). 3 real gaps (action-split, enriched action args, shutdown hook). |
 | **Stage 4-5: Report + Deep interaction** | ✅ Full + ➕ exceeds (5th tool, semantic insight_forge, SSE). Residual = shared/serve-provider items. |
-| **Web UI** | ❌ **MISSING ENTIRELY** — the one structural downgrade vs MiroFish. Backend endpoints to drive it already exist. |
+| **Web UI** | ✅ **LANDED 2026-06-23** (was ❌) — MiroFish Vue 3 SPA copied into `frontend/`, rebranded, wired to teri's API, production build passes. Live-against-`serve` smoke test + optional SSE adoption remain. |
+| **teri↔pebesen community seam** | ✅ **LANDED 2026-06-23** — `CommunityAdapter`/`CommunityFeedback` + `PebesenAdapter`/`PebesenFeedback` in teri; pebesen `intelligence` crate is now a real prediction receiver (`IntelligenceStore` + calibration). pebesen router wiring + sqlx-backed store remain. |
 
 **Bottom line:** the backend is a real, near-complete port (the "port complete" claim was honest at
-the *engine* layer). The bluff was the **missing UI** and the fabricated-looking community docs (now
-resolved: pebesen is vendored in). The headline remaining work is the **Vue 3 frontend**.
+the *engine* layer). The two structural gaps — the **missing UI** and the **unbuilt community seam** —
+were **closed on 2026-06-23** (see the session-update section below). Remaining work is
+simulation-fidelity refinement + the autonomy layer (L2–L5), not missing structure.
+
+---
+
+## Session update — 2026-06-23 (UI + seam landed)
+
+**Closed this session (commits on `chore/rusty-idd-fleet-adapter`):**
+- `a7daa49` — pebesen vendored into the teri workspace.
+- `54293d7` — docs regenerated from real MiroFish + this ledger.
+- `4e6f0f4` — real ARCHITECTURE ASCII + data flow + USER-STORY + AGENTIC-STORY.
+- `5c26f1f` — **Web UI** copied & wired (`frontend/`, `npm run build` ✅).
+- `398ea9d` — **teri↔pebesen seam** (`src/seed/community/` + pebesen `intelligence` receiver).
+- Verified: teri `cargo test` **1671 passed / 6 ignored**, clippy clean; `pebesen-intelligence`
+  **8 passed**, clippy clean; fmt clean.
+
+**New tasks added to the backlog below** (surfaced while building the UI + seam):
+- TASK-UI-1 … TASK-UI-3 (live-verify, SSE adoption, polish)
+- TASK-SEAM-1 … TASK-SEAM-3 (pebesen router, sqlx store, end-to-end loop test)
+- TASK-AUTO-1 … TASK-AUTO-2 (autonomy orchestrator, calibration loop — L2–L5)
 
 ---
 
@@ -160,15 +180,48 @@ InteractionView — 3-mode layout switcher + step header + GraphPanel host + pol
 
 ---
 
-## Consolidated build backlog (priority order)
+## Consolidated build backlog
 
-1. **Web UI** — Vue 3 SPA (scaffold → router/api/i18n → GraphPanel d3 viz → 6 views + 8 components).
-   *Biggest gap, backend-ready.*
-2. **Persona memory injection + bilingual two-prompt strategy + randomization** (Stage 1-2 #1-3) —
-   biggest simulation-fidelity gap.
-3. **Per-platform action split** + **enriched action_args** (Stage 3 #1-2) — sim correctness/fidelity.
-4. **Social-DB producer + `sqlite`-default serve** (Stage 4-5 #1) — unlocks posts/comments/history.
-5. **Provider-agnostic `serve` ApiState** (Stage 4-5 #2) — Anthropic/Gemini under serve.
-6. **`register_cleanup` shutdown hook** (Stage 3 #3) — no orphaned sims.
-7. **Persona/config `json_object`+`finish_reason`, ontology reserved-names/edge constraints,
-   per-entity search enrichment** (Stage 1-2 #4-7) — refinements.
+Status: ☑ done · ☐ open. Priority groups top→bottom.
+
+### Web UI (structural gap — LANDED, follow-ups open)
+- ☑ **TASK-UI-0** — copy + wire the Vue 3 SPA into `frontend/`; production build green. *(5c26f1f)*
+- ☐ **TASK-UI-1** — live smoke test: `teri serve` + `npm run dev`, drive all 5 steps end-to-end
+  against the running engine; fix any envelope/field/CORS mismatch the static build can't catch.
+- ☐ **TASK-UI-2** — adopt teri's SSE endpoints in the UI (EventSource for `/agent-log/sse`,
+  `/console-log/sse`, `/events`, `/ticks/sse`) replacing MiroFish's `from_line`/30s polling.
+- ☐ **TASK-UI-3** — teri-native branding pass (replace the renamed MiroFish logo with a teri mark);
+  split the large d3 chunk; resolve the `pendingUpload.js` dual-import warning.
+
+### teri↔pebesen community seam (structural gap — LANDED, follow-ups open)
+- ☑ **TASK-SEAM-0** — `CommunityAdapter`/`CommunityFeedback` + `PebesenAdapter`/`PebesenFeedback`
+  in teri; pebesen `intelligence` prediction receiver (`IntelligenceStore` + calibration). *(398ea9d)*
+- ☐ **TASK-SEAM-1** — wire pebesen's router: `bin/main.rs` is still "Hello world" with no `Router`;
+  mount the `api` crate + the new `/api/intelligence/*` receiver endpoints so feedback actually lands.
+  (The adapter's route paths are inferred — reconcile once the router exists.)
+- ☐ **TASK-SEAM-2** — sqlx/postgres-backed `IntelligenceStore` (make it a trait, in-memory + Postgres
+  impls; tables `predictions`, `prediction_actions` per the inline `// SQLX SLOT:` markers).
+- ☐ **TASK-SEAM-3** — end-to-end loop test: pebesen signal → teri `CommunityAdapter` → pipeline →
+  report → `CommunityFeedback` → pebesen receiver → `report_actioned` → calibration delta.
+
+### Autonomy (L2–L5, see docs/AGENTIC-STORY.md)
+- ☐ **TASK-AUTO-1** — autonomy orchestrator (DECIDE layer): watch adapters, debounce signal deltas
+  into `(seed, query)` jobs, schedule headless `pipeline::run_pipeline` runs under a compute budget,
+  with continuity/resume + witnessed audit trail.
+- ☐ **TASK-AUTO-2** — calibration loop: turn actioned/accurate outcomes into per-community confidence
+  weights (persist in redb); upgrades report `confidence` from synthesized metadata → calibrated.
+
+### Simulation fidelity & refinements (engine — open)
+- ☐ **TASK-SIM-1** — persona memory injection + bilingual two-prompt strategy + randomization
+  (Stage 1-2 #1-3) — biggest simulation-fidelity gap.
+- ☐ **TASK-SIM-2** — per-platform action split + enriched `action_args` (Stage 3 #1-2).
+- ☐ **TASK-SIM-3** — social-DB producer + `sqlite`-default serve (Stage 4-5 #1) — unlocks
+  posts/comments/history.
+- ☐ **TASK-SIM-4** — provider-agnostic `serve` ApiState (Stage 4-5 #2) — Anthropic/Gemini under serve.
+- ☐ **TASK-SIM-5** — `register_cleanup` shutdown hook (Stage 3 #3) — no orphaned sims.
+- ☐ **TASK-SIM-6** — persona/config `json_object`+`finish_reason`, ontology reserved-names/edge
+  constraints, per-entity search enrichment (Stage 1-2 #4-7).
+
+### Doc debt
+- ☐ **TASK-DOC-1** — refresh the stale `TODO.md` (dated 2026-06-12, says "pipeline pending") — point
+  it at this ledger or rewrite against current code state.
