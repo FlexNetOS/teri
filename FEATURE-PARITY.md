@@ -67,19 +67,21 @@ Pipeline is wired end-to-end (ontology → graph build → entity read → perso
 config-generation layer is value-exact. Gaps are concentrated in **persona generation quality**.
 
 ### Teri must build
-1. **Persona memory injection** *(highest sim-quality impact)* — teri's English persona prompt
-   (`agent/mod.rs:1404-1426`) omits the 个人记忆/机构记忆 section that ties each agent to the event
-   and its prior actions/reactions (`oasis_profile_generator.py:710,759`). This *is* the stage-1
-   "individual/collective memory injection."
-2. **Bilingual two-prompt persona strategy** — individual-vs-group prompt selection, system prompt,
-   `response_format=json_object`, temperature ramp (0.7−attempt×0.1), 3-attempt loop,
-   `finish_reason=="length"` truncation detection (`oasis_profile_generator.py:497-772`). Teri does
-   a single English single-shot prompt.
-3. **Persona randomization** — restore random counter ranges (karma 500-5000, etc.) and random
-   age/gender/mbti/country in rule-based branches (`oasis_profile_generator.py:262-265,786-845`).
-   Teri uses fixed/deterministic values → profiles aren't varied.
+1. **Persona memory injection** *(highest sim-quality impact)* — ✅ **LANDED (S6/TASK-SIM-1).**
+   Both persona frames now carry a memory section (个人记忆 for individuals, 机构记忆 for
+   institutions) grounded in the entity summary + graph-neighbor context
+   (`oasis_profile_generator.py:710,759`). This *was* the stage-1 "individual/collective memory injection."
+2. **Bilingual two-prompt persona strategy** — ✅ **LANDED (S6/TASK-SIM-1)** except finish_reason.
+   Individual-vs-group prompt selection, system prompt, temperature ramp (0.7−attempt×0.1) over a
+   3-attempt loop are wired through the existing `chat()` API (`oasis_profile_generator.py:497-772`).
+   `finish_reason=="length"` truncation detection needs an `LlmClient` API change and is DEFERRED to
+   **S11 / TASK-SIM-6 #7** (`// S11:` comment at the call site).
+3. **Persona randomization** — ✅ **LANDED (S6/TASK-SIM-1).** Random counter ranges (karma 500-5000,
+   etc.) + random age/gender/mbti/country via a seedable `StdRng` in the rule-based / default
+   branches; institutions keep MiroFish's fixed values (`oasis_profile_generator.py:262-265,786-845`).
 4. **Constants + missing branches** — `MBTI_TYPES`/`COUNTRIES`/`INDIVIDUAL`/`GROUP_ENTITY_TYPES`
-   (`oasis_profile_generator.py:156-179`); add `socialmediaplatform` arm, split `mediaoutlet`.
+   added in S6 (`oasis_profile_generator.py:156-179`); still TODO: add `socialmediaplatform` arm,
+   split `mediaoutlet`.
 5. **Per-entity context search enrichment** (`_search_zep_for_entity`,
    `oasis_profile_generator.py:286-412`) — wire teri's semantic-recall/graph-search to enrich
    persona context (fact dedup in `_build_entity_context`).
@@ -239,8 +241,19 @@ Status: ☑ done · ☐ open. Priority groups top→bottom.
   weights (persist in redb); upgrades report `confidence` from synthesized metadata → calibrated.
 
 ### Simulation fidelity & refinements (engine — open)
-- ☐ **TASK-SIM-1** — persona memory injection + bilingual two-prompt strategy + randomization
+- ☑ **TASK-SIM-1** — persona memory injection + bilingual two-prompt strategy + randomization
   (Stage 1-2 #1-3) — biggest simulation-fidelity gap.
+  - _S6 landed (2026-06-23):_ `PersonaGenerator::generate_social` now drives the LLM via the
+    existing `chat(&[ChatMessage], &ChatOptions)` API with a system prompt + a SELECTED user
+    prompt (individual vs group, via `is_individual_entity`/`GROUP_ENTITY_TYPES`) and a 3-attempt
+    retry loop with the `temp = 0.7 - attempt*0.1` ramp. Both persona frames carry a memory
+    section — personal-memory (个人记忆) for individuals, institutional-memory (机构记忆) for
+    groups — grounded in the entity summary + graph-neighbor context (#1). `generate_social_rule_based`
+    and the LLM-path numeric defaults now randomize via a seedable `StdRng` (karma 500-5000,
+    friends 50-500, followers 100-1000, statuses 100-2000; age/gender/mbti/country drawn from the
+    new `MBTI_TYPES`/`COUNTRIES` tables — institutions keep MiroFish's fixed age=30/other/ISTJ) (#3).
+    `finish_reason=="length"` truncation detection needs an `LlmClient` API change and is DEFERRED
+    to **S11 / TASK-SIM-6 #7** (marked with an `// S11:` comment at the call site). +8 tests.
 - ☐ **TASK-SIM-2** — per-platform action split + enriched `action_args` (Stage 3 #1-2).
 - ☐ **TASK-SIM-3** — social-DB producer + `sqlite`-default serve (Stage 4-5 #1) — unlocks
   posts/comments/history.
