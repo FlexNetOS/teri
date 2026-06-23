@@ -198,8 +198,12 @@ Status: ☑ done · ☐ open. Priority groups top→bottom.
   polling fallback share one code path); `SimulationRunView.vue` streams `/ticks/sse` to refresh the
   graph per tick instead of MiroFish's blind 30s poll. Each stream falls back to the original
   `from_line`/30s polling if SSE can't connect (no-downgrade). `npm run build` green. *(S2)*
-- ☐ **TASK-UI-3** — teri-native branding pass (replace the renamed MiroFish logo with a teri mark);
-  split the large d3 chunk; resolve the `pendingUpload.js` dual-import warning.
+- ☑ **TASK-UI-3** — UI polish: (1) native teri SVG mark (a school of anchovies forming one larger
+  fish — the swarm-emergence metaphor) replaces the 600 kB renamed-MiroFish jpeg (now inlined,
+  ~2.5 kB); (2) `vite.config` `manualChunks` splits d3 (62 kB) + the Vue framework (158 kB) out of
+  the entry chunk (524→305 kB), clearing the >500 kB warning; (3) Home.vue's dynamic
+  `pendingUpload` import made static to match siblings, clearing the dual-import warning.
+  `npm run build` now green with **zero warnings**. *(S3)*
 
 ### teri↔pebesen community seam (structural gap — LANDED, follow-ups open)
 - ☑ **TASK-SEAM-0** — `CommunityAdapter`/`CommunityFeedback` + `PebesenAdapter`/`PebesenFeedback`
