@@ -1,0 +1,7 @@
+[advisories]
+# Ignore transitive dependency vulnerabilities from sqlx and meilisearch-sdk
+# These are from upstream crates we don't control
+ignore = [
+    "RUSTSEC-2025-0009", # ring 0.16.20 (from jsonwebtoken via meilisearch-sdk)
+    "RUSTSEC-2023-0071", # rsa 0.9.10 (from sqlx-mysql)
+]
