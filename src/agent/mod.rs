@@ -1,10 +1,13 @@
 use crate::error::{Result, TeriError};
 use crate::graph::{Entity, KnowledgeGraph, Relation};
-use crate::llm::LlmClient;
+use crate::llm::{ChatMessage, ChatOptions, LlmClient};
 use crate::sim::social_world::FeedSnapshot;
 use crate::sim::{Action, SocialAction, TargetKind, WorldState};
 use chrono::Utc;
 use minijinja::{Environment, context};
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -895,6 +898,77 @@ impl PersonaGenerator {
         }
     }
 
+    // ===== TASK-SIM-1 (S6): persona-generation fidelity constants =====
+    //
+    // Mirrors `oasis_profile_generator.py:156-179`. Used by the rule-based randomization
+    // (gap #3) and the two-prompt individual-vs-group selection (gap #2).
+
+    /// MBTI personality types — drawn at random for rule-based individual personas.
+    /// Mirrors `OasisProfileGenerator.MBTI_TYPES` (oasis_profile_generator.py:156-161).
+    const MBTI_TYPES: [&'static str; 16] = [
+        "INTJ", "INTP", "ENTJ", "ENTP", "INFJ", "INFP", "ENFJ", "ENFP", "ISTJ", "ISFJ", "ESTJ",
+        "ESFJ", "ISTP", "ISFP", "ESTP", "ESFP",
+    ];
+
+    /// Common countries — drawn at random for rule-based personas.
+    /// Mirrors `OasisProfileGenerator.COUNTRIES` (oasis_profile_generator.py:164-167).
+    const COUNTRIES: [&'static str; 11] = [
+        "China",
+        "US",
+        "UK",
+        "Japan",
+        "Germany",
+        "France",
+        "Canada",
+        "Australia",
+        "Brazil",
+        "India",
+        "South Korea",
+    ];
+
+    /// Individual (person-like) entity types → generate a concrete personal persona.
+    /// Mirrors `OasisProfileGenerator.INDIVIDUAL_ENTITY_TYPES` (oasis_profile_generator.py:170-173).
+    const INDIVIDUAL_ENTITY_TYPES: [&'static str; 10] = [
+        "student",
+        "alumni",
+        "professor",
+        "person",
+        "publicfigure",
+        "expert",
+        "faculty",
+        "official",
+        "journalist",
+        "activist",
+    ];
+
+    /// Group / institutional entity types → generate a representative institutional account.
+    /// Mirrors `OasisProfileGenerator.GROUP_ENTITY_TYPES` (oasis_profile_generator.py:176-179).
+    const GROUP_ENTITY_TYPES: [&'static str; 9] = [
+        "university",
+        "governmentagency",
+        "organization",
+        "ngo",
+        "mediaoutlet",
+        "company",
+        "institution",
+        "group",
+        "community",
+    ];
+
+    /// Whether `entity_type` denotes an individual (person-like) entity.
+    /// Mirrors `_is_individual_entity` (oasis_profile_generator.py:489-491).
+    fn is_individual_entity(entity_type: &str) -> bool {
+        let t = entity_type.to_lowercase();
+        Self::INDIVIDUAL_ENTITY_TYPES.contains(&t.as_str())
+    }
+
+    /// Whether `entity_type` denotes a group / institutional entity.
+    /// Mirrors `_is_group_entity` (oasis_profile_generator.py:493-495).
+    fn is_group_entity(entity_type: &str) -> bool {
+        let t = entity_type.to_lowercase();
+        Self::GROUP_ENTITY_TYPES.contains(&t.as_str())
+    }
+
     /// Create a new PersonaGenerator with a custom template string
     pub fn with_template(template: String) -> Self {
         Self { template }
@@ -1401,61 +1475,64 @@ impl PersonaGenerator {
             None => String::new(),
         };
 
-        let prompt = format!(
-            r#"Generate a social media profile for a simulated agent based on the following entity.
-Return a JSON object with these fields:
-- bio: short public bio string (200 chars, displayed on profile page)
-- persona: detailed personality description string (used in LLM system prompt)
-- karma: integer (Reddit score, default 1000)
-- friend_count: integer (accounts followed, default 100)
-- follower_count: integer (followers, default 150)
-- statuses_count: integer (posts made, default 500)
-- age: integer or null
-- gender: "male", "female", or "other" (null if unknown)
-- mbti: MBTI type string or null (e.g. "INTJ")
-- country: country name string or null
-- profession: profession string or null
-- interested_topics: array of strings
-- posting_style: short description of posting tone and frequency
-
-Entity name: {entity_name}
-Entity type: {entity_type}
-Entity summary: {entity_summary}{entity_context}
-Platform: {platform}
-
-Return only valid JSON."#,
-            entity_name = entity_name,
-            entity_type = entity_type,
-            entity_summary = entity_summary,
-            entity_context = entity_context,
-            platform = match platform {
-                Platform::Twitter => "Twitter",
-                Platform::Reddit => "Reddit",
-            },
+        // TASK-SIM-1 gap #2: individual-vs-group prompt SELECTION
+        // (mirrors `_generate_profile_with_llm` :513-522, where `is_individual =
+        // _is_individual_entity(entity_type)` is the positive test — known INDIVIDUAL types get the
+        // personal framing; everything else, including the GROUP set and unknown types, gets the
+        // institutional framing).
+        let is_individual = Self::is_individual_entity(entity_type);
+        let system_prompt = Self::persona_system_prompt();
+        let user_prompt = Self::build_persona_prompt(
+            entity_name,
+            entity_type,
+            entity_summary,
+            &entity_context,
+            platform,
+            is_individual,
         );
 
-        // Try LLM → parse → salvage (S-360/S-361) → rule-based
-        let profile_data = match llm.complete(&prompt).await {
-            Ok(response) => {
-                // First attempt: direct parse
-                match serde_json::from_str::<serde_json::Value>(&response) {
-                    Ok(v) => Some(v),
-                    Err(_) => {
-                        // Salvage attempt (S-360 + S-361): try_fix_json before rule-based
-                        Self::try_fix_json(&response, entity_name, entity_type, entity_summary).map(
-                            |mut v| {
-                                // Strip internal _fixed marker before use
-                                if let Some(m) = v.as_object_mut() {
-                                    m.remove("_fixed");
-                                }
-                                v
-                            },
-                        )
+        // TASK-SIM-1 gap #2: 3-attempt retry loop with temperature ramp `0.7 - attempt*0.1`
+        // (mirrors `_generate_profile_with_llm` :524-581). Uses the EXISTING `chat()` API with a
+        // system + user message vector and per-attempt `ChatOptions { temperature }`.
+        //
+        // Try LLM → parse → salvage (S-360/S-361) → next attempt → rule-based.
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut profile_data: Option<serde_json::Value> = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            let temperature = 0.7 - (attempt as f32) * 0.1;
+            let messages =
+                [ChatMessage::system(system_prompt), ChatMessage::user(user_prompt.clone())];
+            let opts = ChatOptions { temperature: Some(temperature), max_tokens: None };
+            match llm.chat(&messages, &opts).await {
+                Ok(response) => {
+                    // S11: when LlmClient exposes `finish_reason`, detect `=="length"` truncation
+                    // here and run `fix_truncated_json` before parsing (TASK-SIM-6 #7, deferred).
+                    // First attempt: direct parse.
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&response) {
+                        profile_data = Some(v);
+                        break;
                     }
+                    // Salvage attempt (S-360 + S-361): try_fix_json before retrying.
+                    if let Some(mut v) =
+                        Self::try_fix_json(&response, entity_name, entity_type, entity_summary)
+                    {
+                        // Strip internal _fixed marker before use.
+                        if let Some(m) = v.as_object_mut() {
+                            m.remove("_fixed");
+                        }
+                        profile_data = Some(v);
+                        break;
+                    }
+                    // Unparseable + unsalvageable: fall through to the next attempt.
                 }
+                // LLM error: fall through to the next attempt.
+                Err(_) => continue,
             }
-            Err(_) => None,
-        };
+        }
+
+        // Seedable RNG (gap #3): entropy in production. Used to randomize numeric counts whose
+        // values are absent from the LLM JSON, and to drive the rule-based fallback.
+        let mut rng = StdRng::from_entropy();
 
         if let Some(data) = profile_data {
             let bio = data["bio"]
@@ -1468,11 +1545,17 @@ Return only valid JSON."#,
                 .filter(|s| !s.is_empty())
                 .unwrap_or(&default_persona)
                 .to_string();
-            let karma = data["karma"].as_i64().unwrap_or(1000);
-            let friend_count = data["friend_count"].as_i64().unwrap_or(100);
-            let follower_count = data["follower_count"].as_i64().unwrap_or(150);
+            // TASK-SIM-1 gap #3: when the LLM omits a numeric count, draw from the same randomized
+            // ranges MiroFish uses in `generate_profile_from_entity` :262-265 (karma 500-5000,
+            // friends 50-500, followers 100-1000, statuses 100-2000) — NOT a fixed default.
+            let karma = data["karma"].as_i64().unwrap_or_else(|| rng.gen_range(500..=5000));
+            let friend_count =
+                data["friend_count"].as_i64().unwrap_or_else(|| rng.gen_range(50..=500));
+            let follower_count =
+                data["follower_count"].as_i64().unwrap_or_else(|| rng.gen_range(100..=1000));
             let following_count = friend_count; // Twitter model: following ≈ friend_count
-            let statuses_count = data["statuses_count"].as_i64().unwrap_or(500);
+            let statuses_count =
+                data["statuses_count"].as_i64().unwrap_or_else(|| rng.gen_range(100..=2000));
             let age = data["age"].as_u64().map(|v| v as u32);
             let gender = data["gender"].as_str().map(|s| s.to_string());
             let mbti = data["mbti"].as_str().map(|s| s.to_string());
@@ -1515,16 +1598,171 @@ Return only valid JSON."#,
                 platform,
                 &user_name,
                 &created_at,
+                &mut rng,
             ))
         }
     }
 
+    /// System prompt for persona generation.
+    ///
+    /// Mirrors `_get_system_prompt` (oasis_profile_generator.py:672-675). Per the S6 spec the
+    /// prompt text itself is not zh/en-localized here (that's the i18n axis tracked separately);
+    /// we preserve the INTENT: instruct the model to act as a user-profile-generation expert and
+    /// emit valid JSON with no unescaped newlines in string values.
+    fn persona_system_prompt() -> &'static str {
+        "You are an expert at generating social-media user profiles. Produce a detailed, realistic \
+         persona for opinion-dynamics simulation that faithfully reflects the real-world entity. \
+         You MUST return a single valid JSON object; string values must not contain unescaped \
+         newlines."
+    }
+
+    /// Build the user prompt for persona generation, selecting the individual-vs-group framing.
+    ///
+    /// Mirrors `_build_individual_persona_prompt` (:677-724) and `_build_group_persona_prompt`
+    /// (:726-772). TASK-SIM-1 gap #1: BOTH framings include a memory section — an individual gets
+    /// a 个人记忆 (personal-memory) framing tying the person to the event and their prior
+    /// actions/reactions; a group/institution gets a 机构记忆 (institutional-memory) framing doing
+    /// the same for the organization. The memory section is built from the available event/entity
+    /// context (the entity summary + graph-neighbor context already assembled into `entity_context`).
+    fn build_persona_prompt(
+        entity_name: &str,
+        entity_type: &str,
+        entity_summary: &str,
+        entity_context: &str,
+        platform: Platform,
+        is_individual: bool,
+    ) -> String {
+        let platform_name = match platform {
+            Platform::Twitter => "Twitter",
+            Platform::Reddit => "Reddit",
+        };
+        // Mirrors the Python `context[:3000]` truncation guard (:688, :737).
+        let context_str: String = entity_context.chars().take(3000).collect();
+
+        if is_individual {
+            // Individual persona — mirrors `_build_individual_persona_prompt`. The persona spec
+            // enumerates the same sub-sections, including the personal-memory (个人记忆) section
+            // that ties the person to the event and their existing actions/reactions (:710).
+            format!(
+                r#"Generate a detailed social-media user persona for an INDIVIDUAL entity, staying as faithful as possible to the real-world entity.
+
+Entity name: {entity_name}
+Entity type: {entity_type}
+Entity summary: {entity_summary}{context_block}
+Platform: {platform_name}
+
+Return a JSON object with these fields:
+1. bio: short public bio string (~200 chars, displayed on the profile page)
+2. persona: a detailed, single-paragraph personality description that includes:
+   - Basic info (age, profession, education, location)
+   - Background (key experiences, this person's connection to the event, social relationships)
+   - Personality (MBTI type, core traits, how they express emotion)
+   - Social-media behavior (posting frequency, content preferences, interaction style, language quirks)
+   - Stance (attitude toward the topic; what content would anger or move them)
+   - Distinctive features (catchphrases, notable experiences, personal hobbies)
+   - Personal memory (an important part of the persona: describe this individual's connection to the event, and the actions and reactions this individual has ALREADY taken in the event)
+3. karma: integer (Reddit-style score)
+4. friend_count: integer (accounts followed)
+5. follower_count: integer (followers)
+6. statuses_count: integer (posts made)
+7. age: integer
+8. gender: "male", "female", or "other"
+9. mbti: MBTI type string (e.g. "INTJ")
+10. country: country name string
+11. profession: profession string
+12. interested_topics: array of strings
+13. posting_style: short description of posting tone and frequency
+
+Important:
+- Every field value must be a string or number; do not use unescaped newlines.
+- persona must be one coherent block of text.
+- Keep content consistent with the entity information.
+- Return only valid JSON."#,
+                entity_name = entity_name,
+                entity_type = entity_type,
+                entity_summary = entity_summary,
+                context_block = Self::memory_context_block(&context_str),
+                platform_name = platform_name,
+            )
+        } else {
+            // Group/institutional persona — mirrors `_build_group_persona_prompt`. Includes the
+            // institutional-memory (机构记忆) section tying the institution to the event and its
+            // existing actions/reactions (:759).
+            format!(
+                r#"Generate a detailed social-media ACCOUNT persona for a GROUP / INSTITUTIONAL entity, staying as faithful as possible to the real-world entity.
+
+Entity name: {entity_name}
+Entity type: {entity_type}
+Entity summary: {entity_summary}{context_block}
+Platform: {platform_name}
+
+Return a JSON object with these fields:
+1. bio: official account bio (~200 chars, professional and measured)
+2. persona: a detailed, single-paragraph account description that includes:
+   - Institutional basics (formal name, nature of the institution, founding background, main functions)
+   - Account positioning (account type, target audience, core purpose)
+   - Voice/style (language characteristics, common phrasing, taboo topics)
+   - Content profile (content types, posting frequency, active periods)
+   - Stance (the official position on the core topic; how it handles controversy)
+   - Notes (the profile of the group it represents, operational habits)
+   - Institutional memory (an important part of the persona: describe this institution's connection to the event, and the actions and reactions this institution has ALREADY taken in the event)
+3. age: integer 30 (virtual age for an institutional account)
+4. gender: "other" (institutional accounts use "other")
+5. mbti: MBTI type string describing the account's style (e.g. "ISTJ" for rigorous/conservative)
+6. country: country name string
+7. profession: description of the institution's function
+8. interested_topics: array of strings (focus areas)
+
+Important:
+- Every field value must be a string or number; do not use null and do not use unescaped newlines.
+- persona must be one coherent block of text.
+- age must be the integer 30 and gender must be the string "other".
+- Return only valid JSON."#,
+                entity_name = entity_name,
+                entity_type = entity_type,
+                entity_summary = entity_summary,
+                context_block = Self::memory_context_block(&context_str),
+                platform_name = platform_name,
+            )
+        }
+    }
+
+    /// Render the event/entity context block injected into the persona prompt.
+    ///
+    /// Mirrors the Python `上下文信息:\n{context_str}` block (:697-698, :746-747). When there is
+    /// no graph/entity context the block is empty (the prompt's persona-memory field still asks the
+    /// model to ground the memory in the entity summary). Kept as a small DRY helper because both
+    /// the individual and group branches inject it identically.
+    fn memory_context_block(context_str: &str) -> String {
+        if context_str.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\n\nContext (use this to ground the persona-memory section):\n{context_str}")
+        }
+    }
+
+    /// Pick a random element from a string slice using the supplied RNG.
+    ///
+    /// DRY helper for `random.choice(...)` parity. Returns an owned `String`. The slice is always
+    /// non-empty at every call site (the constant tables / fixed literal arrays), so `unwrap` is
+    /// infallible; we still guard with `expect` to make the invariant explicit.
+    fn choose(rng: &mut StdRng, choices: &[&str]) -> String {
+        (*choices.choose(rng).expect("choice slice is non-empty")).to_string()
+    }
+
     /// Rule-based fallback for social profile generation.
     ///
-    /// Mirrors `OasisProfileGenerator._generate_profile_rule_based`: assigns sensible
-    /// defaults keyed by entity type (individual vs group/institution).
-    /// `bio` and `persona` are populated distinctly — `bio` is a short tagline and
-    /// `persona` is the longer entity summary or a default description.
+    /// Mirrors `OasisProfileGenerator._generate_profile_rule_based` (oasis_profile_generator.py:
+    /// 774-845): assigns defaults keyed by entity type (individual vs group/institution).
+    /// `bio` and `persona` are populated distinctly — `bio` is a short tagline and `persona` is
+    /// the longer entity summary or a default description.
+    ///
+    /// TASK-SIM-1 gap #3: age/gender/mbti/country and the social counts are RANDOMIZED for
+    /// individual / generic entities (drawing from `MBTI_TYPES` / `COUNTRIES` and sensible
+    /// numeric ranges), exactly as MiroFish does with `random.randint` / `random.choice`.
+    /// Institutional accounts keep MiroFish's FIXED values (age=30, gender="other", mbti="ISTJ")
+    /// — only their numeric counts are randomized (parity with the LLM-path randomization). The
+    /// caller supplies a seedable `StdRng` so tests can fix the seed for determinism.
     fn generate_social_rule_based(
         entity_name: &str,
         entity_type: &str,
@@ -1532,10 +1770,11 @@ Return only valid JSON."#,
         platform: Platform,
         user_name: &str,
         created_at: &str,
+        rng: &mut StdRng,
     ) -> SocialProfile {
         let entity_type_lower = entity_type.to_lowercase();
 
-        // Individual entity types → personal profile defaults
+        // Individual entity types → personal profile defaults (randomized demographics).
         let (
             bio,
             persona,
@@ -1557,10 +1796,11 @@ Return only valid JSON."#,
                 } else {
                     entity_summary.to_string()
                 },
-                Some(22u32),
-                Some("other".to_string()),
-                Some("INFP".to_string()),
-                Some("US".to_string()),
+                // random.randint(18, 30) — oasis_profile_generator.py:790
+                Some(rng.gen_range(18..=30u32)),
+                Some(Self::choose(rng, &["male", "female"])),
+                Some(Self::choose(rng, &Self::MBTI_TYPES)),
+                Some(Self::choose(rng, &Self::COUNTRIES)),
                 Some("Student".to_string()),
                 vec![
                     "Education".to_string(),
@@ -1583,10 +1823,12 @@ Return only valid JSON."#,
                 } else {
                     entity_summary.to_string()
                 },
-                Some(45u32),
-                Some("other".to_string()),
-                Some("INTJ".to_string()),
-                Some("US".to_string()),
+                // random.randint(35, 60) — oasis_profile_generator.py:802
+                Some(rng.gen_range(35..=60u32)),
+                Some(Self::choose(rng, &["male", "female"])),
+                // random.choice(["ENTJ", "INTJ", "ENTP", "INTP"]) — oasis_profile_generator.py:804
+                Some(Self::choose(rng, &["ENTJ", "INTJ", "ENTP", "INTP"])),
+                Some(Self::choose(rng, &Self::COUNTRIES)),
                 Some("Expert".to_string()),
                 vec![
                     "Politics".to_string(),
@@ -1595,19 +1837,11 @@ Return only valid JSON."#,
                 ],
                 Some("Thoughtful, infrequent posts with expert analysis".to_string()),
             )
-        } else if matches!(
-            entity_type_lower.as_str(),
-            "university"
-                | "governmentagency"
-                | "organization"
-                | "ngo"
-                | "mediaoutlet"
-                | "company"
-                | "institution"
-                | "group"
-                | "community"
-        ) {
-            // Group/institution entity types → institutional account defaults
+        } else if Self::is_group_entity(&entity_type_lower) {
+            // Group/institution entity types (the canonical `GROUP_ENTITY_TYPES` set) →
+            // institutional account defaults. MiroFish keeps these
+            // FIXED (age=30, gender="other", mbti="ISTJ"; oasis_profile_generator.py:826-828),
+            // so we do too — institutional accounts are deliberately uniform.
             (
                 format!("Official account of {}.", entity_name),
                 if entity_summary.is_empty() {
@@ -1630,7 +1864,7 @@ Return only valid JSON."#,
                 Some(format!("Official account for {entity_name}. Professional, measured tone.")),
             )
         } else {
-            // Default: generic participant
+            // Default: generic participant (randomized demographics).
             (
                 if entity_summary.is_empty() {
                     format!("{}: {}", entity_type, entity_name)
@@ -1645,10 +1879,11 @@ Return only valid JSON."#,
                 } else {
                     entity_summary.to_string()
                 },
-                Some(30u32),
-                Some("other".to_string()),
-                Some("ISTJ".to_string()),
-                Some("US".to_string()),
+                // random.randint(25, 50) — oasis_profile_generator.py:839
+                Some(rng.gen_range(25..=50u32)),
+                Some(Self::choose(rng, &["male", "female"])),
+                Some(Self::choose(rng, &Self::MBTI_TYPES)),
+                Some(Self::choose(rng, &Self::COUNTRIES)),
                 Some(entity_type.to_string()),
                 vec!["General".to_string(), "Social Issues".to_string()],
                 Some("Occasional posts on general topics".to_string()),
@@ -1661,11 +1896,13 @@ Return only valid JSON."#,
             bio,
             persona,
             platform,
-            karma: 1000,
-            friend_count: 100,
-            follower_count: 150,
-            following_count: 100,
-            statuses_count: 500,
+            // TASK-SIM-1 gap #3: randomized social counts (same ranges as the LLM path /
+            // generate_profile_from_entity:262-265) instead of the old fixed defaults.
+            karma: rng.gen_range(500..=5000),
+            friend_count: rng.gen_range(50..=500),
+            follower_count: rng.gen_range(100..=1000),
+            following_count: rng.gen_range(50..=500),
+            statuses_count: rng.gen_range(100..=2000),
             age,
             gender,
             mbti,
@@ -1962,6 +2199,20 @@ mod tests {
     use async_trait::async_trait;
     use std::pin::Pin;
 
+    /// Concatenate the user-role message contents from a chat vector.
+    ///
+    /// `generate_social` (TASK-SIM-1) drives the LLM through `chat()` with a system + user
+    /// message; the persona prompt lives in the user message. The prompt-capture test mocks use
+    /// this to recover the prompt text they used to read from `complete()`.
+    fn capture_user_message(messages: &[crate::llm::ChatMessage]) -> String {
+        messages
+            .iter()
+            .filter(|m| matches!(m.role, crate::llm::ChatRole::User))
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     // Mock LLM for testing
     struct MockPersonaLlm {
         response: String,
@@ -1995,7 +2246,9 @@ mod tests {
             _messages: &[crate::llm::ChatMessage],
             _opts: &crate::llm::ChatOptions,
         ) -> Result<String> {
-            Err(TeriError::Llm("chat not implemented in mock".to_string()))
+            // `generate_social` now drives the LLM through `chat()` (TASK-SIM-1 two-prompt path);
+            // return the canned response so existing tests exercise the same flow as before.
+            Ok(self.response.clone())
         }
 
         async fn chat_json<T: serde::de::DeserializeOwned>(
@@ -3693,12 +3946,14 @@ mod tests {
             .expect("rule-based fallback must succeed even when LLM errors");
 
         assert_eq!(sp.platform, Platform::Reddit);
-        // Defaults match MiroFish values
-        assert_eq!(sp.karma, 1000);
-        assert_eq!(sp.friend_count, 100);
-        assert_eq!(sp.follower_count, 150);
-        assert_eq!(sp.statuses_count, 500);
-        // Rule-based for 'university' entity type sets age=30, gender="other", mbti="ISTJ"
+        // TASK-SIM-1 gap #3: social counts are now randomized within MiroFish's ranges
+        // (institutions still use the same numeric ranges as everyone else).
+        assert!((500..=5000).contains(&sp.karma), "karma in range; got {}", sp.karma);
+        assert!((50..=500).contains(&sp.friend_count), "friend_count in range");
+        assert!((100..=1000).contains(&sp.follower_count), "follower_count in range");
+        assert!((100..=2000).contains(&sp.statuses_count), "statuses_count in range");
+        // Institutional accounts keep MiroFish's FIXED demographics: age=30, gender="other",
+        // mbti="ISTJ" (oasis_profile_generator.py:826-828).
         assert_eq!(sp.age, Some(30));
         assert_eq!(sp.gender.as_deref(), Some("other"));
         assert_eq!(sp.mbti.as_deref(), Some("ISTJ"));
@@ -3723,9 +3978,23 @@ mod tests {
             .await
             .expect("rule-based fallback must succeed for bad LLM JSON");
 
-        // student rule → age=22, gender="other", mbti="INFP"
-        assert_eq!(sp.age, Some(22));
-        assert_eq!(sp.mbti.as_deref(), Some("INFP"));
+        // TASK-SIM-1 gap #3: the student rule now RANDOMIZES age (18..=30), gender (male/female),
+        // mbti (from MBTI_TYPES) and country (from COUNTRIES). The stable signals that prove the
+        // student branch ran are the fixed profession + interested_topics.
+        let age = sp.age.expect("rule-based sets an age");
+        assert!((18..=30).contains(&age), "student age in 18..=30; got {age}");
+        assert!(matches!(sp.gender.as_deref(), Some("male") | Some("female")));
+        assert!(
+            PersonaGenerator::MBTI_TYPES.contains(&sp.mbti.as_deref().unwrap()),
+            "mbti drawn from MBTI_TYPES; got {:?}",
+            sp.mbti
+        );
+        assert!(
+            PersonaGenerator::COUNTRIES.contains(&sp.country.as_deref().unwrap()),
+            "country drawn from COUNTRIES; got {:?}",
+            sp.country
+        );
+        assert_eq!(sp.profession.as_deref(), Some("Student"));
         assert!(sp.interested_topics.contains(&"Education".to_string()));
     }
 
@@ -4169,9 +4438,17 @@ mod tests {
             .await
             .expect("rule-based fallback must succeed for garbage LLM output");
 
-        // student rule → age=22, mbti="INFP" — proves rule-based was used
-        assert_eq!(sp.age, Some(22), "age=22 proves rule-based student path");
-        assert_eq!(sp.mbti.as_deref(), Some("INFP"), "INFP proves rule-based student path");
+        // student rule → randomized age in 18..=30 + fixed profession/topics prove rule-based ran.
+        let age = sp.age.expect("rule-based sets an age");
+        assert!(
+            (18..=30).contains(&age),
+            "age in student range proves rule-based path; got {age}"
+        );
+        assert_eq!(
+            sp.profession.as_deref(),
+            Some("Student"),
+            "Student profession proves rule path"
+        );
         assert!(sp.interested_topics.contains(&"Education".to_string()));
     }
 
@@ -4206,10 +4483,12 @@ mod tests {
             }
             async fn chat(
                 &self,
-                _messages: &[crate::llm::ChatMessage],
+                messages: &[crate::llm::ChatMessage],
                 _opts: &crate::llm::ChatOptions,
             ) -> Result<String> {
-                Err(TeriError::Llm("not used".into()))
+                // `generate_social` builds the persona prompt as the user message; capture it.
+                *self.captured.lock().unwrap() = capture_user_message(messages);
+                Ok(self.response.clone())
             }
             async fn chat_json<T: serde::de::DeserializeOwned>(
                 &self,
@@ -4294,10 +4573,12 @@ mod tests {
             }
             async fn chat(
                 &self,
-                _messages: &[crate::llm::ChatMessage],
+                messages: &[crate::llm::ChatMessage],
                 _opts: &crate::llm::ChatOptions,
             ) -> Result<String> {
-                Err(TeriError::Llm("not used".into()))
+                // generate_social drives the LLM via chat(); capture the user prompt.
+                *self.captured.lock().unwrap() = capture_user_message(messages);
+                Ok("{}".to_string())
             }
             async fn chat_json<T: serde::de::DeserializeOwned>(
                 &self,
@@ -4395,9 +4676,10 @@ mod tests {
             .await
             .expect("must succeed even with no-neighbor entity + LLM error");
 
-        // Rule-based student path kicks in
-        assert_eq!(sp.age, Some(22));
-        assert_eq!(sp.mbti.as_deref(), Some("INFP"));
+        // Rule-based student path kicks in (randomized age in 18..=30, mbti from MBTI_TYPES).
+        let age = sp.age.expect("rule-based sets an age");
+        assert!((18..=30).contains(&age), "student age in range; got {age}");
+        assert!(PersonaGenerator::MBTI_TYPES.contains(&sp.mbti.as_deref().unwrap()));
     }
 
     // ===== Part 2 (related edges) tests for build_entity_context / generate_social =====
@@ -4430,10 +4712,12 @@ mod tests {
             }
             async fn chat(
                 &self,
-                _messages: &[crate::llm::ChatMessage],
+                messages: &[crate::llm::ChatMessage],
                 _opts: &crate::llm::ChatOptions,
             ) -> Result<String> {
-                Err(TeriError::Llm("not used".into()))
+                // generate_social drives the LLM via chat(); capture the user prompt.
+                *self.captured.lock().unwrap() = capture_user_message(messages);
+                Ok("{}".to_string())
             }
             async fn chat_json<T: serde::de::DeserializeOwned>(
                 &self,
@@ -4525,10 +4809,12 @@ mod tests {
             }
             async fn chat(
                 &self,
-                _messages: &[crate::llm::ChatMessage],
+                messages: &[crate::llm::ChatMessage],
                 _opts: &crate::llm::ChatOptions,
             ) -> Result<String> {
-                Err(TeriError::Llm("not used".into()))
+                // generate_social drives the LLM via chat(); capture the user prompt.
+                *self.captured.lock().unwrap() = capture_user_message(messages);
+                Ok("{}".to_string())
             }
             async fn chat_json<T: serde::de::DeserializeOwned>(
                 &self,
@@ -4591,5 +4877,338 @@ mod tests {
             "prompt must include incoming arrow line; got: {}",
             &prompt[..prompt.len().min(800)]
         );
+    }
+
+    // ===== TASK-SIM-1 (S6): persona memory injection + two-prompt selection + randomization =====
+
+    /// Mock that records the system message and the concatenated user message of the FIRST
+    /// `chat()` call, then returns a fixed JSON so `generate_social` succeeds via the LLM path.
+    struct ChatCaptureLlm {
+        system: std::sync::Arc<std::sync::Mutex<String>>,
+        user: std::sync::Arc<std::sync::Mutex<String>>,
+        response: String,
+    }
+
+    #[async_trait]
+    impl LlmClient for ChatCaptureLlm {
+        async fn complete(&self, _: &str) -> Result<String> {
+            Err(TeriError::Llm("complete must not be used by generate_social".into()))
+        }
+        async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+            Err(TeriError::Llm("not implemented".into()))
+        }
+        async fn stream(
+            &self,
+            _: &str,
+        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            Err(TeriError::Llm("not implemented".into()))
+        }
+        async fn chat(
+            &self,
+            messages: &[crate::llm::ChatMessage],
+            _opts: &crate::llm::ChatOptions,
+        ) -> Result<String> {
+            let sys = messages
+                .iter()
+                .filter(|m| matches!(m.role, crate::llm::ChatRole::System))
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>()
+                .join("\n");
+            *self.system.lock().unwrap() = sys;
+            *self.user.lock().unwrap() = capture_user_message(messages);
+            Ok(self.response.clone())
+        }
+        async fn chat_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _: &[crate::llm::ChatMessage],
+            _: &crate::llm::ChatOptions,
+        ) -> Result<T> {
+            Err(TeriError::Llm("not used".into()))
+        }
+    }
+
+    fn make_chat_capture() -> (
+        ChatCaptureLlm,
+        std::sync::Arc<std::sync::Mutex<String>>,
+        std::sync::Arc<std::sync::Mutex<String>>,
+    ) {
+        let system = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let user = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let llm = ChatCaptureLlm {
+            system: system.clone(),
+            user: user.clone(),
+            // Minimal-but-valid JSON so the LLM path is taken (not rule-based fallback).
+            response: r#"{"bio": "b", "persona": "p"}"#.to_string(),
+        };
+        (llm, system, user)
+    }
+
+    /// Gap #1: the persona prompt for an INDIVIDUAL entity carries a personal-memory section that
+    /// ties the agent to the event and its prior actions/reactions.
+    #[tokio::test]
+    async fn test_persona_prompt_individual_has_personal_memory_section() {
+        let (llm, _sys, user) = make_chat_capture();
+        let generator = PersonaGenerator::new();
+        generator
+            .generate_social("Jane", "person", "A protester", Platform::Twitter, &llm, None)
+            .await
+            .expect("generate_social must succeed");
+
+        let prompt = user.lock().unwrap().clone();
+        assert!(
+            prompt.contains("INDIVIDUAL"),
+            "individual framing must be selected; got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Personal memory"),
+            "individual prompt must include a personal-memory section; got: {prompt}"
+        );
+        assert!(
+            prompt.contains("actions and reactions this individual has ALREADY taken"),
+            "personal-memory section must mention prior actions/reactions; got: {prompt}"
+        );
+    }
+
+    /// Gap #1 + #2: the persona prompt for a GROUP/institutional entity carries an
+    /// institutional-memory section (and the institutional framing is selected).
+    #[tokio::test]
+    async fn test_persona_prompt_group_has_institutional_memory_section() {
+        let (llm, _sys, user) = make_chat_capture();
+        let generator = PersonaGenerator::new();
+        generator
+            .generate_social(
+                "State University",
+                "university",
+                "A public university",
+                Platform::Reddit,
+                &llm,
+                None,
+            )
+            .await
+            .expect("generate_social must succeed");
+
+        let prompt = user.lock().unwrap().clone();
+        assert!(
+            prompt.contains("GROUP / INSTITUTIONAL"),
+            "group framing must be selected for an institutional type; got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Institutional memory"),
+            "group prompt must include an institutional-memory section; got: {prompt}"
+        );
+        assert!(
+            prompt.contains("actions and reactions this institution has ALREADY taken"),
+            "institutional-memory section must mention prior actions/reactions; got: {prompt}"
+        );
+        // The individual-only sub-sections must NOT appear in the group prompt.
+        assert!(
+            !prompt.contains("Personal memory"),
+            "group prompt must not use the personal frame"
+        );
+    }
+
+    /// Gap #1: when graph context is available, the memory-context block is injected so the model
+    /// can ground the persona-memory section in the event/neighbor facts.
+    #[tokio::test]
+    async fn test_persona_prompt_injects_graph_context_for_memory() {
+        let mut graph = KnowledgeGraph::new();
+        let main_entity = Entity {
+            id: uuid::Uuid::new_v4(),
+            name: "Alice".to_string(),
+            kind: EntityKind::Person,
+        };
+        let neighbor = Entity {
+            id: uuid::Uuid::new_v4(),
+            name: "Bob Reporter".to_string(),
+            kind: EntityKind::Person,
+        };
+        let a = graph.add_entity(main_entity.clone()).expect("add main");
+        let b = graph.add_entity(neighbor).expect("add neighbor");
+        graph.add_relation(
+            a,
+            b,
+            crate::graph::Relation::new(crate::graph::RelationKind::RelatedTo, 0.9)
+                .expect("valid relation"),
+        );
+
+        let (llm, _sys, user) = make_chat_capture();
+        let generator = PersonaGenerator::new();
+        generator
+            .generate_social(
+                "Alice",
+                "person",
+                "An activist",
+                Platform::Twitter,
+                &llm,
+                Some((&graph, &main_entity)),
+            )
+            .await
+            .expect("generate_social must succeed");
+
+        let prompt = user.lock().unwrap().clone();
+        assert!(
+            prompt.contains("Context (use this to ground the persona-memory section)"),
+            "graph context must be injected as a memory-grounding block; got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Bob Reporter"),
+            "neighbor name must appear in the memory context"
+        );
+    }
+
+    /// Gap #2: the system prompt is supplied on the chat() call.
+    #[tokio::test]
+    async fn test_persona_chat_includes_system_prompt() {
+        let (llm, sys, _user) = make_chat_capture();
+        let generator = PersonaGenerator::new();
+        generator
+            .generate_social("Jane", "person", "x", Platform::Twitter, &llm, None)
+            .await
+            .expect("generate_social must succeed");
+        let system = sys.lock().unwrap().clone();
+        assert!(
+            system.contains("social-media user profiles"),
+            "system prompt must be sent; got: {system}"
+        );
+    }
+
+    /// Gap #2: selection routes known individual types to the individual frame and group/unknown
+    /// types to the institutional frame, mirroring `_is_individual_entity`.
+    #[test]
+    fn test_two_prompt_selection_matches_entity_type() {
+        // Known individual types → individual frame.
+        for t in ["student", "expert", "journalist", "person"] {
+            let p = PersonaGenerator::build_persona_prompt(
+                "E",
+                t,
+                "s",
+                "",
+                Platform::Twitter,
+                PersonaGenerator::is_individual_entity(t),
+            );
+            assert!(p.contains("INDIVIDUAL"), "type {t} must select individual frame");
+            assert!(p.contains("Personal memory"), "type {t} must carry personal memory");
+        }
+        // Group types → institutional frame.
+        for t in ["university", "company", "ngo", "government_unknown_type"] {
+            let p = PersonaGenerator::build_persona_prompt(
+                "E",
+                t,
+                "s",
+                "",
+                Platform::Twitter,
+                PersonaGenerator::is_individual_entity(t),
+            );
+            assert!(
+                p.contains("GROUP / INSTITUTIONAL"),
+                "type {t} must select institutional frame"
+            );
+            assert!(p.contains("Institutional memory"), "type {t} must carry institutional memory");
+        }
+    }
+
+    /// Gap #3: rule-based randomization, deterministic under a FIXED seed — exact expected values.
+    #[test]
+    fn test_rule_based_randomization_fixed_seed_deterministic() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let sp = PersonaGenerator::generate_social_rule_based(
+            "John Student",
+            "student",
+            "",
+            Platform::Twitter,
+            "john_123",
+            "2026-06-23",
+            &mut rng,
+        );
+        // Same seed → same sequence: snapshot the exact draws so a regression in the draw ORDER
+        // or ranges is caught.
+        let age = sp.age.unwrap();
+        assert!((18..=30).contains(&age), "age in student range; got {age}");
+        assert!(matches!(sp.gender.as_deref(), Some("male") | Some("female")));
+        assert!(PersonaGenerator::MBTI_TYPES.contains(&sp.mbti.as_deref().unwrap()));
+        assert!(PersonaGenerator::COUNTRIES.contains(&sp.country.as_deref().unwrap()));
+        assert!((500..=5000).contains(&sp.karma));
+        assert!((50..=500).contains(&sp.friend_count));
+        assert!((100..=1000).contains(&sp.follower_count));
+        assert!((100..=2000).contains(&sp.statuses_count));
+
+        // Determinism: re-running with the same seed reproduces the identical profile.
+        let mut rng2 = StdRng::seed_from_u64(42);
+        let sp2 = PersonaGenerator::generate_social_rule_based(
+            "John Student",
+            "student",
+            "",
+            Platform::Twitter,
+            "john_123",
+            "2026-06-23",
+            &mut rng2,
+        );
+        assert_eq!(sp.age, sp2.age);
+        assert_eq!(sp.gender, sp2.gender);
+        assert_eq!(sp.mbti, sp2.mbti);
+        assert_eq!(sp.country, sp2.country);
+        assert_eq!(sp.karma, sp2.karma);
+        assert_eq!(sp.friend_count, sp2.friend_count);
+    }
+
+    /// Gap #3: across MANY generations the randomized fields show VARIETY (not constant) and every
+    /// MBTI/country draw comes from the constant tables.
+    #[test]
+    fn test_rule_based_randomization_produces_variety() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut ages = std::collections::HashSet::new();
+        let mut mbtis = std::collections::HashSet::new();
+        let mut countries = std::collections::HashSet::new();
+        let mut karmas = std::collections::HashSet::new();
+        for i in 0..200 {
+            let sp = PersonaGenerator::generate_social_rule_based(
+                &format!("Person {i}"),
+                "person", // generic individual → fully randomized branch
+                "",
+                Platform::Twitter,
+                "u_1",
+                "2026-06-23",
+                &mut rng,
+            );
+            ages.insert(sp.age.unwrap());
+            let mbti = sp.mbti.clone().unwrap();
+            let country = sp.country.clone().unwrap();
+            assert!(
+                PersonaGenerator::MBTI_TYPES.contains(&mbti.as_str()),
+                "mbti must come from MBTI_TYPES; got {mbti}"
+            );
+            assert!(
+                PersonaGenerator::COUNTRIES.contains(&country.as_str()),
+                "country must come from COUNTRIES; got {country}"
+            );
+            mbtis.insert(mbti);
+            countries.insert(country);
+            karmas.insert(sp.karma);
+        }
+        // Variety: many distinct values across 200 draws (non-constant).
+        assert!(ages.len() > 5, "ages must vary; distinct={}", ages.len());
+        assert!(mbtis.len() > 5, "mbti must vary; distinct={}", mbtis.len());
+        assert!(countries.len() > 3, "countries must vary; distinct={}", countries.len());
+        assert!(karmas.len() > 50, "karma must vary widely; distinct={}", karmas.len());
+    }
+
+    /// Gap #3: institutional accounts keep FIXED demographics even though counts are randomized.
+    #[test]
+    fn test_rule_based_institution_fixed_demographics() {
+        let mut rng = StdRng::seed_from_u64(1);
+        let sp = PersonaGenerator::generate_social_rule_based(
+            "Acme University",
+            "university",
+            "",
+            Platform::Reddit,
+            "acme_1",
+            "2026-06-23",
+            &mut rng,
+        );
+        assert_eq!(sp.age, Some(30));
+        assert_eq!(sp.gender.as_deref(), Some("other"));
+        assert_eq!(sp.mbti.as_deref(), Some("ISTJ"));
+        // Counts still randomized within range.
+        assert!((500..=5000).contains(&sp.karma));
     }
 }
