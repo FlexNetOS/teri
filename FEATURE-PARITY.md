@@ -227,5 +227,6 @@ Status: ☑ done · ☐ open. Priority groups top→bottom.
   constraints, per-entity search enrichment (Stage 1-2 #4-7).
 
 ### Doc debt
-- ☐ **TASK-DOC-1** — refresh the stale `TODO.md` (dated 2026-06-12, says "pipeline pending") — point
-  it at this ledger or rewrite against current code state.
+- ☑ **TASK-DOC-1** — refreshed the stale `TODO.md` (was dated 2026-06-12, claimed "pipeline pending"):
+  rewritten as a current-state pointer to this ledger + `SPRINT.md`. The final sprint plan
+  (`SPRINT.md`, S0–S14) now sequences this backlog. *(S0)*
