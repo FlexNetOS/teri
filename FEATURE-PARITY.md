@@ -263,8 +263,16 @@ Status: ☑ done · ☐ open. Priority groups top→bottom.
     `comment_content`/`quote_content`/`target_user_name` from the social-world post/comment/user
     graph; wired the log site to enrich when the platform world is installed (structural-only path
     unchanged with no world). Replaced the stale `[≠]U028-OASIS-INTERNALS` comment. +17 tests.
-- ☐ **TASK-SIM-3** — social-DB producer + `sqlite`-default serve (Stage 4-5 #1) — unlocks
-  posts/comments/history.
+- ☑ **TASK-SIM-3** — social-DB producer + `sqlite`-default serve (Stage 4-5 #1) — unlocks
+  posts/comments/history. Flipped `Cargo.toml` `default = ["sqlite"]` so a normal `cargo build` /
+  `teri serve` BOTH produces `{sim_dir}/{platform}_simulation.db` (the `SocialDbWriter` producer is
+  already installed on the live run/serve path via `engine.with_social` at `api/simulation.rs` and
+  `pipeline.rs` — verified, not newly wired) AND reads it back through `/posts` + `/comments`.
+  Added a producer→handler end-to-end test (`producer_db_is_readable_through_handlers_end_to_end`):
+  produces via the runtime `SocialWorldSet` at the manager's `get_simulation_dir` and reads back
+  through the HTTP handlers — proves producer-path == reader `social_db_path`, DDL == reader needs,
+  and the feature wires both halves. No-DB-empty + honest-500 (`--no-default-features`) contracts
+  preserved.
 - ☐ **TASK-SIM-4** — provider-agnostic `serve` ApiState (Stage 4-5 #2) — Anthropic/Gemini under serve.
 - ☐ **TASK-SIM-5** — `register_cleanup` shutdown hook (Stage 3 #3) — no orphaned sims.
 - ☐ **TASK-SIM-6** — persona/config `json_object`+`finish_reason`, ontology reserved-names/edge
