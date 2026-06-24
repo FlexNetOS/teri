@@ -769,7 +769,7 @@ impl ReportAgent {
         };
 
         // Step 6: chat_json([system, user], temperature=0.3)
-        let opts = ChatOptions { temperature: Some(0.3), max_tokens: None };
+        let opts = ChatOptions { temperature: Some(0.3), max_tokens: None, response_format: None };
         let messages = vec![ChatMessage::system(system_prompt), ChatMessage::user(user_prompt)];
 
         let response: serde_json::Value = match llm.chat_json(&messages, &opts).await {
@@ -1048,7 +1048,8 @@ impl ReportAgent {
         let report_context =
             format!("章节标题: {}\n模拟需求: {}", section.title, self.simulation_requirement);
 
-        let opts = ChatOptions { temperature: Some(0.5), max_tokens: Some(4096) };
+        let opts =
+            ChatOptions { temperature: Some(0.5), max_tokens: Some(4096), response_format: None };
 
         // ── Main ReACT loop ──────────────────────────────────────────────────
         for iteration in 0..max_iterations {
@@ -2202,7 +2203,7 @@ impl ReportAgent {
 
         // ── ReACT loop (max 2 iterations) ───────────────────────────────────
         let mut tool_calls_made: Vec<crate::services::zep_tools::ToolCall> = Vec::new();
-        let opts = ChatOptions { temperature: Some(0.5), max_tokens: None };
+        let opts = ChatOptions { temperature: Some(0.5), max_tokens: None, response_format: None };
 
         // Regexes for response cleanup (same in both early-return and post-loop paths).
         // (?s) = DOTALL flag — matches newlines inside <tool_call>…</tool_call>.

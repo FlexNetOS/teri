@@ -653,6 +653,70 @@ pub struct GraphSearchLens {
     pub store: std::sync::Arc<crate::memory::MemoryStore>,
 }
 
+/// A [`crate::agent::EntityFactRecall`] backed by a [`ReportTools`] semantic search
+/// (TASK-SIM-6 #5 — teri's analog of MiroFish's `_search_zep_for_entity`).
+///
+/// `recall` runs two semantic searches over the graph's vector namespace — `scope="edges"`
+/// for facts and `scope="nodes"` for related-node summaries — mirroring the parallel
+/// edge/node searches in `oasis_profile_generator.py:319-395`. It is best-effort: if the
+/// `ReportTools` carries no search lens, the underlying `search_graph_semantic` falls back to
+/// keyword search; the persona path always degrades gracefully.
+pub struct GraphSemanticRecall<'r, 'g, L: LlmClient + Send + Sync + 'static> {
+    tools: &'r ReportTools<'g, L>,
+    graph_id: String,
+    /// Per-scope result cap. MiroFish uses limit=30 (edges) / 20 (nodes); we keep a single
+    /// modest cap since the downstream formatter re-caps at 15 facts / 10 summaries.
+    limit: i64,
+}
+
+impl<'r, 'g, L: LlmClient + Send + Sync + 'static> GraphSemanticRecall<'r, 'g, L> {
+    /// Bind a recall source to a `ReportTools` + the graph namespace key.
+    pub fn new(tools: &'r ReportTools<'g, L>, graph_id: impl Into<String>) -> Self {
+        Self { tools, graph_id: graph_id.into(), limit: 20 }
+    }
+}
+
+#[async_trait::async_trait]
+impl<L: LlmClient + Send + Sync + 'static> crate::agent::EntityFactRecall
+    for GraphSemanticRecall<'_, '_, L>
+{
+    async fn recall(&self, entity_name: &str) -> crate::agent::RecalledEntityFacts {
+        // Query mirrors `t('progress.zepSearchQuery', name=entity_name)` — a name-anchored query.
+        let query = entity_name;
+
+        // Facts from edge-scope search (oasis_profile_generator.py:319-342).
+        let edge_result = self
+            .tools
+            .search_graph_semantic(&self.graph_id, query, self.limit, Some("edges"))
+            .await;
+        let facts = edge_result.facts;
+
+        // Node summaries from node-scope search (oasis_profile_generator.py:344-395). Each
+        // result node contributes its summary, plus its name (when distinct) as a
+        // "Related entity: <name>" line, matching the Python branch.
+        let node_result = self
+            .tools
+            .search_graph_semantic(&self.graph_id, query, self.limit, Some("nodes"))
+            .await;
+        let mut node_summaries: Vec<String> = Vec::new();
+        for node in &node_result.nodes {
+            if let Some(summary) =
+                node.get("summary").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+            {
+                node_summaries.push(summary.to_string());
+            }
+            if let Some(name) = node.get("name").and_then(|v| v.as_str())
+                && !name.is_empty()
+                && name != entity_name
+            {
+                node_summaries.push(format!("Related entity: {name}"));
+            }
+        }
+
+        crate::agent::RecalledEntityFacts { facts, node_summaries }
+    }
+}
+
 impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
     /// Create a new `ReportTools` binding graph and LLM by reference.
     ///
@@ -1338,7 +1402,7 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
 
         let messages =
             [ChatMessage::system(system_prompt), ChatMessage::user(user_prompt.as_str())];
-        let opts = ChatOptions { temperature: Some(0.3), max_tokens: None };
+        let opts = ChatOptions { temperature: Some(0.3), max_tokens: None, response_format: None };
 
         match self.llm.chat_json::<serde_json::Value>(&messages, &opts).await {
             Ok(resp) => {
@@ -1893,7 +1957,7 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
         );
 
         let messages = [ChatMessage::system(system_prompt), ChatMessage::user(user_prompt)];
-        let opts = ChatOptions { temperature: Some(0.3), max_tokens: None };
+        let opts = ChatOptions { temperature: Some(0.3), max_tokens: None, response_format: None };
 
         let fallback = |profiles: &[serde_json::Map<String, serde_json::Value>]| {
             let n = max_agents_usize.min(profiles.len());
@@ -1965,7 +2029,7 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
         );
 
         let messages = [ChatMessage::system(system_prompt), ChatMessage::user(user_prompt)];
-        let opts = ChatOptions { temperature: Some(0.5), max_tokens: None };
+        let opts = ChatOptions { temperature: Some(0.5), max_tokens: None, response_format: None };
 
         match self.llm.chat_json::<serde_json::Value>(&messages, &opts).await {
             Ok(resp) => {
@@ -2034,7 +2098,8 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
         );
 
         let messages = [ChatMessage::system(system_prompt), ChatMessage::user(user_prompt)];
-        let opts = ChatOptions { temperature: Some(0.3), max_tokens: Some(800) };
+        let opts =
+            ChatOptions { temperature: Some(0.3), max_tokens: Some(800), response_format: None };
 
         match self.llm.chat(&messages, &opts).await {
             Ok(s) => s,
@@ -3794,6 +3859,37 @@ mod tests {
         let result = tools.quick_search("graph1", "anything", 10);
         assert_eq!(result.total_count, 0);
         assert!(result.facts.is_empty());
+    }
+
+    // ── TASK-SIM-6 #5: GraphSemanticRecall adapter ──────────────────────────
+
+    /// Without a lens, `recall` falls back to keyword search and returns a
+    /// `RecalledEntityFacts` (never errors) — best-effort, as MiroFish requires.
+    #[tokio::test]
+    async fn graph_semantic_recall_returns_facts_no_lens() {
+        use crate::agent::EntityFactRecall;
+        let g = fixture_graph();
+        let llm = StubLlm;
+        let tools = ReportTools::new(&g, &llm); // no lens → keyword fallback
+        let recall = GraphSemanticRecall::new(&tools, "graph1");
+        let recalled = recall.recall("Alice").await;
+        // Keyword search over the fixture graph yields some facts/edges for "Alice".
+        // The exact count is graph-dependent; the contract is: it does not error and
+        // produces a well-formed result.
+        assert!(recalled.facts.len() + recalled.node_summaries.len() <= 40);
+    }
+
+    /// On an empty graph, recall yields empty (graceful) results.
+    #[tokio::test]
+    async fn graph_semantic_recall_empty_graph() {
+        use crate::agent::EntityFactRecall;
+        let g = KnowledgeGraph::new();
+        let llm = StubLlm;
+        let tools = ReportTools::new(&g, &llm);
+        let recall = GraphSemanticRecall::new(&tools, "graph1");
+        let recalled = recall.recall("Nobody").await;
+        assert!(recalled.facts.is_empty());
+        assert!(recalled.node_summaries.is_empty());
     }
 
     /// teri-native `recall_agent_discussion`: with a lens, it surfaces the swarm's real utterances

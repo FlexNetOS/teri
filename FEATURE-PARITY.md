@@ -282,8 +282,31 @@ Status: ☑ done · ☐ open. Priority groups top→bottom.
   via a `cleanup_done` compare-exchange). Verified at `src/server.rs` (`serve()` ~271-352) and the 4
   `cleanup_all_*` tests in `simulation_runner.rs` (idempotent / terminates+records / preserves
   finished / stops-running-skips-finished). *(S10 — verification slice, no code change)*
-- ☐ **TASK-SIM-6** — persona/config `json_object`+`finish_reason`, ontology reserved-names/edge
-  constraints, per-entity search enrichment (Stage 1-2 #4-7).
+- ☑ **TASK-SIM-6** — persona/config `json_object`+`finish_reason`, ontology reserved-names/edge
+  constraints, per-entity search enrichment (Stage 1-2 #4-7). *(S11)*
+  - **#7 (added)** — `ChatOptions` gained `response_format: Option<ResponseFormat>` (`ResponseFormat::JsonObject`
+    → OpenAI `{"type":"json_object"}`; Anthropic → JSON-sentinel turn; Gemini → `responseMimeType`).
+    New `LlmClient::chat_with_meta` returns `ChatCompletion { content, finish_reason }`; the OpenAI
+    adapter surfaces `finish_reason` (warns on `"length"`). The persona loop now requests JSON mode
+    and, on a `"length"` truncation, repairs via `fix_truncated_json` then parses (retrying the
+    attempt if even the repair is unparseable) — matching `oasis_profile_generator.py:536-547`. The
+    `chat_json` structured callers (ontology / sim-config) already force JSON mode internally.
+    *Already present in S6:* the 3-attempt temperature-ramp loop + JSON-salvage fallback + the
+    hardcoded `chat_json` `response_format`.
+  - **#5 (added)** — `EntityFactRecall` trait + `RecalledEntityFacts`; `generate_social_with_recall`
+    appends semantically-recalled facts/summaries (deduped against the graph-derived relationship
+    lines, capped 15 facts / 10 summaries) — the part-4 `_search_zep_for_entity` half
+    (`oasis_profile_generator.py:286-485`). Concrete `GraphSemanticRecall` adapter bridges
+    `ReportTools::search_graph_semantic` (edges→facts, nodes→summaries). Threaded through
+    `generate_profiles_from_entities` as an optional param (live batch-path wiring is a follow-up;
+    `None` → byte-identical to today). *Already present:* in-process parts 1-3 of `_build_entity_context`.
+  - **#6 (added)** — reserved attribute-name remap (`safe_attr_name`: `name`/`uuid`/`group_id`/
+    `name_embedding`/`summary`/`created_at` → `entity_*`, case-insensitive) for entity & edge
+    attributes in `validate_and_process` (`graph_builder.py:217-264`). *Already present:* type-name
+    PascalCase/UPPER_SNAKE remap + `source_targets` source/target remap.
+  - **#4 (added)** — distinct rule-based `mediaoutlet | socialmediaplatform` branch (profession
+    "Media", news-focused bio/persona/interests; `oasis_profile_generator.py:810-820`), placed
+    before the generic group branch. *Already present (S6):* `MBTI_TYPES` / `COUNTRIES` constants.
 
 ### Doc debt
 - ☑ **TASK-DOC-1** — refreshed the stale `TODO.md` (was dated 2026-06-12, claimed "pipeline pending"):

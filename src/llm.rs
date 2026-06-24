@@ -240,19 +240,73 @@ impl ChatMessage {
     }
 }
 
+/// Structured-output request shape for a chat completion.
+///
+/// # MiroFish parity (TASK-SIM-6 #7)
+/// Mirrors the `response_format={"type": "json_object"}` kwarg passed to
+/// `client.chat.completions.create(...)` in `oasis_profile_generator.py:536`
+/// (and the other structured callers). The OpenAI adapter serializes
+/// [`ResponseFormat::JsonObject`] to `{"type":"json_object"}`; the
+/// Anthropic / Gemini adapters map it onto their nearest equivalent
+/// (a JSON sentinel turn / `responseMimeType`) since their wire APIs have no
+/// `response_format` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseFormat {
+    /// Constrain the model to emit a single JSON object.
+    JsonObject,
+}
+
+impl ResponseFormat {
+    /// The OpenAI `response_format` JSON value (`{"type":"json_object"}`).
+    fn to_openai_value(self) -> serde_json::Value {
+        match self {
+            ResponseFormat::JsonObject => serde_json::json!({ "type": "json_object" }),
+        }
+    }
+}
+
 /// Optional per-call tuning knobs.
 ///
-/// `None` on either field means "let the adapter apply its own default" —
-/// callers that don't care about temperature or max_tokens use
-/// `ChatOptions::default()` and nothing changes from today's behaviour.
+/// `None` on every field means "let the adapter apply its own default" —
+/// callers that don't care about temperature, max_tokens, or structured output
+/// use `ChatOptions::default()` and nothing changes from today's behaviour
+/// (no-downgrade: `response_format: None` produces a byte-identical payload to
+/// the pre-S11 `chat()` path).
 ///
-/// # DECISION-7 — MiroFish parity
-/// Maps directly to the `temperature` / `max_tokens` kwargs of
-/// `LLMClient.chat()` / `LLMClient.chat_json()` in `llm_client.py`.
+/// # DECISION-7 / TASK-SIM-6 #7 — MiroFish parity
+/// Maps directly to the `temperature` / `max_tokens` / `response_format` kwargs
+/// of `LLMClient.chat()` / `LLMClient.chat_json()` in `llm_client.py` and the
+/// structured callers in `oasis_profile_generator.py`.
 #[derive(Debug, Clone, Default)]
 pub struct ChatOptions {
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
+    /// Structured-output request shape. `None` = omit (today's behaviour).
+    pub response_format: Option<ResponseFormat>,
+}
+
+/// A chat completion together with the provider's completion metadata.
+///
+/// # MiroFish parity (TASK-SIM-6 #7)
+/// `finish_reason` mirrors `response.choices[0].finish_reason`
+/// (`oasis_profile_generator.py:544`). A value of `Some("length")` means the
+/// completion was truncated by the token cap — the persona retry loop treats
+/// that like a failed attempt (after a salvage repair), exactly as MiroFish
+/// does at `:545-547`. `None` means the provider did not report a reason
+/// (e.g. the Anthropic / Gemini adapters, which surface no equivalent field).
+#[derive(Debug, Clone, Default)]
+pub struct ChatCompletion {
+    /// The (post-processed) completion text — identical to what `chat()` returns.
+    pub content: String,
+    /// The raw `finish_reason` string, when the provider reports one.
+    pub finish_reason: Option<String>,
+}
+
+impl ChatCompletion {
+    /// True when the provider reported the completion was cut off by the token cap.
+    pub fn is_truncated(&self) -> bool {
+        self.finish_reason.as_deref() == Some("length")
+    }
 }
 
 /// Core LLM client trait - completely provider-agnostic.
@@ -280,6 +334,22 @@ pub trait LlmClient: Send + Sync {
     /// Post-processing: `strip_think` is applied to the raw response (matches
     /// MiroFish `llm_client.py:67`).
     async fn chat(&self, messages: &[ChatMessage], opts: &ChatOptions) -> Result<String>;
+
+    /// Send a multi-role message vector and return the text plus completion metadata.
+    ///
+    /// TASK-SIM-6 #7: this is the truncation-aware entry point. The OpenAI adapter
+    /// overrides it to surface `finish_reason` (so the persona retry loop can detect
+    /// a `"length"` truncation). The default impl delegates to [`chat`](Self::chat)
+    /// and reports `finish_reason: None` — providers that surface no equivalent field
+    /// (Anthropic, Gemini) keep this default, so behaviour is byte-identical to `chat`.
+    async fn chat_with_meta(
+        &self,
+        messages: &[ChatMessage],
+        opts: &ChatOptions,
+    ) -> Result<ChatCompletion> {
+        let content = self.chat(messages, opts).await?;
+        Ok(ChatCompletion { content, finish_reason: None })
+    }
 
     /// Send a multi-role message vector and parse the response as JSON.
     ///
@@ -329,6 +399,33 @@ impl OpenAiAdapter {
             max_retries: config.max_retries,
             max_tokens: config.max_tokens,
         }
+    }
+
+    /// Build the `/chat/completions` request body from a message vector + options.
+    ///
+    /// DRY: shared by `chat_with_meta` and `chat_json`. No-downgrade: optional keys
+    /// (`temperature` / `max_tokens` / `response_format`) are emitted ONLY when set,
+    /// so `ChatOptions::default()` produces the exact pre-S11 `{model, messages}` body.
+    fn build_chat_payload(
+        &self,
+        messages: &[ChatMessage],
+        opts: &ChatOptions,
+    ) -> serde_json::Value {
+        let mut payload = serde_json::json!({
+            "model": self.model,
+            "messages": messages,
+        });
+        if let Some(temp) = opts.temperature {
+            payload["temperature"] = serde_json::json!(temp);
+        }
+        if let Some(max) = opts.max_tokens {
+            payload["max_tokens"] = serde_json::json!(max);
+        }
+        // TASK-SIM-6 #7: structured-output request shape (OpenAI's `response_format`).
+        if let Some(fmt) = opts.response_format {
+            payload["response_format"] = fmt.to_openai_value();
+        }
+        payload
     }
 
     async fn call_api(&self, payload: serde_json::Value) -> Result<serde_json::Value> {
@@ -518,33 +615,42 @@ impl LlmClient for OpenAiAdapter {
     // --- DECISION-7: parameterized chat (additive; complete/complete_json/stream UNCHANGED) ---
 
     async fn chat(&self, messages: &[ChatMessage], opts: &ChatOptions) -> Result<String> {
+        Ok(self.chat_with_meta(messages, opts).await?.content)
+    }
+
+    async fn chat_with_meta(
+        &self,
+        messages: &[ChatMessage],
+        opts: &ChatOptions,
+    ) -> Result<ChatCompletion> {
         // Serialize messages verbatim — roles are lowercased by serde (ChatRole's rename_all).
-        let mut payload = serde_json::json!({
-            "model": self.model,
-            "messages": messages,
-        });
-
-        // Add temperature only when explicitly set (DECISION-7: omit key → server default).
-        if let Some(temp) = opts.temperature {
-            payload["temperature"] = serde_json::json!(temp);
-        }
-        // Add max_tokens only when explicitly set.
-        if let Some(max) = opts.max_tokens {
-            payload["max_tokens"] = serde_json::json!(max);
-        }
-
+        // No-downgrade: with `opts == ChatOptions::default()` this is byte-identical to the
+        // pre-S11 payload (model + messages, no optional keys).
+        let payload = self.build_chat_payload(messages, opts);
         let response = self.call_api(payload).await?;
 
-        let raw = response
-            .get("choices")
-            .and_then(|c| c.get(0))
+        let choice = response.get("choices").and_then(|c| c.get(0));
+        let raw = choice
             .and_then(|c| c.get("message"))
             .and_then(|m| m.get("content"))
             .and_then(|c| c.as_str())
             .ok_or_else(|| TeriError::Llm("Invalid response format".to_string()))?;
 
+        // TASK-SIM-6 #7: surface finish_reason so callers can detect a "length" truncation
+        // (mirrors `response.choices[0].finish_reason`, oasis_profile_generator.py:544).
+        let finish_reason = choice
+            .and_then(|c| c.get("finish_reason"))
+            .and_then(|f| f.as_str())
+            .map(str::to_string);
+
+        if finish_reason.as_deref() == Some("length") {
+            tracing::warn!(
+                "OpenAI completion truncated (finish_reason=\"length\"); output may be incomplete"
+            );
+        }
+
         // Strip <think>…</think> blocks (MiroFish llm_client.py:67)
-        Ok(strip_think(raw))
+        Ok(ChatCompletion { content: strip_think(raw), finish_reason })
     }
 
     async fn chat_json<T: DeserializeOwned>(
@@ -552,19 +658,11 @@ impl LlmClient for OpenAiAdapter {
         messages: &[ChatMessage],
         opts: &ChatOptions,
     ) -> Result<T> {
-        let mut payload = serde_json::json!({
-            "model": self.model,
-            "messages": messages,
-            // JSON mode — matches existing complete_json and MiroFish chat_json
-            "response_format": { "type": "json_object" },
-        });
-
-        if let Some(temp) = opts.temperature {
-            payload["temperature"] = serde_json::json!(temp);
-        }
-        if let Some(max) = opts.max_tokens {
-            payload["max_tokens"] = serde_json::json!(max);
-        }
+        // chat_json always requests JSON mode (matches existing complete_json and MiroFish
+        // chat_json) regardless of `opts.response_format`.
+        let mut opts = opts.clone();
+        opts.response_format = Some(ResponseFormat::JsonObject);
+        let payload = self.build_chat_payload(messages, &opts);
 
         let response = self.call_api(payload).await?;
 
@@ -865,9 +963,17 @@ impl LlmClient for AnthropicAdapter {
             .collect::<Vec<_>>()
             .join("\n\n");
 
+        // TASK-SIM-6 #7: Anthropic's Messages API has no `response_format` field. The faithful
+        // mapping for `ResponseFormat::JsonObject` is the same JSON-sentinel turn `chat_json`
+        // already uses — append "Respond with valid JSON only." as a trailing user turn.
+        // `response_format: None` → no extra turn (byte-identical to today).
+        let extra_json_turn = matches!(opts.response_format, Some(ResponseFormat::JsonObject))
+            .then(|| ChatMessage::user("\n\nRespond with valid JSON only."));
+
         let user_msgs: Vec<serde_json::Value> = messages
             .iter()
             .filter(|m| !matches!(m.role, ChatRole::System))
+            .chain(extra_json_turn.iter())
             .map(|m| {
                 let role = match m.role {
                     ChatRole::User => "user",
@@ -1201,6 +1307,13 @@ impl LlmClient for GeminiAdapter {
         if let Some(max) = opts.max_tokens {
             gen_config.insert("maxOutputTokens".to_string(), serde_json::json!(max));
         }
+        // TASK-SIM-6 #7: Gemini's nearest equivalent of OpenAI's `response_format` is the
+        // `responseMimeType` generationConfig key (the same one `chat_json` already sets).
+        // `response_format: None` → key omitted (byte-identical to today).
+        if matches!(opts.response_format, Some(ResponseFormat::JsonObject)) {
+            gen_config
+                .insert("responseMimeType".to_string(), serde_json::json!("application/json"));
+        }
         if !gen_config.is_empty() {
             payload["generationConfig"] = serde_json::Value::Object(gen_config);
         }
@@ -1382,6 +1495,20 @@ impl LlmClient for ProviderAdapter {
             ProviderAdapter::Openai(a) => a.chat(messages, opts).await,
             ProviderAdapter::Anthropic(a) => a.chat(messages, opts).await,
             ProviderAdapter::Gemini(a) => a.chat(messages, opts).await,
+        }
+    }
+
+    async fn chat_with_meta(
+        &self,
+        messages: &[ChatMessage],
+        opts: &ChatOptions,
+    ) -> Result<ChatCompletion> {
+        // Forward to each adapter's own impl so the OpenAI finish_reason is preserved
+        // (Anthropic/Gemini use the trait default → finish_reason: None).
+        match self {
+            ProviderAdapter::Openai(a) => a.chat_with_meta(messages, opts).await,
+            ProviderAdapter::Anthropic(a) => a.chat_with_meta(messages, opts).await,
+            ProviderAdapter::Gemini(a) => a.chat_with_meta(messages, opts).await,
         }
     }
 
@@ -2122,7 +2249,8 @@ data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" Gemini\"}]}}]}\n",
     fn test_openai_chat_payload_shape() {
         // Build the payload that chat() would send (mirrors the implementation)
         let messages = &[ChatMessage::system("You are helpful"), ChatMessage::user("Hello")];
-        let opts = ChatOptions { temperature: Some(0.3), max_tokens: Some(4096) };
+        let opts =
+            ChatOptions { temperature: Some(0.3), max_tokens: Some(4096), response_format: None };
 
         let mut payload = serde_json::json!({
             "model": "gpt-4o",
@@ -2177,7 +2305,8 @@ data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" Gemini\"}]}}]}\n",
     #[test]
     fn test_openai_chat_json_payload_has_response_format() {
         let messages = &[ChatMessage::system("sys"), ChatMessage::user("user")];
-        let opts = ChatOptions { temperature: Some(0.3), max_tokens: Some(4096) };
+        let opts =
+            ChatOptions { temperature: Some(0.3), max_tokens: Some(4096), response_format: None };
 
         let mut payload = serde_json::json!({
             "model": "gpt-4o",
@@ -2211,7 +2340,11 @@ data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" Gemini\"}]}}]}\n",
         let resp = client
             .chat(
                 &[ChatMessage::system("You are helpful"), ChatMessage::user("Hello")],
-                &ChatOptions { temperature: Some(0.3), max_tokens: Some(4096) },
+                &ChatOptions {
+                    temperature: Some(0.3),
+                    max_tokens: Some(4096),
+                    response_format: None,
+                },
             )
             .await
             .unwrap();
@@ -2267,7 +2400,11 @@ data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" Gemini\"}]}}]}\n",
         let resp: serde_json::Value = client
             .chat_json(
                 &[ChatMessage::system("sys"), ChatMessage::user("user")],
-                &ChatOptions { temperature: Some(0.3), max_tokens: Some(4096) },
+                &ChatOptions {
+                    temperature: Some(0.3),
+                    max_tokens: Some(4096),
+                    response_format: None,
+                },
             )
             .await
             .unwrap();
@@ -2294,6 +2431,146 @@ data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" Gemini\"}]}}]}\n",
             .await
             .unwrap();
         assert_eq!(resp["v"], 1);
+    }
+
+    // =========================================================================
+    // TASK-SIM-6 #7 — ResponseFormat / finish_reason
+    // =========================================================================
+
+    /// ResponseFormat::JsonObject serializes to OpenAI's `{"type":"json_object"}`.
+    #[test]
+    fn test_response_format_json_object_openai_value() {
+        assert_eq!(
+            ResponseFormat::JsonObject.to_openai_value(),
+            serde_json::json!({ "type": "json_object" })
+        );
+    }
+
+    /// build_chat_payload omits response_format when None (no-downgrade: byte-identical to today).
+    #[test]
+    fn test_build_chat_payload_omits_response_format_when_none() {
+        let server = MockServer::start();
+        let client = OpenAiAdapter::new(&openai_config(&server, 0));
+        let payload =
+            client.build_chat_payload(&[ChatMessage::user("hi")], &ChatOptions::default());
+        assert!(
+            payload.get("response_format").is_none(),
+            "response_format must be absent when None"
+        );
+    }
+
+    /// build_chat_payload includes response_format when set to JsonObject.
+    #[test]
+    fn test_build_chat_payload_includes_response_format_when_set() {
+        let server = MockServer::start();
+        let client = OpenAiAdapter::new(&openai_config(&server, 0));
+        let opts =
+            ChatOptions { response_format: Some(ResponseFormat::JsonObject), ..Default::default() };
+        let payload = client.build_chat_payload(&[ChatMessage::user("hi")], &opts);
+        assert_eq!(payload["response_format"]["type"], "json_object");
+    }
+
+    /// The OpenAI adapter actually sends response_format on the wire when set.
+    #[tokio::test]
+    async fn test_openai_chat_sends_response_format_over_wire() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .json_body_partial(r#"{"response_format":{"type":"json_object"}}"#);
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"choices":[{"message":{"content":"{}"},"finish_reason":"stop"}]}"#);
+        });
+
+        let client = OpenAiAdapter::new(&openai_config(&server, 0));
+        let opts =
+            ChatOptions { response_format: Some(ResponseFormat::JsonObject), ..Default::default() };
+        let _ = client.chat(&[ChatMessage::user("q")], &opts).await.unwrap();
+        mock.assert();
+    }
+
+    /// chat_with_meta surfaces finish_reason=="length" as a truncation signal.
+    #[tokio::test]
+    async fn test_openai_chat_with_meta_detects_length_truncation() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/chat/completions");
+            then.status(200).header("Content-Type", "application/json").body(
+                r#"{"choices":[{"message":{"content":"{\"bio\":\"truncat"},"finish_reason":"length"}]}"#,
+            );
+        });
+
+        let client = OpenAiAdapter::new(&openai_config(&server, 0));
+        let completion = client
+            .chat_with_meta(&[ChatMessage::user("q")], &ChatOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(completion.finish_reason.as_deref(), Some("length"));
+        assert!(completion.is_truncated(), "finish_reason==length must read as truncated");
+    }
+
+    /// chat_with_meta reports a non-length finish_reason as NOT truncated.
+    #[tokio::test]
+    async fn test_openai_chat_with_meta_stop_not_truncated() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/chat/completions");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"choices":[{"message":{"content":"done"},"finish_reason":"stop"}]}"#);
+        });
+
+        let client = OpenAiAdapter::new(&openai_config(&server, 0));
+        let completion = client
+            .chat_with_meta(&[ChatMessage::user("q")], &ChatOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(completion.content, "done");
+        assert!(!completion.is_truncated());
+    }
+
+    /// Anthropic's response_format maps to a JSON-sentinel user turn (no `response_format` key).
+    #[tokio::test]
+    async fn test_anthropic_chat_response_format_appends_json_sentinel() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/messages")
+                .body_contains("Respond with valid JSON only");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"content":[{"text":"{}"}]}"#);
+        });
+
+        let client = AnthropicAdapter::new_with_base(
+            "k".to_string(),
+            "claude-3".to_string(),
+            server.base_url(),
+        );
+        let opts =
+            ChatOptions { response_format: Some(ResponseFormat::JsonObject), ..Default::default() };
+        let _ = client.chat(&[ChatMessage::user("q")], &opts).await.unwrap();
+        mock.assert();
+    }
+
+    /// Gemini's response_format maps to responseMimeType in generationConfig.
+    #[tokio::test]
+    async fn test_gemini_chat_response_format_sets_mime_type() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).body_contains("application/json");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"candidates":[{"content":{"parts":[{"text":"{}"}]}}]}"#);
+        });
+
+        let client =
+            GeminiAdapter::new_with_base("k".to_string(), "gemini".to_string(), server.base_url());
+        let opts =
+            ChatOptions { response_format: Some(ResponseFormat::JsonObject), ..Default::default() };
+        let _ = client.chat(&[ChatMessage::user("q")], &opts).await.unwrap();
+        mock.assert();
     }
 
     // =========================================================================
@@ -2400,7 +2677,11 @@ data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" Gemini\"}]}}]}\n",
         let resp = client
             .chat(
                 &[ChatMessage::user("q")],
-                &ChatOptions { temperature: Some(0.5), max_tokens: Some(2048) },
+                &ChatOptions {
+                    temperature: Some(0.5),
+                    max_tokens: Some(2048),
+                    response_format: None,
+                },
             )
             .await
             .unwrap();
@@ -2427,7 +2708,11 @@ data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" Gemini\"}]}}]}\n",
         let resp: serde_json::Value = client
             .chat_json(
                 &[ChatMessage::system("sys"), ChatMessage::user("produce JSON")],
-                &ChatOptions { temperature: Some(0.3), max_tokens: Some(4096) },
+                &ChatOptions {
+                    temperature: Some(0.3),
+                    max_tokens: Some(4096),
+                    response_format: None,
+                },
             )
             .await
             .unwrap();
@@ -2444,7 +2729,8 @@ data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" Gemini\"}]}}]}\n",
     #[test]
     fn test_gemini_chat_payload_shape() {
         let messages = &[ChatMessage::system("Be brief"), ChatMessage::user("Q?")];
-        let opts = ChatOptions { temperature: Some(0.3), max_tokens: Some(4096) };
+        let opts =
+            ChatOptions { temperature: Some(0.3), max_tokens: Some(4096), response_format: None };
 
         let system_text: String = messages
             .iter()
@@ -2514,7 +2800,11 @@ data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" Gemini\"}]}}]}\n",
         let resp = client
             .chat(
                 &[ChatMessage::system("Be brief"), ChatMessage::user("Q?")],
-                &ChatOptions { temperature: Some(0.3), max_tokens: Some(4096) },
+                &ChatOptions {
+                    temperature: Some(0.3),
+                    max_tokens: Some(4096),
+                    response_format: None,
+                },
             )
             .await
             .unwrap();
