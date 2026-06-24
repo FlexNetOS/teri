@@ -273,7 +273,7 @@ Status: ☑ done · ☐ open. Priority groups top→bottom.
   through the HTTP handlers — proves producer-path == reader `social_db_path`, DDL == reader needs,
   and the feature wires both halves. No-DB-empty + honest-500 (`--no-default-features`) contracts
   preserved.
-- ☐ **TASK-SIM-4** — provider-agnostic `serve` ApiState (Stage 4-5 #2) — Anthropic/Gemini under serve.
+- ☑ **TASK-SIM-4** — provider-agnostic `serve` ApiState (Stage 4-5 #2) — Anthropic/Gemini under serve. `ApiState`/runner monomorphized over `ProviderAdapter` (enum dispatch) instead of `OpenAiAdapter`; `build_llm` + `BackendLlm` now provider-selected from `config.llm.provider`; boost wrapped as `ProviderAdapter::Openai`. No-downgrade (OpenAI byte-identical). S9.
 - ☐ **TASK-SIM-5** — `register_cleanup` shutdown hook (Stage 3 #3) — no orphaned sims.
 - ☐ **TASK-SIM-6** — persona/config `json_object`+`finish_reason`, ontology reserved-names/edge
   constraints, per-entity search enrichment (Stage 1-2 #4-7).
