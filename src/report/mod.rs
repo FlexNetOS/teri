@@ -83,6 +83,9 @@ pub struct PredictionReport {
     pub summary: String,
     pub timeline: Vec<TimelineEvent>,
     pub agent_highlights: Vec<AgentHighlight>,
+    /// Synthesized report confidence, `[0.0, 1.0]` — the model's self-assessment, not a calibrated
+    /// probability. The autonomy LEARN layer ([`crate::autonomy::calibration`]) provides an opt-in
+    /// per-community calibration of this value where actioned/accurate outcomes have been recorded.
     pub confidence: f32,
     pub raw_query: String,
     pub created_at: chrono::DateTime<chrono::Utc>,

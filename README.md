@@ -175,8 +175,11 @@ weakened to make a run proceed.
 
 Teri is a broad agentic scenario engine, not an oracle. It can simulate and forecast scenarios that
 fit its seed data, ontology, persona, action, memory, and report model. It does not prove causal
-truth, and report `confidence` is synthesized report metadata rather than calibrated probability
-unless a separate calibration loop is added.
+truth. Prediction/report `confidence` is **synthesized** metadata by default; an **opt-in
+per-community calibration loop** (the autonomy LEARN layer, `src/autonomy/calibration.rs`) now
+adjusts it toward calibrated for communities where actioned/accurate outcomes have been recorded —
+using the same `(0.5 + accuracy).clamp(0.5, 1.5)` heuristic as the pebesen receiver. Until outcomes
+are recorded for a community its weight is neutral (1.0), so confidence is unchanged.
 
 Parity against MiroFish is tracked in [`RUNBOOK.md`](./RUNBOOK.md) §12 and the feature-parity
 ledger. The **Web UI** is the principal in-progress surface relative to MiroFish.
