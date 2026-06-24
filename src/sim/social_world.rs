@@ -88,6 +88,12 @@ pub struct SocialWorld {
     post_index: HashMap<i64, usize>,
     /// `comment_id` -> index into `comments`.
     comment_index: HashMap<i64, usize>,
+    /// `user_id` -> display name. Populated as agents act (poster/commenter/actor names are known
+    /// at the call site). Used to resolve `author_name` / `target_user_name` enrichment for the
+    /// `actions.jsonl` records (`run_parallel_simulation.py:_get_post_info`/`_enrich_action_context`
+    /// look the same names up out of the OASIS `user` table). Missing ⇒ empty string, exactly like
+    /// MiroFish's `author_name = ''` fallback.
+    users: HashMap<i64, String>,
     next_post_id: i64,
     next_comment_id: i64,
 }
@@ -97,7 +103,7 @@ pub struct SocialWorld {
 /// `comment-` prefix then parses the remainder as an `i64`. Returns `None` on anything
 /// unparseable — the fail-closed signal that an `apply` becomes a [`ApplyOutcome::NoOp`] (never a
 /// panic, never an invented post).
-fn parse_target_id(raw: &str) -> Option<i64> {
+pub(crate) fn parse_target_id(raw: &str) -> Option<i64> {
     let trimmed = raw.trim();
     let stripped = trimmed
         .strip_prefix("post-")
@@ -130,6 +136,30 @@ impl SocialWorld {
     /// Read-only view of the follow edges.
     pub fn follows(&self) -> &[FollowEdge] {
         &self.follows
+    }
+
+    /// Record a `user_id` -> display-name mapping for enrichment lookups. Idempotent; a later call
+    /// overwrites (names are stable in practice). No-op for an empty name so we never shadow a real
+    /// name with `""`.
+    pub fn register_user(&mut self, user_id: i64, name: &str) {
+        if !name.is_empty() {
+            self.users.insert(user_id, name.to_string());
+        }
+    }
+
+    /// Resolve a `user_id` to its registered display name, or `None` if unknown.
+    pub fn user_name(&self, user_id: i64) -> Option<&str> {
+        self.users.get(&user_id).map(String::as_str)
+    }
+
+    /// Read-only post lookup by id (for enrichment).
+    pub fn post_by_id(&self, id: i64) -> Option<&Post> {
+        self.post_index.get(&id).and_then(|&idx| self.posts.get(idx))
+    }
+
+    /// Read-only comment lookup by id (for enrichment).
+    pub fn comment_by_id(&self, id: i64) -> Option<&Comment> {
+        self.comment_index.get(&id).and_then(|&idx| self.comments.get(idx))
     }
 
     /// Mint and insert a new post; returns its id. Used by both `CreatePost` and the round-0

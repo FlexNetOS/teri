@@ -22,6 +22,54 @@ pub enum Platform {
     Reddit,
 }
 
+/// Per-platform allowed social-action names (TASK-SIM-2 #1). Mirrors MiroFish's
+/// `TWITTER_ACTIONS` / `REDDIT_ACTIONS` (`run_parallel_simulation.py:178-202`), which it passes as
+/// `available_actions` to the OASIS agent-graph generator so the LLM is only ever OFFERED its
+/// platform's actions. teri's LLM can emit any action string, so we gate at validation time
+/// instead: an action not in the agent's platform set is coerced to `DO_NOTHING` (the
+/// behaviourally-equivalent outcome of "never offered" — it produces no social effect).
+///
+/// Kept as a static set rather than threading `Config` to every agent; `Platform::allowed_actions`
+/// is asserted equal to `Config.oasis_twitter_actions` / `oasis_reddit_actions` by
+/// `config.rs` so the two never drift. NOTE: MiroFish's lists include `REFRESH` (Reddit) and
+/// `DO_NOTHING`, neither of which is an agent-selectable `SocialAction` variant in teri (REFRESH is
+/// a FILTERED_ACTION never recorded; DO_NOTHING is the fallback target). Both are still listed so
+/// the set equals the config list verbatim.
+const TWITTER_ALLOWED_ACTIONS: &[&str] =
+    &["CREATE_POST", "LIKE_POST", "REPOST", "FOLLOW", "DO_NOTHING", "QUOTE_POST"];
+
+const REDDIT_ALLOWED_ACTIONS: &[&str] = &[
+    "LIKE_POST",
+    "DISLIKE_POST",
+    "CREATE_POST",
+    "CREATE_COMMENT",
+    "LIKE_COMMENT",
+    "DISLIKE_COMMENT",
+    "SEARCH_POSTS",
+    "SEARCH_USER",
+    "TREND",
+    "REFRESH",
+    "DO_NOTHING",
+    "FOLLOW",
+    "MUTE",
+];
+
+impl Platform {
+    /// The OASIS action-name strings this platform offers (the static mirror of the config lists).
+    pub fn allowed_actions(self) -> &'static [&'static str] {
+        match self {
+            Platform::Twitter => TWITTER_ALLOWED_ACTIONS,
+            Platform::Reddit => REDDIT_ALLOWED_ACTIONS,
+        }
+    }
+
+    /// Whether `action_type` (an OASIS `ACTION_TYPE_MAP` value, e.g. `CREATE_COMMENT`) is offered
+    /// on this platform.
+    pub fn allows_action(self, action_type: &str) -> bool {
+        self.allowed_actions().contains(&action_type)
+    }
+}
+
 /// Social-media–specific profile data for a simulated agent.
 ///
 /// Holds the fields that map directly to `OasisAgentProfile` fields.  `SocialProfile.bio`
@@ -588,7 +636,7 @@ impl Agent {
             // Args parsed as key=value pairs; bare values accepted for single-field actions.
             let social = self.parse_social_action(action_type, content);
             if let Some(sa) = social {
-                return Ok(Action::Social(sa));
+                return Ok(Action::Social(self.gate_platform_action(sa)));
             }
 
             return Err(TeriError::Agent(format!("Unknown action type: {}", action_type)));
@@ -653,6 +701,26 @@ impl Agent {
             "TREND" | "trend" => Some(SocialAction::Trend),
             "DO_NOTHING" => Some(SocialAction::DoNothing),
             _ => None,
+        }
+    }
+
+    /// Gate a parsed social action against the agent's platform allowed-set (TASK-SIM-2 #1).
+    ///
+    /// MiroFish only OFFERS each agent its platform's actions (`TWITTER_ACTIONS` / `REDDIT_ACTIONS`
+    /// → `available_actions`), so a Twitter agent can never select e.g. `CREATE_COMMENT`. teri's LLM
+    /// can emit any name, so an action outside the agent's platform set is coerced to
+    /// `DO_NOTHING` — the behaviourally-equivalent "no social effect" outcome of an action that was
+    /// never offered.
+    ///
+    /// A generic (non-social) agent has no platform; its actions are never gated (they are not
+    /// social actions anyway). `DO_NOTHING` itself is in both platform sets, so coercion is
+    /// idempotent and never loops.
+    fn gate_platform_action(&self, sa: SocialAction) -> SocialAction {
+        match self.persona.social.as_ref() {
+            Some(profile) if !profile.platform.allows_action(sa.oasis_action_type()) => {
+                SocialAction::DoNothing
+            }
+            _ => sa,
         }
     }
 
@@ -3313,6 +3381,100 @@ mod tests {
             role: "Poster".to_string(),
             social: None,
         })
+    }
+
+    /// An agent carrying a minimal `SocialProfile` on `platform` (for the per-platform action gate).
+    fn make_platform_agent(platform: Platform) -> Agent {
+        Agent::new(Persona {
+            name: "SocialBot".to_string(),
+            background: "A social media agent".to_string(),
+            traits: vec!["engaged".to_string()],
+            role: "Poster".to_string(),
+            social: Some(SocialProfile {
+                user_id: 1,
+                user_name: "bot_1".to_string(),
+                bio: String::new(),
+                persona: String::new(),
+                platform,
+                karma: SocialProfile::default_karma(),
+                friend_count: SocialProfile::default_friend_count(),
+                follower_count: SocialProfile::default_follower_count(),
+                following_count: SocialProfile::default_friend_count(),
+                statuses_count: SocialProfile::default_statuses_count(),
+                age: None,
+                gender: None,
+                mbti: None,
+                country: None,
+                profession: None,
+                interested_topics: vec![],
+                posting_style: None,
+                source_entity_uuid: None,
+                source_entity_type: None,
+                created_at: "2026-06-14".to_string(),
+            }),
+        })
+    }
+
+    // --- TASK-SIM-2 #1: per-platform action gate ---
+
+    #[test]
+    fn test_platform_gate_twitter_rejects_reddit_only_action() {
+        // CREATE_COMMENT / DISLIKE_COMMENT are Reddit-only; a Twitter agent must be coerced to
+        // DO_NOTHING (MiroFish never OFFERS them to a Twitter agent).
+        let agent = make_platform_agent(Platform::Twitter);
+        for line in ["CREATE_COMMENT(post_id=1,content=hi)", "DISLIKE_COMMENT(target_id=1)"] {
+            let action = agent.parse_and_validate_action(line).unwrap();
+            assert!(
+                matches!(action, Action::Social(SocialAction::DoNothing)),
+                "Twitter agent should drop Reddit-only action {line} to DO_NOTHING, got {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_platform_gate_twitter_allows_twitter_action() {
+        let agent = make_platform_agent(Platform::Twitter);
+        let action = agent.parse_and_validate_action("LIKE_POST(post-42)").unwrap();
+        assert!(matches!(
+            action,
+            Action::Social(SocialAction::Like { target_kind: TargetKind::Post, .. })
+        ));
+    }
+
+    #[test]
+    fn test_platform_gate_reddit_allows_reddit_only_action() {
+        // The Reddit-only action a Twitter agent was denied is accepted on Reddit.
+        let agent = make_platform_agent(Platform::Reddit);
+        let action =
+            agent.parse_and_validate_action("CREATE_COMMENT(post_id=1,content=hi)").unwrap();
+        assert!(matches!(action, Action::Social(SocialAction::Comment { .. })));
+    }
+
+    #[test]
+    fn test_platform_gate_reddit_rejects_twitter_only_action() {
+        // QUOTE_POST is Twitter-only (not in REDDIT_ACTIONS); a Reddit agent must drop it.
+        let agent = make_platform_agent(Platform::Reddit);
+        let action =
+            agent.parse_and_validate_action("QUOTE_POST(post_id=1,content=agree)").unwrap();
+        assert!(matches!(action, Action::Social(SocialAction::DoNothing)));
+    }
+
+    #[test]
+    fn test_platform_gate_does_not_touch_generic_agent() {
+        // A non-social agent (no platform) is never gated — a Reddit-only action parses as-is.
+        let agent = make_test_agent();
+        let action =
+            agent.parse_and_validate_action("CREATE_COMMENT(post_id=1,content=hi)").unwrap();
+        assert!(matches!(action, Action::Social(SocialAction::Comment { .. })));
+    }
+
+    #[test]
+    fn test_platform_gate_donothing_is_idempotent_both_platforms() {
+        for p in [Platform::Twitter, Platform::Reddit] {
+            let agent = make_platform_agent(p);
+            let action = agent.parse_and_validate_action("DO_NOTHING()").unwrap();
+            assert!(matches!(action, Action::Social(SocialAction::DoNothing)));
+        }
     }
 
     #[test]
