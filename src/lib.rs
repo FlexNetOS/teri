@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod api;
+pub mod autonomy;
 pub mod config;
 pub mod embedding;
 pub mod error;
