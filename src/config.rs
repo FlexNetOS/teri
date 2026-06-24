@@ -704,6 +704,22 @@ mod tests {
         assert!(trend_pos < refresh_pos, "TREND must precede REFRESH (source order preserved)");
     }
 
+    // --- TASK-SIM-2 #1: the static per-platform gate set must equal the config lists ---
+
+    #[test]
+    fn test_platform_allowed_actions_match_config_lists() {
+        use crate::agent::Platform;
+        let c = Config::build(Some("key"));
+        // The static gate sets (used by `Platform::allows_action` at decision time) must be the
+        // verbatim mirror of the config-driven action lists, so the two can never drift.
+        let twitter: Vec<String> =
+            Platform::Twitter.allowed_actions().iter().map(|s| s.to_string()).collect();
+        let reddit: Vec<String> =
+            Platform::Reddit.allowed_actions().iter().map(|s| s.to_string()).collect();
+        assert_eq!(twitter, c.oasis_twitter_actions, "Twitter gate set drifted from config list");
+        assert_eq!(reddit, c.oasis_reddit_actions, "Reddit gate set drifted from config list");
+    }
+
     // --- S-019 / REPORT_AGENT_MAX_TOOL_CALLS ---
 
     #[test]

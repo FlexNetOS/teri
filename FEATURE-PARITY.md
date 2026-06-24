@@ -254,7 +254,15 @@ Status: ☑ done · ☐ open. Priority groups top→bottom.
     new `MBTI_TYPES`/`COUNTRIES` tables — institutions keep MiroFish's fixed age=30/other/ISTJ) (#3).
     `finish_reason=="length"` truncation detection needs an `LlmClient` API change and is DEFERRED
     to **S11 / TASK-SIM-6 #7** (marked with an `// S11:` comment at the call site). +8 tests.
-- ☐ **TASK-SIM-2** — per-platform action split + enriched `action_args` (Stage 3 #1-2).
+- ☑ **TASK-SIM-2** — per-platform action split + enriched `action_args` (Stage 3 #1-2). S7:
+    (#1) added a decision-time platform gate (`Platform::allows_action` + `Agent::gate_platform_action`)
+    that coerces any action outside the agent's platform set to `DO_NOTHING` — the behavioural
+    equivalent of MiroFish only OFFERING `TWITTER_ACTIONS`/`REDDIT_ACTIONS` via `available_actions`;
+    static sets asserted equal to `Config.oasis_twitter_actions`/`oasis_reddit_actions`. (#2) added
+    `SocialAction::oasis_action_args_enriched(&SocialWorld)` resolving `post_content`/`author_name`/
+    `comment_content`/`quote_content`/`target_user_name` from the social-world post/comment/user
+    graph; wired the log site to enrich when the platform world is installed (structural-only path
+    unchanged with no world). Replaced the stale `[≠]U028-OASIS-INTERNALS` comment. +17 tests.
 - ☐ **TASK-SIM-3** — social-DB producer + `sqlite`-default serve (Stage 4-5 #1) — unlocks
   posts/comments/history.
 - ☐ **TASK-SIM-4** — provider-agnostic `serve` ApiState (Stage 4-5 #2) — Anthropic/Gemini under serve.
