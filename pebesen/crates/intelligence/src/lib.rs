@@ -287,7 +287,7 @@ impl IntelligenceStore {
             .filter(|p| p.payload.domain_id() == domain_id)
             .cloned()
             .collect();
-        out.sort_by(|a, b| b.ingested_at.cmp(&a.ingested_at));
+        out.sort_by_key(|p| std::cmp::Reverse(p.ingested_at));
         Ok(out)
     }
 
@@ -305,7 +305,7 @@ impl IntelligenceStore {
             .filter(|p| p.payload.topic_id() == Some(topic_id))
             .cloned()
             .collect();
-        out.sort_by(|a, b| b.ingested_at.cmp(&a.ingested_at));
+        out.sort_by_key(|p| std::cmp::Reverse(p.ingested_at));
         Ok(out)
     }
 

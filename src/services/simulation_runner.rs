@@ -5395,7 +5395,7 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
         // Convert to TimelineEntry and sort by round_num ascending
         let mut result: Vec<TimelineEntry> = rounds.into_values().map(|r| r.into_entry()).collect();
 
-        result.sort_by(|a, b| a.round_num.cmp(&b.round_num));
+        result.sort_by_key(|a| a.round_num);
 
         Ok(result)
     }
@@ -5441,7 +5441,7 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
             agent_stats.into_values().map(|e| e.into_stats()).collect();
 
         // Sort by total_actions descending (Python's reverse=True on key=lambda x: x["total_actions"])
-        result.sort_by(|a, b| b.total_actions.cmp(&a.total_actions));
+        result.sort_by_key(|r| std::cmp::Reverse(r.total_actions));
 
         Ok(result)
     }
