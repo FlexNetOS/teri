@@ -1842,10 +1842,10 @@ pub fn spawn_prepare_simulation(
     defined_entity_types: Option<Vec<String>>,
     use_llm_for_profiles: bool,
     parallel_profile_count: usize,
-    llm: crate::llm::OpenAiAdapter,
+    llm: crate::llm::ProviderAdapter,
     graph: crate::graph::KnowledgeGraph,
     config_generator: crate::services::simulation_config::SimulationConfigGenerator<
-        crate::llm::OpenAiAdapter,
+        crate::llm::ProviderAdapter,
     >,
 ) -> String {
     // Capture locale before spawning (L504-505: thread-local capture).
@@ -1899,10 +1899,10 @@ pub(crate) async fn prepare_worker(
     defined_entity_types: Option<Vec<String>>,
     use_llm_for_profiles: bool,
     parallel_profile_count: usize,
-    llm: crate::llm::OpenAiAdapter,
+    llm: crate::llm::ProviderAdapter,
     graph: crate::graph::KnowledgeGraph,
     config_generator: crate::services::simulation_config::SimulationConfigGenerator<
-        crate::llm::OpenAiAdapter,
+        crate::llm::ProviderAdapter,
     >,
 ) {
     use crate::task::{TaskManager, TaskStatus};

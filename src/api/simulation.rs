@@ -8,8 +8,9 @@
 //! ## Sub-cycle (a) — ApiState runtime-state extension + router skeleton + nest
 //!
 //! DECISION-U026-1: `ApiState` now carries the shared simulation runtime registry
-//! (`sim_manager: Arc<SimulationManager>` + `sim_runner: Arc<SimulationRunner<OpenAiAdapter>>`)
-//! — concrete monomorphization at the state-construction boundary (see `src/api/mod.rs`).
+//! (`sim_manager: Arc<SimulationManager>` + `sim_runner: Arc<SimulationRunner<ProviderAdapter>>`)
+//! — concrete enum-dispatch monomorphization at the state-construction boundary (S9 / TASK-SIM-4:
+//! serve is provider-agnostic — OpenAI / Anthropic / Gemini; see `src/api/mod.rs`).
 //! `simulation_router` is nested under `/api/simulation` in `server.rs`.
 //!
 //! ## Sub-cycle (c) — THIS landing: `POST /create`, `GET /:id`, `GET /list`
@@ -2109,7 +2110,7 @@ async fn build_run_inputs(
     graph_id: Option<&str>,
 ) -> Result<
     (
-        RunInputs<crate::llm::OpenAiAdapter>,
+        RunInputs<crate::llm::ProviderAdapter>,
         Option<Arc<tokio::sync::Mutex<KnowledgeGraph>>>,
     ),
     ApiError,
@@ -2178,15 +2179,23 @@ async fn build_run_inputs(
     let pool = crate::services::oasis_profile_export::load_agent_pool(&sim_dir, platform)
         .map_err(ApiError::server)?;
 
-    // llm: always OpenAiAdapter (the concrete monomorphization, DECISION-U025-1).
+    // llm: the provider-selected `ProviderAdapter` (S9 / TASK-SIM-4 — serve is provider-agnostic;
+    // `build_llm` picks OpenAI / Anthropic / Gemini from `config.llm.provider`). Single concrete
+    // type, so it lives in the non-generic runner state.
     let llm = Arc::new(crate::api::build_llm(&state.config));
 
     // Dual-LLM boost (U-030 S-934): ONLY for a parallel run, and ONLY when `LLM_BOOST_API_KEY` is
     // configured — reddit agents then run against the boost client, twitter against `llm`
     // (`create_model(use_boost=True/False)` per coroutine). Single-platform runs and an unconfigured
     // boost → `None` → every agent uses `llm` (byte-identical to before).
+    //
+    // The boost wire format is OpenAI-compatible (`build_boost_llm` returns `OpenAiAdapter`), but
+    // `SimulationRunner<L>` uses ONE `L` for both the main and boost client, so the boost is wrapped
+    // as `ProviderAdapter::Openai(..)` to match `llm`'s `ProviderAdapter` type (S9 / TASK-SIM-4).
+    // Only the type changes — the boost still drives an OpenAI-compatible endpoint as before.
     let boost_llm = if platform == "parallel" {
-        crate::api::build_boost_llm(&state.config).map(Arc::new)
+        crate::api::build_boost_llm(&state.config)
+            .map(|a| Arc::new(crate::llm::ProviderAdapter::Openai(a)))
     } else {
         None
     };

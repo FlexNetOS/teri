@@ -45,7 +45,7 @@ use std::time::Duration;
 use crate::api::simulation::load_entity_reader_graph;
 use crate::api::{ApiError, ApiState};
 use crate::graph::KnowledgeGraph;
-use crate::llm::{ChatMessage, OpenAiAdapter};
+use crate::llm::{ChatMessage, ProviderAdapter};
 use crate::report::ReportStatus;
 use crate::report::manager::ReportManager;
 use crate::report::sink::{ReportEvent, ReportSink};
@@ -1169,13 +1169,13 @@ fn spawn_report_generation(
     simulation_id: String,
     simulation_requirement: String,
     report_id: String,
-    llm: OpenAiAdapter,
+    llm: ProviderAdapter,
     graph: KnowledgeGraph,
     upload_folder: String,
     // U-024: owned `Arc` clone of the live runner, moved into the detached worker
     // thread (a borrow cannot cross the `'static` thread boundary).
     runner: Option<
-        std::sync::Arc<crate::services::simulation_runner::SimulationRunner<OpenAiAdapter>>,
+        std::sync::Arc<crate::services::simulation_runner::SimulationRunner<ProviderAdapter>>,
     >,
     // Workstream B (U4): optional embedding-search lens, moved into the detached worker thread.
     search_lens: Option<crate::services::zep_tools::GraphSearchLens>,
@@ -1221,13 +1221,13 @@ pub(crate) async fn report_generate_worker(
     simulation_id: String,
     simulation_requirement: String,
     report_id: String,
-    llm: OpenAiAdapter,
+    llm: ProviderAdapter,
     graph: KnowledgeGraph,
     upload_folder: String,
     // U-024: optional live runner for interview_agents IPC. `None` in tests that
     // drive the worker directly without an `ApiState` runner.
     runner: Option<
-        std::sync::Arc<crate::services::simulation_runner::SimulationRunner<OpenAiAdapter>>,
+        std::sync::Arc<crate::services::simulation_runner::SimulationRunner<ProviderAdapter>>,
     >,
     // Workstream B (U4): optional embedding-search lens for the ReACT search tools.
     search_lens: Option<crate::services::zep_tools::GraphSearchLens>,
