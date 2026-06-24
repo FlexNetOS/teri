@@ -6007,6 +6007,107 @@ mod tests {
         assert_eq!(json["data"]["count"], 2, "filtered to post_id 10");
     }
 
+    /// PRODUCER → READER end-to-end (S8 / TASK-SIM-3): produce the social DB the way the LIVE
+    /// runtime does — drive a `SocialWorldSet::new(<sim_dir>, …)` (the exact type + path the
+    /// run/serve path installs via `engine.with_social`) → apply real posts/comments → `flush_final`
+    /// → then read it back through the SAME `/posts` + `/comments` HTTP handlers the reader path
+    /// uses. This closes the loop the hand-built-DB tests above do NOT: it proves the producer's
+    /// landing path equals the reader's `social_db_path`, the producer's DDL is consumable by the
+    /// reader's `SELECT *`, and the `sqlite` feature wires BOTH halves — the thing that was never
+    /// verified end-to-end before the feature was enabled by default.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn producer_db_is_readable_through_handlers_end_to_end() {
+        use crate::agent::Platform;
+        use crate::sim::social_world::SocialWorldSet;
+        use crate::sim::{SocialAction, TargetKind};
+
+        let (state, _tmp) = test_state();
+        let simulation_id = "sim_e2e";
+
+        // Land the DB at EXACTLY the dir the reader resolves: the manager's `get_simulation_dir`
+        // (== `oasis_simulation_data_dir/<id>`, the same base `social_db_path` joins). Producing
+        // through this path-resolver — not a hand-rolled join — is what proves path alignment.
+        let sim_dir = state.sim_manager.get_simulation_dir(simulation_id).unwrap();
+
+        // Produce via the runtime substrate, then flush like the run loop's `flush_final`.
+        {
+            let mut set = SocialWorldSet::new([Platform::Reddit], &sim_dir).unwrap();
+            {
+                let w = set.world_mut(Platform::Reddit).unwrap();
+                let p1 = w.create_post(7, "hello from the producer", "2025-12-01T10:00:00");
+                w.create_post(7, "second post", "2025-12-01T10:01:00");
+                w.apply(
+                    8,
+                    &SocialAction::Like {
+                        target_kind: TargetKind::Post,
+                        target_id: p1.to_string(),
+                    },
+                    "2025-12-01T10:02:00",
+                );
+                w.apply(
+                    8,
+                    &SocialAction::Comment {
+                        post_id: p1.to_string(),
+                        content: "a real comment".into(),
+                    },
+                    "2025-12-01T10:03:00",
+                );
+            }
+            set.flush_final().unwrap();
+        }
+
+        // The file MUST be at the reader's resolved path (producer-path == reader-path).
+        let reader_path = social_db_path(&state, simulation_id, "reddit_simulation.db");
+        assert!(reader_path.exists(), "producer DB must land at the reader's social_db_path");
+
+        let app = crate::server::create_app(state);
+
+        // READ BACK through the /posts handler — populated, content matches, DESC ordering.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_e2e/posts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        let data = &json["data"];
+        assert_eq!(data["platform"], "reddit");
+        assert_eq!(data["total"], 2, "both producer posts are readable");
+        assert_eq!(data["count"], 2);
+        // ORDER BY created_at DESC → "second post" (10:01) before "hello…" (10:00).
+        assert_eq!(data["posts"][0]["content"], "second post");
+        assert_eq!(data["posts"][1]["content"], "hello from the producer");
+        // The like applied by the producer survives the round-trip.
+        let post1 = data["posts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["post_id"] == 1)
+            .expect("producer post_id 1 present");
+        assert_eq!(post1["num_likes"], 1, "producer-applied like is readable");
+
+        // READ BACK through the /comments handler — the producer comment on post 1 is populated.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_e2e/comments?post_id=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["data"]["count"], 1, "producer comment is readable");
+        assert_eq!(json["data"]["comments"][0]["content"], "a real comment");
+    }
+
     // -----------------------------------------------------------------------
     // Sub-cycle (k) — interview routes (/interview, /interview/{batch,all,history})
     //   Validation + env-gate fully tested (env never alive now → 400 envNotRunning,
