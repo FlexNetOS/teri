@@ -274,7 +274,14 @@ Status: ☑ done · ☐ open. Priority groups top→bottom.
   and the feature wires both halves. No-DB-empty + honest-500 (`--no-default-features`) contracts
   preserved.
 - ☑ **TASK-SIM-4** — provider-agnostic `serve` ApiState (Stage 4-5 #2) — Anthropic/Gemini under serve. `ApiState`/runner monomorphized over `ProviderAdapter` (enum dispatch) instead of `OpenAiAdapter`; `build_llm` + `BackendLlm` now provider-selected from `config.llm.provider`; boost wrapped as `ProviderAdapter::Openai`. No-downgrade (OpenAI byte-identical). S9.
-- ☐ **TASK-SIM-5** — `register_cleanup` shutdown hook (Stage 3 #3) — no orphaned sims.
+- ☑ **TASK-SIM-5** — `register_cleanup` shutdown hook: **already landed** (the ledger was stale).
+  `server::serve` wires `axum::serve(...).with_graceful_shutdown(...)` so SIGTERM/SIGINT/SIGHUP
+  (SIGTERM/SIGHUP unix-only; Ctrl-C elsewhere) route to `SimulationRunner::cleanup_all().await`
+  (terminate running sims cooperative-then-abort, persist STOPPED) before the socket stops accepting,
+  plus an atexit-style backup `cleanup_all` on the non-signal exit path (`cleanup_all` is idempotent
+  via a `cleanup_done` compare-exchange). Verified at `src/server.rs` (`serve()` ~271-352) and the 4
+  `cleanup_all_*` tests in `simulation_runner.rs` (idempotent / terminates+records / preserves
+  finished / stops-running-skips-finished). *(S10 — verification slice, no code change)*
 - ☐ **TASK-SIM-6** — persona/config `json_object`+`finish_reason`, ontology reserved-names/edge
   constraints, per-entity search enrichment (Stage 1-2 #4-7).
 
