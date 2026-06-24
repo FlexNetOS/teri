@@ -255,8 +255,31 @@ Status: ☑ done · ☐ open. Priority groups top→bottom.
   retry / policy-query / report-shape / budget normalization). **Left for S13 (TASK-AUTO-2):** the L3
   `CommunityFeedback` ACT push and L4 per-community confidence calibration — `// SEAM(S13)` marker in
   `mod.rs` marks the hook point inside the per-run record loop. *(S12)*
-- ☐ **TASK-AUTO-2** — calibration loop: turn actioned/accurate outcomes into per-community confidence
-  weights (persist in redb); upgrades report `confidence` from synthesized metadata → calibrated.
+- ☑ **TASK-AUTO-2** — calibration loop (LEARN layer, L4) landed in `src/autonomy/calibration.rs`
+  (re-exported via `autonomy::mod`). `CommunityCalibration` folds per-domain `scored`/`accurate`
+  counts → `accuracy` → `confidence_weight` via `confidence_weight_from_counts(scored, accurate) =
+  (0.5 + accuracy).clamp(0.5, 1.5)`, neutral `1.0` when nothing scored — **byte-identical** to
+  pebesen's `IntelligenceStore::calibration` inline arithmetic (`pebesen/crates/intelligence/src/
+  lib.rs`; pebesen has no `from_counts` ctor, so parity is by replicated arithmetic + the
+  cross-checking test `weight_matches_pebesen_for_the_same_counts` over a 0..=10 grid). `apply(domain,
+  raw) = (raw * weight).clamp(0.0, 1.0)` (clamp documented: weight >1 can't push confidence past 1.0).
+  **Store backend: redb** (`RedbCalibrationStore`, single `autonomy_calibration` table `domain_id ->
+  serde_json(stats)`, mirrors `memory::MemoryStore`'s redb idiom) — the ledger specified redb and it
+  is already teri's persistence engine; `InMemoryCalibrationStore` for tests. Both behind a
+  `CalibrationStore` trait mirroring `StateStore`. **Wired** into `Orchestrator` (both calibration +
+  feedback optional, builder-style `.with_calibration`/`.with_feedback` → absent = byte-identical
+  pre-S13 behavior, no-downgrade): at the `// SEAM(S13)` marker each completed run derives a
+  domain-scoped `SpaceHealthRisk` whose confidence is **calibrated** by the domain's weight and pushed
+  via the optional `CommunityFeedback` (L3 ACT). **LEARN input** = `Orchestrator::record_outcome(
+  domain_id, accurate)` (public entry point; persists through the store). Synthesized-confidence
+  caveat softened in README §Status + the `TopicSignal`/`ContributorTrajectory`/`SpaceHealthRisk`/
+  `PredictionReport` confidence doc-comments (honest: calibrated only where outcomes recorded, neutral
+  otherwise). 13 new tests (no-evidence-identity / ceiling+clamp / floor / mixed / pebesen-parity /
+  in-mem + redb round-trip across restart / deletion-reconcile / orchestrator applies stored weight /
+  uncalibrated-identity / no-op-without-wiring / record_outcome durability). **Remaining thin
+  connector:** the LEARN-input *puller* — pulling actioned/accurate verdicts from pebesen's
+  `/calibration` (or its `CommunityFeedback` acks) and calling `record_outcome` — is a deployment-
+  wiring concern (noted at the foot of `autonomy/mod.rs`), as is the `teri autonomy` CLI attach. *(S13)*
 
 ### Simulation fidelity & refinements (engine — open)
 - ☑ **TASK-SIM-1** — persona memory injection + bilingual two-prompt strategy + randomization

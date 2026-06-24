@@ -39,18 +39,30 @@
 //! returns canned outcomes — NO LLM, NO network) and an in-memory state store. The unit of test is
 //! [`Orchestrator::tick`]; a thin [`Orchestrator::run_forever`] loops it on an interval.
 //!
-//! ## What's left for S13 (TASK-AUTO-2 — calibration)
+//! ## LEARN + ACT (S13, TASK-AUTO-2) — calibration
 //!
-//! This slice builds SENSE→DECIDE→PREDICT + budget/continuity/audit. The L3 ACT push
-//! (`CommunityFeedback`) and the L4 calibration loop are deliberately out of scope; see the
-//! `// SEAM(S13):` markers below for exactly where actioned-outcome feedback and per-community
-//! confidence calibration hook in.
+//! S12 built SENSE→DECIDE→PREDICT + budget/continuity/audit. S13 closes the loop's LEARN (L4) and
+//! ACT (L3) layers, both **opt-in** (attach via [`Orchestrator::with_calibration`] /
+//! [`Orchestrator::with_feedback`]; absent → byte-identical pre-S13 behavior):
+//!
+//! * **LEARN** ([`calibration`]) — [`CommunityCalibration`] folds actioned/accurate outcomes
+//!   (fed in via [`Orchestrator::record_outcome`]) into a per-domain confidence weight using the
+//!   **same** `(0.5 + accuracy).clamp(0.5, 1.5)` heuristic pebesen's receiver uses, so the two
+//!   halves of the loop agree. Persisted behind [`CalibrationStore`] (redb in production).
+//! * **ACT** — at the `// SEAM(S13)` marker each completed run derives a domain-scoped
+//!   [`SpaceHealthRisk`] prediction whose confidence is **calibrated** (raw × weight, clamped) and
+//!   pushed back via the optional [`CommunityFeedback`] sink.
 
+mod calibration;
 mod fingerprint;
 mod policy;
 mod runner;
 mod state;
 
+pub use calibration::{
+    CalibrationStore, CommunityCalibration, DomainCalibration, InMemoryCalibrationStore,
+    RedbCalibrationStore, confidence_weight_from_counts,
+};
 pub use fingerprint::SignalFingerprint;
 pub use policy::{DEFAULT_HORIZON_DAYS, DecidePolicy, DefaultDecidePolicy};
 pub use runner::{Job, JobOutcome, PipelineJobRunner, PredictionJobRunner, build_job};
@@ -59,10 +71,17 @@ pub use state::{
 };
 
 use crate::error::Result;
-use crate::seed::community::CommunityAdapter;
+use crate::seed::community::{CommunityAdapter, CommunityFeedback, SpaceHealthRisk};
 use chrono::Utc;
 use futures::stream::StreamExt;
 use std::sync::Arc;
+
+/// The raw (synthesized) confidence the orchestrator attaches to a derived prediction before
+/// calibration. A run that completes is a meaningful signal, but the orchestrator has no model-level
+/// confidence to attach (the [`JobOutcome`] is a flat summary), so it starts from a deliberately
+/// modest synthesized baseline that the per-domain calibration weight then adjusts. Single-sourced
+/// so the value is auditable and the test can assert against it.
+const DERIVED_PREDICTION_RAW_CONFIDENCE: f64 = 0.6;
 
 /// Compute budget for a single [`Orchestrator::tick`]. The orchestrator MUST NEVER exceed it: when
 /// more domains changed than `max_runs_per_tick`, it runs up to the cap and reports the rest as
@@ -128,6 +147,9 @@ pub struct TickReport {
     pub deferred: Vec<DeferredDomain>,
     /// Per-domain errors (isolated; the tick still completed for the other domains).
     pub errors: Vec<DomainError>,
+    /// Predictions pushed back to the community platform this tick (ACT, L3) — the calibrated
+    /// [`SpaceHealthRisk`]s derived from completed runs. Empty when no feedback sink is attached.
+    pub pushed: Vec<SpaceHealthRisk>,
 }
 
 impl TickReport {
@@ -146,10 +168,16 @@ pub struct Orchestrator<R: PredictionJobRunner> {
     store: Arc<dyn StateStore>,
     runner: Arc<R>,
     budget: Budget,
+    /// LEARN/ACT extensions (both optional → absent means byte-identical pre-S13 behavior):
+    /// the calibration store (L4) and the feedback sink the calibrated prediction is pushed to (L3).
+    calibration: Option<Arc<dyn CalibrationStore>>,
+    feedback: Option<Arc<dyn CommunityFeedback>>,
 }
 
 impl<R: PredictionJobRunner + 'static> Orchestrator<R> {
-    /// Construct an orchestrator. `budget` is normalized (see [`Budget::normalized`]).
+    /// Construct an orchestrator. `budget` is normalized (see [`Budget::normalized`]). Calibration
+    /// (L4) and feedback (L3) are off by default — attach them with
+    /// [`with_calibration`](Self::with_calibration) / [`with_feedback`](Self::with_feedback).
     pub fn new(
         adapter: Arc<dyn CommunityAdapter>,
         policy: Arc<dyn DecidePolicy>,
@@ -157,7 +185,15 @@ impl<R: PredictionJobRunner + 'static> Orchestrator<R> {
         runner: Arc<R>,
         budget: Budget,
     ) -> Self {
-        Self { adapter, policy, store, runner, budget: budget.normalized() }
+        Self {
+            adapter,
+            policy,
+            store,
+            runner,
+            budget: budget.normalized(),
+            calibration: None,
+            feedback: None,
+        }
     }
 
     /// Convenience constructor with the [`DefaultDecidePolicy`].
@@ -168,6 +204,55 @@ impl<R: PredictionJobRunner + 'static> Orchestrator<R> {
         budget: Budget,
     ) -> Self {
         Self::new(adapter, Arc::new(DefaultDecidePolicy::default()), store, runner, budget)
+    }
+
+    /// Attach a [`CalibrationStore`] (the LEARN layer, L4). With it, the confidence the orchestrator
+    /// attaches to a run-derived prediction is **calibrated** by the originating domain's recorded
+    /// accuracy (neutral until outcomes are recorded — purely additive). Builder-style so existing
+    /// call sites are unaffected.
+    pub fn with_calibration(mut self, calibration: Arc<dyn CalibrationStore>) -> Self {
+        self.calibration = Some(calibration);
+        self
+    }
+
+    /// Attach a [`CommunityFeedback`] sink (the ACT layer, L3). With it, each completed run derives a
+    /// [`SpaceHealthRisk`] prediction (calibrated confidence, if a calibration store is also
+    /// attached) and pushes it back to the community platform. Absent → no push (pre-S13 behavior).
+    pub fn with_feedback(mut self, feedback: Arc<dyn CommunityFeedback>) -> Self {
+        self.feedback = Some(feedback);
+        self
+    }
+
+    /// **LEARN input.** Fold one actioned outcome (`accurate` = did the prediction come true?) for
+    /// `domain_id` into the calibration store, then persist. This is the public entry point teri's
+    /// accuracy connector calls — the source is an operator action or pebesen's actioned-outcome
+    /// calibration (`/calibration` / `CommunityFeedback`); pulling it live from pebesen is a thin
+    /// connector left to deployment wiring (see the ledger). teri never fabricates accuracy.
+    ///
+    /// No-op (returns `Ok`) when no calibration store is attached, so callers needn't branch on it.
+    pub fn record_outcome(&self, domain_id: &str, accurate: bool) -> Result<()> {
+        let Some(store) = &self.calibration else {
+            return Ok(());
+        };
+        let mut cal = store.load()?;
+        cal.record_outcome(domain_id, accurate);
+        store.save(&cal)?;
+        tracing::info!(
+            domain_id,
+            accurate,
+            weight = cal.weight(domain_id),
+            "autonomy.learn: recorded actioned outcome; calibration weight updated"
+        );
+        Ok(())
+    }
+
+    /// The current per-domain confidence multiplier (`1.0` if no calibration store, or no outcomes
+    /// recorded for `domain_id`). Exposed so the call site (and any UI) can read the calibration.
+    pub fn calibration_weight(&self, domain_id: &str) -> Result<f64> {
+        match &self.calibration {
+            Some(store) => Ok(store.load()?.weight(domain_id)),
+            None => Ok(1.0),
+        }
     }
 
     /// Run one supervised cycle. See the module docs for the SENSE→DECIDE→PREDICT→PERSIST shape.
@@ -277,6 +362,13 @@ impl<R: PredictionJobRunner + 'static> Orchestrator<R> {
             .collect()
             .await;
 
+        // ── LEARN: load the calibration once per tick (latest per-domain weights) ─
+        // None when no calibration store is attached → every weight is 1.0 (no-downgrade).
+        let calibration = match &self.calibration {
+            Some(store) => store.load()?,
+            None => CommunityCalibration::default(),
+        };
+
         // ── PERSIST: record successful runs in the durable state; isolate failures ─
         let now = Utc::now();
         for (domain_id, fingerprint, outcome) in results {
@@ -293,10 +385,13 @@ impl<R: PredictionJobRunner + 'static> Orchestrator<R> {
                     // Continuity: advance the debounce key ONLY for domains whose run succeeded, so
                     // a failed run is retried next tick (its fingerprint is not advanced).
                     state.record_run(&domain_id, fingerprint, now, Some(summary));
-                    // SEAM(S13 — ACT/LEARN): this is where the L3 CommunityFeedback push of
-                    // report-derived TopicSignals/SpaceHealthRisks would fire, and where the L4
-                    // calibration loop would later fold actioned/accurate outcomes into a
-                    // per-community confidence weight. Out of scope for TASK-AUTO-1.
+                    // SEAM(S13 — ACT/LEARN): the L4 LEARN+ACT closure. Derive a domain-scoped
+                    // SpaceHealthRisk prediction from the completed run, **calibrate** its confidence
+                    // by the originating domain's recorded accuracy (neutral 1.0 until outcomes are
+                    // recorded), and push it back to the platform via the optional CommunityFeedback
+                    // (ACT, L3). The accuracy that drives the weight enters via `record_outcome`
+                    // (LEARN input). Both are opt-in: absent → no push and identity confidence.
+                    self.act_on_outcome(&o, &calibration, &mut report).await;
                     report.ran.push(o);
                 }
                 Err(e) => {
@@ -322,6 +417,59 @@ impl<R: PredictionJobRunner + 'static> Orchestrator<R> {
         );
 
         Ok(report)
+    }
+
+    /// ACT (L3) + apply LEARN (L4): derive a domain-scoped [`SpaceHealthRisk`] prediction from one
+    /// completed run, **calibrate** its synthesized confidence by the domain's accuracy weight, and
+    /// push it to the feedback sink. A successful push is recorded in `report.pushed`. A push failure
+    /// is isolated into `report.errors` (one platform hiccup never aborts the tick). When no feedback
+    /// sink is attached this is a pure no-op (nothing derived is pushed or recorded) — pre-S13
+    /// behavior. The calibrated confidence is always logged for the audit trail.
+    async fn act_on_outcome(
+        &self,
+        outcome: &JobOutcome,
+        calibration: &CommunityCalibration,
+        report: &mut TickReport,
+    ) {
+        // No feedback sink → no ACT (pre-S13 behavior). The LEARN weight still applies to anything
+        // teri pushes elsewhere; here there is nothing to push.
+        let Some(feedback) = &self.feedback else {
+            return;
+        };
+        // Calibrate the synthesized baseline by the originating domain's weight (1.0 → identity).
+        let raw = DERIVED_PREDICTION_RAW_CONFIDENCE;
+        let confidence = calibration.apply(&outcome.domain_id, raw);
+        let weight = calibration.weight(&outcome.domain_id);
+        let detail = outcome
+            .report_summary
+            .clone()
+            .unwrap_or_else(|| format!("forecast {}", outcome.report_id));
+        let risk = SpaceHealthRisk {
+            domain_id: outcome.domain_id.clone(),
+            // A forecast-availability signal — the run produced a fresh space-health forecast.
+            risk: "forecast_available".to_string(),
+            severity: 0.0,
+            confidence,
+            detail,
+        };
+        tracing::info!(
+            domain_id = %outcome.domain_id,
+            raw_confidence = raw,
+            calibration_weight = weight,
+            calibrated_confidence = confidence,
+            "autonomy.act: derived calibrated space-health prediction from run"
+        );
+
+        if let Err(e) = feedback.push_health_risks(vec![risk.clone()]).await {
+            tracing::warn!(domain_id = %outcome.domain_id, error = %e, "autonomy.act: feedback push failed (isolated)");
+            report.errors.push(DomainError {
+                domain_id: outcome.domain_id.clone(),
+                stage: "act".to_string(),
+                message: e.to_string(),
+            });
+            return;
+        }
+        report.pushed.push(risk);
     }
 
     /// Loop [`Orchestrator::tick`] on a fixed interval, forever. The unit of behavior/test is
@@ -362,12 +510,17 @@ fn autonomy_outcome_summary(o: &JobOutcome) -> String {
     }
 }
 
-// NOTE (CLI wiring, intentionally out of scope for S12): a `teri autonomy` subcommand would attach
-// in `src/main.rs` beside `run`/`serve` — build the provider LLM-backed `PipelineJobRunner` +
+// NOTE (CLI wiring, intentionally out of scope): a `teri autonomy` subcommand would attach in
+// `src/main.rs` beside `run`/`serve` — build the provider LLM-backed `PipelineJobRunner` +
 // `JsonFileStateStore::for_config(&config)` + a concrete `CommunityAdapter`
-// (`seed::community::pebesen::PebesenAdapter`), then call `tick()` once (cron mode) or
+// (`seed::community::pebesen::PebesenAdapter`), optionally `.with_calibration(
+// Arc::new(RedbCalibrationStore::for_config(&config)?))` (LEARN) and `.with_feedback(
+// Arc::new(PebesenFeedback::…))` (ACT), then call `tick()` once (cron mode) or
 // `run_forever(interval)` (daemon mode). It would preflight the backend exactly like `run`/`serve`
-// (the PipelineJobRunner inherits the guard via `run_pipeline`). Kept a pure library module here.
+// (the PipelineJobRunner inherits the guard via `run_pipeline`). The LEARN *input* connector —
+// pulling actioned/accurate verdicts from pebesen's `/calibration` (or its `CommunityFeedback`
+// acks) and calling `orchestrator.record_outcome(domain_id, accurate)` — is the remaining thin
+// piece, also a deployment-wiring concern. Kept a pure library module here.
 
 #[cfg(test)]
 mod tests {
@@ -469,6 +622,37 @@ mod tests {
                 graph_node_count: 3,
                 graph_edge_count: 2,
             })
+        }
+    }
+
+    // ── Fake ACT feedback sink ───────────────────────────────────────────────
+    // Records every health-risk push so tests assert the calibrated confidence that was pushed.
+    #[derive(Default)]
+    struct FakeFeedback {
+        pushed_risks: StdMutex<Vec<SpaceHealthRisk>>,
+    }
+    impl FakeFeedback {
+        fn pushed(&self) -> Vec<SpaceHealthRisk> {
+            self.pushed_risks.lock().unwrap().clone()
+        }
+    }
+    #[async_trait]
+    impl CommunityFeedback for FakeFeedback {
+        async fn push_topic_signals(
+            &self,
+            _signals: Vec<crate::seed::community::TopicSignal>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn push_contributor_trajectories(
+            &self,
+            _t: Vec<crate::seed::community::ContributorTrajectory>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn push_health_risks(&self, risks: Vec<SpaceHealthRisk>) -> Result<()> {
+            self.pushed_risks.lock().unwrap().extend(risks);
+            Ok(())
         }
     }
 
@@ -750,5 +934,118 @@ mod tests {
         // Concurrency above the per-tick cap is clamped down (pointless otherwise).
         let b = Budget { max_runs_per_tick: 2, max_concurrent: 9 }.normalized();
         assert_eq!(b.max_concurrent, 2);
+    }
+
+    // ── S13: calibration wiring ──────────────────────────────────────────────
+
+    // (g) With no recorded outcomes, the derived prediction's confidence is the raw baseline
+    // (weight 1.0 → identity) — the no-downgrade guarantee at the orchestrator level.
+    #[tokio::test]
+    async fn derived_prediction_uses_raw_confidence_when_uncalibrated() {
+        let adapter = Arc::new(FakeAdapter::new(vec![domain("d1")]));
+        adapter.set_signal(signal("d1", 2));
+        let runner = Arc::new(FakeRunner::default());
+        let store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
+        let feedback = Arc::new(FakeFeedback::default());
+        let cal: Arc<dyn CalibrationStore> = Arc::new(InMemoryCalibrationStore::new());
+        let orch = orchestrator(
+            Arc::clone(&adapter),
+            Arc::clone(&runner),
+            Arc::clone(&store),
+            Budget::default(),
+        )
+        .with_calibration(Arc::clone(&cal))
+        .with_feedback(Arc::clone(&feedback) as Arc<dyn CommunityFeedback>);
+
+        let report = orch.tick().await.unwrap();
+        assert_eq!(report.ran.len(), 1);
+        assert_eq!(report.pushed.len(), 1, "one derived prediction pushed");
+        let pushed = feedback.pushed();
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(pushed[0].domain_id, "d1");
+        // Uncalibrated → confidence == raw baseline (0.6), unchanged.
+        assert!((pushed[0].confidence - DERIVED_PREDICTION_RAW_CONFIDENCE).abs() < 1e-12);
+        assert!((report.pushed[0].confidence - DERIVED_PREDICTION_RAW_CONFIDENCE).abs() < 1e-12);
+    }
+
+    // (g) The orchestrator applies the STORED per-domain weight to the derived prediction's
+    // confidence: record all-accurate outcomes → weight 1.5 → 0.6 * 1.5 = 0.9 (calibrated up).
+    #[tokio::test]
+    async fn orchestrator_applies_stored_weight_to_derived_prediction() {
+        let adapter = Arc::new(FakeAdapter::new(vec![domain("d1")]));
+        adapter.set_signal(signal("d1", 2));
+        let runner = Arc::new(FakeRunner::default());
+        let store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
+        let feedback = Arc::new(FakeFeedback::default());
+        let cal: Arc<dyn CalibrationStore> = Arc::new(InMemoryCalibrationStore::new());
+        let orch = orchestrator(
+            Arc::clone(&adapter),
+            Arc::clone(&runner),
+            Arc::clone(&store),
+            Budget::default(),
+        )
+        .with_calibration(Arc::clone(&cal))
+        .with_feedback(Arc::clone(&feedback) as Arc<dyn CommunityFeedback>);
+
+        // LEARN: record accurate outcomes for d1 through the public entry point → weight 1.5.
+        for _ in 0..3 {
+            orch.record_outcome("d1", true).unwrap();
+        }
+        assert_eq!(orch.calibration_weight("d1").unwrap(), 1.5);
+
+        let report = orch.tick().await.unwrap();
+        let pushed = feedback.pushed();
+        assert_eq!(pushed.len(), 1);
+        // 0.6 raw * 1.5 weight = 0.9 calibrated.
+        let expected = (DERIVED_PREDICTION_RAW_CONFIDENCE * 1.5).clamp(0.0, 1.0);
+        assert!((pushed[0].confidence - expected).abs() < 1e-12, "confidence calibrated up");
+        assert!((pushed[0].confidence - 0.9).abs() < 1e-12);
+        assert!(report.is_clean());
+    }
+
+    // Without a calibration store AND without a feedback sink, S13 is a pure no-op: no pushes,
+    // behavior byte-identical to S12.
+    #[tokio::test]
+    async fn no_calibration_no_feedback_is_a_noop() {
+        let adapter = Arc::new(FakeAdapter::new(vec![domain("d1")]));
+        adapter.set_signal(signal("d1", 2));
+        let runner = Arc::new(FakeRunner::default());
+        let store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
+        let orch = orchestrator(
+            Arc::clone(&adapter),
+            Arc::clone(&runner),
+            Arc::clone(&store),
+            Budget::default(),
+        );
+
+        let report = orch.tick().await.unwrap();
+        assert_eq!(report.ran.len(), 1);
+        assert!(report.pushed.is_empty(), "no feedback sink → nothing pushed");
+        // record_outcome is a harmless no-op without a store; weight reads neutral.
+        assert!(orch.record_outcome("d1", true).is_ok());
+        assert_eq!(orch.calibration_weight("d1").unwrap(), 1.0);
+    }
+
+    // record_outcome persists through the store across a fresh load (LEARN durability).
+    #[tokio::test]
+    async fn record_outcome_persists_to_store() {
+        let adapter = Arc::new(FakeAdapter::new(vec![domain("d1")]));
+        let runner = Arc::new(FakeRunner::default());
+        let store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
+        let cal: Arc<dyn CalibrationStore> = Arc::new(InMemoryCalibrationStore::new());
+        let orch = orchestrator(
+            Arc::clone(&adapter),
+            Arc::clone(&runner),
+            Arc::clone(&store),
+            Budget::default(),
+        )
+        .with_calibration(Arc::clone(&cal));
+
+        orch.record_outcome("d1", false).unwrap();
+        orch.record_outcome("d1", false).unwrap();
+        // Read back via an independent load of the same store.
+        let loaded = cal.load().unwrap();
+        assert_eq!(loaded.weight("d1"), 0.5, "two wrong outcomes → floor weight");
+        assert_eq!(orch.calibration_weight("d1").unwrap(), 0.5);
     }
 }

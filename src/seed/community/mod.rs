@@ -14,7 +14,9 @@
 //! * **Feedback** ([`CommunityFeedback`]) — teri pushes *predictions* back to the
 //!   community platform (per-topic momentum signals, contributor trajectories,
 //!   space-health risks) where the platform's `intelligence` layer receives them
-//!   and (later) calibrates confidence against actioned outcomes.
+//!   and calibrates confidence against actioned outcomes. teri's own autonomy LEARN
+//!   layer ([`crate::autonomy::calibration`]) mirrors that same calibration so the
+//!   confidence it attaches here can already be calibrated where outcomes are known.
 //!
 //! The normalized types are deliberately decoupled from pebesen's wire DTOs: teri
 //! takes **no cargo dependency** on the pebesen crates. The concrete
@@ -126,7 +128,9 @@ pub struct TopicSignal {
     pub domain_id: String,
     /// Predicted momentum, normalized to `[-1.0, 1.0]` (decline ↔ surge).
     pub momentum: f64,
-    /// teri's confidence in this signal, `[0.0, 1.0]` (synthesized metadata).
+    /// teri's confidence in this signal, `[0.0, 1.0]`. Synthesized metadata by default;
+    /// calibrated by the autonomy LEARN layer ([`crate::autonomy::calibration`]) for domains
+    /// with recorded actioned/accurate outcomes (neutral, i.e. unchanged, otherwise).
     pub confidence: f64,
     /// Short human-readable rationale for surfacing in the platform UI.
     pub rationale: String,
@@ -143,7 +147,8 @@ pub struct ContributorTrajectory {
     pub trajectory: String,
     /// Engagement score forecast, `[0.0, 1.0]`.
     pub engagement_score: f64,
-    /// teri's confidence, `[0.0, 1.0]`.
+    /// teri's confidence, `[0.0, 1.0]`. Synthesized by default; calibrated per-domain by the
+    /// autonomy LEARN layer ([`crate::autonomy::calibration`]) where outcomes are recorded.
     pub confidence: f64,
 }
 
@@ -157,7 +162,9 @@ pub struct SpaceHealthRisk {
     pub risk: String,
     /// Severity, `[0.0, 1.0]` (higher = more severe).
     pub severity: f64,
-    /// teri's confidence, `[0.0, 1.0]`.
+    /// teri's confidence, `[0.0, 1.0]`. Synthesized by default; calibrated per-domain by the
+    /// autonomy LEARN layer ([`crate::autonomy::calibration`]) where outcomes are recorded — the
+    /// autonomy loop derives and pushes these with already-calibrated confidence.
     pub confidence: f64,
     /// Human-readable detail for the platform UI.
     pub detail: String,
