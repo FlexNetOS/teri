@@ -56,7 +56,7 @@ tested (**1629 tests**), and reachable by driving `teri serve`'s `/api/*` endpoi
 
 | Requirement | Notes |
 |-------------|-------|
-| **Rust toolchain** | stable; build with `cargo build --release` |
+| **Rust toolchain** | **floating `nightly`** (pinned by `rust-toolchain.toml`; auto-selected — no `+nightly` needed). The single resolved toolchain for teri; see §3.1. |
 | **A real OpenAI-compatible LLM backend** | local (shimmy/ruvllm/Ollama/LM Studio/vLLM) or hosted (OpenAI/Anthropic/Gemini). **Stub/canned backends are refused** — see §6. |
 | **An LLM API key** *(for hosted backends)* | injected via envctl or a dev `.env`; **never** exported in a shell profile. Local keyless backends need none. |
 | **envctl** *(recommended)* | vault-held secret injection — `envctl run -- teri …` |
@@ -75,6 +75,43 @@ cargo build --release            # binary at ./target/release/teri
 CLI exit codes: usage errors = `2` (clap), runtime errors = `1`, success/help = `0`.
 Config loads **only inside commands**, never before argument parsing — so `--help`/`--version`
 work with no secrets present.
+
+---
+
+## 3.1 Toolchain (single floating nightly + optional GPU / perf paths)
+
+teri builds on **one** toolchain: **floating `nightly`**, pinned by `rust-toolchain.toml`
+(`channel = "nightly"`, `edition 2024`). It is *floating* — always the latest nightly, refreshed
+on the meta cadence, **never** date-pinned — and there is **no stable fallback**: nightly is
+mandatory (it's a hard requirement of the optional CUDA path), not weighed against stable. `cargo`
+auto-selects it inside the repo, so `+nightly` is never needed.
+
+Only **always-available** components (`rustfmt`, `clippy`) are hard-pinned in
+`rust-toolchain.toml`. A component listed there that a given nightly didn't build is a *fatal*
+rustup error, so the sometimes-missing backend below is deliberately **not** pinned.
+
+**Codegen backend (`rustc_codegen_gcc`, optional, perf).** LLVM stays the **default** codegen so
+`cargo`/CI stay portable. For a GCC-codegen perf build:
+
+```bash
+rustup component add rustc-codegen-gcc            # not built for every nightly — add on demand
+RUSTFLAGS="-Zcodegen-backend=gcc" cargo build --release
+```
+
+**Linker + compiler cache (`wild` + `kache`, meta-tree only).** Inside the meta workspace teri
+inherits `meta/.cargo/config.toml` (`linker = clang`, `-Clink-arg=--ld-path=wild`,
+`rustc-wrapper = kache`) — a perf path, not a correctness one. teri ships **no** repo-local
+`.cargo/config.toml`, so a **standalone** checkout (and GitHub-hosted CI, which clones teri alone)
+builds with the default LLVM linker and no wrapper. This split is intentional: it keeps standalone
+CI and `scripts/preflight.sh` in agreement (both default-linker) while the meta tree gets the fast
+path. The toolchain + caches are owned by **meta/envctl paths**, not user-global `~/.rustup`.
+
+**GPU / CUDA.** Not yet wired into teri. The build-time Rust→PTX contract uses `nvcc` + `llc`
+(`CUDA_OXIDE_LLC=$(command -v llc)`), which are license-clean tools. The owner-named runtime crate
+`cuda-oxide` is **GPL-3.0-or-later** and is therefore **incompatible with teri's MIT license** — it
+will not be added. The license-clean substitute is **`cudarc` (MIT/Apache-2.0)**, whose
+`dynamic-loading` feature dlopens `libcuda` at runtime (so it compiles even on GPU-less CI). The
+runtime-crate selection awaits owner sign-off before a `cuda` feature lands.
 
 ---
 

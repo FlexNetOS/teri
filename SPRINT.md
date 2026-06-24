@@ -185,12 +185,23 @@ build stack and adding the GPU path):
    numbers in the PR); confirm `cuda` feature builds.
 
 **Done (S14):**
-- `rustc --version` inside teri = pinned nightly; `cargo build`, `cargo test`, `cargo clippy
-  --all-targets --all-features -- -D warnings`, `cargo fmt --all --check` all green on nightly.
-- Standalone CI (`ci.yml`, `pebesen-ci.yml`) green with wild+kache resolved (no inheritance gap).
-- `cargo build --features cuda` compiles on a CUDA-capable host; default build unaffected.
-- `./target/*/teri --help` still exit 0 keyless.
-- `RUNBOOK.md` documents the nightly + codegen-gcc + wild + kache + CUDA build.
+- ☑ `rust-toolchain.toml` = floating `nightly` (single toolchain, no date-pin, no stable fallback);
+  `cargo build`, `cargo test` (1764 default + all-features), `cargo clippy --all-targets
+  --all-features -- -D warnings`, `cargo fmt --all --check` all **green on nightly 1.98.0**
+  (teri + pebesen). Nightly `unnecessary_sort_by` drift fixed in the same slice.
+- ☑ CI toolchains bumped to `nightly` (`ci.yml`, `pebesen-ci.yml`, `promote.yml`).
+- ☑ wild+kache resolved as an intentional **meta-tree-inherited** perf path; teri ships no repo-local
+  `.cargo/config.toml`, so standalone CI + preflight agree on the default LLVM linker (no inheritance
+  gap, no brittle CI install). Documented in `RUNBOOK.md §3.1`.
+- ☑ `rustc_codegen_gcc` documented as an on-demand perf backend (NOT pinned in `rust-toolchain.toml`
+  — a floating nightly doesn't build it every day, and a missing pinned component is a fatal rustup
+  error). `RUNBOOK.md §3.1`.
+- ☑ `./target/*/teri --help` still exit 0 keyless; backend-honesty guard untouched.
+- ☐ **CUDA `cuda` feature — DEFERRED, owner decision required.** The owner-named `cuda-oxide` is
+  **GPL-3.0-or-later**, incompatible with teri's **MIT** license; it will not be added. License-clean
+  substitute is **`cudarc` (MIT/Apache-2.0, `dynamic-loading`)**. The build-time `nvcc`/`llc`/
+  `CUDA_OXIDE_LLC` PTX contract is license-clean and documented. Awaiting sign-off on the runtime
+  crate before a `cuda` feature lands (tracked in `RUNBOOK.md §3.1`).
 
 **Risk notes**
 - Floating nightly is a moving floor — this is why S14 is **last**: all feature work (S0–S13) lands on
