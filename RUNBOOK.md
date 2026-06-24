@@ -106,12 +106,22 @@ builds with the default LLVM linker and no wrapper. This split is intentional: i
 CI and `scripts/preflight.sh` in agreement (both default-linker) while the meta tree gets the fast
 path. The toolchain + caches are owned by **meta/envctl paths**, not user-global `~/.rustup`.
 
-**GPU / CUDA.** Not yet wired into teri. The build-time Rust→PTX contract uses `nvcc` + `llc`
-(`CUDA_OXIDE_LLC=$(command -v llc)`), which are license-clean tools. The owner-named runtime crate
-`cuda-oxide` is **GPL-3.0-or-later** and is therefore **incompatible with teri's MIT license** — it
-will not be added. The license-clean substitute is **`cudarc` (MIT/Apache-2.0)**, whose
-`dynamic-loading` feature dlopens `libcuda` at runtime (so it compiles even on GPU-less CI). The
-runtime-crate selection awaits owner sign-off before a `cuda` feature lands.
+**GPU codegen ([NVlabs/cuda-oxide](https://github.com/NVlabs/cuda-oxide), optional, perf).** This is
+*not* a CUDA-driver-bindings crate — it's a **custom `rustc` backend that compiles GPU kernels in
+pure Rust** (`Rust → MIR → Pliron IR → LLVM IR → PTX`), built with `cargo oxide build`. Single-source
+(host + device in one file), generic kernels, device intrinsics, async layer. It's the **third
+codegen backend** on teri's single nightly toolchain — LLVM (default), `rustc_codegen_gcc` (CPU perf,
+above), and cuda-oxide (GPU). A custom rustc backend is exactly why teri **must** be nightly.
+
+- License: Apache-2.0 (the `cuda-bindings` crate is under the NVIDIA Software License) — *not* GPL.
+- `llc`: the pipeline prefers `llc` from the Rust toolchain and auto-discovers `llc-22`/`llc-21` on
+  `PATH`; pin one with `CUDA_OXIDE_LLC=$(command -v llc-21)`. The meta `llvm-clang` component
+  provides `llc` (also wild's link driver + libclang for bindgen), so the meta tree already has it.
+
+**Status:** the cuda-oxide *toolchain path* (above) is what teri's GPU acceleration will be built
+with. teri ships **no** GPU kernels yet, so there is no GPU build target in this slice and the
+default/CI build is unaffected. Authoring teri's first cuda-oxide kernels (and a `cargo oxide build`
+target) is a follow-up feature — tracked separately, not part of this toolchain slice.
 
 ---
 

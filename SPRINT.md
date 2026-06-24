@@ -197,11 +197,19 @@ build stack and adding the GPU path):
   — a floating nightly doesn't build it every day, and a missing pinned component is a fatal rustup
   error). `RUNBOOK.md §3.1`.
 - ☑ `./target/*/teri --help` still exit 0 keyless; backend-honesty guard untouched.
-- ☐ **CUDA `cuda` feature — DEFERRED, owner decision required.** The owner-named `cuda-oxide` is
-  **GPL-3.0-or-later**, incompatible with teri's **MIT** license; it will not be added. License-clean
-  substitute is **`cudarc` (MIT/Apache-2.0, `dynamic-loading`)**. The build-time `nvcc`/`llc`/
-  `CUDA_OXIDE_LLC` PTX contract is license-clean and documented. Awaiting sign-off on the runtime
-  crate before a `cuda` feature lands (tracked in `RUNBOOK.md §3.1`).
+- ☑ **License corrected → AGPL-3.0-or-later** (owner decision 2026-06-24). teri's stale `MIT` +
+  upstream-port attribution (`Kresna Sucandra` / `SHA888/teri`) was wrong; set to
+  `AGPL-3.0-or-later`, `FlexNetOS`, `FlexNetOS/teri`, with the canonical AGPL `LICENSE` added.
+  Copyleft + network-use clause = reciprocity (no SaaS freeloading), faithful to MiroFish's AGPL.
+- ☑ **GPU codegen path = [NVlabs/cuda-oxide](https://github.com/NVlabs/cuda-oxide)** documented as
+  the third codegen backend on the nightly toolchain (LLVM default · codegen-gcc CPU · cuda-oxide
+  GPU). It's a custom `rustc` backend that compiles GPU kernels in pure Rust (Rust→MIR→Pliron→LLVM→
+  PTX via `cargo oxide build`, `llc`/`CUDA_OXIDE_LLC`) — *the* reason teri must be nightly. Apache-2.0
+  (not GPL). teri has no GPU kernels yet, so no GPU build target lands here; authoring the first
+  cuda-oxide kernels is a follow-up feature. `RUNBOOK.md §3.1`.
+  *(Correction: an earlier draft of this slice wrongly added the unrelated `cudarc` driver-bindings
+  crate after mis-identifying "cuda-oxide" as the abandoned Protryon GPL crate. Reverted — cuda-oxide
+  is NVlabs' Rust→PTX compiler, not a runtime binding, and is not interchangeable with cudarc.)*
 
 **Risk notes**
 - Floating nightly is a moving floor — this is why S14 is **last**: all feature work (S0–S13) lands on

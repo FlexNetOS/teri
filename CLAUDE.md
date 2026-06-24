@@ -75,8 +75,8 @@ in spirit; they still govern every change.
 
 ## What teri is (state of truth, refreshed 2026-06-21)
 
-A Rust rewrite of MiroFish (AGPL upstream; this is an MIT independent reimplementation — parity by
-spec, never by code copy). The five-stage pipeline mirrors upstream: seed → graph → agents → sim →
+A Rust rewrite of MiroFish (AGPL upstream; teri is itself licensed AGPL-3.0-or-later, keeping faith
+with that copyleft intent — see LICENSE). The five-stage pipeline mirrors upstream: seed → graph → agents → sim →
 report. **1629 tests green** (was ~140 at the 2026-06-12 snapshot). All five stages and their
 services are implemented and tested, and the **full pipeline runs today via `teri serve` + the
 REST API** (`/api/graph` build → `/api/simulation` prepare/start → `/api/report` generate/chat).

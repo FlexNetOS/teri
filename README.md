@@ -11,8 +11,8 @@
 </div>
 
 > **Teri** is a Rust-native rewrite of [MiroFish](https://github.com/666ghj/MiroFish)
-> (AGPL-3.0 upstream). Teri is an independent **MIT** reimplementation — parity by spec,
-> never by code copy. It is the *upgrade*, not a downgrade: every MiroFish capability is a
+> (AGPL-3.0 upstream). Teri is itself licensed **AGPL-3.0-or-later**, keeping faith with
+> MiroFish's copyleft intent. It is the *upgrade*, not a downgrade: every MiroFish capability is a
 > requirement here. "Teri" (Indonesian *ikan teri*, the anchovy) is one of the smallest fish in
 > the sea, yet moves in vast, tightly coordinated schools — emergent behavior no single fish
 > planned. That is exactly what this engine does: seed the world, spawn the swarm, watch
@@ -186,11 +186,16 @@ ledger. The **Web UI** is the principal in-progress surface relative to MiroFish
 
 ## 📄 Acknowledgments
 
-Teri is an independent MIT reimplementation of **[MiroFish](https://github.com/666ghj/MiroFish)** by
-BaiFu / 666ghj (AGPL-3.0) — parity by spec, never by code copy. Its simulation design draws on
-**[OASIS (Open Agent Social Interaction Simulations)](https://github.com/camel-ai/oasis)** from the
-CAMEL-AI team. Our thanks to both.
+Teri is a Rust rewrite of **[MiroFish](https://github.com/666ghj/MiroFish)** by BaiFu / 666ghj
+(AGPL-3.0), and is itself licensed AGPL-3.0-or-later in keeping with that copyleft intent. Its
+simulation design draws on **[OASIS (Open Agent Social Interaction Simulations)](https://github.com/camel-ai/oasis)**
+from the CAMEL-AI team. Our thanks to both.
 
 ## License
 
-MIT
+Teri is licensed under the **GNU Affero General Public License v3.0 or later**
+([AGPL-3.0-or-later](LICENSE)). Copyright © 2026 FlexNetOS.
+
+The AGPL's network-use clause is the point: if you run a modified teri as a network service
+(`teri serve`), you must offer your modified source to its users. Improvements flow back to the
+commons rather than disappearing into a closed product — the same reciprocity MiroFish intended.
