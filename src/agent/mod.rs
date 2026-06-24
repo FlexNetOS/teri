@@ -1,6 +1,6 @@
 use crate::error::{Result, TeriError};
 use crate::graph::{Entity, KnowledgeGraph, Relation};
-use crate::llm::{ChatMessage, ChatOptions, LlmClient};
+use crate::llm::{ChatMessage, ChatOptions, LlmClient, ResponseFormat};
 use crate::sim::social_world::FeedSnapshot;
 use crate::sim::{Action, SocialAction, TargetKind, WorldState};
 use chrono::Utc;
@@ -13,6 +13,35 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
+
+/// Facts + node summaries semantically recalled about a single entity.
+///
+/// # MiroFish parity (TASK-SIM-6 #5)
+/// Mirrors the `{"facts": [...], "node_summaries": [...]}` dict returned by
+/// `OasisProfileGenerator._search_zep_for_entity` (oasis_profile_generator.py:286-412).
+/// `facts` are edge facts; `node_summaries` are related-node summaries / names.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecalledEntityFacts {
+    pub facts: Vec<String>,
+    pub node_summaries: Vec<String>,
+}
+
+/// A source of semantically-recalled facts about an entity, used to enrich the persona
+/// prompt (TASK-SIM-6 #5 — the part-4 "Zep hybrid search" half of `_build_entity_context`).
+///
+/// teri's analog of Zep's graph hybrid search is the embedding-cosine recall over the
+/// graph's vector namespace ([`ReportTools::search_graph_semantic`] +
+/// [`GraphSearchLens`](crate::services::zep_tools::GraphSearchLens)). A wired implementation
+/// runs that search; a stub implementation feeds fixed facts in tests. When no recall source
+/// is supplied to `generate_social`, this enrichment is skipped entirely and the persona
+/// context is byte-identical to the pre-S11 (parts 1-3 only) behaviour (no-downgrade).
+#[async_trait::async_trait]
+pub trait EntityFactRecall: Send + Sync {
+    /// Recall facts/summaries relevant to `entity_name`. Implementations should fail soft
+    /// (return [`RecalledEntityFacts::default`]) rather than erroring — a recall miss must
+    /// never abort persona generation, matching MiroFish's best-effort Zep search.
+    async fn recall(&self, entity_name: &str) -> RecalledEntityFacts;
+}
 
 /// Social media platform a `SocialProfile` belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1415,12 +1444,21 @@ impl PersonaGenerator {
     /// - Part 2: related edges — relationship/fact lines (S-356, was previously dropped)
     /// - Part 3: related nodes (neighbor names + kinds from `KnowledgeGraph::get_neighbors`)
     ///
-    /// The Zep-search half (part 4, `_search_zep_for_entity`) is `[≠]` (S-355) and is not
-    /// ported — teri uses an in-process graph.
+    /// The Zep-search half (part 4, `_search_zep_for_entity`) is wired separately via the
+    /// optional [`EntityFactRecall`] source in
+    /// [`generate_social_with_recall`](Self::generate_social_with_recall) (TASK-SIM-6 #5).
     ///
-    /// Returns an empty string if the entity has no neighbors (graceful flat fallback).
-    fn build_entity_context(graph: &KnowledgeGraph, entity: &Entity) -> String {
+    /// Returns the entity-context string plus the set of graph-derived relationship/fact lines
+    /// (TASK-SIM-6 #5: `existing_facts`, oasis_profile_generator.py:435), used to dedup
+    /// semantically-recalled facts. Returns an empty string if the entity has no neighbors
+    /// (graceful flat fallback).
+    fn build_entity_context_with_facts(
+        graph: &KnowledgeGraph,
+        entity: &Entity,
+    ) -> (String, std::collections::HashSet<String>) {
         let mut context_parts: Vec<String> = Vec::new();
+        let mut existing_facts: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         // Part 1: entity attributes — in teri's Entity model, the main attributes are
         // `name` and `kind`; we surface them as a context section.
@@ -1433,12 +1471,9 @@ impl PersonaGenerator {
         // emit a fact line if the relation carries a fact, else a directional arrow line.
         //
         // In teri, `Relation` carries no free-text fact field (facts are derived from entity
-        // summaries passed in by the caller), so this section always emits directional lines:
-        //   - outgoing: entity --[RelationKind]--> (neighbor)
-        //   - incoming: (neighbor) --[RelationKind]--> entity
-        //
-        // The `_fact_for_relation` helper is called with the relation to allow future enrichment.
-        // `existing_facts` dedup set from MiroFish is not needed here (no free-text facts).
+        // summaries passed in by the caller), so this section always emits directional lines.
+        // Each emitted line (minus its leading "- ") is recorded in `existing_facts` so that
+        // part-4 recall enrichment can dedup against the graph-derived relationships.
         let neighbor_relations = graph.get_neighbor_relations(entity.id).unwrap_or_default();
         if !neighbor_relations.is_empty() {
             let relationships: Vec<String> = neighbor_relations
@@ -1448,6 +1483,9 @@ impl PersonaGenerator {
                 })
                 .collect();
             if !relationships.is_empty() {
+                for line in &relationships {
+                    existing_facts.insert(line.trim_start_matches("- ").to_string());
+                }
                 context_parts.push(format!(
                     "### Related Facts and Relationships\n{}",
                     relationships.join("\n")
@@ -1464,7 +1502,39 @@ impl PersonaGenerator {
             context_parts.push(format!("### Related Entities\n{}", related_info.join("\n")));
         }
 
-        context_parts.join("\n\n")
+        (context_parts.join("\n\n"), existing_facts)
+    }
+
+    /// Format recalled facts/summaries into the part-4 enrichment sections, deduped against
+    /// `existing_facts`. Mirrors oasis_profile_generator.py:478-485:
+    /// - facts not already present → "### Recalled Facts" (capped at 15, matching `[:15]`)
+    /// - node summaries → "### Recalled Related Nodes" (capped at 10, matching `[:10]`)
+    ///
+    /// Returns an empty string when there is nothing new to add.
+    fn format_recalled_facts(
+        recalled: &RecalledEntityFacts,
+        existing_facts: &std::collections::HashSet<String>,
+    ) -> String {
+        let mut parts: Vec<String> = Vec::new();
+
+        let new_facts: Vec<&String> = recalled
+            .facts
+            .iter()
+            .filter(|f| !existing_facts.contains(*f))
+            .take(15)
+            .collect();
+        if !new_facts.is_empty() {
+            let lines: Vec<String> = new_facts.iter().map(|f| format!("- {}", f)).collect();
+            parts.push(format!("### Recalled Facts\n{}", lines.join("\n")));
+        }
+
+        if !recalled.node_summaries.is_empty() {
+            let lines: Vec<String> =
+                recalled.node_summaries.iter().take(10).map(|s| format!("- {}", s)).collect();
+            parts.push(format!("### Recalled Related Nodes\n{}", lines.join("\n")));
+        }
+
+        parts.join("\n\n")
     }
 
     /// Formats one relationship line for Part 2 of `build_entity_context`.
@@ -1515,6 +1585,9 @@ impl PersonaGenerator {
     /// `graph_ctx`: optional `(&KnowledgeGraph, &Entity)` — when provided, enriches the LLM
     /// prompt with neighbor context from the graph (ports S-356 `_build_entity_context`).
     /// When `None`, the profile is generated from the flat summary alone (backward-compatible).
+    ///
+    /// Delegates to [`generate_social_with_recall`](Self::generate_social_with_recall) with no
+    /// recall source — i.e. the persona context uses only the in-process graph (parts 1-3).
     pub async fn generate_social<L: LlmClient>(
         &self,
         entity_name: &str,
@@ -1523,6 +1596,39 @@ impl PersonaGenerator {
         platform: Platform,
         llm: &L,
         graph_ctx: Option<(&KnowledgeGraph, &Entity)>,
+    ) -> Result<SocialProfile> {
+        self.generate_social_with_recall(
+            entity_name,
+            entity_type,
+            entity_summary,
+            platform,
+            llm,
+            graph_ctx,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`generate_social`](Self::generate_social), but with an optional semantic-recall
+    /// source that enriches the persona context with facts about the entity (TASK-SIM-6 #5 —
+    /// the part-4 "Zep hybrid search" half of `_build_entity_context`,
+    /// oasis_profile_generator.py:475-485).
+    ///
+    /// `recall`: when `Some`, the recalled facts/summaries are appended to the entity context
+    /// AFTER the in-process graph parts (1-3), with the same dedup MiroFish applies — facts
+    /// already present in the graph-derived "Related Facts and Relationships" section are
+    /// dropped (oasis_profile_generator.py:480). When `None`, the context is byte-identical to
+    /// `generate_social` (no-downgrade).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn generate_social_with_recall<L: LlmClient>(
+        &self,
+        entity_name: &str,
+        entity_type: &str,
+        entity_summary: &str,
+        platform: Platform,
+        llm: &L,
+        graph_ctx: Option<(&KnowledgeGraph, &Entity)>,
+        recall: Option<&dyn EntityFactRecall>,
     ) -> Result<SocialProfile> {
         let user_name = Self::generate_username(entity_name);
         let created_at = chrono::Utc::now().format("%Y-%m-%d").to_string();
@@ -1534,13 +1640,33 @@ impl PersonaGenerator {
             entity_summary.to_string()
         };
 
-        // S-356: build entity context from graph neighbors (enrichment)
-        let entity_context = match graph_ctx {
-            Some((graph, entity)) => {
-                let ctx = Self::build_entity_context(graph, entity);
-                if ctx.is_empty() { String::new() } else { format!("\n\nEntity context:\n{}", ctx) }
+        // S-356: build entity context from graph neighbors (enrichment).
+        // TASK-SIM-6 #5: also collect the graph-derived facts so we can dedup recalled facts
+        // against them (oasis_profile_generator.py:435,480 — `existing_facts`).
+        let (mut graph_context, existing_facts) = match graph_ctx {
+            Some((graph, entity)) => Self::build_entity_context_with_facts(graph, entity),
+            None => (String::new(), std::collections::HashSet::new()),
+        };
+
+        // TASK-SIM-6 #5: part-4 semantic recall enrichment (deduped). Best-effort: a recall
+        // miss leaves the context unchanged. Mirrors oasis_profile_generator.py:475-485.
+        if let Some(recall_source) = recall {
+            let recalled = recall_source.recall(entity_name).await;
+            let enrichment = Self::format_recalled_facts(&recalled, &existing_facts);
+            if !enrichment.is_empty() {
+                if graph_context.is_empty() {
+                    graph_context = enrichment;
+                } else {
+                    graph_context.push_str("\n\n");
+                    graph_context.push_str(&enrichment);
+                }
             }
-            None => String::new(),
+        }
+
+        let entity_context = if graph_context.is_empty() {
+            String::new()
+        } else {
+            format!("\n\nEntity context:\n{}", graph_context)
         };
 
         // TASK-SIM-1 gap #2: individual-vs-group prompt SELECTION
@@ -1570,11 +1696,43 @@ impl PersonaGenerator {
             let temperature = 0.7 - (attempt as f32) * 0.1;
             let messages =
                 [ChatMessage::system(system_prompt), ChatMessage::user(user_prompt.clone())];
-            let opts = ChatOptions { temperature: Some(temperature), max_tokens: None };
-            match llm.chat(&messages, &opts).await {
-                Ok(response) => {
-                    // S11: when LlmClient exposes `finish_reason`, detect `=="length"` truncation
-                    // here and run `fix_truncated_json` before parsing (TASK-SIM-6 #7, deferred).
+            // TASK-SIM-6 #7: request the structured-output (JSON-object) shape — mirrors
+            // `response_format={"type":"json_object"}` (oasis_profile_generator.py:536). No
+            // max_tokens (let the model run free, like MiroFish :538).
+            let opts = ChatOptions {
+                temperature: Some(temperature),
+                max_tokens: None,
+                response_format: Some(ResponseFormat::JsonObject),
+            };
+            // TASK-SIM-6 #7: use the truncation-aware entry point so we can detect a
+            // `finish_reason == "length"` cutoff (mirrors oasis_profile_generator.py:544-547).
+            match llm.chat_with_meta(&messages, &opts).await {
+                Ok(completion) => {
+                    let truncated = completion.is_truncated();
+                    let response = completion.content;
+                    if truncated {
+                        // Truncated by the token cap: close the open braces/brackets/strings
+                        // before parsing (mirrors `_fix_truncated_json`, :545-547), then let
+                        // the normal parse → salvage path run on the repaired content. If even
+                        // the repair is unparseable, fall through to the next (lower-temp) attempt
+                        // — MiroFish's loop retries truncated attempts the same way.
+                        let repaired = Self::fix_truncated_json(&response);
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&repaired) {
+                            profile_data = Some(v);
+                            break;
+                        }
+                        if let Some(mut v) =
+                            Self::try_fix_json(&repaired, entity_name, entity_type, entity_summary)
+                        {
+                            if let Some(m) = v.as_object_mut() {
+                                m.remove("_fixed");
+                            }
+                            profile_data = Some(v);
+                            break;
+                        }
+                        // Still unparseable after repair: treat as a failed attempt, retry.
+                        continue;
+                    }
                     // First attempt: direct parse.
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&response) {
                         profile_data = Some(v);
@@ -1904,6 +2062,37 @@ Important:
                     "Culture & Society".to_string(),
                 ],
                 Some("Thoughtful, infrequent posts with expert analysis".to_string()),
+            )
+        } else if matches!(entity_type_lower.as_str(), "mediaoutlet" | "socialmediaplatform") {
+            // TASK-SIM-6 #4: media entities get a DISTINCT profile, not the generic
+            // institutional one. Mirrors `_generate_default_profile`
+            // (oasis_profile_generator.py:810-820): news-focused bio/persona, profession
+            // "Media", and media-specific interests. Note `socialmediaplatform` is NOT in
+            // GROUP_ENTITY_TYPES, so without this arm it would fall to the generic default —
+            // this branch must precede `is_group_entity` (which contains `mediaoutlet`).
+            (
+                format!("Official account for {}. News and updates.", entity_name),
+                if entity_summary.is_empty() {
+                    format!(
+                        "{entity_name} is a media entity that reports news and facilitates public discourse. The account shares timely updates and engages with the audience on current events."
+                    )
+                } else {
+                    entity_summary.to_string()
+                },
+                // Fixed institutional virtual demographics (oasis_profile_generator.py:814-817).
+                Some(30u32),
+                Some("other".to_string()),
+                Some("ISTJ".to_string()),
+                Some("China".to_string()),
+                Some("Media".to_string()),
+                vec![
+                    "General News".to_string(),
+                    "Current Events".to_string(),
+                    "Public Affairs".to_string(),
+                ],
+                Some(format!(
+                    "News-focused account for {entity_name}. Timely, professional updates."
+                )),
             )
         } else if Self::is_group_entity(&entity_type_lower) {
             // Group/institution entity types (the canonical `GROUP_ENTITY_TYPES` set) →
@@ -5372,5 +5561,334 @@ mod tests {
         assert_eq!(sp.mbti.as_deref(), Some("ISTJ"));
         // Counts still randomized within range.
         assert!((500..=5000).contains(&sp.karma));
+    }
+
+    // ===== TASK-SIM-6 #4: media-outlet / socialmediaplatform rule-based branch =====
+
+    /// `mediaoutlet` gets the DISTINCT media profile (profession "Media", news interests),
+    /// NOT the generic institutional one. Mirrors oasis_profile_generator.py:810-820.
+    #[test]
+    fn test_rule_based_media_outlet_distinct_branch() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let sp = PersonaGenerator::generate_social_rule_based(
+            "Daily Times",
+            "mediaoutlet",
+            "",
+            Platform::Reddit,
+            "daily_1",
+            "2026-06-23",
+            &mut rng,
+        );
+        assert_eq!(sp.profession.as_deref(), Some("Media"));
+        assert!(sp.persona.contains("media entity"), "persona must read as a media entity");
+        assert!(sp.interested_topics.contains(&"General News".to_string()));
+        assert!(sp.interested_topics.contains(&"Current Events".to_string()));
+        // Fixed institutional virtual demographics.
+        assert_eq!(sp.age, Some(30));
+        assert_eq!(sp.gender.as_deref(), Some("other"));
+        assert_eq!(sp.mbti.as_deref(), Some("ISTJ"));
+    }
+
+    /// `socialmediaplatform` (NOT in GROUP_ENTITY_TYPES) also hits the media branch — proving the
+    /// arm precedes the generic-default fall-through.
+    #[test]
+    fn test_rule_based_social_media_platform_uses_media_branch() {
+        let mut rng = StdRng::seed_from_u64(9);
+        let sp = PersonaGenerator::generate_social_rule_based(
+            "ChatApp",
+            "socialmediaplatform",
+            "",
+            Platform::Reddit,
+            "chatapp_1",
+            "2026-06-23",
+            &mut rng,
+        );
+        assert_eq!(sp.profession.as_deref(), Some("Media"));
+        assert!(sp.interested_topics.contains(&"Public Affairs".to_string()));
+    }
+
+    // ===== TASK-SIM-6 #5: per-entity semantic-recall enrichment (with dedup) =====
+
+    /// A stub recall source returning fixed facts/summaries.
+    struct StubRecall {
+        facts: Vec<String>,
+        summaries: Vec<String>,
+    }
+    #[async_trait]
+    impl EntityFactRecall for StubRecall {
+        async fn recall(&self, _entity_name: &str) -> RecalledEntityFacts {
+            RecalledEntityFacts {
+                facts: self.facts.clone(),
+                node_summaries: self.summaries.clone(),
+            }
+        }
+    }
+
+    /// Captures the user prompt and returns fixed JSON so the LLM path succeeds.
+    struct PromptCaptureOk {
+        captured: std::sync::Arc<std::sync::Mutex<String>>,
+    }
+    #[async_trait]
+    impl LlmClient for PromptCaptureOk {
+        async fn complete(&self, _: &str) -> Result<String> {
+            Err(TeriError::Llm("unused".into()))
+        }
+        async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+            Err(TeriError::Llm("unused".into()))
+        }
+        async fn stream(
+            &self,
+            _: &str,
+        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            Err(TeriError::Llm("unused".into()))
+        }
+        async fn chat(
+            &self,
+            messages: &[crate::llm::ChatMessage],
+            _: &crate::llm::ChatOptions,
+        ) -> Result<String> {
+            *self.captured.lock().unwrap() = capture_user_message(messages);
+            Ok("{}".to_string())
+        }
+        async fn chat_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _: &[crate::llm::ChatMessage],
+            _: &crate::llm::ChatOptions,
+        ) -> Result<T> {
+            Err(TeriError::Llm("unused".into()))
+        }
+    }
+
+    /// When a recall source is supplied, recalled facts/summaries appear in the persona prompt.
+    #[tokio::test]
+    async fn test_generate_social_with_recall_enriches_prompt() {
+        let mut graph = KnowledgeGraph::new();
+        let person =
+            Entity { id: uuid::Uuid::new_v4(), name: "Jane".to_string(), kind: EntityKind::Person };
+        graph.add_entity(person.clone()).expect("add person");
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let llm = PromptCaptureOk { captured: captured.clone() };
+        let recall = StubRecall {
+            facts: vec!["Jane founded Acme in 2020".to_string()],
+            summaries: vec!["Jane is a well-known engineer".to_string()],
+        };
+        let generator = PersonaGenerator::new();
+
+        generator
+            .generate_social_with_recall(
+                "Jane",
+                "person",
+                "An engineer",
+                Platform::Reddit,
+                &llm,
+                Some((&graph, &person)),
+                Some(&recall),
+            )
+            .await
+            .expect("generate_social_with_recall must succeed");
+
+        let prompt = captured.lock().unwrap().clone();
+        assert!(
+            prompt.contains("### Recalled Facts"),
+            "prompt must include recalled facts section; got: {}",
+            &prompt[..prompt.len().min(900)]
+        );
+        assert!(prompt.contains("Jane founded Acme in 2020"));
+        assert!(prompt.contains("### Recalled Related Nodes"));
+        assert!(prompt.contains("Jane is a well-known engineer"));
+    }
+
+    /// No recall source → no "Recalled" sections (byte-identical to today's behaviour).
+    #[tokio::test]
+    async fn test_generate_social_without_recall_no_recalled_sections() {
+        let mut graph = KnowledgeGraph::new();
+        let person =
+            Entity { id: uuid::Uuid::new_v4(), name: "Jane".to_string(), kind: EntityKind::Person };
+        graph.add_entity(person.clone()).expect("add person");
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let llm = PromptCaptureOk { captured: captured.clone() };
+        let generator = PersonaGenerator::new();
+
+        generator
+            .generate_social(
+                "Jane",
+                "person",
+                "An engineer",
+                Platform::Reddit,
+                &llm,
+                Some((&graph, &person)),
+            )
+            .await
+            .expect("generate_social must succeed");
+
+        let prompt = captured.lock().unwrap().clone();
+        assert!(!prompt.contains("### Recalled Facts"));
+        assert!(!prompt.contains("### Recalled Related Nodes"));
+    }
+
+    /// Recalled facts duplicating a graph-derived relationship line are deduped out.
+    #[test]
+    fn test_format_recalled_facts_dedups_existing() {
+        let mut existing = std::collections::HashSet::new();
+        existing.insert("Jane --[Founded]--> (Acme)".to_string());
+        let recalled = RecalledEntityFacts {
+            facts: vec![
+                "Jane --[Founded]--> (Acme)".to_string(), // duplicate → dropped
+                "Jane lives in Paris".to_string(),        // new → kept
+            ],
+            node_summaries: vec![],
+        };
+        let out = PersonaGenerator::format_recalled_facts(&recalled, &existing);
+        assert!(out.contains("Jane lives in Paris"));
+        // The duplicate fact must NOT be re-listed under Recalled Facts.
+        assert!(!out.contains("- Jane --[Founded]--> (Acme)"));
+    }
+
+    /// Empty recall → empty enrichment string.
+    #[test]
+    fn test_format_recalled_facts_empty_is_empty() {
+        let out = PersonaGenerator::format_recalled_facts(
+            &RecalledEntityFacts::default(),
+            &std::collections::HashSet::new(),
+        );
+        assert!(out.is_empty());
+    }
+
+    // ===== TASK-SIM-6 #7: persona path truncation retry =====
+
+    /// An LLM whose FIRST chat_with_meta call returns truncated JSON (finish_reason=="length")
+    /// and whose SECOND returns clean JSON — proving the truncation triggers a retry.
+    struct TruncateThenOk {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait]
+    impl LlmClient for TruncateThenOk {
+        async fn complete(&self, _: &str) -> Result<String> {
+            Err(TeriError::Llm("unused".into()))
+        }
+        async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+            Err(TeriError::Llm("unused".into()))
+        }
+        async fn stream(
+            &self,
+            _: &str,
+        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            Err(TeriError::Llm("unused".into()))
+        }
+        async fn chat(
+            &self,
+            _: &[crate::llm::ChatMessage],
+            _: &crate::llm::ChatOptions,
+        ) -> Result<String> {
+            Ok("{}".to_string())
+        }
+        async fn chat_with_meta(
+            &self,
+            _: &[crate::llm::ChatMessage],
+            _: &crate::llm::ChatOptions,
+        ) -> Result<crate::llm::ChatCompletion> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                // Truncated AND unrepairable garbage so the attempt is discarded (forces retry).
+                Ok(crate::llm::ChatCompletion {
+                    content: "not json at all <<<".to_string(),
+                    finish_reason: Some("length".to_string()),
+                })
+            } else {
+                Ok(crate::llm::ChatCompletion {
+                    content: r#"{"bio":"clean bio","persona":"clean persona"}"#.to_string(),
+                    finish_reason: Some("stop".to_string()),
+                })
+            }
+        }
+        async fn chat_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _: &[crate::llm::ChatMessage],
+            _: &crate::llm::ChatOptions,
+        ) -> Result<T> {
+            Err(TeriError::Llm("unused".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_social_retries_on_truncation() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let llm = TruncateThenOk { calls: calls.clone() };
+        let generator = PersonaGenerator::new();
+
+        let sp = generator
+            .generate_social("Jane", "person", "x", Platform::Reddit, &llm, None)
+            .await
+            .expect("generate_social must succeed");
+
+        // The truncated first attempt was retried; the second (clean) attempt won.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(sp.bio, "clean bio");
+        assert_eq!(sp.persona, "clean persona");
+    }
+
+    /// A truncated-but-repairable response is salvaged in-place (no retry needed).
+    struct TruncatedButRepairable {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait]
+    impl LlmClient for TruncatedButRepairable {
+        async fn complete(&self, _: &str) -> Result<String> {
+            Err(TeriError::Llm("unused".into()))
+        }
+        async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+            Err(TeriError::Llm("unused".into()))
+        }
+        async fn stream(
+            &self,
+            _: &str,
+        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            Err(TeriError::Llm("unused".into()))
+        }
+        async fn chat(
+            &self,
+            _: &[crate::llm::ChatMessage],
+            _: &crate::llm::ChatOptions,
+        ) -> Result<String> {
+            Ok("{}".to_string())
+        }
+        async fn chat_with_meta(
+            &self,
+            _: &[crate::llm::ChatMessage],
+            _: &crate::llm::ChatOptions,
+        ) -> Result<crate::llm::ChatCompletion> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Missing the closing brace — fix_truncated_json closes it.
+            Ok(crate::llm::ChatCompletion {
+                content: r#"{"bio":"b","persona":"p""#.to_string(),
+                finish_reason: Some("length".to_string()),
+            })
+        }
+        async fn chat_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _: &[crate::llm::ChatMessage],
+            _: &crate::llm::ChatOptions,
+        ) -> Result<T> {
+            Err(TeriError::Llm("unused".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_social_salvages_repairable_truncation_without_retry() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let llm = TruncatedButRepairable { calls: calls.clone() };
+        let generator = PersonaGenerator::new();
+
+        let sp = generator
+            .generate_social("Jane", "person", "x", Platform::Reddit, &llm, None)
+            .await
+            .expect("generate_social must succeed");
+
+        // Repaired on the FIRST attempt — no retry.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(sp.bio, "b");
+        assert_eq!(sp.persona, "p");
     }
 }

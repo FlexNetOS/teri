@@ -574,6 +574,10 @@ pub async fn generate_profiles_from_entities<L: LlmClient>(
     parallel_count: usize,
     realtime_output: Option<(&Path, OutputPlatform)>,
     progress_callback: &mut dyn FnMut(i64, i64, String),
+    // TASK-SIM-6 #5: optional semantic-recall source. When `Some`, persona generation enriches
+    // each entity's context with recalled facts (deduped); when `None`, behaviour is identical
+    // to before (in-process graph context only). See [`PersonaGenerator::generate_social_with_recall`].
+    recall: Option<&dyn crate::agent::EntityFactRecall>,
 ) -> Vec<(SocialProfile, String)> {
     let total = entities.len() as i64;
     // Pre-allocate indexed slots for order-preserving collection.
@@ -606,13 +610,14 @@ pub async fn generate_profiles_from_entities<L: LlmClient>(
 
         async move {
             let generation_result = generator
-                .generate_social(
+                .generate_social_with_recall(
                     &entity_name,
                     &entity_type,
                     &entity_summary,
                     platform,
                     llm,
                     graph_ctx,
+                    recall,
                 )
                 .await;
 
@@ -739,6 +744,7 @@ pub fn generate_profiles_no_cb<L: LlmClient>(
                 parallel_count,
                 None,
                 &mut noop,
+                None,
             )
             .await
         })
@@ -1652,7 +1658,7 @@ mod tests {
         };
 
         let results = generate_profiles_from_entities(
-            &generator, &llm, &entities, None, true, 1, None, &mut cb,
+            &generator, &llm, &entities, None, true, 1, None, &mut cb, None,
         )
         .await;
 
@@ -1678,7 +1684,7 @@ mod tests {
         let mut cb = |_c: i64, _t: i64, _m: String| {};
 
         let results = generate_profiles_from_entities(
-            &generator, &llm, &entities, None, true, 1, None, &mut cb,
+            &generator, &llm, &entities, None, true, 1, None, &mut cb, None,
         )
         .await;
 
@@ -1722,6 +1728,7 @@ mod tests {
             1,
             Some((&rt_path, OutputPlatform::Reddit)),
             &mut cb,
+            None,
         )
         .await;
 
@@ -1747,7 +1754,7 @@ mod tests {
         let mut cb = |_c: i64, _t: i64, _m: String| {};
 
         let results = generate_profiles_from_entities(
-            &generator, &llm, &entities, None, true, 1, None, &mut cb,
+            &generator, &llm, &entities, None, true, 1, None, &mut cb, None,
         )
         .await;
 
@@ -1792,6 +1799,7 @@ mod tests {
             parallel_count,
             None,
             &mut cb,
+            None,
         )
         .await
     }

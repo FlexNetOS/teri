@@ -1346,6 +1346,10 @@ impl SimulationManager {
             parallel_profile_count,
             rt_ref,
             &mut profile_progress,
+            // TASK-SIM-6 #5: no recall source wired into the batch path yet; persona context
+            // uses the in-process graph (parts 1-3). Live `GraphSemanticRecall` wiring is a
+            // follow-up — the param is plumbed so it can be supplied without an API change.
+            None,
         )
         .await;
 

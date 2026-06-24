@@ -345,7 +345,11 @@ impl<L: LlmClient> OntologyGenerator<L> {
             .client
             .chat_json(
                 &[ChatMessage::system(system_prompt), ChatMessage::user(user_message)],
-                &ChatOptions { temperature: Some(0.3), max_tokens: Some(4096) },
+                &ChatOptions {
+                    temperature: Some(0.3),
+                    max_tokens: Some(4096),
+                    response_format: None,
+                },
             )
             .await
             .map_err(|e| TeriError::Llm(format!("OntologyGenerator LLM call failed: {e}")))?;
@@ -480,6 +484,10 @@ pub fn validate_and_process(mut result: Value) -> Value {
             if entity.get("examples").is_none() {
                 entity["examples"] = Value::Array(vec![]);
             }
+            // Remap reserved attribute names (py:236 `safe_attr_name`). teri applies it here in
+            // `set_ontology` rather than at graph-materialization time, since teri carries the
+            // ontology as JSON through the pipeline.
+            remap_reserved_attribute_names(entity);
             // Truncate description (py:303-305) — char-based
             truncate_description(entity);
         }
@@ -527,6 +535,8 @@ pub fn validate_and_process(mut result: Value) -> Value {
             if edge.get("attributes").is_none() {
                 edge["attributes"] = Value::Array(vec![]);
             }
+            // Remap reserved attribute names on edge attributes (py:260 `safe_attr_name`).
+            remap_reserved_attribute_names(edge);
             // Truncate description (py:325-326) — char-based
             truncate_description(edge);
         }
@@ -635,6 +645,51 @@ fn truncate_description(obj: &mut Value) {
         // Take first 97 chars (char-indexed) then append "..."
         let truncated: String = desc.chars().take(97).collect();
         obj["description"] = Value::String(format!("{truncated}..."));
+    }
+}
+
+/// Reserved attribute names that the graph backend uses for its own node/edge fields
+/// and that therefore cannot be used as user-defined attribute names.
+///
+/// Mirrors `graph_builder.py:217` `RESERVED_NAMES`.
+const RESERVED_ATTR_NAMES: [&str; 6] =
+    ["uuid", "name", "group_id", "name_embedding", "summary", "created_at"];
+
+/// Convert a reserved attribute name to a safe one by prefixing it with `entity_`.
+///
+/// Mirrors `graph_builder.py:219-223` `safe_attr_name`: the comparison is
+/// case-insensitive (Python uses `attr_name.lower() in RESERVED_NAMES`), and a
+/// collision yields `entity_{attr_name}` (the ORIGINAL casing is preserved in the
+/// prefixed result, matching Python's `f"entity_{attr_name}"`).
+fn safe_attr_name(attr_name: &str) -> String {
+    if RESERVED_ATTR_NAMES.contains(&attr_name.to_lowercase().as_str()) {
+        format!("entity_{attr_name}")
+    } else {
+        attr_name.to_string()
+    }
+}
+
+/// Remap reserved attribute names in an entity/edge type's `attributes` array.
+///
+/// Each attribute is an object `{"name": ..., ...}`; when its `name` collides with a
+/// reserved name it is rewritten to the `safe_attr_name` form. Mirrors the
+/// `safe_attr_name(attr_def["name"])` calls in `graph_builder.py:236,260` — which apply
+/// the remap when materializing the ontology, the step teri folds into `validate_and_process`.
+fn remap_reserved_attribute_names(type_obj: &mut Value) {
+    if let Some(attrs) = type_obj.get_mut("attributes").and_then(Value::as_array_mut) {
+        for attr in attrs.iter_mut() {
+            if let Some(name) = attr.get("name").and_then(Value::as_str).map(str::to_string) {
+                let safe = safe_attr_name(&name);
+                if safe != name {
+                    tracing::warn!(
+                        "Attribute name '{}' collides with a reserved name; renamed to '{}'",
+                        name,
+                        safe
+                    );
+                    attr["name"] = Value::String(safe);
+                }
+            }
+        }
     }
 }
 
@@ -1027,5 +1082,59 @@ mod tests {
         let out_desc = entities[0]["description"].as_str().unwrap();
         assert_eq!(out_desc.chars().count(), 100);
         assert!(!out_desc.ends_with("..."));
+    }
+
+    // =========================================================================
+    // TASK-SIM-6 #6 — reserved attribute-name remap (safe_attr_name)
+    // =========================================================================
+
+    #[test]
+    fn safe_attr_name_prefixes_reserved() {
+        assert_eq!(safe_attr_name("name"), "entity_name");
+        assert_eq!(safe_attr_name("uuid"), "entity_uuid");
+        assert_eq!(safe_attr_name("summary"), "entity_summary");
+        // Case-insensitive comparison (Python lowercases before matching).
+        assert_eq!(safe_attr_name("Name"), "entity_Name");
+    }
+
+    #[test]
+    fn safe_attr_name_leaves_non_reserved() {
+        assert_eq!(safe_attr_name("full_name"), "full_name");
+        assert_eq!(safe_attr_name("occupation"), "occupation");
+    }
+
+    #[test]
+    fn reserved_entity_attribute_names_are_remapped() {
+        let input = json!({
+            "entity_types": [{
+                "name": "Person",
+                "attributes": [
+                    {"name": "name", "type": "text"},
+                    {"name": "occupation", "type": "text"}
+                ]
+            }],
+            "edge_types": [],
+            "analysis_summary": ""
+        });
+        let result = validate_and_process(input);
+        let attrs = result["entity_types"][0]["attributes"].as_array().unwrap();
+        assert_eq!(attrs[0]["name"], "entity_name", "reserved attr name must be prefixed");
+        assert_eq!(attrs[1]["name"], "occupation", "non-reserved attr name unchanged");
+    }
+
+    #[test]
+    fn reserved_edge_attribute_names_are_remapped() {
+        let input = json!({
+            "entity_types": [],
+            "edge_types": [{
+                "name": "WORKS_FOR",
+                "source_targets": [],
+                "attributes": [{"name": "summary", "type": "text"}]
+            }],
+            "analysis_summary": ""
+        });
+        let result = validate_and_process(input);
+        let attrs = result["edge_types"][0]["attributes"].as_array().unwrap();
+        assert_eq!(attrs[0]["name"], "entity_summary");
     }
 }
