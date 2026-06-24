@@ -234,9 +234,27 @@ Status: ☑ done · ☐ open. Priority groups top→bottom.
   (full pipeline, ~36s). *(S5)*
 
 ### Autonomy (L2–L5, see docs/AGENTIC-STORY.md)
-- ☐ **TASK-AUTO-1** — autonomy orchestrator (DECIDE layer): watch adapters, debounce signal deltas
-  into `(seed, query)` jobs, schedule headless `pipeline::run_pipeline` runs under a compute budget,
-  with continuity/resume + witnessed audit trail.
+- ☑ **TASK-AUTO-1** — autonomy orchestrator (DECIDE layer) landed in `src/autonomy/` (re-exported in
+  `lib.rs`). Wires the loop's SENSE→DECIDE→PREDICT spine above `pipeline.rs` as a pure library module
+  (no CLI wiring this slice; the `teri autonomy` subcommand attach point is noted at the foot of
+  `autonomy/mod.rs`). Pieces: **SENSE** drives `CommunityAdapter::fetch_domains/fetch_signal`;
+  `SignalFingerprint` (`fingerprint.rs`) is the **debounce** key over salient signal fields
+  (counts + recent-topic `(id,status)`; excludes `captured_at`/`last_active` jitter). **DECIDE** =
+  `DecidePolicy` trait + `DefaultDecidePolicy` (templated engagement/health trend question over a
+  horizon) + `build_job` pairing the adapter's `to_seed_document` seed with the policy query.
+  **PREDICT** = `PredictionJobRunner` trait (`runner.rs`); `PipelineJobRunner` stages the seed to a
+  temp file and calls `pipeline::run_pipeline` (provider-selected LLM, inherits the backend guard),
+  tests inject a fake. **Budget** (`max_runs_per_tick`/`max_concurrent`, normalized) caps runs and
+  reports the rest as `deferred` (never silent); concurrency bounded by `buffer_unordered`.
+  **Continuity** = `OrchestratorState` behind a `StateStore` trait (`InMemoryStateStore` for tests,
+  `JsonFileStateStore` atomic-write checkpoint for prod) — a restart on an unchanged signal does not
+  re-run; a failed run does not advance its fingerprint (retried next tick). **Audit** = structured
+  `tracing` per decision + a `TickReport` (sensed/changed/ran/deferred/errors) with per-domain error
+  isolation. `Orchestrator::tick()` is the unit of behavior; `run_forever(interval)` loops it. 20 new
+  unit tests (debounce / one-job / budget-cap / persist-reload continuity / per-domain isolation /
+  retry / policy-query / report-shape / budget normalization). **Left for S13 (TASK-AUTO-2):** the L3
+  `CommunityFeedback` ACT push and L4 per-community confidence calibration — `// SEAM(S13)` marker in
+  `mod.rs` marks the hook point inside the per-run record loop. *(S12)*
 - ☐ **TASK-AUTO-2** — calibration loop: turn actioned/accurate outcomes into per-community confidence
   weights (persist in redb); upgrades report `confidence` from synthesized metadata → calibrated.
 
