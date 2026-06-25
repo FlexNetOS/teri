@@ -185,12 +185,31 @@ build stack and adding the GPU path):
    numbers in the PR); confirm `cuda` feature builds.
 
 **Done (S14):**
-- `rustc --version` inside teri = pinned nightly; `cargo build`, `cargo test`, `cargo clippy
-  --all-targets --all-features -- -D warnings`, `cargo fmt --all --check` all green on nightly.
-- Standalone CI (`ci.yml`, `pebesen-ci.yml`) green with wild+kache resolved (no inheritance gap).
-- `cargo build --features cuda` compiles on a CUDA-capable host; default build unaffected.
-- `./target/*/teri --help` still exit 0 keyless.
-- `RUNBOOK.md` documents the nightly + codegen-gcc + wild + kache + CUDA build.
+- ☑ `rust-toolchain.toml` = floating `nightly` (single toolchain, no date-pin, no stable fallback);
+  `cargo build`, `cargo test` (1764 default + all-features), `cargo clippy --all-targets
+  --all-features -- -D warnings`, `cargo fmt --all --check` all **green on nightly 1.98.0**
+  (teri + pebesen). Nightly `unnecessary_sort_by` drift fixed in the same slice.
+- ☑ CI toolchains bumped to `nightly` (`ci.yml`, `pebesen-ci.yml`, `promote.yml`).
+- ☑ wild+kache resolved as an intentional **meta-tree-inherited** perf path; teri ships no repo-local
+  `.cargo/config.toml`, so standalone CI + preflight agree on the default LLVM linker (no inheritance
+  gap, no brittle CI install). Documented in `RUNBOOK.md §3.1`.
+- ☑ `rustc_codegen_gcc` documented as an on-demand perf backend (NOT pinned in `rust-toolchain.toml`
+  — a floating nightly doesn't build it every day, and a missing pinned component is a fatal rustup
+  error). `RUNBOOK.md §3.1`.
+- ☑ `./target/*/teri --help` still exit 0 keyless; backend-honesty guard untouched.
+- ☑ **License corrected → AGPL-3.0-or-later** (owner decision 2026-06-24). teri's stale `MIT` +
+  upstream-port attribution (`Kresna Sucandra` / `SHA888/teri`) was wrong; set to
+  `AGPL-3.0-or-later`, `FlexNetOS`, `FlexNetOS/teri`, with the canonical AGPL `LICENSE` added.
+  Copyleft + network-use clause = reciprocity (no SaaS freeloading), faithful to MiroFish's AGPL.
+- ☑ **GPU codegen path = [NVlabs/cuda-oxide](https://github.com/NVlabs/cuda-oxide)** documented as
+  the third codegen backend on the nightly toolchain (LLVM default · codegen-gcc CPU · cuda-oxide
+  GPU). It's a custom `rustc` backend that compiles GPU kernels in pure Rust (Rust→MIR→Pliron→LLVM→
+  PTX via `cargo oxide build`, `llc`/`CUDA_OXIDE_LLC`) — *the* reason teri must be nightly. Apache-2.0
+  (not GPL). teri has no GPU kernels yet, so no GPU build target lands here; authoring the first
+  cuda-oxide kernels is a follow-up feature. `RUNBOOK.md §3.1`.
+  *(Correction: an earlier draft of this slice wrongly added the unrelated `cudarc` driver-bindings
+  crate after mis-identifying "cuda-oxide" as the abandoned Protryon GPL crate. Reverted — cuda-oxide
+  is NVlabs' Rust→PTX compiler, not a runtime binding, and is not interchangeable with cudarc.)*
 
 **Risk notes**
 - Floating nightly is a moving floor — this is why S14 is **last**: all feature work (S0–S13) lands on

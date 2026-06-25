@@ -1100,7 +1100,7 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
                 })
                 .collect();
             // Sort by score descending (matches Python `sorted(key=x[0], reverse=True)`).
-            scored_edges.sort_by(|a, b| b.0.cmp(&a.0));
+            scored_edges.sort_by_key(|e| std::cmp::Reverse(e.0));
 
             for (_, edge) in scored_edges.into_iter().take(limit) {
                 if !edge.fact.is_empty() {
@@ -1126,7 +1126,7 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
                     if score > 0 { Some((score, node)) } else { None }
                 })
                 .collect();
-            scored_nodes.sort_by(|a, b| b.0.cmp(&a.0));
+            scored_nodes.sort_by_key(|n| std::cmp::Reverse(n.0));
 
             for (_, node) in scored_nodes.into_iter().take(limit) {
                 let mut m = serde_json::Map::new();
@@ -1311,7 +1311,7 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
                 if fact.is_empty() { None } else { Some((relevance_score(&fact), fact)) }
             })
             .collect();
-        active_facts.sort_by(|a, b| b.0.cmp(&a.0));
+        active_facts.sort_by_key(|f| std::cmp::Reverse(f.0));
         let active_facts: Vec<String> =
             active_facts.into_iter().take(limit).map(|(_, f)| f).collect();
         let active_count = active_facts.len() as i64;
@@ -1336,7 +1336,7 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
                 Some((relevance_score(&tagged), tagged))
             })
             .collect();
-        historical_facts.sort_by(|a, b| b.0.cmp(&a.0));
+        historical_facts.sort_by_key(|f| std::cmp::Reverse(f.0));
         let historical_facts_full: Vec<String> =
             historical_facts.into_iter().take(limit).map(|(_, f)| f).collect();
         let historical_count = historical_facts_full.len() as i64;

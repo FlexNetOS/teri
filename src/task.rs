@@ -386,7 +386,7 @@ impl TaskManager {
             None => guard.values().collect(),
         };
         // Newest first, matching `reverse=True` in Python.
-        tasks.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        tasks.sort_by_key(|t| std::cmp::Reverse(t.created_at));
         tasks.iter().map(|t| t.to_dict()).collect()
     }
 
