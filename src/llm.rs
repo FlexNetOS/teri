@@ -587,11 +587,17 @@ impl LlmClient for OpenAiAdapter {
                     let line = buffer[..idx].trim_end_matches('\r').to_string();
                     buffer = buffer[idx + 1..].to_string();
 
-                    if line.is_empty() || !line.starts_with("data: ") {
+                    // The space after `data:` is OPTIONAL per the SSE spec — an OpenAI-compatible
+                    // backend that frames `data:{...}` (no space) is valid. Matching on `"data: "`
+                    // (with space) silently dropped every delta + the `[DONE]` sentinel for such
+                    // servers, yielding an empty stream with no error. Use `strip_prefix("data:")`
+                    // + `.trim()` like the Anthropic/Gemini adapters.
+                    let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+                        continue;
+                    };
+                    if data.is_empty() {
                         continue;
                     }
-
-                    let data = line.trim_start_matches("data: ").trim();
                     if data == "[DONE]" {
                         return;
                     }
@@ -2059,6 +2065,31 @@ data: [DONE]\n",
             output.push_str(&chunk.unwrap());
         }
         assert_eq!(output, "Hello world");
+        mock.assert();
+    }
+
+    /// Regression: the space after `data:` is OPTIONAL per the SSE spec. A backend that frames
+    /// `data:{...}` with NO space must still parse — the old `starts_with("data: ")` gate silently
+    /// dropped every delta + `[DONE]`, yielding an empty-but-successful stream.
+    #[tokio::test]
+    async fn test_openai_adapter_stream_no_space_after_data() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/chat/completions");
+            then.status(200).header("Content-Type", "text/event-stream").body(
+                "data:{\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\
+data:{\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\
+data:[DONE]\n",
+            );
+        });
+
+        let client = OpenAiAdapter::new(&openai_config(&server, 0));
+        let mut stream = client.stream("hi").await.unwrap();
+        let mut output = String::new();
+        while let Some(chunk) = stream.next().await {
+            output.push_str(&chunk.unwrap());
+        }
+        assert_eq!(output, "Hello world", "no-space `data:` framing must still yield deltas");
         mock.assert();
     }
 

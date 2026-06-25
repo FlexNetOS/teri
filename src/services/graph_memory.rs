@@ -1217,6 +1217,15 @@ async fn update_buffer_snapshot(
 ///
 /// `[≠]` MAX_RETRIES/RETRY_DELAY literal retry-loop: the 3-attempt Zep-network retry cadence
 /// is omitted (DECISION-14 §4). The *resilience* (continue-on-error + failed_count) IS ported.
+/// Truncate `s` to at most `max_chars` Unicode scalar values for a debug preview.
+///
+/// MUST be char-based, not a byte slice: the batch preview is built from `to_episode_text()`,
+/// whose templates are multibyte (Chinese), so a raw `&s[..200]` would panic on a non-char
+/// boundary and abort the graph-memory worker — silently dropping every later update for the sim.
+fn preview_chars(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn flush_batch<L: LlmClient + Send + Sync + 'static>(
     activities: Vec<AgentActivity>,
@@ -1236,7 +1245,7 @@ async fn flush_batch<L: LlmClient + Send + Sync + 'static>(
         activities.iter().map(AgentActivity::to_episode_text).collect();
     let combined_text = episode_texts.join("\n");
 
-    debug!("批量内容预览: {}...", &combined_text[..combined_text.len().min(200)]);
+    debug!("批量内容预览: {}...", preview_chars(&combined_text, 200));
 
     // Extend the graph with the combined text.
     // Holds the Mutex across the LLM await — required (async Mutex), and the lock is held
@@ -1282,6 +1291,28 @@ async fn flush_batch<L: LlmClient + Send + Sync + 'static>(
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests for GraphMemoryUpdater (sub-cycle b)
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod preview_tests {
+    use super::preview_chars;
+
+    /// Regression for the UTF-8 char-boundary panic: a multibyte (Chinese) string longer than the
+    /// limit must truncate by chars without panicking, where a raw `&s[..200]` byte slice would.
+    #[test]
+    fn preview_chars_does_not_panic_on_multibyte() {
+        // 300 Chinese chars = 900 bytes; byte index 200 is mid-character.
+        let s: String = "发布了一条帖子".chars().cycle().take(300).collect();
+        let preview = preview_chars(&s, 200);
+        assert_eq!(preview.chars().count(), 200, "must keep exactly 200 chars");
+        assert!(s.starts_with(&preview), "preview is a char-aligned prefix");
+    }
+
+    #[test]
+    fn preview_chars_shorter_than_limit_is_unchanged() {
+        let s = "短文本";
+        assert_eq!(preview_chars(s, 200), s);
+    }
+}
 
 #[cfg(test)]
 mod updater_tests {
