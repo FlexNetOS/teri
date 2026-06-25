@@ -119,32 +119,50 @@ async fn logging_middleware(request: Request, next: Next) -> Response {
 // ---------------------------------------------------------------------------
 
 async fn accept_language_middleware(headers: HeaderMap, request: Request, next: Next) -> Response {
-    // Step 1: read Accept-Language header, default "zh"
+    // Step 1: read Accept-Language header, default "en" (teri ships English-first).
     let raw = headers
         .get(header::ACCEPT_LANGUAGE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("zh")
+        .unwrap_or("en")
         .to_string();
 
-    // Step 2: validate against translations set {en, zh} (locale.py:31)
-    // crate::i18n::translations() is private; use the public API instead:
-    // only "en" and "zh" are in translations, so inline the check.
+    // Step 2: parse the header and pick the first supported locale (else "en").
     let locale = validate_locale(&raw);
 
     // Step 3: run downstream inside the locale scope
     crate::i18n::with_locale(locale, next.run(request)).await
 }
 
-/// Validate a raw locale string against the translations set {en, zh}.
-/// Returns the value if valid, else falls back to "zh".
+/// Resolve a real `Accept-Language` header to a supported locale.
 ///
-/// Mirrors locale.py:31: `return raw if raw in _translations else 'zh'`
+/// Browsers send a weighted list like `en-US,en;q=0.9,zh;q=0.8`, never a bare `"en"`,
+/// so an exact-equality membership test (the original `raw in _translations` port from
+/// `locale.py:31`) matched almost nothing and fell every real request back to the default.
+/// This parses the header instead: split on `,`, drop the `;q=…` weight, lowercase, and
+/// strip the region subtag (`en-US` → `en`), returning the first tag that is in the embedded
+/// translation set. Falls back to `"en"` (English-first) when none match.
+///
+/// Note: this does not honor q-weight ordering — it takes the header's left-to-right
+/// preference order as-is, which matches how browsers list their most-preferred language
+/// first. Good enough for the {en, zh} set; revisit if many locales are added.
 pub fn validate_locale(raw: &str) -> String {
-    // Single source of truth: validate against the i18n module's actually-embedded
-    // translation set (currently {en, zh}). Routing through `is_supported_locale`
-    // means a future locale file added under `i18n/locales/` is covered automatically —
-    // no second site to update (removes the latent-drift risk a hardcoded list carries).
-    if crate::i18n::is_supported_locale(raw) { raw.to_string() } else { "zh".to_string() }
+    for tag in raw.split(',') {
+        // Drop the optional `;q=<weight>` quality value, trim, lowercase.
+        let tag = tag.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        if tag.is_empty() {
+            continue;
+        }
+        // Try the full tag first (e.g. an exact "zh" / "en"), then the primary subtag
+        // with the region stripped (`en-us` → `en`).
+        let primary = tag.split('-').next().unwrap_or(&tag);
+        if crate::i18n::is_supported_locale(&tag) {
+            return tag;
+        }
+        if crate::i18n::is_supported_locale(primary) {
+            return primary.to_string();
+        }
+    }
+    "en".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -490,9 +508,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accept_language_fr_not_in_translations_falls_back_to_zh() {
-        // "fr" is NOT in the translations set {en, zh} → fallback to "zh"
-        // Mirrors locale.py:31: `return raw if raw in _translations else 'zh'`
+    async fn accept_language_fr_not_in_translations_falls_back_to_en() {
+        // "fr" is NOT in the translations set {en, zh} → fall back to the English-first default.
         let app = locale_test_app();
         let resp = app
             .oneshot(
@@ -508,15 +525,14 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert_eq!(
             std::str::from_utf8(&body).unwrap(),
-            "zh",
-            "fr not in translations → should fall back to zh"
+            "en",
+            "fr not in translations → should fall back to en (English-first)"
         );
     }
 
     #[tokio::test]
-    async fn accept_language_absent_defaults_to_zh() {
-        // No Accept-Language header → default "zh"
-        // Mirrors locale.py:30: request.headers.get('Accept-Language', 'zh')
+    async fn accept_language_absent_defaults_to_en() {
+        // No Accept-Language header → English-first default.
         let app = locale_test_app();
         let resp = app
             .oneshot(Request::builder().uri("/locale-echo").body(Body::empty()).unwrap())
@@ -524,7 +540,7 @@ mod tests {
             .unwrap();
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(std::str::from_utf8(&body).unwrap(), "zh");
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "en");
     }
 
     #[tokio::test]
@@ -543,6 +559,53 @@ mod tests {
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert_eq!(std::str::from_utf8(&body).unwrap(), "zh");
+    }
+
+    #[tokio::test]
+    async fn accept_language_real_browser_en_us_resolves_en() {
+        // The regression that left the UI Chinese: real browsers send a weighted list, never a
+        // bare "en". The parser must strip the region subtag + q-weight and resolve to "en".
+        let app = locale_test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/locale-echo")
+                    .header(header::ACCEPT_LANGUAGE, "en-US,en;q=0.9,zh;q=0.8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            "en",
+            "en-US,en;q=0.9,zh;q=0.8 must resolve to en"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_language_real_browser_zh_cn_resolves_zh() {
+        // A genuinely Chinese browser still gets Chinese: "zh-CN,zh;q=0.9" → "zh".
+        let app = locale_test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/locale-echo")
+                    .header(header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            "zh",
+            "zh-CN,zh;q=0.9 must resolve to zh (Chinese still works)"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -652,17 +715,27 @@ mod tests {
     }
 
     #[test]
-    fn validate_locale_fr_falls_back_to_zh() {
-        assert_eq!(validate_locale("fr"), "zh");
+    fn validate_locale_fr_falls_back_to_en() {
+        // Unsupported locale → English-first default.
+        assert_eq!(validate_locale("fr"), "en");
     }
 
     #[test]
-    fn validate_locale_empty_falls_back_to_zh() {
-        assert_eq!(validate_locale(""), "zh");
+    fn validate_locale_empty_falls_back_to_en() {
+        assert_eq!(validate_locale(""), "en");
     }
 
     #[test]
-    fn validate_locale_unknown_falls_back_to_zh() {
-        assert_eq!(validate_locale("de"), "zh");
+    fn validate_locale_unknown_falls_back_to_en() {
+        assert_eq!(validate_locale("de"), "en");
+    }
+
+    #[test]
+    fn validate_locale_real_browser_header_resolves_primary_subtag() {
+        // Real browsers send weighted region-tagged lists; the parser strips region + q-weight.
+        assert_eq!(validate_locale("en-US,en;q=0.9,zh;q=0.8"), "en");
+        assert_eq!(validate_locale("zh-CN,zh;q=0.9,en;q=0.8"), "zh");
+        // First supported tag wins when the most-preferred is unsupported.
+        assert_eq!(validate_locale("fr-FR,fr;q=0.9,zh;q=0.7"), "zh");
     }
 }

@@ -673,7 +673,7 @@ mod tests {
         let task = tm.get_task(&id).unwrap();
         assert_eq!(task.status, TaskStatus::Completed);
         assert_eq!(task.progress, 100);
-        assert_eq!(task.message, "任务完成"); // i18n::t("progress.taskComplete"), zh default
+        assert_eq!(task.message, "Task complete"); // i18n::t("progress.taskComplete"), en default
         assert_eq!(task.result.as_ref().unwrap(), &result);
         assert!(task.error.is_none());
     }
@@ -684,7 +684,7 @@ mod tests {
         let id = tm.create_task("test", None);
         tm.complete_task(&id, json!({}));
         let task = tm.get_task(&id).unwrap();
-        assert_eq!(task.message, "任务完成");
+        assert_eq!(task.message, "Task complete");
     }
 
     // ------------------------------------------------------------------
@@ -700,7 +700,7 @@ mod tests {
 
         let task = tm.get_task(&id).unwrap();
         assert_eq!(task.status, TaskStatus::Failed);
-        assert_eq!(task.message, "任务失败"); // i18n::t("progress.taskFailed"), zh default
+        assert_eq!(task.message, "Task failed"); // i18n::t("progress.taskFailed"), en default
         assert_eq!(task.error.as_deref(), Some("connection refused"));
         assert!(task.result.is_none(), "fail_task must not set result");
         // Python does NOT set progress=100 on failure
@@ -713,7 +713,7 @@ mod tests {
         let id = tm.create_task("test", None);
         tm.fail_task(&id, "err");
         let task = tm.get_task(&id).unwrap();
-        assert_eq!(task.message, "任务失败");
+        assert_eq!(task.message, "Task failed");
     }
 
     // ------------------------------------------------------------------
