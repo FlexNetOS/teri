@@ -59,6 +59,7 @@ perf.data.old
 # Agents and memory
 .claude/
 .harness-mem/
+.worktrees/
 Plans.md
 out/
 

@@ -40,6 +40,9 @@ tested (the full `cargo test` suite is green, 1700+ tests), and reachable both o
 `teri run` and by driving `teri serve`'s `/api/*` endpoints in sequence
 (§8). The full MiroFish parity verification is in **§12**.
 
+- **`teri run`** — **works today.** Preflights the backend (§6), selects the configured provider
+  via `build_provider_llm`, and runs the one-shot `seed -> graph -> agents -> sim -> report`
+  pipeline through `pipeline::run_pipeline`.
 - **`teri serve`** — **works today.** Preflights the backend (§6), then boots the axum REST
   server (`/health` + the three `/api/*` blueprints). **This is the supported way to run a full
   simulation today**: `POST /api/graph/ontology/generate` → `/build` → `/api/simulation/create`
@@ -363,7 +366,7 @@ backgrounding. Launch with the Bash tool's `run_in_background: true` **and**
 five stages and their services, all are implemented and tested in teri (the full `cargo test`
 suite is green, 1700+ tests); several
 are re-architected to be *stronger* (native, keyless, single-binary). The remaining items are a
-short, named list of wiring gaps (§13), none of which block simulating through the REST API.
+short, named list of wiring gaps (§13), none of which block one-shot CLI or REST simulation.
 
 **Method:** the authoritative `666ghj/MiroFish` GitHub source (the ground truth DeepWiki is
 generated from) was inventoried component-by-component, then each was located in current teri
@@ -474,7 +477,9 @@ graph is no longer write-only during the run).
   mid-run event injection is an intentional MiroFish-parity stub, not yet wired to the engine.
 - **Persona detail** — influence/reaction live on the sim-config layer, not the profile; individual
   vs institutional is behavioral (entity-type branching), not a stored `account_type` flag.
-- **README config table** — stale defaults; this runbook's §4 is authoritative.
+- **Specialized solvers and calibration** — teri's agentic world model does not replace physics,
+  epidemiology, markets, weather, supply-chain, adversarial-security, or other domain engines, and
+  report confidence is not calibrated probability.
 
 The phased build order (P1 wire-the-spine → P2 parity-core → P3 serve+estate → P4
 scale+provenance) lives at `~/Desktop/meta/MIROFISH-PORT-PLAN.md`. That file's **parity matrix is
