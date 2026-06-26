@@ -703,14 +703,14 @@ pub fn load_run_state(
     let raw = match std::fs::read_to_string(&state_file) {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!("加载运行状态失败: {}", e);
+            tracing::error!("Failed to load run state: {}", e);
             return Ok(None);
         }
     };
     let data: Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(e) => {
-            tracing::error!("加载运行状态失败: {}", e);
+            tracing::error!("Failed to load run state: {}", e);
             return Ok(None);
         }
     };
@@ -932,6 +932,11 @@ pub struct RunHandle {
     /// `/ticks/sse` feed can tail every `WorldSnapshot` the run produces. The `Arc` keeps the
     /// history alive for streaming consumers even after the engine is dropped at run end.
     snapshot_history: Arc<parking_lot::Mutex<Vec<crate::sim::WorldSnapshot>>>,
+    /// God's-eye runtime injection queue, shared with the engine (`SimEngine::with_injections`).
+    /// `SimulationRunner::inject_variable` pushes `(key, value)` here; the engine drains and applies
+    /// it at the next tick boundary. The `Arc` is cloned into the engine before it moves into the
+    /// spawned task, so this handle and the live run mutate the SAME queue.
+    injections: crate::sim::InjectionQueue,
 }
 
 impl RunHandle {
@@ -1186,14 +1191,16 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
         if let Some(existing) = self.get_run_state(simulation_id).await?
             && matches!(existing.runner_status, RunnerStatus::Running | RunnerStatus::Starting)
         {
-            return Err(TeriError::Sim(format!("模拟已在运行中: {simulation_id}")));
+            return Err(TeriError::Sim(format!("Simulation already running: {simulation_id}")));
         }
 
         // (2) Load config + compute total_rounds (L340-353).
-        let config = self
-            .manager
-            .get_simulation_config(simulation_id)?
-            .ok_or_else(|| TeriError::Sim("模拟配置不存在，请先调用 /prepare 接口".to_string()))?;
+        let config = self.manager.get_simulation_config(simulation_id)?.ok_or_else(|| {
+            TeriError::Sim(
+                "Simulation config does not exist; please call the /prepare endpoint first"
+                    .to_string(),
+            )
+        })?;
         let time_config = config.get("time_config");
         let total_hours = time_config
             .and_then(|t| t.get("total_simulation_hours"))
@@ -1219,7 +1226,12 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
             let original = total_rounds;
             total_rounds = total_rounds.min(mr);
             if total_rounds < original {
-                tracing::info!("轮数已截断: {} -> {} (max_rounds={})", original, total_rounds, mr);
+                tracing::info!(
+                    "Rounds truncated: {} -> {} (max_rounds={})",
+                    original,
+                    total_rounds,
+                    mr
+                );
             }
         }
 
@@ -1234,8 +1246,11 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
         // (5) Graph-memory updater (L373-385).
         let mut graph_enabled = false;
         if enable_graph_memory_update {
-            let gid = graph_id
-                .ok_or_else(|| TeriError::Sim("启用图谱记忆更新时必须提供 graph_id".to_string()))?;
+            let gid = graph_id.ok_or_else(|| {
+                TeriError::Sim(
+                    "graph_id must be provided when enabling graph-memory updates".to_string(),
+                )
+            })?;
             // The updater needs the shared graph handle to write into.
             match graph_for_updater {
                 Some(g) => {
@@ -1247,21 +1262,23 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
                         Ok(()) => {
                             graph_enabled = true;
                             tracing::info!(
-                                "已启用图谱记忆更新: simulation_id={}, graph_id={}",
+                                "Graph-memory updates enabled: simulation_id={}, graph_id={}",
                                 simulation_id,
                                 gid
                             );
                         }
                         Err(e) => {
                             // Python L381-383: catch, log, set enabled=false — do NOT abort.
-                            tracing::error!("创建图谱记忆更新器失败: {}", e);
+                            tracing::error!("Failed to create graph-memory updater: {}", e);
                             graph_enabled = false;
                         }
                     }
                 }
                 None => {
                     // graph_id given but no graph handle supplied to write into.
-                    tracing::error!("创建图谱记忆更新器失败: no knowledge-graph handle provided");
+                    tracing::error!(
+                        "Failed to create graph-memory updater: no knowledge-graph handle provided"
+                    );
                     graph_enabled = false;
                 }
             }
@@ -1287,6 +1304,11 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
 
         let RunInputs { mut engine, pool, graph, llm, boost_llm } = inputs;
         engine.with_shutdown(Arc::clone(&shutdown));
+
+        // God's-eye runtime injection queue: shared between this handle and the engine so a
+        // `POST /:id/inject` can push variables into the LIVE run (drained at each tick boundary).
+        let injections: crate::sim::InjectionQueue = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        engine.with_injections(Arc::clone(&injections));
 
         // Subscribe to the terminal completion signal (U-048) BEFORE the engine moves into the
         // spawned task — this receiver is the monitor's loop-exit signal, replacing Python's
@@ -1317,7 +1339,7 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
         state.runner_status = RunnerStatus::Running;
         save_run_state(&self.sim_data_dir, &state)?;
 
-        tracing::info!("模拟启动成功: {}, platform={}", simulation_id, platform);
+        tracing::info!("Simulation started successfully: {}, platform={}", simulation_id, platform);
 
         // (7b) Spawn the monitor task (`_monitor_threads[id]`, S-605/S-613). It tails the
         // per-platform `actions.jsonl` files by byte offset (S-614 / U-047), fires graph-memory
@@ -1347,6 +1369,7 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
             monitor: Some(monitor),
             graph_enabled,
             snapshot_history,
+            injections,
         };
 
         {
@@ -1371,6 +1394,55 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
     /// 6. Stop the graph-memory updater if enabled (L813-819).
     ///
     /// Returns the final STOPPED state.
+    /// God's-eye variable injection — push `(variable, value)` into a LIVE run.
+    ///
+    /// Looks up the running handle (held in `runs`, NOT removed — the run continues) and queues the
+    /// variable on its shared injection `Vec`. The engine drains the queue at its next tick boundary
+    /// and applies it via `WorldState::inject_variable`, so the value lands deterministically at a
+    /// round boundary and persists in `world.variables` (and every subsequent snapshot) thereafter.
+    ///
+    /// Returns the number of injections now pending for that run (≥1). Errors if the simulation has
+    /// no live in-memory handle (never started, or stopped/cleaned-up) — you can only inject into a
+    /// currently-running simulation.
+    ///
+    /// A naturally-completed (or stopped/failed) run keeps its handle in `runs` until
+    /// `stop`/`cleanup` removes it — and the spawned task itself outlives the engine's tick loop
+    /// (it stays alive to serve IPC interview round-trips), so `JoinHandle::is_finished()` is NOT a
+    /// reliable "will this ever drain" signal. The authoritative signal is the run's
+    /// `runner_status`: only a `Running` engine is still ticking and will drain the queue. Once the
+    /// monitor flips the status to `Completed` (or it is `Stopped`/`Failed`), an injection would be
+    /// a silent no-op, so we reject it as a misleading success.
+    pub async fn inject_variable(
+        &self,
+        simulation_id: &str,
+        variable: String,
+        value: f32,
+    ) -> Result<usize> {
+        // Clone the shared handles out under the `runs` lock, then release it before awaiting on the
+        // per-run state mutex (never hold the contended `runs` lock across an `.await`).
+        let (injections, state) = {
+            let runs = self.runs.lock().await;
+            let handle = runs.get(simulation_id).ok_or_else(|| {
+                TeriError::Sim(format!(
+                    "Simulation is not running; cannot inject into it: {simulation_id}"
+                ))
+            })?;
+            (Arc::clone(&handle.injections), Arc::clone(&handle.state))
+        };
+
+        let status = state.lock().await.runner_status.clone();
+        if status != RunnerStatus::Running {
+            return Err(TeriError::Sim(format!(
+                "Simulation is not actively running (status: {}); injection would never be applied: {simulation_id}",
+                status.as_str()
+            )));
+        }
+
+        let mut queue = injections.lock();
+        queue.push((variable, value));
+        Ok(queue.len())
+    }
+
     pub async fn stop_simulation(&self, simulation_id: &str) -> Result<SimulationRunState> {
         // (1)/(2): validate existence + status against the LIVE handle's state.
         // Take the handle OUT of the map (we will await on its task — never hold the lock
@@ -1386,7 +1458,9 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
             None => match load_run_state(&self.sim_data_dir, simulation_id)? {
                 Some(s) => s.runner_status,
                 None => {
-                    return Err(TeriError::Sim(format!("模拟不存在: {simulation_id}")));
+                    return Err(TeriError::Sim(format!(
+                        "Simulation does not exist: {simulation_id}"
+                    )));
                 }
             },
         };
@@ -1398,7 +1472,7 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
                 runs.insert(simulation_id.to_string(), h);
             }
             return Err(TeriError::Sim(format!(
-                "模拟未在运行: {simulation_id}, status={current_status}"
+                "Simulation not running: {simulation_id}, status={current_status}"
             )));
         }
 
@@ -1429,10 +1503,10 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
         let graph_enabled = handle.as_ref().map(|h| h.graph_enabled).unwrap_or(false);
         if graph_enabled {
             self.graph_mgr.stop_updater(simulation_id).await;
-            tracing::info!("已停止图谱记忆更新: simulation_id={}", simulation_id);
+            tracing::info!("Graph-memory updates stopped: simulation_id={}", simulation_id);
         }
 
-        tracing::info!("模拟已停止: {}", simulation_id);
+        tracing::info!("Simulation stopped: {}", simulation_id);
         // The handle is dropped here (removed from the map and not re-inserted) — the run is
         // terminated, mirroring Python popping `_processes[id]` after termination.
         Ok(state)
@@ -1479,7 +1553,7 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
             return; // nothing to clean
         }
 
-        tracing::info!("正在清理所有模拟进程...");
+        tracing::info!("Cleaning up all simulation processes...");
 
         // (3) Stop all graph-memory updaters first (L1208-1212). `stop_all` is itself
         // idempotent; errors are logged inside it.
@@ -1505,7 +1579,7 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
             }
 
             // process.poll() is None → the run is still RUNNING; terminate + record shutdown.
-            tracing::info!("终止模拟进程: {}", simulation_id);
+            tracing::info!("Terminating simulation process: {}", simulation_id);
             // cleanup_all calls `_terminate_process(process, timeout=5)` (py:1224) → 5s grace.
             terminate_handle(&mut handle, &simulation_id, CLEANUP_GRACE).await;
 
@@ -1515,28 +1589,28 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
             state.twitter_running = false;
             state.reddit_running = false;
             state.completed_at = Some(crate::models::project::python_isoformat_local());
-            state.error = Some("服务器关闭，模拟被终止".to_string());
+            state.error = Some("Server shutting down; simulation terminated".to_string());
             if let Err(e) = save_run_state(&self.sim_data_dir, &state) {
                 // Per-run catch-log-continue (Python L1261-1262).
-                tracing::error!("清理进程失败: {}, error={}", simulation_id, e);
+                tracing::error!("Failed to clean up process: {}, error={}", simulation_id, e);
             }
 
             // Secondary state.json write via the SimulationManager (L1244-1259).
-            tracing::info!("尝试更新 state.json: {}", simulation_id);
+            tracing::info!("Attempting to update state.json: {}", simulation_id);
             match self.manager.mark_state_json_stopped(&simulation_id) {
                 Ok(true) => {
-                    tracing::info!("已更新 state.json 状态为 stopped: {}", simulation_id);
+                    tracing::info!("Updated state.json status to stopped: {}", simulation_id);
                 }
                 Ok(false) => {
-                    tracing::warn!("state.json 不存在: {}", simulation_id);
+                    tracing::warn!("state.json does not exist: {}", simulation_id);
                 }
                 Err(e) => {
-                    tracing::warn!("更新 state.json 失败: {}, error={}", simulation_id, e);
+                    tracing::warn!("Failed to update state.json: {}, error={}", simulation_id, e);
                 }
             }
         }
 
-        tracing::info!("模拟进程清理完成");
+        tracing::info!("Simulation process cleanup complete");
         // (5) The runs map was already drained above.
     }
 
@@ -1566,7 +1640,9 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
                 success: true,
                 cleaned_files: vec![],
                 errors: None,
-                message: Some("模拟目录不存在，无需清理".to_string()),
+                message: Some(
+                    "Simulation directory does not exist; nothing to clean up".to_string(),
+                ),
             };
         }
 
@@ -1770,7 +1846,10 @@ async fn dispatch_command<L: LlmClient + Send + Sync>(
         CommandType::CloseEnv => {
             // Python: send_response(id, "completed", result={"message": "环境即将关闭"}); return False.
             let mut m = Map::new();
-            m.insert("message".to_string(), Value::String("环境即将关闭".to_string()));
+            m.insert(
+                "message".to_string(),
+                Value::String("Environment is about to close".to_string()),
+            );
             SimulationIPCServer::send_success(env, m);
             false
         }
@@ -1901,7 +1980,7 @@ async fn execute_batch_interview<L: LlmClient + Send + Sync>(
         };
         let prompt = item.get("prompt").and_then(Value::as_str).unwrap_or("");
         let Some(agent) = resolve_agent_by_user_id(pool, agent_id) else {
-            tracing::warn!("批量采访: 无法获取Agent {}", agent_id);
+            tracing::warn!("Batch interview: failed to get Agent {}", agent_id);
             continue;
         };
         let interview_prompt = build_interview_prompt(agent, prompt);
@@ -1912,13 +1991,13 @@ async fn execute_batch_interview<L: LlmClient + Send + Sync>(
                     Value::Object(interview_result(agent_id, response)),
                 );
             }
-            Err(e) => tracing::warn!("批量采访: Agent {} LLM 失败: {}", agent_id, e),
+            Err(e) => tracing::warn!("Batch interview: Agent {} LLM failed: {}", agent_id, e),
         }
     }
 
     if results.is_empty() {
         // Python: if not actions → send_response(id, "failed", error="没有有效的Agent").
-        return Err("没有有效的Agent".to_string());
+        return Err("No valid Agent".to_string());
     }
 
     let mut m = Map::new();
@@ -1997,7 +2076,7 @@ async fn execute_interview_one_platform<L: LlmClient + Send + Sync>(
 ) -> Map<String, Value> {
     // Python: `if not env` → `{"platform": platform, "error": f"{platform}平台不可用"}`.
     if !pool_has_platform(pool, platform) {
-        return error_map(platform, &format!("{platform}平台不可用"));
+        return error_map(platform, &format!("{platform} platform unavailable"));
     }
     // Python: `agent = agent_graph.get_agent(agent_id)` (raises on unknown → caught → error map).
     let Some(agent) = resolve_agent_on_platform(pool, agent_id, platform) else {
@@ -2057,7 +2136,7 @@ async fn execute_interview_parallel<L: LlmClient + Send + Sync>(
     let has_twitter = pool_has_platform(pool, "twitter");
     let has_reddit = pool_has_platform(pool, "reddit");
     if !has_twitter && !has_reddit {
-        return Err("没有可用的模拟环境".to_string());
+        return Err("No available simulation environment".to_string());
     }
 
     let mut platforms = Map::new();
@@ -2139,7 +2218,7 @@ async fn execute_batch_interview_parallel<L: LlmClient + Send + Sync>(
 
     if results.is_empty() {
         // Python: `else: send_response(id, "failed", error="没有成功的采访")`.
-        return Err("没有成功的采访".to_string());
+        return Err("No successful interviews".to_string());
     }
     let mut m = Map::new();
     m.insert("interviews_count".to_string(), Value::from(results.len() as u64));
@@ -2170,7 +2249,7 @@ async fn collect_platform_batch<L: LlmClient + Send + Sync>(
             let prompt = item.get("prompt").and_then(Value::as_str).unwrap_or("");
             let ok = resolve_agent_on_platform(pool, agent_id, platform).is_some();
             if !ok {
-                tracing::warn!("批量采访: 无法获取{}Agent {}", platform, agent_id);
+                tracing::warn!("Batch interview: failed to get {} Agent {}", platform, agent_id);
             }
             Some((agent_id, prompt, ok))
         })
@@ -2189,7 +2268,12 @@ async fn collect_platform_batch<L: LlmClient + Send + Sync>(
                 Ok(response) => interview_result(agent_id, response),
                 // LLM failure → null-response record (the no-result shape), platform-keyed below.
                 Err(e) => {
-                    tracing::warn!("批量采访: {}Agent {} LLM 失败: {}", platform, agent_id, e);
+                    tracing::warn!(
+                        "Batch interview: {} Agent {} LLM failed: {}",
+                        platform,
+                        agent_id,
+                        e
+                    );
                     interview_result_null(agent_id)
                 }
             }
@@ -2230,7 +2314,7 @@ fn interview_result_null(agent_id: i64) -> Map<String, Value> {
 async fn terminate_handle(handle: &mut RunHandle, simulation_id: &str, grace: Duration) {
     // (1) Cooperative stop — SIGTERM analog.
     handle.shutdown.store(true, Ordering::Release);
-    tracing::info!("终止模拟 (cooperative): simulation={}", simulation_id);
+    tracing::info!("Terminating simulation (cooperative): simulation={}", simulation_id);
 
     // (2)/(3) grace window, then force-abort.
     match tokio::time::timeout(grace, &mut handle.task).await {
@@ -2239,7 +2323,10 @@ async fn terminate_handle(handle: &mut RunHandle, simulation_id: &str, grace: Du
         }
         Err(_elapsed) => {
             // Grace window elapsed — force-abort (SIGKILL analog), then reap the cancellation.
-            tracing::warn!("模拟未响应协作停止，强制终止: {}", simulation_id);
+            tracing::warn!(
+                "Simulation did not respond to cooperative stop; forcing termination: {}",
+                simulation_id
+            );
             handle.task.abort();
             let _ = (&mut handle.task).await; // observe the JoinError::Cancelled, ignore it
         }
@@ -2376,7 +2463,7 @@ async fn monitor_simulation<L: LlmClient + Send + Sync + 'static>(
         {
             let state = ctx.state.lock().await;
             if let Err(e) = save_run_state(&ctx.sim_data_dir, &state) {
-                tracing::warn!("保存运行状态失败: {}, error={}", ctx.simulation_id, e);
+                tracing::warn!("Failed to save run state: {}, error={}", ctx.simulation_id, e);
             }
         }
 
@@ -2433,7 +2520,7 @@ async fn monitor_simulation<L: LlmClient + Send + Sync + 'static>(
     // Stop the graph-memory updater (Python L549-557 `finally:` block — stop updater if enabled).
     if ctx.graph_enabled {
         ctx.graph_mgr.stop_updater(&ctx.simulation_id).await;
-        tracing::info!("已停止图谱记忆更新: simulation_id={}", ctx.simulation_id);
+        tracing::info!("Graph-memory updates stopped: simulation_id={}", ctx.simulation_id);
     }
 
     // Report agent-LTM write-back stats (observability — mirrors the graph updater's end stats).
@@ -2448,7 +2535,7 @@ async fn monitor_simulation<L: LlmClient + Send + Sync + 'static>(
         );
     }
 
-    tracing::info!("模拟监控结束: {}", ctx.simulation_id);
+    tracing::info!("Simulation monitoring ended: {}", ctx.simulation_id);
 }
 
 /// Port of `SimulationRunner._read_action_log` (S-614, `simulation_runner.py:559-688`) — the
@@ -2497,19 +2584,19 @@ async fn read_action_log<L: LlmClient + Send + Sync + 'static>(
     let mut file = match std::fs::File::open(log_path) {
         Ok(f) => f,
         Err(e) => {
-            tracing::warn!("读取动作日志失败: {}, error={}", log_path.display(), e);
+            tracing::warn!("Failed to read action log: {}, error={}", log_path.display(), e);
             return position;
         }
     };
     if let Err(e) = file.seek(SeekFrom::Start(position)) {
-        tracing::warn!("读取动作日志失败: {}, error={}", log_path.display(), e);
+        tracing::warn!("Failed to read action log: {}, error={}", log_path.display(), e);
         return position;
     }
 
     // Read the delta from `position` to EOF.
     let mut buf = Vec::new();
     if let Err(e) = file.read_to_end(&mut buf) {
-        tracing::warn!("读取动作日志失败: {}, error={}", log_path.display(), e);
+        tracing::warn!("Failed to read action log: {}, error={}", log_path.display(), e);
         return position;
     }
 
@@ -2569,7 +2656,7 @@ async fn apply_log_record<L: LlmClient + Send + Sync + 'static>(
                         state.twitter_completed = true;
                         state.twitter_running = false;
                         tracing::info!(
-                            "Twitter 模拟已完成: {}, total_rounds={:?}, total_actions={:?}",
+                            "Twitter simulation complete: {}, total_rounds={:?}, total_actions={:?}",
                             ctx.simulation_id,
                             action_data.get("total_rounds"),
                             action_data.get("total_actions"),
@@ -2579,7 +2666,7 @@ async fn apply_log_record<L: LlmClient + Send + Sync + 'static>(
                         state.reddit_completed = true;
                         state.reddit_running = false;
                         tracing::info!(
-                            "Reddit 模拟已完成: {}, total_rounds={:?}, total_actions={:?}",
+                            "Reddit simulation complete: {}, total_rounds={:?}, total_actions={:?}",
                             ctx.simulation_id,
                             action_data.get("total_rounds"),
                             action_data.get("total_actions"),
@@ -2591,7 +2678,7 @@ async fn apply_log_record<L: LlmClient + Send + Sync + 'static>(
                 if check_all_platforms_completed(&ctx.sim_data_dir, &state) {
                     state.runner_status = RunnerStatus::Completed;
                     state.completed_at = Some(crate::models::project::python_isoformat_local());
-                    tracing::info!("所有平台模拟已完成: {}", ctx.simulation_id);
+                    tracing::info!("All platform simulations complete: {}", ctx.simulation_id);
                 }
             }
             "round_end" => {
@@ -3724,7 +3811,7 @@ mod lifecycle_tests {
             Value::Array(vec![serde_json::json!({"agent_id": 404, "prompt": "ghost"})]),
         );
         let err = execute_batch_interview(&pool, &MockLlm, &args).await.unwrap_err();
-        assert_eq!(err, "没有有效的Agent");
+        assert_eq!(err, "No valid Agent");
     }
 
     // ---- PARALLEL (dual-platform) interview dispatch — Cycle 59 (S-920/921/922/924) ----
@@ -3807,7 +3894,7 @@ mod lifecycle_tests {
         let mut args = Map::new();
         args.insert("agent_id".into(), Value::from(7i64));
         let err = execute_interview_parallel(&pool, &MockLlm, &args).await.unwrap_err();
-        assert_eq!(err, "没有可用的模拟环境");
+        assert_eq!(err, "No available simulation environment");
     }
 
     /// platform specified but that platform absent → `{platform}平台不可用` surfaced as the error.
@@ -3819,7 +3906,7 @@ mod lifecycle_tests {
         args.insert("agent_id".into(), Value::from(7i64));
         args.insert("platform".into(), Value::String("reddit".into()));
         let err = execute_interview_parallel(&pool, &MockLlm, &args).await.unwrap_err();
-        assert_eq!(err, "reddit平台不可用");
+        assert_eq!(err, "reddit platform unavailable");
     }
 
     /// No platform, agent unknown on BOTH available platforms → joined per-platform errors.
@@ -3905,7 +3992,7 @@ mod lifecycle_tests {
             ]),
         );
         let err = execute_batch_interview_parallel(&pool, &MockLlm, &args).await.unwrap_err();
-        assert_eq!(err, "没有成功的采访");
+        assert_eq!(err, "No successful interviews");
     }
 
     /// Single-platform run (parallel=false) is UNAFFECTED: `dispatch_command(parallel=false)`
@@ -4145,7 +4232,7 @@ mod lifecycle_tests {
         assert!(res.is_err(), "missing config must error");
         let msg = format!("{}", res.err().unwrap());
         assert!(
-            msg.contains("模拟配置不存在"),
+            msg.contains("Simulation config does not exist"),
             "error must be the missing-config message: {msg}"
         );
     }
@@ -4185,6 +4272,74 @@ mod lifecycle_tests {
         let log = sim_dir.join("twitter").join("actions.jsonl");
         let content = std::fs::read_to_string(&log).expect("actions.jsonl written by the producer");
         assert!(content.contains("simulation_end"), "actions.jsonl must contain simulation_end");
+    }
+
+    /// God's-eye injection is accepted while a run is actively Running (the engine will drain the
+    /// queue). A no-producer run keeps `runner_status = Running` (the monitor never sees a
+    /// `simulation_end` record), so the handle stays injectable and the pending count grows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inject_into_running_run_is_accepted() {
+        let (runner, dir, _mgr) = make_runner("inject_running");
+        write_config(&dir, "sim-run", 1, 30);
+        runner
+            .start_simulation("sim-run", "twitter", None, false, None, run_inputs(50), None)
+            .await
+            .expect("start should succeed");
+
+        let pending = runner
+            .inject_variable("sim-run", "crisis".into(), 0.9)
+            .await
+            .expect("injection into a running sim is accepted");
+        assert!(pending >= 1, "an accepted injection increments the pending count");
+
+        // Unknown id → the distinct not-running error (guard didn't break that path).
+        let err = runner
+            .inject_variable("does-not-exist", "x".into(), 1.0)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not running"), "unknown id → not-running error, got: {err}");
+
+        runner.stop_simulation("sim-run").await.ok();
+    }
+
+    /// Verify-driven upgrade: a COMPLETED run keeps its handle in `runs` until stop/cleanup, but its
+    /// engine tick loop is over (the task stays alive only to serve IPC), so an injection would be a
+    /// silent no-op. `inject_variable` must REJECT it — the `runner_status` is the authoritative
+    /// signal, NOT `JoinHandle::is_finished()` (the task outlives the engine loop).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inject_into_completed_run_is_rejected() {
+        let (runner, dir, _mgr) = make_runner("inject_completed");
+        write_config(&dir, "sim-fin", 1, 30); // 2 rounds
+        let sim_dir = dir.join("sim-fin");
+        let inputs = run_inputs_with_producer(2, &sim_dir, "twitter");
+        runner
+            .start_simulation("sim-fin", "twitter", None, false, None, inputs, None)
+            .await
+            .expect("start should succeed");
+
+        // Wait until the producer's `simulation_end` drives the monitor → COMPLETED.
+        let mut completed = false;
+        for _ in 0..50 {
+            if let Some(rs) = runner.get_run_state("sim-fin").await.unwrap()
+                && rs.runner_status == RunnerStatus::Completed
+            {
+                completed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(completed, "producer run must reach COMPLETED");
+
+        let err = runner
+            .inject_variable("sim-fin", "crisis".into(), 0.9)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not actively running"),
+            "injecting into a COMPLETED run must be rejected, got: {err}"
+        );
     }
 
     /// U-030 cycle B end-to-end: a PARALLEL run with a dual-logger producer writes BOTH
@@ -4315,7 +4470,7 @@ mod lifecycle_tests {
             .start_simulation("sim-dup", "parallel", Some(50), false, None, run_inputs(50), None)
             .await;
         assert!(res.is_err(), "second concurrent start must reject");
-        assert!(format!("{}", res.err().unwrap()).contains("模拟已在运行中"));
+        assert!(format!("{}", res.err().unwrap()).contains("Simulation already running"));
     }
 
     #[tokio::test]
@@ -4380,7 +4535,7 @@ mod lifecycle_tests {
         let (runner, _dir, _mgr) = make_runner("stop_missing");
         let res = runner.stop_simulation("ghost").await;
         assert!(res.is_err());
-        assert!(format!("{}", res.err().unwrap()).contains("模拟不存在"));
+        assert!(format!("{}", res.err().unwrap()).contains("Simulation does not exist"));
     }
 
     #[tokio::test]
@@ -4393,7 +4548,7 @@ mod lifecycle_tests {
 
         let res = runner.stop_simulation("sim-done").await;
         assert!(res.is_err(), "stop on a non-running sim must error");
-        assert!(format!("{}", res.err().unwrap()).contains("模拟未在运行"));
+        assert!(format!("{}", res.err().unwrap()).contains("Simulation not running"));
     }
 
     #[tokio::test]
@@ -4522,7 +4677,7 @@ mod lifecycle_tests {
         // run_state.json must be STOPPED with the shutdown error message.
         let on_disk = load_run_state(&dir, &sim_id).unwrap().unwrap();
         assert_eq!(on_disk.runner_status, RunnerStatus::Stopped);
-        assert_eq!(on_disk.error.as_deref(), Some("服务器关闭，模拟被终止"));
+        assert_eq!(on_disk.error.as_deref(), Some("Server shutting down; simulation terminated"));
         assert!(on_disk.completed_at.is_some());
 
         // Secondary state.json write: status flipped to "stopped".
@@ -4610,7 +4765,7 @@ mod lifecycle_tests {
         );
         assert_eq!(
             on_disk.error, None,
-            "finished run must NOT acquire the '服务器关闭' shutdown error"
+            "finished run must NOT acquire the 'Server shutting down' shutdown error"
         );
         assert_eq!(
             on_disk.completed_at.as_deref(),
@@ -4688,7 +4843,7 @@ mod lifecycle_tests {
             RunnerStatus::Stopped,
             "the still-running run MUST be stopped by cleanup_all"
         );
-        assert_eq!(live_disk.error.as_deref(), Some("服务器关闭，模拟被终止"));
+        assert_eq!(live_disk.error.as_deref(), Some("Server shutting down; simulation terminated"));
         assert!(!live_disk.twitter_running);
         assert!(!live_disk.reddit_running);
         assert_eq!(read_state_json_status(&dir, &live_id), "stopped");

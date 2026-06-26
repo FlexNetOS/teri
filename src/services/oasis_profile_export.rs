@@ -685,7 +685,7 @@ pub async fn generate_profiles_from_entities<L: LlmClient>(
             if !completed.is_empty()
                 && let Err(e) = realtime_save(&completed, rt_path, rt_platform)
             {
-                warn!("实时保存 profiles 失败: {}", e);
+                warn!("Failed to save profiles in realtime: {}", e);
             }
         }
 
@@ -698,9 +698,9 @@ pub async fn generate_profiles_from_entities<L: LlmClient>(
             .and_then(|(p, _)| p.source_entity_type.clone())
             .unwrap_or_else(|| "Entity".to_string());
         let msg = if had_error {
-            format!("[{current}/{total}] {entity_name} 使用备用人设")
+            format!("[{current}/{total}] {entity_name} using fallback persona")
         } else {
-            format!("已完成 {current}/{total}: {entity_name}（{entity_type_display}）")
+            format!("Completed {current}/{total}: {entity_name} ({entity_type_display})")
         };
         progress_callback(current, total, msg);
     }

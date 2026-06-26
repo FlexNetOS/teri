@@ -1387,8 +1387,15 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
     ) -> String {
         let entity_summary = self.summarize_entities(entities);
 
-        let part1 = format!("## 模拟需求\n{simulation_requirement}");
-        let part2 = format!("\n## 实体信息 ({}个)\n{entity_summary}", entities.len());
+        let part1 = format!(
+            "{}\n{simulation_requirement}",
+            crate::i18n::localized("## Simulation Requirements", "## 模拟需求")
+        );
+        let part2 = format!(
+            "\n{}\n{entity_summary}",
+            crate::i18n::localized("## Entity Information ({n})", "## 实体信息 ({n}个)")
+                .replace("{n}", &entities.len().to_string())
+        );
 
         let current_length: usize = part1.chars().count() + part2.chars().count();
         let remaining_length =
@@ -1400,9 +1407,18 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
             let doc_chars: Vec<char> = document_text.chars().collect();
             let truncated = doc_chars.len() > remaining_length;
             let doc_text: String = doc_chars.into_iter().take(remaining_length).collect();
-            let doc_text =
-                if truncated { format!("{doc_text}\n...(文档已截断)") } else { doc_text };
-            context_parts.push(format!("\n## 原始文档内容\n{doc_text}"));
+            let doc_text = if truncated {
+                format!(
+                    "{doc_text}\n{}",
+                    crate::i18n::localized("...(document truncated)", "...(文档已截断)")
+                )
+            } else {
+                doc_text
+            };
+            context_parts.push(format!(
+                "\n{}\n{doc_text}",
+                crate::i18n::localized("## Source Document Content", "## 原始文档内容")
+            ));
         }
 
         context_parts.join("\n")
@@ -1447,7 +1463,12 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
 
         for entity_type in &type_order {
             let type_entities = &by_type[entity_type];
-            lines.push(format!("\n### {} ({}个)", entity_type, type_entities.len()));
+            lines.push(format!(
+                "\n{}",
+                crate::i18n::localized("### {type} ({n})", "### {type} ({n}个)")
+                    .replace("{type}", entity_type)
+                    .replace("{n}", &type_entities.len().to_string())
+            ));
 
             let display_count = Self::ENTITIES_PER_TYPE_DISPLAY;
             let summary_len = Self::ENTITY_SUMMARY_LENGTH;
@@ -1466,7 +1487,10 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
             }
 
             if type_entities.len() > display_count {
-                lines.push(format!("  ... 还有 {} 个", type_entities.len() - display_count));
+                lines.push(
+                    crate::i18n::localized("  ... and {k} more", "  ... 还有 {k} 个")
+                        .replace("{k}", &(type_entities.len() - display_count).to_string()),
+                );
             }
         }
 
@@ -1535,7 +1559,7 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "LLM调用失败 (attempt {}): {}",
+                        "LLM call failed (attempt {}): {}",
                         attempt + 1,
                         &e.to_string()[..e.to_string().len().min(80)]
                     );
@@ -1546,7 +1570,7 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| TeriError::Config("LLM调用失败".into())))
+        Err(last_error.unwrap_or_else(|| TeriError::Config("LLM call failed".into())))
     }
 
     // -----------------------------------------------------------------------
@@ -1682,7 +1706,7 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
         match self.call_llm_with_retry(&prompt, &system_prompt).await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!("时间配置LLM生成失败: {e}, 使用默认配置");
+                tracing::warn!("Time-config LLM generation failed: {e}, using default config");
                 self.get_default_time_config(num_entities)
             }
         }
@@ -1706,7 +1730,7 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
             "off_peak_hours": [0, 1, 2, 3, 4, 5],
             "morning_hours": [6, 7, 8],
             "work_hours": [9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
-            "reasoning": "使用默认中国人作息配置（每轮1小时）"
+            "reasoning": "Using the default daily-routine schedule (1 hour per round)"
         })
     }
 
@@ -1751,14 +1775,14 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
         // Validate: ensure not exceeding total agent count
         if agents_per_hour_min > num_entities_i64 {
             tracing::warn!(
-                "agents_per_hour_min ({agents_per_hour_min}) 超过总Agent数 ({num_entities_i64})，已修正"
+                "agents_per_hour_min ({agents_per_hour_min}) exceeds total agent count ({num_entities_i64}); corrected"
             );
             agents_per_hour_min = (num_entities_i64 / 10).max(1);
         }
 
         if agents_per_hour_max > num_entities_i64 {
             tracing::warn!(
-                "agents_per_hour_max ({agents_per_hour_max}) 超过总Agent数 ({num_entities_i64})，已修正"
+                "agents_per_hour_max ({agents_per_hour_max}) exceeds total agent count ({num_entities_i64}); corrected"
             );
             agents_per_hour_max = (agents_per_hour_min + 1).max(num_entities_i64 / 2);
         }
@@ -1766,7 +1790,7 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
         // Ensure min < max
         if agents_per_hour_min >= agents_per_hour_max {
             agents_per_hour_min = (agents_per_hour_max / 2).max(1);
-            tracing::warn!("agents_per_hour_min >= max，已修正为 {agents_per_hour_min}");
+            tracing::warn!("agents_per_hour_min >= max; corrected to {agents_per_hour_min}");
         }
 
         TimeSimulationConfig {
@@ -1848,12 +1872,12 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
         match self.call_llm_with_retry(&prompt, &system_prompt).await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!("事件配置LLM生成失败: {e}, 使用默认配置");
+                tracing::warn!("Event-config LLM generation failed: {e}, using default config");
                 serde_json::json!({
                     "hot_topics": [],
                     "narrative_direction": "",
                     "initial_posts": [],
-                    "reasoning": "使用默认配置"
+                    "reasoning": "Using the default config"
                 })
             }
         }
@@ -2093,25 +2117,29 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
             .replace("{lang_instruction}", &lang_instruction);
 
         // Step 3 — call LLM; on ANY error fall back to empty map (rule generation below)
-        let llm_configs: HashMap<i64, Value> =
-            match self.call_llm_with_retry(&prompt, &system_prompt).await {
-                Ok(result) => result
-                    .get("agent_configs")
-                    .and_then(Value::as_array)
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|cfg| {
-                                let id = cfg.get("agent_id")?.as_i64()?;
-                                Some((id, cfg.clone()))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                Err(e) => {
-                    tracing::warn!("Agent配置批次LLM生成失败: {e}, 使用规则生成");
-                    HashMap::new()
-                }
-            };
+        let llm_configs: HashMap<i64, Value> = match self
+            .call_llm_with_retry(&prompt, &system_prompt)
+            .await
+        {
+            Ok(result) => result
+                .get("agent_configs")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|cfg| {
+                            let id = cfg.get("agent_id")?.as_i64()?;
+                            Some((id, cfg.clone()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(
+                    "Agent-config batch LLM generation failed: {e}, falling back to rule-based generation"
+                );
+                HashMap::new()
+            }
+        };
 
         // Step 4+5 — build AgentActivityConfig for each entity
         // NOTE: the .get() defaults here DIFFER from the struct's dataclass defaults.
@@ -2224,7 +2252,7 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
         let simulation_requirement = simulation_requirement.into();
 
         tracing::info!(
-            "开始智能生成模拟配置: simulation_id={}, 实体数={}",
+            "Starting intelligent simulation-config generation: simulation_id={}, entity_count={}",
             simulation_id,
             entities.len()
         );
@@ -2311,7 +2339,7 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
             .push(t_args("progress.agentConfigResult", &[("count", &all_agent_configs.len())]));
 
         // ===== Assign initial-post agents =====
-        tracing::info!("为初始帖子分配合适的发布者 Agent...");
+        tracing::info!("Assigning suitable publisher agents to the initial posts...");
         event_config = self.assign_initial_post_agents(event_config, &all_agent_configs);
         let assigned_count = event_config
             .initial_posts
@@ -2368,7 +2396,10 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
             generation_reasoning: reasoning_parts.join(" | "),
         };
 
-        tracing::info!("模拟配置生成完成: {} 个Agent配置", params.agent_configs.len());
+        tracing::info!(
+            "Simulation-config generation complete: {} agent configs",
+            params.agent_configs.len()
+        );
 
         params
     }
@@ -2615,12 +2646,29 @@ mod generator_tests {
         let g = make_gen("{}");
         let summary = g.summarize_entities(&entities);
 
-        // Must contain both type headers
-        assert!(summary.contains("### Person (2个)"), "missing Person header");
-        assert!(summary.contains("### MediaOutlet (1个)"), "missing MediaOutlet header");
+        // Must contain both type headers (English by default)
+        assert!(summary.contains("### Person (2)"), "missing Person header");
+        assert!(summary.contains("### MediaOutlet (1)"), "missing MediaOutlet header");
         assert!(summary.contains("- Alice:"), "missing Alice entry");
         assert!(summary.contains("- Bob:"), "missing Bob entry");
         assert!(summary.contains("- CCTV:"), "missing CCTV entry");
+    }
+
+    #[tokio::test]
+    async fn summarize_entities_groups_by_type_zh_locale() {
+        // Under an explicit zh scope, the Chinese headers (with the `个` count suffix) are preserved.
+        let summary = crate::i18n::with_locale("zh".to_string(), async {
+            let entities = vec![
+                make_node("Alice", vec!["Entity", "Person"], "A person"),
+                make_node("Bob", vec!["Entity", "Person"], "Another person"),
+                make_node("CCTV", vec!["Entity", "MediaOutlet"], "A media outlet"),
+            ];
+            let g = make_gen("{}");
+            g.summarize_entities(&entities)
+        })
+        .await;
+        assert!(summary.contains("### Person (2个)"), "missing zh Person header");
+        assert!(summary.contains("### MediaOutlet (1个)"), "missing zh MediaOutlet header");
     }
 
     #[test]
@@ -2628,7 +2676,7 @@ mod generator_tests {
         let entities = vec![make_node("X", vec!["Entity", "Node"], "only base labels")];
         let g = make_gen("{}");
         let summary = g.summarize_entities(&entities);
-        assert!(summary.contains("### Unknown (1个)"), "should use Unknown for Entity/Node only");
+        assert!(summary.contains("### Unknown (1)"), "should use Unknown for Entity/Node only");
     }
 
     #[test]
@@ -2659,15 +2707,32 @@ mod generator_tests {
 
     #[test]
     fn summarize_entities_shows_tail_line_when_overflow() {
-        // 21 entities of same type; ENTITIES_PER_TYPE_DISPLAY=20 → "  ... 还有 1 个"
+        // 21 entities of same type; ENTITIES_PER_TYPE_DISPLAY=20 → "  ... and 1 more" (English default)
         let entities: Vec<EntityNode> = (0..21)
             .map(|i| make_node(&format!("Person{i}"), vec!["Person"], "desc"))
             .collect();
         let g = make_gen("{}");
         let summary = g.summarize_entities(&entities);
         assert!(
-            summary.contains("  ... 还有 1 个"),
+            summary.contains("  ... and 1 more"),
             "should show tail line for overflow: {summary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn summarize_entities_shows_tail_line_when_overflow_zh_locale() {
+        // Under an explicit zh scope, the Chinese tail line is preserved byte-for-byte.
+        let summary = crate::i18n::with_locale("zh".to_string(), async {
+            let entities: Vec<EntityNode> = (0..21)
+                .map(|i| make_node(&format!("Person{i}"), vec!["Person"], "desc"))
+                .collect();
+            let g = make_gen("{}");
+            g.summarize_entities(&entities)
+        })
+        .await;
+        assert!(
+            summary.contains("  ... 还有 1 个"),
+            "should show zh tail line for overflow: {summary}"
         );
     }
 
@@ -2677,7 +2742,7 @@ mod generator_tests {
             (0..20).map(|i| make_node(&format!("P{i}"), vec!["Person"], "d")).collect();
         let g = make_gen("{}");
         let summary = g.summarize_entities(&entities);
-        assert!(!summary.contains("还有"), "no tail line when exactly at display count");
+        assert!(!summary.contains("... and"), "no tail line when exactly at display count");
     }
 
     // -----------------------------------------------------------------------
@@ -2689,10 +2754,24 @@ mod generator_tests {
         let entities = vec![make_node("Alice", vec!["Person"], "test")];
         let g = make_gen("{}");
         let ctx = g.build_context("Test requirement", "Some document text", &entities);
-        assert!(ctx.contains("## 模拟需求"), "missing requirement header");
+        assert!(ctx.contains("## Simulation Requirements"), "missing requirement header");
         assert!(ctx.contains("Test requirement"));
-        assert!(ctx.contains("## 实体信息 (1个)"), "missing entity info header");
-        assert!(ctx.contains("## 原始文档内容"), "should include document text");
+        assert!(ctx.contains("## Entity Information (1)"), "missing entity info header");
+        assert!(ctx.contains("## Source Document Content"), "should include document text");
+    }
+
+    #[tokio::test]
+    async fn build_context_includes_requirement_and_entity_summary_zh_locale() {
+        // Under an explicit zh scope, the Chinese section headers are preserved byte-for-byte.
+        let ctx = crate::i18n::with_locale("zh".to_string(), async {
+            let entities = vec![make_node("Alice", vec!["Person"], "test")];
+            let g = make_gen("{}");
+            g.build_context("Test requirement", "Some document text", &entities)
+        })
+        .await;
+        assert!(ctx.contains("## 模拟需求"), "missing zh requirement header");
+        assert!(ctx.contains("## 实体信息 (1个)"), "missing zh entity info header");
+        assert!(ctx.contains("## 原始文档内容"), "missing zh document header");
     }
 
     #[test]
@@ -2705,10 +2784,13 @@ mod generator_tests {
         let doc: String = "X".repeat(60_000);
         let ctx = g.build_context("req", &doc, &entities);
         // Should be truncated and contain the truncation marker
-        assert!(ctx.contains("...(文档已截断)"), "should have truncation marker in context");
+        assert!(
+            ctx.contains("...(document truncated)"),
+            "should have truncation marker in context"
+        );
         // Total char length should be under MAX_CONTEXT_LENGTH + some margin for markers
         // The marker itself adds chars, just verify truncation happened
-        let doc_section_start = ctx.find("## 原始文档内容").unwrap();
+        let doc_section_start = ctx.find("## Source Document Content").unwrap();
         let doc_section = &ctx[doc_section_start..];
         assert!(doc_section.chars().count() < 51_500, "document section should be capped");
     }
@@ -2719,7 +2801,7 @@ mod generator_tests {
         let g = make_gen("{}");
         let ctx = g.build_context("req", "Short doc.", &entities);
         assert!(ctx.contains("Short doc."), "short doc should appear verbatim");
-        assert!(!ctx.contains("...(文档已截断)"), "should not have truncation marker");
+        assert!(!ctx.contains("...(document truncated)"), "should not have truncation marker");
     }
 
     #[test]
@@ -2727,7 +2809,10 @@ mod generator_tests {
         let entities = vec![];
         let g = make_gen("{}");
         let ctx = g.build_context("req", "", &entities);
-        assert!(!ctx.contains("## 原始文档内容"), "should not include doc section when empty");
+        assert!(
+            !ctx.contains("## Source Document Content"),
+            "should not include doc section when empty"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2985,7 +3070,10 @@ mod generator_tests {
         let result = g.generate_time_config("context", 15).await;
         // Default config must have total_simulation_hours = 72
         assert_eq!(result["total_simulation_hours"].as_i64().unwrap(), 72);
-        assert_eq!(result["reasoning"].as_str().unwrap(), "使用默认中国人作息配置（每轮1小时）");
+        assert_eq!(
+            result["reasoning"].as_str().unwrap(),
+            "Using the default daily-routine schedule (1 hour per round)"
+        );
     }
 
     // -----------------------------------------------------------------------

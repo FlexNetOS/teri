@@ -59,10 +59,25 @@ impl SeedIngestor {
             let filename = Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path);
             match Self::from_file(path).await {
                 Ok(doc) => {
-                    all_texts.push(format!("=== 文档 {idx}: {filename} ===\n{}", doc.raw_text));
+                    // Document separators are concatenated into the text fed to the graph-build
+                    // LLM → English-default, Chinese preserved for zh.
+                    let header = crate::i18n::localized(
+                        "=== Document {idx}: {name} ===",
+                        "=== 文档 {idx}: {name} ===",
+                    )
+                    .replace("{idx}", &idx.to_string())
+                    .replace("{name}", filename);
+                    all_texts.push(format!("{header}\n{}", doc.raw_text));
                 }
                 Err(e) => {
-                    all_texts.push(format!("=== 文档 {idx}: {path} (提取失败: {e}) ==="));
+                    let header = crate::i18n::localized(
+                        "=== Document {idx}: {name} (extraction failed: {err}) ===",
+                        "=== 文档 {idx}: {name} (提取失败: {err}) ===",
+                    )
+                    .replace("{idx}", &idx.to_string())
+                    .replace("{name}", path)
+                    .replace("{err}", &e.to_string());
+                    all_texts.push(header);
                 }
             }
         }
@@ -760,9 +775,9 @@ mod tests {
 
         let doc = SeedIngestor::from_files(&[file1, file2]).await.expect("from_files ok");
 
-        // Headers must appear in order
-        let pos1 = doc.raw_text.find("=== 文档 1: multi_a.txt ===").expect("header 1");
-        let pos2 = doc.raw_text.find("=== 文档 2: multi_b.txt ===").expect("header 2");
+        // Headers must appear in order (English by default).
+        let pos1 = doc.raw_text.find("=== Document 1: multi_a.txt ===").expect("header 1");
+        let pos2 = doc.raw_text.find("=== Document 2: multi_b.txt ===").expect("header 2");
         assert!(pos1 < pos2, "file A header must precede file B header");
 
         assert!(doc.raw_text.contains("Content of file A"));
@@ -786,7 +801,10 @@ mod tests {
             .expect("from_files returns Ok");
 
         assert!(doc.raw_text.contains("Good content"), "good file must be in output");
-        assert!(doc.raw_text.contains("提取失败"), "failed file must produce an error marker");
+        assert!(
+            doc.raw_text.contains("extraction failed"),
+            "failed file must produce an error marker"
+        );
 
         let _ = tokio::fs::remove_file(file1).await;
     }
