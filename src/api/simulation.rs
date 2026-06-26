@@ -2610,12 +2610,11 @@ async fn run_status(
 // One-shot detailed snapshot with embedded action lists (reads the U-047 actions.jsonl tail).
 // Query param: `platform` (twitter|reddit, optional) — filters all_actions + recent_actions.
 //
-// `[!] U026-h-ACTIONS-PRODUCER-PENDING`: the action lists come from `get_all_actions`, which
-// reads `{sim_dir}/{platform}/actions.jsonl`.  teri's SimEngine does not yet WRITE that log
-// (producer lands with U-028/029/030 platform runners), so on a started run the lists are
-// currently empty — a FAITHFUL no-op on a missing file (Python's reader also yields [] when the
-// file is absent), NOT a dropped feature.  The full route assembly + filter logic is ported and
-// proven now; the lists populate when the producer lands.
+// The action lists come from `get_all_actions`, which reads `{sim_dir}/{platform}/actions.jsonl`.
+// teri's SimEngine WRITES that log on the live run/serve path (the `RunProducer` /
+// `PlatformActionLogger` installed via `engine.with_producer`, U-028/029/030), so a started run
+// populates these lists. A missing file still yields `[]` (a faithful no-op, matching Python's
+// reader) — e.g. before the first action is logged.
 //
 // Source assembly (simulation.py:1857-1878):
 //   result = run_state.to_dict()
@@ -2714,11 +2713,11 @@ async fn run_status_detail(
 // Sub-cycle (i) — world-state read routes: actions / timeline / agent-stats
 //   (simulation.py:1864-1980). Primitives ported + parity-verified in U-022(d).
 //
-// `[!] U026-i-PRODUCER-PENDING` (informational, NOT a port bug): all three read the
-// actions.jsonl tail (via SimulationRunner readers).  teri's SimEngine does not yet WRITE
-// that log (producer lands U-028/029/030), so they return the FAITHFUL empty contract — a
-// sim that produced no actions yields count 0 / empty lists.  Identical to Python on an
-// absent log.  Routes port + verify against THAT contract now.
+// (informational, NOT a port bug): all three read the actions.jsonl tail (via SimulationRunner
+// readers).  teri's SimEngine WRITES that log on the live run/serve path (the `RunProducer`
+// installed via `engine.with_producer`), so a run that produced actions populates these. A sim
+// that produced no actions (or before the first log line) yields count 0 / empty lists —
+// identical to Python on an absent log.
 //
 // Flask `type=int` graceful-fallback (same convention as U-025 graph `?limit`): an absent
 // OR unparseable int param falls back to its default (NOT a 400).

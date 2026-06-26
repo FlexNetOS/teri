@@ -43,10 +43,10 @@ tested (**1629 tests**), and reachable by driving `teri serve`'s `/api/*` endpoi
   server (`/health` + the three `/api/*` blueprints). **This is the supported way to run a full
   simulation today**: `POST /api/graph/ontology/generate` → `/build` → `/api/simulation/create`
   → `/prepare` → `/start` → `/api/report/generate` → `/api/report/chat`.
-- **`teri run`** — **preflights, then bails** with `Pipeline not yet implemented`. The engine
-  stages it would call all exist and are tested; only the **CLI one-shot composition** of them is
-  unwired (see [Known gaps](#13-known-gaps--not-yet-wired) — the last `not implemented`). Use
-  `run` today to validate config/backend; use `serve` + the API to actually simulate.
+- **`teri run`** — **works today.** Preflights the backend (§6), then runs the in-process one-shot
+  `seed → graph → agents → sim → report` composition (`main.rs` → `pipeline::run_pipeline`,
+  tested in `tests/pipeline_run.rs`) and writes a `verdict.json` summary. Use `serve` + the API for
+  the interactive studio; use `run` for a single CLI prediction.
 - **Both** `run` and `serve` run the **same fail-closed guard** (§6) before doing work — `serve`
   refuses to *boot* against a stub/unreachable backend.
 
@@ -254,9 +254,10 @@ env-ctl run --provider <p> -- teri run \
   --agents 100
 ```
 Flags: `-s/--seed <path|url>` (required), `-q/--query <text>` (required),
-`-a/--agents <n>` (default `100`). Today this validates config + backend then returns
-`Pipeline not yet implemented` — see [Known gaps](#13-known-gaps--not-yet-wired). To run a full
-simulation now, use `teri serve` + the API sequence (§1, §8).
+`-a/--agents <n>` (default `100`), `-o/--out <path>` (optional `verdict.json`). This validates
+config + backend, then runs the full in-process `seed → graph → agents → sim → report` pipeline
+and prints a summary (and writes `verdict.json` when `--out` is given). For the interactive studio,
+use `teri serve` + the API sequence (§1, §8).
 
 ---
 
@@ -451,22 +452,24 @@ D3-shape JSON seam. These are **architecture choices, not gaps**.
 ## 13. Known gaps / not-yet-wired
 
 Operate with these in mind (state of `main`, 2026-06). None block simulating via the REST API
-(§1, §8); they are the honest backlog from the §12 verification:
+(§1, §8); they are the honest backlog from the §12 verification.
 
-- **`teri run` CLI composition** — the one remaining `Pipeline not yet implemented`. Every engine
-  stage exists and is tested; only the CLI one-shot `seed → graph → agents → sim → report` wiring
-  is unbuilt. The full pipeline already runs via `serve` + the API sequence.
-- **Runtime provider selection** — `api/mod.rs::build_llm` hardcodes `OpenAiAdapter`; the
-  Anthropic/Gemini adapters are dead at runtime until selection is wired (small, high-value).
-- **Anthropic/Gemini streaming** — `stream()` parses OpenAI SSE framing; native event/JSON-array
-  framing is a TODO (non-streaming completion works).
-- **Live SSE endpoints** — `*-log/stream` return one-shot JSON; `api/streaming.rs` + `report/sink.rs`
-  infra is ready but unwired to a `text/event-stream` route.
-- **Agent LTM/vector write-back from the sim loop** — the redb store + cosine recall are real and
-  tested, but no sim-path code calls `write_ltm`/`write_vec_text` (graph-memory write-back *is* wired).
-- **i18n coverage** — `en`/`zh` only vs MiroFish's 7 locales.
+**Closed since the original list (kept here so the record is honest — these are NO LONGER gaps):**
+`teri run` is fully wired (`main.rs` → `pipeline::run_pipeline`, the in-process
+`seed → graph → agents → sim → report` composition, tested in `tests/pipeline_run.rs`); runtime
+provider selection picks the adapter from `config.llm.provider` (`api/mod.rs::build_llm` →
+`ProviderAdapter::from_config`); the Anthropic/Gemini adapters stream with their **native** SSE
+framing; live `text/event-stream` routes exist (`/ticks/sse`, the report `/events` + log SSE
+feeds); the agent-LTM/vector write-back runs from the live sim loop (`AgentMemoryWriter` via the
+monitor); and each agent now reads per-tick **knowledge-graph context** in `prepare_action` (the
+graph is no longer write-only during the run).
+
+**Still open:**
+- **i18n coverage** — `en`/`zh` only vs MiroFish's 7 locales (English is now the default; see §4).
 - **`/api/graph/data` shape** — emits `edges`, not D3-conventional `links` (1-line affordance for
   a D3 consumer).
+- **`scheduled_events`** — the sim-config field is parsed-then-discarded (always `vec![]`); timed
+  mid-run event injection is an intentional MiroFish-parity stub, not yet wired to the engine.
 - **Persona detail** — influence/reaction live on the sim-config layer, not the profile; individual
   vs institutional is behavioral (entity-type branching), not a stored `account_type` flag.
 - **README config table** — stale defaults; this runbook's §4 is authoritative.
@@ -493,4 +496,4 @@ stale** (2026-06-12); §12 here is the current verification — extend the plan,
 
 ---
 
-*License: MIT. Teri is an independent rewrite of MiroFish — parity by spec, never by code copy.*
+*License: AGPL-3.0-or-later. Teri is an independent rewrite of MiroFish — parity by spec, never by code copy.*
