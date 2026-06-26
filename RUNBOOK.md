@@ -263,6 +263,42 @@ config + backend, then runs the full in-process `seed → graph → agents → s
 and prints a summary (and writes `verdict.json` when `--out` is given). For the interactive studio,
 use `teri serve` + the API sequence (§1, §8).
 
+### Local GPU engine: inferrs (the meta-native backend)
+
+[inferrs](https://github.com/FlexNetOS/inferrs) (FlexNetOS fork of `ericcurtin/inferrs`) is a
+Rust TurboQuant inference server that serves the OpenAI API on **`127.0.0.1:11435`** — exactly
+teri's default `LLM_BASE_URL`, so it is a drop-in backend. teri's honesty guard (§6) accepts it;
+verified end-to-end (guard pass → `provider=Openai` → full pipeline `seed → ontology → …`).
+
+**Build (on this CUDA 13.3 box):**
+```bash
+cd ~/Desktop/meta/inferrs
+export CUDA_HOME=/usr/local/cuda-13.3 CUDA_COMPUTE_CAP=120
+export PATH=/usr/local/cuda-13.3/bin:$PATH
+cargo build --release -p inferrs --features cuda     # cudarc ≥0.19.8 (on main) recognizes CUDA 13.3
+```
+
+**Serve a model** (supported arches: **Qwen2/3/3.5, Gemma2/3/4, Phi3 — not Llama**):
+```bash
+# Recommended: Qwen3-4B (enables inferrs' TurboQuant KV-cache compression). Staged + Q4K-cached.
+inferrs serve --device cpu  --host 127.0.0.1 --port 11435 Qwen/Qwen3-4B   # works today (slow on CPU)
+inferrs serve --device cuda --host 127.0.0.1 --port 11435 Qwen/Qwen3-4B   # GPU — see driver gate below
+```
+For a GGUF-only repo, add `--gguf-file <name>.gguf --tokenizer-source <source-model-repo>`.
+
+**Wire teri to it:**
+```bash
+LLM_BASE_URL=http://127.0.0.1:11435/v1 LLM_MODEL_NAME=Qwen/Qwen3-4B LLM_API_KEY=sk-local \
+  teri run --seed ./examples/seed.txt --query "…" --agents 100
+```
+
+**GPU driver gate (current).** inferrs *builds and loads* on `--device cuda`, but at the first
+kernel launch a **CUDA-13.2 driver** (`595.71.05`; `cuDriverGetVersion=13020`) rejects the
+`nvcc`-13.3 PTX (`.version 9.3`) with `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`. Unlock by **strict-
+upgrading the driver to a CUDA-13.3 driver** — then the same release binary runs on GPU with no
+code change (weights + Q4K cache already staged). The alternative (no driver change) is
+cuda-oxide-authored kernels emitting PTX ≤9.2 (§3.1) — a larger follow-up.
+
 ---
 
 ## 8. REST API surface
