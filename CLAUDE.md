@@ -73,7 +73,7 @@ in spirit; they still govern every change.
   hand-written handoff markdown at repo root is guard-denied workspace-wide (ADR-0004).
 - Full unfiltered test summaries in PR bodies (`cargo test` count, failures verbatim).
 
-## What teri is (state of truth, refreshed 2026-06-21)
+## What teri is (state of truth, refreshed 2026-06-22)
 
 A Rust rewrite of MiroFish (AGPL upstream; teri is itself licensed AGPL-3.0-or-later, keeping faith
 with that copyleft intent — see LICENSE). The five-stage pipeline mirrors upstream: seed → graph → agents → sim →
