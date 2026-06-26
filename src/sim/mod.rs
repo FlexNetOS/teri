@@ -585,6 +585,10 @@ impl SimulationResult {
 /// Each hook is called once per tick with a clone of the tick's snapshot.
 pub type SnapshotHook = Arc<dyn Fn(WorldSnapshot) + Send + Sync>;
 
+/// God's-eye runtime injection queue: shared `(variable, value)` entries pushed from outside a
+/// live run (REST `POST /:id/inject`) and drained by the engine at each tick boundary.
+pub type InjectionQueue = Arc<Mutex<Vec<(String, f32)>>>;
+
 /// Terminal signal emitted once by `SimEngine::run()` when the tick loop completes.
 ///
 /// Mirrors MiroFish `action_logger.log_simulation_end` / `simulation_runner.py` monitor
@@ -795,6 +799,14 @@ pub struct SimEngine {
     /// into the run future) but the world must be mutated (apply / flush) across the run. The lock
     /// is uncontended — `run_with_boost` is the sole accessor, single-threaded across ticks.
     social: Option<Mutex<social_world::SocialWorldSet>>,
+    /// God's-eye runtime injection queue (additive, opt-in). `None` → no runtime injection.
+    /// `Some` → at each tick boundary `run()` drains the queue and applies every pending
+    /// `(key, value)` via `WorldState::inject_variable` BEFORE the optional `inject_fn` runs, so
+    /// an operator can push variables into a LIVE simulation from outside (REST `POST /:id/inject`)
+    /// and the value persists in `world.variables` (and every subsequent snapshot) thereafter.
+    /// Wrapped in a `Mutex<Vec<…>>` shared with the runner's `RunHandle`. Callers that never call
+    /// `with_injections` observe byte-identical behavior.
+    injections: Option<InjectionQueue>,
 }
 
 impl SimEngine {
@@ -818,6 +830,7 @@ impl SimEngine {
             activation: None,
             producer: None,
             social: None,
+            injections: None,
         }
     }
 
@@ -868,6 +881,18 @@ impl SimEngine {
     /// Ordering::Release)`.
     pub fn with_shutdown(&mut self, flag: Arc<std::sync::atomic::AtomicBool>) {
         self.shutdown = Some(flag);
+    }
+
+    /// Install the God's-eye runtime injection queue (additive, opt-in).
+    ///
+    /// The shared `Vec<(key, value)>` is drained at every tick boundary and each entry applied via
+    /// `WorldState::inject_variable` (the injected value then persists in `world.variables` and in
+    /// every subsequent snapshot). An external caller (REST `POST /api/simulation/:id/inject` →
+    /// `SimulationRunner::inject_variable`) pushes to this same `Arc`, so variables can be injected
+    /// into a LIVE run from a god's-eye view. Callers that never call this method are unaffected
+    /// (the field stays `None` and the per-tick drain is skipped).
+    pub fn with_injections(&mut self, queue: InjectionQueue) {
+        self.injections = Some(queue);
     }
 
     /// Register a snapshot hook called once per tick during `run()`.
@@ -1322,6 +1347,16 @@ impl SimEngine {
             // feature, and no-op when no social set is installed.
             if let Some(social) = &self.social {
                 social.lock().flush_round()?;
+            }
+
+            // God's-eye runtime injection: drain any variables pushed into a LIVE run from
+            // outside (REST /:id/inject) and apply them BEFORE the static inject_fn so a
+            // scheduled policy can react to them. Each persists in world.variables thereafter.
+            if let Some(ref queue) = self.injections {
+                let drained: Vec<(String, f32)> = { queue.lock().drain(..).collect() };
+                for (key, value) in drained {
+                    world.inject_variable(key, value);
+                }
             }
 
             // Apply God's-eye injection if configured
@@ -2477,6 +2512,46 @@ mod tests {
         engine2.with_shutdown(Arc::new(AtomicBool::new(false)));
         let result2 = engine2.run(&mut pool2, &graph, &IdleLlm).await.expect("run failed");
         assert_eq!(result2.history.len() as u32, N, "shutdown=false must run full loop");
+    }
+
+    #[tokio::test]
+    async fn test_with_injections_applies_and_persists_across_ticks() {
+        // God's-eye injection: a variable pushed into the shared queue is drained at the next
+        // tick boundary, applied to the world, and persists in every subsequent snapshot.
+        use std::sync::Arc;
+
+        const N: u32 = 4;
+        let mut pool = one_agent_pool("inject");
+        let mut engine = SimEngine::new(SimConfig::new(N, 1));
+        let queue: InjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        engine.with_injections(Arc::clone(&queue));
+        // Push BEFORE run → drains at tick 0; persists for the remaining ticks.
+        queue.lock().push(("crisis".to_string(), 1.0));
+
+        let graph = crate::graph::KnowledgeGraph::new();
+        let result = engine.run(&mut pool, &graph, &IdleLlm).await.expect("run failed");
+
+        assert_eq!(result.history.len() as u32, N);
+        for snap in &result.history {
+            assert_eq!(
+                snap.get_variable("crisis"),
+                Some(1.0),
+                "injected variable persists in every snapshot after it lands"
+            );
+        }
+        assert!(queue.lock().is_empty(), "queue is drained after the tick applies it");
+    }
+
+    #[tokio::test]
+    async fn test_no_injections_queue_is_noop() {
+        // Additive-safety: an engine that never calls with_injections is byte-identical to before.
+        const N: u32 = 3;
+        let mut pool = one_agent_pool("noinject");
+        let engine = SimEngine::new(SimConfig::new(N, 1));
+        let graph = crate::graph::KnowledgeGraph::new();
+        let result = engine.run(&mut pool, &graph, &IdleLlm).await.expect("run failed");
+        assert_eq!(result.history.len() as u32, N);
+        assert_eq!(result.history.last().unwrap().get_variable("crisis"), None);
     }
 
     #[tokio::test]

@@ -210,6 +210,13 @@
     "generating": "生成中"
   },
   "step3": {
+    "godseyeTitle": "上帝视角注入",
+    "godseyeHint": "向运行中的世界注入变量 — 在下一回合生效",
+    "godseyeVarPlaceholder": "变量名（如 crisis_level）",
+    "godseyeValPlaceholder": "数值",
+    "godseyeInject": "注入",
+    "godseyeInjected": "已注入 {variable} = {value}",
+    "godseyeError": "注入失败 — 模拟是否仍在运行？",
     "startGenerateReport": "开始生成结果报告",
     "generatingReport": "启动中...",
     "waitingForActions": "Waiting for agent actions...",
