@@ -35,6 +35,15 @@ const STUB_MARKERS: &[&str] = &[
     "placeholder",
     "no backend",
     "canned text",
+    // ruvllm's fallback when its `qlama` quantized GGUF loader can't read a
+    // model's tensor layout (qwen2/phi/gemma archs — only llama/mistral are
+    // implemented): instead of erroring it serves a fixed canned reply,
+    // "… Currently running in mock mode for development.", so a swarm would
+    // fabricate an entire simulation on that text. Match the distinctive
+    // multi-word phrase (a real 1-token probe can't contain it).
+    "mock mode",
+    "in mock mode",
+    "running in mock",
 ];
 
 /// What the preflight learned about the backend.
@@ -396,6 +405,29 @@ mod tests {
         assert!(err.to_string().contains("REFUSING stub"), "got: {err}");
     }
 
+    /// ruvllm serves a non-streaming JSON object and, on an unsupported GGUF
+    /// arch, returns its canned "mock mode" reply with a 200 — the guard must
+    /// refuse it, or teri would run a whole simulation on fabricated text.
+    #[tokio::test]
+    async fn verify_backend_refuses_ruvllm_mock_mode() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/models");
+            then.status(200)
+                .body(r#"{"object":"list","data":[{"id":"m","object":"model"}]}"#);
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/chat/completions");
+            then.status(200).body(
+                r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"I understand your request. To provide real responses, please ensure the model is properly loaded. Currently running in mock mode for development."},"finish_reason":"stop"}]}"#,
+            );
+        });
+
+        let err = verify_backend(&probe_config(&server)).await.unwrap_err();
+        assert!(matches!(err, TeriError::Config(_)));
+        assert!(err.to_string().contains("REFUSING stub"), "got: {err}");
+    }
+
     // ── extract_probe_text (both framings) ──────────────
 
     #[test]
@@ -434,6 +466,16 @@ mod tests {
         let canned = "SafeTensors model loaded successfully! \
                       Full transformer inference coming soon!";
         assert!(detect_stub_text(canned).is_some());
+    }
+
+    #[test]
+    fn detects_ruvllm_mock_mode_text() {
+        // Exact string ruvllm serves when its qlama loader can't read the GGUF
+        // arch (e.g. Qwen2.5) and silently falls back instead of erroring.
+        let canned = "I understand your request. To provide real responses, please \
+                      ensure the model is properly loaded. Currently running in mock \
+                      mode for development.";
+        assert_eq!(detect_stub_text(canned), Some("mock mode"));
     }
 
     #[test]
