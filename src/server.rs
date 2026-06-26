@@ -92,11 +92,11 @@ async fn health_handler() -> impl IntoResponse {
 async fn logging_middleware(request: Request, next: Next) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_string();
-    tracing::debug!(target: "teri.request", "请求: {} {}", method, path);
+    tracing::debug!(target: "teri.request", "request: {} {}", method, path);
 
     let response = next.run(request).await;
 
-    tracing::debug!(target: "teri.request", "响应: {}", response.status().as_u16());
+    tracing::debug!(target: "teri.request", "response: {}", response.status().as_u16());
     response
 }
 
@@ -204,7 +204,7 @@ pub fn create_app(state: std::sync::Arc<ApiState>) -> Router {
 
     // Startup logging (faithful to app/__init__.py:37-41, 77)
     tracing::info!("{}", "=".repeat(50));
-    tracing::info!("MiroFish Backend 启动中...");
+    tracing::info!("teri backend starting...");
     tracing::info!("{}", "=".repeat(50));
 
     // Blueprint sub-routers — all three mounted: graph_bp (U-025), simulation_bp (U-026),
@@ -226,7 +226,7 @@ pub fn create_app(state: std::sync::Arc<ApiState>) -> Router {
         // S-040 — Accept-Language → locale middleware (all routes)
         .layer(middleware::from_fn(accept_language_middleware));
 
-    tracing::info!("MiroFish Backend 启动完成");
+    tracing::info!("teri backend started");
 
     router
 }
@@ -279,11 +279,11 @@ pub async fn serve(config: Config, cli_addr: Option<&str>) -> crate::error::Resu
     let errors = config.validate_collect();
     if !errors.is_empty() {
         // Mirror MiroFish: print all errors then exit(1).
-        eprintln!("配置错误:");
+        eprintln!("Configuration error:");
         for err in &errors {
             eprintln!("  - {err}");
         }
-        eprintln!("\n请检查 .env 文件中的配置");
+        eprintln!("\nCheck the configuration in your .env file");
         return Err(TeriError::Config(errors.join("; ")));
     }
 
