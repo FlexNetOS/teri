@@ -972,10 +972,11 @@ impl SimEngine {
     pub async fn run_with_boost<L: crate::llm::LlmClient>(
         &self,
         pool: &mut crate::agent::AgentPool,
-        // TODO(graph-context): pass per-agent subgraph slices once Agent::prepare_action
-        // accepts a graph reference. Tracked: _graph param intentionally kept so callers
-        // do not need an API change when the feature lands.
-        _graph: &crate::graph::KnowledgeGraph,
+        // Each agent's `prepare_action` reads this read-only graph to build per-tick "Knowledge
+        // Graph Context" from its source entity's neighborhood (an agent without a source entity
+        // simply gets no graph section). `&KnowledgeGraph` is `Sync`, shared across the parallel
+        // Phase-1 reads.
+        graph: &crate::graph::KnowledgeGraph,
         llm: &L,
         boost_llm: Option<&L>,
     ) -> crate::error::Result<SimulationResult> {
@@ -1216,7 +1217,7 @@ impl SimEngine {
                         let agent_platform =
                             pool.agents[idx].persona.social.as_ref().map(|s| s.platform);
                         let feed = feed_for(agent_platform);
-                        Box::pin(pool.agents[idx].prepare_action(&world, feed, client))
+                        Box::pin(pool.agents[idx].prepare_action(&world, feed, Some(graph), client))
                             as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send + '_>>
                     })
                     .collect();

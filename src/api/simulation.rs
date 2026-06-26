@@ -2200,8 +2200,9 @@ async fn build_run_inputs(
         None
     };
 
-    // graph + the updater's shared write-handle. The engine reads `graph` (currently a no-op);
-    // the updater (U-021) writes the `Arc<Mutex<_>>` clone.
+    // graph + the updater's shared write-handle. The engine reads `graph` per tick — each agent's
+    // `prepare_action` builds "Knowledge Graph Context" from its source entity's neighborhood; the
+    // updater (U-021) writes the `Arc<Mutex<_>>` clone.
     let (graph, graph_for_updater) = if enable_graph_memory_update {
         let gid = graph_id.ok_or_else(|| {
             ApiError::client(
