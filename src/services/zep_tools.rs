@@ -41,7 +41,7 @@
 
 use crate::error::{Result, TeriError};
 use crate::graph::{Entity, KnowledgeGraph};
-use crate::i18n::{t, t_args};
+use crate::i18n::{get_locale, localized, t, t_args};
 use crate::llm::{ChatMessage, ChatOptions, LlmClient};
 use crate::services::entity_reader::KnowledgeGraphEntityReader;
 use crate::services::simulation_runner::SimulationRunner;
@@ -83,11 +83,15 @@ impl SearchResult {
     /// Convert to text matching Python `to_text()`.
     pub fn to_text(&self) -> String {
         let mut lines = Vec::new();
-        lines.push(format!("搜索查询: {}", self.query));
-        lines.push(format!("找到 {} 条相关信息", self.total_count));
+        lines.push(format!("{}{}", localized("Search query: ", "搜索查询: "), self.query));
+        if get_locale() == "zh" {
+            lines.push(format!("找到 {} 条相关信息", self.total_count));
+        } else {
+            lines.push(format!("Found {} relevant items", self.total_count));
+        }
 
         if !self.facts.is_empty() {
-            lines.push("\n### 相关事实:".to_string());
+            lines.push(localized("\n### Relevant Facts:", "\n### 相关事实:").to_string());
             for (i, fact) in self.facts.iter().enumerate() {
                 lines.push(format!("{}. {}", i + 1, fact));
             }
@@ -131,8 +135,12 @@ impl NodeInfo {
             .iter()
             .find(|l| *l != "Entity" && *l != "Node")
             .map(|s| s.as_str())
-            .unwrap_or("未知类型");
-        format!("实体: {} (类型: {})\n摘要: {}", self.name, entity_type, self.summary)
+            .unwrap_or(localized("Unknown type", "未知类型"));
+        if get_locale() == "zh" {
+            format!("实体: {} (类型: {})\n摘要: {}", self.name, entity_type, self.summary)
+        } else {
+            format!("Entity: {} (Type: {})\nSummary: {}", self.name, entity_type, self.summary)
+        }
     }
 }
 
@@ -195,15 +203,27 @@ impl EdgeInfo {
             _ => uuid_prefix(&self.target_node_uuid),
         };
 
-        let mut base =
-            format!("关系: {} --[{}]--> {}\n事实: {}", source, self.name, target, self.fact);
+        let mut base = if get_locale() == "zh" {
+            format!("关系: {} --[{}]--> {}\n事实: {}", source, self.name, target, self.fact)
+        } else {
+            format!("Relationship: {} --[{}]--> {}\nFact: {}", source, self.name, target, self.fact)
+        };
 
         if include_temporal {
-            let valid_at = self.valid_at.as_deref().unwrap_or("未知");
-            let invalid_at = self.invalid_at.as_deref().unwrap_or("至今");
-            base.push_str(&format!("\n时效: {} - {}", valid_at, invalid_at));
+            let valid_at = self.valid_at.as_deref().unwrap_or(localized("unknown", "未知"));
+            let invalid_at = self.invalid_at.as_deref().unwrap_or(localized("present", "至今"));
+            base.push_str(&format!(
+                "{}{} - {}",
+                localized("\nValidity: ", "\n时效: "),
+                valid_at,
+                invalid_at
+            ));
             if let Some(expired) = &self.expired_at {
-                base.push_str(&format!(" (已过期: {})", expired));
+                if get_locale() == "zh" {
+                    base.push_str(&format!(" (已过期: {})", expired));
+                } else {
+                    base.push_str(&format!(" (expired: {})", expired));
+                }
             }
         }
 
@@ -286,49 +306,88 @@ impl InsightForgeResult {
 
     /// Convert to text matching Python `to_text()` (`zep_tools.py:171-211`).
     pub fn to_text(&self) -> String {
+        let is_zh = get_locale() == "zh";
         let mut text_parts = vec![
-            "## 未来预测深度分析".to_string(),
-            format!("分析问题: {}", self.query),
-            format!("预测场景: {}", self.simulation_requirement),
-            "\n### 预测数据统计".to_string(),
-            format!("- 相关预测事实: {}条", self.total_facts),
-            format!("- 涉及实体: {}个", self.total_entities),
-            format!("- 关系链: {}条", self.total_relationships),
+            localized("## Future Prediction Deep Analysis", "## 未来预测深度分析").to_string(),
+            format!("{}{}", localized("Analysis question: ", "分析问题: "), self.query),
+            format!(
+                "{}{}",
+                localized("Prediction scenario: ", "预测场景: "),
+                self.simulation_requirement
+            ),
+            localized("\n### Prediction Data Statistics", "\n### 预测数据统计").to_string(),
+            if is_zh {
+                format!("- 相关预测事实: {}条", self.total_facts)
+            } else {
+                format!("- Relevant prediction facts: {}", self.total_facts)
+            },
+            if is_zh {
+                format!("- 涉及实体: {}个", self.total_entities)
+            } else {
+                format!("- Entities involved: {}", self.total_entities)
+            },
+            if is_zh {
+                format!("- 关系链: {}条", self.total_relationships)
+            } else {
+                format!("- Relationship chains: {}", self.total_relationships)
+            },
         ];
 
         if !self.sub_queries.is_empty() {
-            text_parts.push("\n### 分析的子问题".to_string());
+            text_parts
+                .push(localized("\n### Analyzed Sub-questions", "\n### 分析的子问题").to_string());
             for (i, sq) in self.sub_queries.iter().enumerate() {
                 text_parts.push(format!("{}. {}", i + 1, sq));
             }
         }
 
         if !self.semantic_facts.is_empty() {
-            text_parts.push("\n### 【关键事实】(请在报告中引用这些原文)".to_string());
+            text_parts.push(
+                localized(
+                    "\n### [Key Facts] (please quote these verbatim in the report)",
+                    "\n### 【关键事实】(请在报告中引用这些原文)",
+                )
+                .to_string(),
+            );
             for (i, fact) in self.semantic_facts.iter().enumerate() {
                 text_parts.push(format!("{}. \"{}\"", i + 1, fact));
             }
         }
 
         if !self.entity_insights.is_empty() {
-            text_parts.push("\n### 【核心实体】".to_string());
+            text_parts.push(localized("\n### [Core Entities]", "\n### 【核心实体】").to_string());
             for entity in &self.entity_insights {
-                let name = entity.get("name").and_then(|v| v.as_str()).unwrap_or("未知");
-                let kind = entity.get("type").and_then(|v| v.as_str()).unwrap_or("实体");
+                let name = entity
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(localized("unknown", "未知"));
+                let kind = entity
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(localized("entity", "实体"));
                 text_parts.push(format!("- **{}** ({})", name, kind));
                 if let Some(summary) =
                     entity.get("summary").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
                 {
-                    text_parts.push(format!("  摘要: \"{}\"", summary));
+                    text_parts.push(format!(
+                        "{}\"{}\"",
+                        localized("  Summary: ", "  摘要: "),
+                        summary
+                    ));
                 }
                 if let Some(rf) = entity.get("related_facts").and_then(|v| v.as_array()) {
-                    text_parts.push(format!("  相关事实: {}条", rf.len()));
+                    if is_zh {
+                        text_parts.push(format!("  相关事实: {}条", rf.len()));
+                    } else {
+                        text_parts.push(format!("  Related facts: {}", rf.len()));
+                    }
                 }
             }
         }
 
         if !self.relationship_chains.is_empty() {
-            text_parts.push("\n### 【关系链】".to_string());
+            text_parts
+                .push(localized("\n### [Relationship Chains]", "\n### 【关系链】").to_string());
             for chain in &self.relationship_chains {
                 text_parts.push(format!("- {}", chain));
             }
@@ -392,39 +451,65 @@ impl PanoramaResult {
 
     /// Convert to text matching Python `to_text()` (`zep_tools.py:250-281`).
     pub fn to_text(&self) -> String {
+        let is_zh = get_locale() == "zh";
         let mut text_parts = vec![
-            "## 广度搜索结果（未来全景视图）".to_string(),
-            format!("查询: {}", self.query),
-            "\n### 统计信息".to_string(),
-            format!("- 总节点数: {}", self.total_nodes),
-            format!("- 总边数: {}", self.total_edges),
-            format!("- 当前有效事实: {}条", self.active_count),
-            format!("- 历史/过期事实: {}条", self.historical_count),
+            localized(
+                "## Breadth Search Results (Future Panorama View)",
+                "## 广度搜索结果（未来全景视图）",
+            )
+            .to_string(),
+            format!("{}{}", localized("Query: ", "查询: "), self.query),
+            localized("\n### Statistics", "\n### 统计信息").to_string(),
+            format!("{}{}", localized("- Total nodes: ", "- 总节点数: "), self.total_nodes),
+            format!("{}{}", localized("- Total edges: ", "- 总边数: "), self.total_edges),
+            if is_zh {
+                format!("- 当前有效事实: {}条", self.active_count)
+            } else {
+                format!("- Currently valid facts: {}", self.active_count)
+            },
+            if is_zh {
+                format!("- 历史/过期事实: {}条", self.historical_count)
+            } else {
+                format!("- Historical/expired facts: {}", self.historical_count)
+            },
         ];
 
         if !self.active_facts.is_empty() {
-            text_parts.push("\n### 【当前有效事实】(模拟结果原文)".to_string());
+            text_parts.push(
+                localized(
+                    "\n### [Currently Valid Facts] (verbatim simulation results)",
+                    "\n### 【当前有效事实】(模拟结果原文)",
+                )
+                .to_string(),
+            );
             for (i, fact) in self.active_facts.iter().enumerate() {
                 text_parts.push(format!("{}. \"{}\"", i + 1, fact));
             }
         }
 
         if !self.historical_facts.is_empty() {
-            text_parts.push("\n### 【历史/过期事实】(演变过程记录)".to_string());
+            text_parts.push(
+                localized(
+                    "\n### [Historical/Expired Facts] (record of evolution)",
+                    "\n### 【历史/过期事实】(演变过程记录)",
+                )
+                .to_string(),
+            );
             for (i, fact) in self.historical_facts.iter().enumerate() {
                 text_parts.push(format!("{}. \"{}\"", i + 1, fact));
             }
         }
 
         if !self.all_nodes.is_empty() {
-            text_parts.push("\n### 【涉及实体】".to_string());
+            text_parts
+                .push(localized("\n### [Entities Involved]", "\n### 【涉及实体】").to_string());
             for node in &self.all_nodes {
                 let entity_type = node
                     .labels
                     .iter()
                     .find(|l| *l != "Entity" && *l != "Node")
                     .map(|s| s.as_str())
-                    .unwrap_or("实体");
+                    .unwrap_or(localized("entity", "实体"));
                 text_parts.push(format!("- **{}** ({})", node.name, entity_type));
             }
         }
@@ -469,11 +554,11 @@ impl AgentInterview {
     /// quotes shorter than 10 chars). Byte-identical output required.
     pub fn to_text(&self) -> String {
         let mut text = format!("**{}** ({})\n", self.agent_name, self.agent_role);
-        text += &format!("_简介: {}_\n\n", self.agent_bio);
+        text += &format!("{}{}_\n\n", localized("_Bio: ", "_简介: "), self.agent_bio);
         text += &format!("**Q:** {}\n\n", self.question);
         text += &format!("**A:** {}\n", self.response);
         if !self.key_quotes.is_empty() {
-            text += "\n**关键引言:**\n";
+            text += localized("\n**Key Quotes:**\n", "\n**关键引言:**\n");
             for quote in &self.key_quotes {
                 // Clean quotes: remove unicode quote chars (curly “”, straight ",
                 // CJK corner 「」) — equivalent to Python's chained `.replace(...)`.
@@ -568,32 +653,57 @@ impl InterviewResult {
     /// Convert to text matching Python `to_text()` (`zep_tools.py:380-398`).
     pub fn to_text(&self) -> String {
         let mut text_parts = vec![
-            "## 深度采访报告".to_string(),
-            format!("**采访主题:** {}", self.interview_topic),
-            format!("**采访人数:** {} / {} 位模拟Agent", self.interviewed_count, self.total_agents),
-            "\n### 采访对象选择理由".to_string(),
+            localized("## In-depth Interview Report", "## 深度采访报告").to_string(),
+            format!(
+                "{}{}",
+                localized("**Interview topic:** ", "**采访主题:** "),
+                self.interview_topic
+            ),
+            if get_locale() == "zh" {
+                format!(
+                    "**采访人数:** {} / {} 位模拟Agent",
+                    self.interviewed_count, self.total_agents
+                )
+            } else {
+                format!(
+                    "**Interviewees:** {} / {} simulated agents",
+                    self.interviewed_count, self.total_agents
+                )
+            },
+            localized("\n### Rationale for Interviewee Selection", "\n### 采访对象选择理由")
+                .to_string(),
             if self.selection_reasoning.is_empty() {
-                "（自动选择）".to_string()
+                localized("(auto-selected)", "（自动选择）").to_string()
             } else {
                 self.selection_reasoning.clone()
             },
             "\n---".to_string(),
-            "\n### 采访实录".to_string(),
+            localized("\n### Interview Transcript", "\n### 采访实录").to_string(),
         ];
 
         if !self.interviews.is_empty() {
             for (i, interview) in self.interviews.iter().enumerate() {
-                text_parts.push(format!("\n#### 采访 #{}: {}", i + 1, interview.agent_name));
+                text_parts.push(format!(
+                    "{}{}: {}",
+                    localized("\n#### Interview #", "\n#### 采访 #"),
+                    i + 1,
+                    interview.agent_name
+                ));
                 text_parts.push(interview.to_text());
                 text_parts.push("\n---".to_string());
             }
         } else {
-            text_parts.push("（无采访记录）\n\n---".to_string());
+            text_parts.push(
+                localized("(no interview records)\n\n---", "（无采访记录）\n\n---").to_string(),
+            );
         }
 
-        text_parts.push("\n### 采访摘要与核心观点".to_string());
+        text_parts.push(
+            localized("\n### Interview Summary & Key Insights", "\n### 采访摘要与核心观点")
+                .to_string(),
+        );
         text_parts.push(if self.summary.is_empty() {
-            "（无摘要）".to_string()
+            localized("(no summary)", "（无摘要）").to_string()
         } else {
             self.summary.clone()
         });
@@ -1325,13 +1435,15 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
                     return None;
                 }
                 // Add temporal tag matching Python: "[{valid_at} - {invalid_at}] {fact}".
-                let valid_at_str =
-                    rel.valid_at.map(|(s, _)| s.to_string()).unwrap_or_else(|| "未知".to_string());
+                let valid_at_str = rel
+                    .valid_at
+                    .map(|(s, _)| s.to_string())
+                    .unwrap_or_else(|| localized("unknown", "未知").to_string());
                 let invalid_at_str = rel
                     .valid_at
                     .and_then(|(_, e)| e)
                     .map(|e| e.to_string())
-                    .unwrap_or_else(|| "未知".to_string());
+                    .unwrap_or_else(|| localized("unknown", "未知").to_string());
                 let tagged = format!("[{} - {}] {}", valid_at_str, invalid_at_str, fact);
                 Some((relevance_score(&tagged), tagged))
             })
@@ -1379,17 +1491,39 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
         max_queries: usize,
     ) -> Vec<String> {
         // Verbatim system prompt (zep_tools.py:1104-1110).
-        let system_prompt = "你是一个专业的问题分析专家。你的任务是将一个复杂问题分解为多个可以在模拟世界中独立观察的子问题。\n\n要求：\n1. 每个子问题应该足够具体，可以在模拟世界中找到相关的Agent行为或事件\n2. 子问题应该覆盖原问题的不同维度（如：谁、什么、为什么、怎么样、何时、何地）\n3. 子问题应该与模拟场景相关\n4. 返回JSON格式：{\"sub_queries\": [\"子问题1\", \"子问题2\", ...]}";
+        let system_prompt = localized(
+            "You are a professional question-analysis expert. Your task is to decompose a complex question into multiple sub-questions that can be independently observed in the simulated world.\n\nRequirements:\n1. Each sub-question should be specific enough to find relevant agent behaviors or events in the simulated world\n2. Sub-questions should cover different dimensions of the original question (e.g.: who, what, why, how, when, where)\n3. Sub-questions should be relevant to the simulation scenario\n4. Return JSON format: {\"sub_queries\": [\"sub-question 1\", \"sub-question 2\", ...]}",
+            "你是一个专业的问题分析专家。你的任务是将一个复杂问题分解为多个可以在模拟世界中独立观察的子问题。\n\n要求：\n1. 每个子问题应该足够具体，可以在模拟世界中找到相关的Agent行为或事件\n2. 子问题应该覆盖原问题的不同维度（如：谁、什么、为什么、怎么样、何时、何地）\n3. 子问题应该与模拟场景相关\n4. 返回JSON格式：{\"sub_queries\": [\"子问题1\", \"子问题2\", ...]}",
+        );
 
         // Verbatim user prompt (zep_tools.py:1112-1120).
+        let is_zh = get_locale() == "zh";
         let user_prompt = if report_context.is_empty() {
+            if is_zh {
+                format!(
+                    "模拟需求背景：\n{}\n\n请将以下问题分解为{}个子问题：\n{}\n\n返回JSON格式的子问题列表。",
+                    simulation_requirement, max_queries, query
+                )
+            } else {
+                format!(
+                    "Simulation requirement context:\n{}\n\nPlease decompose the following question into {} sub-questions:\n{}\n\nReturn a JSON-format list of sub-questions.",
+                    simulation_requirement, max_queries, query
+                )
+            }
+        } else if is_zh {
             format!(
-                "模拟需求背景：\n{}\n\n请将以下问题分解为{}个子问题：\n{}\n\n返回JSON格式的子问题列表。",
-                simulation_requirement, max_queries, query
+                "模拟需求背景：\n{}\n\n报告上下文：{}\n\n请将以下问题分解为{}个子问题：\n{}\n\n返回JSON格式的子问题列表。",
+                simulation_requirement,
+                // Python `report_context[:500]` truncates by codepoint, not byte.
+                // A byte slice (`[..500]`) panics when byte 500 lands inside a
+                // multibyte char — the live report_context is Chinese and >500 bytes.
+                report_context.chars().take(500).collect::<String>(),
+                max_queries,
+                query
             )
         } else {
             format!(
-                "模拟需求背景：\n{}\n\n报告上下文：{}\n\n请将以下问题分解为{}个子问题：\n{}\n\n返回JSON格式的子问题列表。",
+                "Simulation requirement context:\n{}\n\nReport context: {}\n\nPlease decompose the following question into {} sub-questions:\n{}\n\nReturn a JSON-format list of sub-questions.",
                 simulation_requirement,
                 // Python `report_context[:500]` truncates by codepoint, not byte.
                 // A byte slice (`[..500]`) panics when byte 500 lands inside a
@@ -1426,12 +1560,21 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
                     "{}",
                     t_args("console.generateSubQueriesFailed", &[("error", &e.to_string())])
                 );
-                vec![
-                    query.to_string(),
-                    format!("{} 的主要参与者", query),
-                    format!("{} 的原因和影响", query),
-                    format!("{} 的发展过程", query),
-                ]
+                if get_locale() == "zh" {
+                    vec![
+                        query.to_string(),
+                        format!("{} 的主要参与者", query),
+                        format!("{} 的原因和影响", query),
+                        format!("{} 的发展过程", query),
+                    ]
+                } else {
+                    vec![
+                        query.to_string(),
+                        format!("Key participants in {}", query),
+                        format!("Causes and impacts of {}", query),
+                        format!("Development process of {}", query),
+                    ]
+                }
                 .into_iter()
                 .take(max_queries)
                 .collect()
@@ -1538,12 +1681,21 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
         let max_sub_queries = if max_sub_queries <= 0 { 5 } else { max_sub_queries as usize };
 
         // Exception-fallback sub-queries (zep_tools.py:1138-1142), used directly here.
-        let sub_queries: Vec<String> = vec![
-            query.to_string(),
-            format!("{} 的主要参与者", query),
-            format!("{} 的原因和影响", query),
-            format!("{} 的发展过程", query),
-        ]
+        let sub_queries: Vec<String> = if get_locale() == "zh" {
+            vec![
+                query.to_string(),
+                format!("{} 的主要参与者", query),
+                format!("{} 的原因和影响", query),
+                format!("{} 的发展过程", query),
+            ]
+        } else {
+            vec![
+                query.to_string(),
+                format!("Key participants in {}", query),
+                format!("Causes and impacts of {}", query),
+                format!("Development process of {}", query),
+            ]
+        }
         .into_iter()
         .take(max_sub_queries)
         .collect();
@@ -1687,7 +1839,7 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
                     .iter()
                     .find(|l| *l != "Entity" && *l != "Node")
                     .cloned()
-                    .unwrap_or_else(|| "实体".to_string());
+                    .unwrap_or_else(|| localized("entity", "实体").to_string());
                 let related_facts: Vec<&String> = all_facts
                     .iter()
                     .filter(|f| f.to_lowercase().contains(&node.name.to_lowercase()))
@@ -1817,7 +1969,7 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
                                 m.insert("username".into(), get("username").into());
                                 m.insert("bio".into(), get("description").into());
                                 m.insert("persona".into(), get("user_char").into());
-                                m.insert("profession".into(), "未知".into());
+                                m.insert("profession".into(), localized("unknown", "未知").into());
                                 profiles.push(m);
                             }
                             Err(e) => {
@@ -1923,7 +2075,7 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
         for (i, profile) in profiles.iter().enumerate() {
             let name = resolve_agent_name(profile, i);
             // Python `profile.get("profession", "未知")` — default ONLY when key absent.
-            let profession = py_get_str(profile, "profession", "未知");
+            let profession = py_get_str(profile, "profession", localized("unknown", "未知"));
             let bio_full = py_get_str(profile, "bio", "");
             let bio: String = bio_full.chars().take(200).collect();
             let interested_topics = profile
@@ -1944,17 +2096,34 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
         let agents_json =
             serde_json::to_string_pretty(&agents_summary).unwrap_or_else(|_| "[]".to_string());
 
-        let system_prompt = "你是一个专业的采访策划专家。你的任务是根据采访需求，从模拟Agent列表中选择最适合采访的对象。\n\n选择标准：\n1. Agent的身份/职业与采访主题相关\n2. Agent可能持有独特或有价值的观点\n3. 选择多样化的视角（如：支持方、反对方、中立方、专业人士等）\n4. 优先选择与事件直接相关的角色\n\n返回JSON格式：\n{\n    \"selected_indices\": [选中Agent的索引列表],\n    \"reasoning\": \"选择理由说明\"\n}";
-        let sim_bg =
-            if simulation_requirement.is_empty() { "未提供" } else { simulation_requirement };
-        let user_prompt = format!(
-            "采访需求：\n{}\n\n模拟背景：\n{}\n\n可选择的Agent列表（共{}个）：\n{}\n\n请选择最多{}个最适合采访的Agent，并说明选择理由。",
-            interview_requirement,
-            sim_bg,
-            agents_summary.len(),
-            agents_json,
-            max_agents
+        let system_prompt = localized(
+            "You are a professional interview-planning expert. Your task is to select the agents most suitable for interviewing from the list of simulated agents, based on the interview requirement.\n\nSelection criteria:\n1. The agent's identity/profession is relevant to the interview topic\n2. The agent may hold unique or valuable viewpoints\n3. Select diverse perspectives (e.g.: supporters, opponents, neutrals, professionals, etc.)\n4. Prioritize roles directly related to the event\n\nReturn JSON format:\n{\n    \"selected_indices\": [list of selected agent indices],\n    \"reasoning\": \"explanation of the selection rationale\"\n}",
+            "你是一个专业的采访策划专家。你的任务是根据采访需求，从模拟Agent列表中选择最适合采访的对象。\n\n选择标准：\n1. Agent的身份/职业与采访主题相关\n2. Agent可能持有独特或有价值的观点\n3. 选择多样化的视角（如：支持方、反对方、中立方、专业人士等）\n4. 优先选择与事件直接相关的角色\n\n返回JSON格式：\n{\n    \"selected_indices\": [选中Agent的索引列表],\n    \"reasoning\": \"选择理由说明\"\n}",
         );
+        let sim_bg = if simulation_requirement.is_empty() {
+            localized("not provided", "未提供")
+        } else {
+            simulation_requirement
+        };
+        let user_prompt = if get_locale() == "zh" {
+            format!(
+                "采访需求：\n{}\n\n模拟背景：\n{}\n\n可选择的Agent列表（共{}个）：\n{}\n\n请选择最多{}个最适合采访的Agent，并说明选择理由。",
+                interview_requirement,
+                sim_bg,
+                agents_summary.len(),
+                agents_json,
+                max_agents
+            )
+        } else {
+            format!(
+                "Interview requirement:\n{}\n\nSimulation background:\n{}\n\nAvailable agent list ({} total):\n{}\n\nPlease select at most {} agents most suitable for interviewing, and explain the rationale.",
+                interview_requirement,
+                sim_bg,
+                agents_summary.len(),
+                agents_json,
+                max_agents
+            )
+        };
 
         let messages = [ChatMessage::system(system_prompt), ChatMessage::user(user_prompt)];
         let opts = ChatOptions { temperature: Some(0.3), max_tokens: None, response_format: None };
@@ -1963,7 +2132,11 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
             let n = max_agents_usize.min(profiles.len());
             let indices: Vec<usize> = (0..n).collect();
             let selected: Vec<serde_json::Map<String, serde_json::Value>> = profiles[..n].to_vec();
-            (selected, indices, "使用默认选择策略".to_string())
+            (
+                selected,
+                indices,
+                localized("Default selection strategy used", "使用默认选择策略").to_string(),
+            )
         };
 
         match self.llm.chat_json::<serde_json::Value>(&messages, &opts).await {
@@ -1976,7 +2149,7 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
                 let reasoning = resp
                     .get("reasoning")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("基于相关性自动选择")
+                    .unwrap_or(localized("Auto-selected based on relevance", "基于相关性自动选择"))
                     .to_string();
 
                 // Take first max_agents indices, filter to valid in-range.
@@ -2015,18 +2188,35 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
         selected_agents: &[serde_json::Map<String, serde_json::Value>],
     ) -> Vec<String> {
         // Python `[a.get("profession", "未知") for a in selected_agents]`.
-        let agent_roles: Vec<String> =
-            selected_agents.iter().map(|a| py_get_str(a, "profession", "未知")).collect();
+        let agent_roles: Vec<String> = selected_agents
+            .iter()
+            .map(|a| py_get_str(a, "profession", localized("unknown", "未知")))
+            .collect();
 
-        let system_prompt = "你是一个专业的记者/采访者。根据采访需求，生成3-5个深度采访问题。\n\n问题要求：\n1. 开放性问题，鼓励详细回答\n2. 针对不同角色可能有不同答案\n3. 涵盖事实、观点、感受等多个维度\n4. 语言自然，像真实采访一样\n5. 每个问题控制在50字以内，简洁明了\n6. 直接提问，不要包含背景说明或前缀\n\n返回JSON格式：{\"questions\": [\"问题1\", \"问题2\", ...]}";
-        let sim_bg =
-            if simulation_requirement.is_empty() { "未提供" } else { simulation_requirement };
-        let user_prompt = format!(
-            "采访需求：{}\n\n模拟背景：{}\n\n采访对象角色：{}\n\n请生成3-5个采访问题。",
-            interview_requirement,
-            sim_bg,
-            agent_roles.join(", ")
+        let system_prompt = localized(
+            "You are a professional journalist/interviewer. Based on the interview requirement, generate 3-5 in-depth interview questions.\n\nQuestion requirements:\n1. Open-ended questions that encourage detailed answers\n2. May elicit different answers from different roles\n3. Cover multiple dimensions such as facts, viewpoints, and feelings\n4. Natural language, like a real interview\n5. Keep each question within 50 characters, concise and clear\n6. Ask directly, without background explanation or prefix\n\nReturn JSON format: {\"questions\": [\"question 1\", \"question 2\", ...]}",
+            "你是一个专业的记者/采访者。根据采访需求，生成3-5个深度采访问题。\n\n问题要求：\n1. 开放性问题，鼓励详细回答\n2. 针对不同角色可能有不同答案\n3. 涵盖事实、观点、感受等多个维度\n4. 语言自然，像真实采访一样\n5. 每个问题控制在50字以内，简洁明了\n6. 直接提问，不要包含背景说明或前缀\n\n返回JSON格式：{\"questions\": [\"问题1\", \"问题2\", ...]}",
         );
+        let sim_bg = if simulation_requirement.is_empty() {
+            localized("not provided", "未提供")
+        } else {
+            simulation_requirement
+        };
+        let user_prompt = if get_locale() == "zh" {
+            format!(
+                "采访需求：{}\n\n模拟背景：{}\n\n采访对象角色：{}\n\n请生成3-5个采访问题。",
+                interview_requirement,
+                sim_bg,
+                agent_roles.join(", ")
+            )
+        } else {
+            format!(
+                "Interview requirement: {}\n\nSimulation background: {}\n\nInterviewee roles: {}\n\nPlease generate 3-5 interview questions.",
+                interview_requirement,
+                sim_bg,
+                agent_roles.join(", ")
+            )
+        };
 
         let messages = [ChatMessage::system(system_prompt), ChatMessage::user(user_prompt)];
         let opts = ChatOptions { temperature: Some(0.5), max_tokens: None, response_format: None };
@@ -2039,7 +2229,13 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
                     Some(arr) => {
                         arr.iter().filter_map(|q| q.as_str().map(|s| s.to_string())).collect()
                     }
-                    None => vec![format!("关于{}，您有什么看法？", interview_requirement)],
+                    None => {
+                        if get_locale() == "zh" {
+                            vec![format!("关于{}，您有什么看法？", interview_requirement)]
+                        } else {
+                            vec![format!("What are your thoughts on {}?", interview_requirement)]
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -2051,11 +2247,20 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
                         &[("error", &e.to_string())]
                     )
                 );
-                vec![
-                    format!("关于{}，您的观点是什么？", interview_requirement),
-                    "这件事对您或您所代表的群体有什么影响？".to_string(),
-                    "您认为应该如何解决或改进这个问题？".to_string(),
-                ]
+                if get_locale() == "zh" {
+                    vec![
+                        format!("关于{}，您的观点是什么？", interview_requirement),
+                        "这件事对您或您所代表的群体有什么影响？".to_string(),
+                        "您认为应该如何解决或改进这个问题？".to_string(),
+                    ]
+                } else {
+                    vec![
+                        format!("What is your view on {}?", interview_requirement),
+                        "What impact does this matter have on you or the group you represent?"
+                            .to_string(),
+                        "How do you think this problem should be solved or improved?".to_string(),
+                    ]
+                }
             }
         }
     }
@@ -2069,33 +2274,53 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
         interview_requirement: &str,
     ) -> String {
         if interviews.is_empty() {
-            return "未完成任何采访".to_string();
+            return localized("No interviews were completed", "未完成任何采访").to_string();
         }
 
+        let is_zh = get_locale() == "zh";
         let interview_texts: Vec<String> = interviews
             .iter()
             .map(|iv| {
                 let resp: String = iv.response.chars().take(500).collect();
-                format!("【{}（{}）】\n{}", iv.agent_name, iv.agent_role, resp)
+                if is_zh {
+                    format!("【{}（{}）】\n{}", iv.agent_name, iv.agent_role, resp)
+                } else {
+                    format!("[{} ({})]\n{}", iv.agent_name, iv.agent_role, resp)
+                }
             })
             .collect();
 
-        let quote_instruction = if crate::i18n::get_locale() == "zh" {
+        let quote_instruction = if is_zh {
             "引用受访者原话时使用中文引号「」"
         } else {
             "Use quotation marks \"\" when quoting interviewees"
         };
 
-        let system_prompt = format!(
-            "你是一个专业的新闻编辑。请根据多位受访者的回答，生成一份采访摘要。\n\n摘要要求：\n1. 提炼各方主要观点\n2. 指出观点的共识和分歧\n3. 突出有价值的引言\n4. 客观中立，不偏袒任何一方\n5. 控制在1000字内\n\n格式约束（必须遵守）：\n- 使用纯文本段落，用空行分隔不同部分\n- 不要使用Markdown标题（如#、##、###）\n- 不要使用分割线（如---、***）\n- {}\n- 可以使用**加粗**标记关键词，但不要使用其他Markdown语法",
-            quote_instruction
-        );
+        let system_prompt = if is_zh {
+            format!(
+                "你是一个专业的新闻编辑。请根据多位受访者的回答，生成一份采访摘要。\n\n摘要要求：\n1. 提炼各方主要观点\n2. 指出观点的共识和分歧\n3. 突出有价值的引言\n4. 客观中立，不偏袒任何一方\n5. 控制在1000字内\n\n格式约束（必须遵守）：\n- 使用纯文本段落，用空行分隔不同部分\n- 不要使用Markdown标题（如#、##、###）\n- 不要使用分割线（如---、***）\n- {}\n- 可以使用**加粗**标记关键词，但不要使用其他Markdown语法",
+                quote_instruction
+            )
+        } else {
+            format!(
+                "You are a professional news editor. Based on the answers from multiple interviewees, generate an interview summary.\n\nSummary requirements:\n1. Distill the main viewpoints of each party\n2. Point out the consensus and divergence among viewpoints\n3. Highlight valuable quotes\n4. Objective and neutral, without favoring any party\n5. Keep within 1000 characters\n\nFormat constraints (must be followed):\n- Use plain-text paragraphs, separating sections with blank lines\n- Do not use Markdown headings (e.g. #, ##, ###)\n- Do not use horizontal rules (e.g. ---, ***)\n- {}\n- You may use **bold** to mark keywords, but do not use other Markdown syntax",
+                quote_instruction
+            )
+        };
         // Python `"".join(interview_texts)` — NO separator between blocks.
-        let user_prompt = format!(
-            "采访主题：{}\n\n采访内容：\n{}\n\n请生成采访摘要。",
-            interview_requirement,
-            interview_texts.join("")
-        );
+        let user_prompt = if is_zh {
+            format!(
+                "采访主题：{}\n\n采访内容：\n{}\n\n请生成采访摘要。",
+                interview_requirement,
+                interview_texts.join("")
+            )
+        } else {
+            format!(
+                "Interview topic: {}\n\nInterview content:\n{}\n\nPlease generate an interview summary.",
+                interview_requirement,
+                interview_texts.join("")
+            )
+        };
 
         let messages = [ChatMessage::system(system_prompt), ChatMessage::user(user_prompt)];
         let opts =
@@ -2114,7 +2339,19 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
                 );
                 let agent_names: Vec<String> =
                     interviews.iter().map(|iv| iv.agent_name.clone()).collect();
-                format!("共采访了{}位受访者，包括：{}", interviews.len(), agent_names.join("、"))
+                if is_zh {
+                    format!(
+                        "共采访了{}位受访者，包括：{}",
+                        interviews.len(),
+                        agent_names.join("、")
+                    )
+                } else {
+                    format!(
+                        "Interviewed {} interviewees in total, including: {}",
+                        interviews.len(),
+                        agent_names.join(", ")
+                    )
+                }
             }
         }
     }
@@ -2168,7 +2405,11 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
                 "{}",
                 t_args("console.profilesNotFound", &[("simId", &simulation_id)])
             );
-            result.summary = "未找到可采访的Agent人设文件".to_string();
+            result.summary = localized(
+                "No interviewable agent persona files were found",
+                "未找到可采访的Agent人设文件",
+            )
+            .to_string();
             return Ok(result);
         }
 
@@ -2231,7 +2472,7 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
             .map(|(i, q)| format!("{}. {}", i + 1, q))
             .collect::<Vec<_>>()
             .join("\n");
-        let optimized_prompt = format!("{}{}", INTERVIEW_AGENTS_PROMPT_PREFIX, combined_prompt);
+        let optimized_prompt = format!("{}{}", interview_agents_prompt_prefix(), combined_prompt);
 
         // Step 4: batch interview.
         let interviews_request: Vec<serde_json::Value> = selected_indices
@@ -2271,8 +2512,14 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
                     "{}",
                     t_args("console.interviewApiCallFailed", &[("error", &msg)])
                 );
-                result.summary =
-                    format!("采访失败：{}。模拟环境可能已关闭，请确保OASIS环境正在运行。", msg);
+                result.summary = if get_locale() == "zh" {
+                    format!("采访失败：{}。模拟环境可能已关闭，请确保OASIS环境正在运行。", msg)
+                } else {
+                    format!(
+                        "Interview failed: {}. The simulation environment may have shut down; please ensure the OASIS environment is running.",
+                        msg
+                    )
+                };
                 return Ok(result);
             }
             Err(e) => {
@@ -2282,7 +2529,11 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
                     "{}",
                     t_args("console.interviewApiCallException", &[("error", &e.to_string())])
                 );
-                result.summary = format!("采访过程发生错误：{}", e);
+                result.summary = if get_locale() == "zh" {
+                    format!("采访过程发生错误：{}", e)
+                } else {
+                    format!("An error occurred during the interview: {}", e)
+                };
                 return Ok(result);
             }
         };
@@ -2305,13 +2556,23 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
 
         // API failure guard → early return.
         if !success {
-            let error_msg = api_result.error.clone().unwrap_or_else(|| "未知错误".to_string());
+            let error_msg = api_result
+                .error
+                .clone()
+                .unwrap_or_else(|| localized("unknown error", "未知错误").to_string());
             tracing::warn!(
                 target: "teri::report",
                 "{}",
                 t_args("console.interviewApiReturnedFailure", &[("error", &error_msg)])
             );
-            result.summary = format!("采访API调用失败：{}。请检查OASIS模拟环境状态。", error_msg);
+            result.summary = if get_locale() == "zh" {
+                format!("采访API调用失败：{}。请检查OASIS模拟环境状态。", error_msg)
+            } else {
+                format!(
+                    "Interview API call failed: {}. Please check the OASIS simulation environment status.",
+                    error_msg
+                )
+            };
             return Ok(result);
         }
 
@@ -2321,7 +2582,7 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
             // Python `agent.get("realname", agent.get("username", f"Agent_{agent_idx}"))`
             // — `.get` defaults apply ONLY when the key is ABSENT (empty string wins).
             let agent_name = resolve_agent_name(agent, *agent_idx);
-            let agent_role = py_get_str(agent, "profession", "未知");
+            let agent_role = py_get_str(agent, "profession", localized("unknown", "未知"));
             let agent_bio = py_get_str(agent, "bio", "");
 
             let twitter_result = results_dict
@@ -2346,20 +2607,29 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
             let twitter_response = Self::clean_tool_call_response(twitter_response_raw);
             let reddit_response = Self::clean_tool_call_response(reddit_response_raw);
 
+            let no_reply =
+                localized("(no reply received from this platform)", "（该平台未获得回复）");
             let twitter_text = if twitter_response.is_empty() {
-                "（该平台未获得回复）".to_string()
+                no_reply.to_string()
             } else {
                 twitter_response.clone()
             };
             let reddit_text = if reddit_response.is_empty() {
-                "（该平台未获得回复）".to_string()
+                no_reply.to_string()
             } else {
                 reddit_response.clone()
             };
-            let response_text = format!(
-                "【Twitter平台回答】\n{}\n\n【Reddit平台回答】\n{}",
-                twitter_text, reddit_text
-            );
+            let response_text = if get_locale() == "zh" {
+                format!(
+                    "【Twitter平台回答】\n{}\n\n【Reddit平台回答】\n{}",
+                    twitter_text, reddit_text
+                )
+            } else {
+                format!(
+                    "[Twitter platform answer]\n{}\n\n[Reddit platform answer]\n{}",
+                    twitter_text, reddit_text
+                )
+            };
 
             // Key-quote extraction.
             let combined_responses = format!("{} {}", twitter_response, reddit_response);
@@ -2403,11 +2673,22 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
 // ---------------------------------------------------------------------------
 
 /// Interview prompt prefix prepended to the combined questions
-/// (`zep_tools.py:1352-1362`). The 6-rule multi-line CJK block is OBSERVABLE in
-/// the prompt sent to the agent — preserve it byte-for-byte. NOTE: this is a
-/// DIFFERENT literal from the single-line `optimize_interview_prompt` prefix in
-/// `api::simulation` (which ports `simulation.py:23`).
-const INTERVIEW_AGENTS_PROMPT_PREFIX: &str = "你正在接受一次采访。请结合你的人设、所有的过往记忆与行动，以纯文本方式直接回答以下问题。\n回复要求：\n1. 直接用自然语言回答，不要调用任何工具\n2. 不要返回JSON格式或工具调用格式\n3. 不要使用Markdown标题（如#、##、###）\n4. 按问题编号逐一回答，每个回答以「问题X：」开头（X为问题编号）\n5. 每个问题的回答之间用空行分隔\n6. 回答要有实质内容，每个问题至少回答2-3句话\n\n";
+/// (`zep_tools.py:1352-1362`). The 6-rule multi-line block is OBSERVABLE in the
+/// prompt sent to the agent — English by default, Chinese byte-for-byte for `zh`.
+/// NOTE: this is a DIFFERENT literal from the single-line `optimize_interview_prompt`
+/// prefix in `api::simulation` (which ports `simulation.py:23`).
+///
+/// PARSER COUPLING: rule 4 keeps the literal answer marker `「问题X：」` in BOTH
+/// language arms because `extract_key_quotes`'s `re_question` regex (`问题\d+[：:]`)
+/// strips exactly that marker from the agent's response. Translating the marker
+/// would break that strip (out-of-scope input-parsing logic). Only the surrounding
+/// prose is localized.
+fn interview_agents_prompt_prefix() -> &'static str {
+    localized(
+        "You are being interviewed. Drawing on your persona and all your past memories and actions, answer the following questions directly in plain text.\nResponse requirements:\n1. Answer directly in natural language; do not call any tools\n2. Do not return JSON format or tool-call format\n3. Do not use Markdown headings (e.g. #, ##, ###)\n4. Answer each question one by one in order, starting each answer with 「问题X：」 (X is the question number)\n5. Separate the answers to different questions with blank lines\n6. Answers should have substantive content, at least 2-3 sentences per question\n\n",
+        "你正在接受一次采访。请结合你的人设、所有的过往记忆与行动，以纯文本方式直接回答以下问题。\n回复要求：\n1. 直接用自然语言回答，不要调用任何工具\n2. 不要返回JSON格式或工具调用格式\n3. 不要使用Markdown标题（如#、##、###）\n4. 按问题编号逐一回答，每个回答以「问题X：」开头（X为问题编号）\n5. 每个问题的回答之间用空行分隔\n6. 回答要有实质内容，每个问题至少回答2-3句话\n\n",
+    )
+}
 
 /// Python `dict.get(key, default)` for a string value: returns the stored string
 /// when the key is PRESENT (even if empty), else `default`. (Distinct from
@@ -2594,7 +2875,27 @@ fn synthesize_fact_from_triple(
 // ── Tool description constants (verbatim from report_agent.py:476–548) ──────
 
 /// Tool description: insight_forge (report_agent.py:476–492).
-pub const TOOL_DESC_INSIGHT_FORGE: &str = "\
+/// English by default; Chinese (byte-identical to the upstream literal) for `zh`.
+pub fn tool_desc_insight_forge() -> &'static str {
+    localized(
+        "\
+[Deep Insight Retrieval - Powerful Search Tool]
+This is our powerful retrieval function, designed for deep analysis. It will:
+1. Automatically decompose your question into multiple sub-questions
+2. Retrieve information from the simulation graph across multiple dimensions
+3. Integrate the results of semantic search, entity analysis, and relationship-chain tracing
+4. Return the most comprehensive and in-depth retrieved content
+
+[Use Cases]
+- When you need to analyze a topic in depth
+- When you need to understand multiple aspects of an event
+- When you need rich material to support a report section
+
+[Returned Content]
+- Verbatim relevant facts (directly quotable)
+- Core entity insights
+- Relationship-chain analysis",
+        "\
 【深度洞察检索 - 强大的检索工具】
 这是我们强大的检索函数，专为深度分析设计。它会：
 1. 自动将你的问题分解为多个子问题
@@ -2610,10 +2911,31 @@ pub const TOOL_DESC_INSIGHT_FORGE: &str = "\
 【返回内容】
 - 相关事实原文（可直接引用）
 - 核心实体洞察
-- 关系链分析";
+- 关系链分析",
+    )
+}
 
 /// Tool description: panorama_search (report_agent.py:494–509).
-pub const TOOL_DESC_PANORAMA_SEARCH: &str = "\
+/// English by default; Chinese (byte-identical to the upstream literal) for `zh`.
+pub fn tool_desc_panorama_search() -> &'static str {
+    localized(
+        "\
+[Breadth Search - Get the Full Picture]
+This tool is used to obtain the complete picture of the simulation results, and is especially suited to understanding how an event evolves. It will:
+1. Retrieve all relevant nodes and relationships
+2. Distinguish currently valid facts from historical/expired facts
+3. Help you understand how public opinion evolved
+
+[Use Cases]
+- When you need to understand the complete development of an event
+- When you need to compare public-opinion changes across different stages
+- When you need comprehensive entity and relationship information
+
+[Returned Content]
+- Currently valid facts (latest simulation results)
+- Historical/expired facts (record of evolution)
+- All entities involved",
+        "\
 【广度搜索 - 获取全貌视图】
 这个工具用于获取模拟结果的完整全貌，特别适合了解事件演变过程。它会：
 1. 获取所有相关节点和关系
@@ -2628,10 +2950,26 @@ pub const TOOL_DESC_PANORAMA_SEARCH: &str = "\
 【返回内容】
 - 当前有效事实（模拟最新结果）
 - 历史/过期事实（演变记录）
-- 所有涉及的实体";
+- 所有涉及的实体",
+    )
+}
 
 /// Tool description: quick_search (report_agent.py:511–521).
-pub const TOOL_DESC_QUICK_SEARCH: &str = "\
+/// English by default; Chinese (byte-identical to the upstream literal) for `zh`.
+pub fn tool_desc_quick_search() -> &'static str {
+    localized(
+        "\
+[Simple Search - Quick Retrieval]
+A lightweight quick-retrieval tool, suited to simple, direct information queries.
+
+[Use Cases]
+- When you need to quickly find a specific piece of information
+- When you need to verify a fact
+- Simple information retrieval
+
+[Returned Content]
+- A list of facts most relevant to the query",
+        "\
 【简单搜索 - 快速检索】
 轻量级的快速检索工具，适合简单、直接的信息查询。
 
@@ -2641,10 +2979,41 @@ pub const TOOL_DESC_QUICK_SEARCH: &str = "\
 - 简单的信息检索
 
 【返回内容】
-- 与查询最相关的事实列表";
+- 与查询最相关的事实列表",
+    )
+}
 
 /// Tool description: interview_agents (report_agent.py:523–548).
-pub const TOOL_DESC_INTERVIEW_AGENTS: &str = "\
+/// English by default; Chinese (byte-identical to the upstream literal) for `zh`.
+pub fn tool_desc_interview_agents() -> &'static str {
+    localized(
+        "\
+[In-depth Interview - Real Agent Interviews (Dual Platform)]
+Calls the OASIS simulation environment's interview API to conduct real interviews with the running simulated agents!
+This is not an LLM simulation; it calls the real interview interface to obtain the simulated agents' original answers.
+By default it interviews on both Twitter and Reddit simultaneously, for a more comprehensive set of viewpoints.
+
+Workflow:
+1. Automatically read the persona files to learn about all simulated agents
+2. Intelligently select the agents most relevant to the interview topic (e.g. students, media, officials)
+3. Automatically generate interview questions
+4. Call the /api/simulation/interview/batch interface to conduct real interviews on both platforms
+5. Integrate all interview results to provide a multi-perspective analysis
+
+[Use Cases]
+- When you need to understand views on an event from different role perspectives (What do students think? What does the media think? What do officials say?)
+- When you need to collect opinions and positions from multiple parties
+- When you need the simulated agents' real answers (from the OASIS simulation environment)
+- When you want to make the report more vivid, including an \"interview transcript\"
+
+[Returned Content]
+- Identity information of the interviewed agents
+- Each agent's interview answers on both Twitter and Reddit
+- Key quotes (directly quotable)
+- Interview summary and comparison of viewpoints
+
+[Important] The OASIS simulation environment must be running to use this feature!",
+        "\
 【深度采访 - 真实Agent采访（双平台）】
 调用OASIS模拟环境的采访API，对正在运行的模拟Agent进行真实采访！
 这不是LLM模拟，而是调用真实的采访接口获取模拟Agent的原始回答。
@@ -2669,10 +3038,30 @@ pub const TOOL_DESC_INTERVIEW_AGENTS: &str = "\
 - 关键引言（可直接引用）
 - 采访摘要和观点对比
 
-【重要】需要OASIS模拟环境正在运行才能使用此功能！";
+【重要】需要OASIS模拟环境正在运行才能使用此功能！",
+    )
+}
 
 /// Tool description: recall_agent_discussion (teri-native — no MiroFish analog).
-pub const TOOL_DESC_RECALL_AGENT_DISCUSSION: &str = "\
+/// English by default; Chinese (byte-identical to the upstream literal) for `zh`.
+pub fn tool_desc_recall_agent_discussion() -> &'static str {
+    localized(
+        "\
+[Discussion Recall - Retrieval of Agents' Real Statements]
+Performs semantic retrieval over the agents' real statements (posts/comments) made during the simulation, recalling the original remarks most relevant to the query.
+This does not ask new questions; it retrieves what the agents actually said during the simulation (from agent long-term memory / agent-LTM).
+
+[Difference from interview_agents]
+- interview_agents: poses new questions to the agents now, with answers regenerated by the LLM.
+- recall_agent_discussion: retrieves real statements that already occurred during the simulation, as factual grounding for the report.
+
+[Use Cases]
+- When you need to quote an agent's real expression about a topic during the simulation
+- When you need real statements to support a prediction, rather than regenerating after the fact
+
+[Returned Content]
+- A list of the agents' real statements most relevant to the query (sorted by semantic relevance)",
+        "\
 【讨论召回 - 智能体真实发言检索】
 对模拟过程中智能体的真实发言（帖子/评论）进行语义检索，召回与查询最相关的原始言论。
 这不是重新提问，而是检索智能体在模拟中实际说过的话（来自智能体长期记忆 / agent-LTM）。
@@ -2686,7 +3075,9 @@ pub const TOOL_DESC_RECALL_AGENT_DISCUSSION: &str = "\
 - 需要用真实言论支撑预测结论，而非事后重新生成
 
 【返回内容】
-- 与查询最相关的智能体真实发言列表（按语义相关性排序）";
+- 与查询最相关的智能体真实发言列表（按语义相关性排序）",
+    )
+}
 
 // ── Tool enum (report_agent.py:919–954 `_define_tools` + _execute_tool dispatch) ─
 
@@ -2928,48 +3319,107 @@ fn normalize_tool_call_keys(obj: &mut serde_json::Map<String, serde_json::Value>
 /// ```
 pub fn get_tools_description() -> String {
     // Mirror the Python dict insertion order in `_define_tools` (report_agent.py:919–954).
+    // Owned Vec (not a `&[..]` literal) so the per-call `localized(..)` values — runtime,
+    // not const — need no rvalue static promotion / temporary-lifetime gymnastics.
     #[allow(clippy::type_complexity)]
-    let tools: &[(&str, &str, &[(&str, &str)])] = &[
+    let tools: Vec<(&str, &str, Vec<(&str, &str)>)> = vec![
         (
             "insight_forge",
-            TOOL_DESC_INSIGHT_FORGE,
-            &[
-                ("query", "你想深入分析的问题或话题"),
-                ("report_context", "当前报告章节的上下文（可选，有助于生成更精准的子问题）"),
+            tool_desc_insight_forge(),
+            vec![
+                (
+                    "query",
+                    localized(
+                        "The question or topic you want to analyze in depth",
+                        "你想深入分析的问题或话题",
+                    ),
+                ),
+                (
+                    "report_context",
+                    localized(
+                        "Context of the current report section (optional; helps generate more precise sub-questions)",
+                        "当前报告章节的上下文（可选，有助于生成更精准的子问题）",
+                    ),
+                ),
             ],
         ),
         (
             "panorama_search",
-            TOOL_DESC_PANORAMA_SEARCH,
-            &[
-                ("query", "搜索查询，用于相关性排序"),
-                ("include_expired", "是否包含过期/历史内容（默认True）"),
+            tool_desc_panorama_search(),
+            vec![
+                (
+                    "query",
+                    localized(
+                        "Search query, used for relevance ranking",
+                        "搜索查询，用于相关性排序",
+                    ),
+                ),
+                (
+                    "include_expired",
+                    localized(
+                        "Whether to include expired/historical content (default True)",
+                        "是否包含过期/历史内容（默认True）",
+                    ),
+                ),
             ],
         ),
         (
             "quick_search",
-            TOOL_DESC_QUICK_SEARCH,
-            &[("query", "搜索查询字符串"), ("limit", "返回结果数量（可选，默认10）")],
+            tool_desc_quick_search(),
+            vec![
+                ("query", localized("Search query string", "搜索查询字符串")),
+                (
+                    "limit",
+                    localized(
+                        "Number of results to return (optional, default 10)",
+                        "返回结果数量（可选，默认10）",
+                    ),
+                ),
+            ],
         ),
         (
             "interview_agents",
-            TOOL_DESC_INTERVIEW_AGENTS,
-            &[
-                ("interview_topic", "采访主题或需求描述（如：'了解学生对宿舍甲醛事件的看法'）"),
-                ("max_agents", "最多采访的Agent数量（可选，默认5，最大10）"),
+            tool_desc_interview_agents(),
+            vec![
+                (
+                    "interview_topic",
+                    localized(
+                        "Interview topic or requirement description (e.g.: 'understand students' views on the dormitory formaldehyde incident')",
+                        "采访主题或需求描述（如：'了解学生对宿舍甲醛事件的看法'）",
+                    ),
+                ),
+                (
+                    "max_agents",
+                    localized(
+                        "Maximum number of agents to interview (optional, default 5, max 10)",
+                        "最多采访的Agent数量（可选，默认5，最大10）",
+                    ),
+                ),
             ],
         ),
         (
             "recall_agent_discussion",
-            TOOL_DESC_RECALL_AGENT_DISCUSSION,
-            &[
-                ("query", "想要召回的话题或观点（用于语义相关性排序）"),
-                ("limit", "返回的发言数量（可选，默认10）"),
+            tool_desc_recall_agent_discussion(),
+            vec![
+                (
+                    "query",
+                    localized(
+                        "The topic or viewpoint to recall (used for semantic relevance ranking)",
+                        "想要召回的话题或观点（用于语义相关性排序）",
+                    ),
+                ),
+                (
+                    "limit",
+                    localized(
+                        "Number of statements to return (optional, default 10)",
+                        "返回的发言数量（可选，默认10）",
+                    ),
+                ),
             ],
         ),
     ];
 
-    let mut parts = vec!["可用工具：".to_string()];
+    let mut parts = vec![localized("Available tools:", "可用工具：").to_string()];
     for (name, desc, params) in tools {
         parts.push(format!("- {}: {}", name, desc));
         if !params.is_empty() {
@@ -2978,7 +3428,7 @@ pub fn get_tools_description() -> String {
                 .map(|(k, v)| format!("{}: {}", k, v))
                 .collect::<Vec<_>>()
                 .join(", ");
-            parts.push(format!("  参数: {}", params_desc));
+            parts.push(format!("{}{}", localized("  Parameters: ", "  参数: "), params_desc));
         }
     }
     parts.join("\n")
@@ -3040,7 +3490,7 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
                         &[("toolName", &tool_name), ("error", &err_str)]
                     )
                 );
-                format!("工具执行失败: {}", e)
+                format!("{}{}", localized("Tool execution failed: ", "工具执行失败: "), e)
             }
         }
     }
@@ -3232,11 +3682,20 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
                 simulation_requirement,
                 report_context,
             ),
-            // Unknown tool string (report_agent.py:1057–1058) — byte-identical.
-            None => format!(
-                "未知工具: {}。请使用以下工具之一: insight_forge, panorama_search, quick_search",
-                tool_name
-            ),
+            // Unknown tool string (report_agent.py:1057–1058) — byte-identical for zh.
+            None => {
+                if get_locale() == "zh" {
+                    format!(
+                        "未知工具: {}。请使用以下工具之一: insight_forge, panorama_search, quick_search",
+                        tool_name
+                    )
+                } else {
+                    format!(
+                        "Unknown tool: {}. Please use one of the following tools: insight_forge, panorama_search, quick_search",
+                        tool_name
+                    )
+                }
+            }
         }
     }
 
@@ -3282,7 +3741,7 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
             Ok(_) => {
                 "No relevant agent discussion was found in the simulation's memory.".to_string()
             }
-            Err(e) => format!("工具执行失败: {e}"),
+            Err(e) => format!("{}{}", localized("Tool execution failed: ", "工具执行失败: "), e),
         }
     }
 
@@ -3311,7 +3770,13 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
             let query = str_param(params, "query");
             let limit = match coerce_int_param(params, "limit", 10) {
                 Ok(n) => n,
-                Err(e) => return format!("工具执行失败: {}", e),
+                Err(e) => {
+                    return format!(
+                        "{}{}",
+                        localized("Tool execution failed: ", "工具执行失败: "),
+                        e
+                    );
+                }
             };
             return self.recall_agent_discussion(simulation_id, &query, limit).await;
         }
@@ -3360,7 +3825,13 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
             // max_agents: str→int, then min(n, 10) (report_agent.py:1011–1014).
             let max_agents = match coerce_int_param(params, "max_agents", 5) {
                 Ok(n) => n.min(10),
-                Err(e) => return format!("工具执行失败: {}", e),
+                Err(e) => {
+                    return format!(
+                        "{}{}",
+                        localized("Tool execution failed: ", "工具执行失败: "),
+                        e
+                    );
+                }
             };
 
             return match self
@@ -3384,7 +3855,7 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
                             &[("toolName", &tool_name), ("error", &e.to_string())]
                         )
                     );
-                    format!("工具执行失败: {}", e)
+                    format!("{}{}", localized("Tool execution failed: ", "工具执行失败: "), e)
                 }
             };
         }
@@ -3405,7 +3876,13 @@ impl<'g, L: LlmClient + Send + Sync + 'static> ReportTools<'g, L> {
             let query = str_param(params, "query");
             let limit = match coerce_int_param(params, "limit", 10) {
                 Ok(n) => n,
-                Err(e) => return format!("工具执行失败: {}", e),
+                Err(e) => {
+                    return format!(
+                        "{}{}",
+                        localized("Tool execution failed: ", "工具执行失败: "),
+                        e
+                    );
+                }
             };
             let result = self.search_graph_semantic(graph_id, &query, limit, Some("edges")).await;
             return result.to_text();
@@ -3687,17 +4164,30 @@ mod tests {
         assert_eq!(dict.get("facts").and_then(|v| v.as_array()), Some(&vec!["fact1".into()]));
     }
 
-    #[test]
-    fn test_node_info_to_text() {
-        let node = NodeInfo {
+    fn node_info_fixture() -> NodeInfo {
+        NodeInfo {
             uuid: "test-uuid".into(),
             name: "Test Node".into(),
             labels: vec!["Person".into()],
             summary: "".into(),
             attributes: serde_json::Map::new(),
-        };
-        let text = node.to_text();
-        assert!(text.contains("实体: Test Node"));
+        }
+    }
+
+    #[test]
+    fn test_node_info_to_text() {
+        // English by default (English-first).
+        let text = node_info_fixture().to_text();
+        assert!(text.contains("Entity: Test Node"));
+    }
+
+    #[tokio::test]
+    async fn test_node_info_to_text_zh() {
+        crate::i18n::with_locale("zh".to_string(), async {
+            let text = node_info_fixture().to_text();
+            assert!(text.contains("实体: Test Node"));
+        })
+        .await;
     }
 
     #[test]
@@ -3762,13 +4252,34 @@ mod tests {
             r#"{"uuid":"","name":"WorksFor","fact":"","source_node_uuid":"aaaaaaaa1111","target_node_uuid":"bbbbbbbb2222","source_node_name":"Alice","target_node_name":"Acme","created_at":null,"valid_at":null,"invalid_at":null,"expired_at":null}"#
         );
         // to_text prefers the names over the uuid prefix (Python `name or uuid[:8]`).
-        assert_eq!(edge.to_text(false), "关系: Alice --[WorksFor]--> Acme\n事实: ");
+        // English by default (English-first).
+        assert_eq!(edge.to_text(false), "Relationship: Alice --[WorksFor]--> Acme\nFact: ");
     }
 
-    #[test]
-    fn test_edge_info_to_text_falls_back_to_uuid_prefix() {
-        // Python golden (no names): '关系: aaaaaaaa --[WorksFor]--> bbbbbbbb\n事实: '
-        let edge = EdgeInfo {
+    #[tokio::test]
+    async fn test_edge_info_to_text_zh() {
+        crate::i18n::with_locale("zh".to_string(), async {
+            let edge = EdgeInfo {
+                uuid: String::new(),
+                name: "WorksFor".into(),
+                fact: String::new(),
+                source_node_uuid: "aaaaaaaa1111".into(),
+                target_node_uuid: "bbbbbbbb2222".into(),
+                source_node_name: Some("Alice".into()),
+                target_node_name: Some("Acme".into()),
+                created_at: None,
+                valid_at: None,
+                invalid_at: None,
+                expired_at: None,
+            };
+            // zh arm preserved byte-identical to the upstream Python golden.
+            assert_eq!(edge.to_text(false), "关系: Alice --[WorksFor]--> Acme\n事实: ");
+        })
+        .await;
+    }
+
+    fn edge_info_no_names_fixture() -> EdgeInfo {
+        EdgeInfo {
             uuid: String::new(),
             name: "WorksFor".into(),
             fact: String::new(),
@@ -3780,8 +4291,28 @@ mod tests {
             valid_at: None,
             invalid_at: None,
             expired_at: None,
-        };
-        assert_eq!(edge.to_text(false), "关系: aaaaaaaa --[WorksFor]--> bbbbbbbb\n事实: ");
+        }
+    }
+
+    #[test]
+    fn test_edge_info_to_text_falls_back_to_uuid_prefix() {
+        // English by default: 'Relationship: aaaaaaaa --[WorksFor]--> bbbbbbbb\nFact: '
+        assert_eq!(
+            edge_info_no_names_fixture().to_text(false),
+            "Relationship: aaaaaaaa --[WorksFor]--> bbbbbbbb\nFact: "
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edge_info_to_text_falls_back_to_uuid_prefix_zh() {
+        crate::i18n::with_locale("zh".to_string(), async {
+            // Python golden (no names): '关系: aaaaaaaa --[WorksFor]--> bbbbbbbb\n事实: '
+            assert_eq!(
+                edge_info_no_names_fixture().to_text(false),
+                "关系: aaaaaaaa --[WorksFor]--> bbbbbbbb\n事实: "
+            );
+        })
+        .await;
     }
 
     #[test]
@@ -4020,8 +4551,23 @@ mod tests {
         let tools = ReportTools::new(&g, &llm);
         let result = tools.panorama_search("graph1", "test", true, 50, Some(300));
         let text = result.to_text();
-        assert!(text.contains("广度搜索结果（未来全景视图）"));
-        assert!(text.contains("统计信息"));
+        // English by default (English-first).
+        assert!(text.contains("Breadth Search Results (Future Panorama View)"));
+        assert!(text.contains("Statistics"));
+    }
+
+    #[tokio::test]
+    async fn test_panorama_search_to_text_contains_headers_zh() {
+        crate::i18n::with_locale("zh".to_string(), async {
+            let g = fixture_graph();
+            let llm = StubLlm;
+            let tools = ReportTools::new(&g, &llm);
+            let result = tools.panorama_search("graph1", "test", true, 50, Some(300));
+            let text = result.to_text();
+            assert!(text.contains("广度搜索结果（未来全景视图）"));
+            assert!(text.contains("统计信息"));
+        })
+        .await;
     }
 
     #[test]
@@ -4162,9 +4708,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_insight_forge_result_to_text_contains_headers() {
-        let r = InsightForgeResult {
+    fn insight_forge_result_fixture() -> InsightForgeResult {
+        InsightForgeResult {
             query: "future".into(),
             simulation_requirement: "predict X".into(),
             sub_queries: vec!["sub1".into()],
@@ -4174,13 +4719,31 @@ mod tests {
             total_facts: 1,
             total_entities: 0,
             total_relationships: 1,
-        };
-        let text = r.to_text();
-        assert!(text.contains("## 未来预测深度分析"));
-        assert!(text.contains("分析问题: future"));
-        assert!(text.contains("预测场景: predict X"));
-        assert!(text.contains("关键事实"));
-        assert!(text.contains("关系链"));
+        }
+    }
+
+    #[test]
+    fn test_insight_forge_result_to_text_contains_headers() {
+        let text = insight_forge_result_fixture().to_text();
+        // English by default (English-first).
+        assert!(text.contains("## Future Prediction Deep Analysis"));
+        assert!(text.contains("Analysis question: future"));
+        assert!(text.contains("Prediction scenario: predict X"));
+        assert!(text.contains("Key Facts"));
+        assert!(text.contains("Relationship Chains"));
+    }
+
+    #[tokio::test]
+    async fn test_insight_forge_result_to_text_contains_headers_zh() {
+        crate::i18n::with_locale("zh".to_string(), async {
+            let text = insight_forge_result_fixture().to_text();
+            assert!(text.contains("## 未来预测深度分析"));
+            assert!(text.contains("分析问题: future"));
+            assert!(text.contains("预测场景: predict X"));
+            assert!(text.contains("关键事实"));
+            assert!(text.contains("关系链"));
+        })
+        .await;
     }
 
     // ── ReportTools::insight_forge (S-315/S-316) ────────────────────────────
@@ -4193,18 +4756,48 @@ mod tests {
         let g = fixture_graph();
         let llm = StubLlm;
         let tools = ReportTools::new(&g, &llm);
-        // StubLlm.chat_json → Err → falls back to 4 Chinese variants.
+        // StubLlm.chat_json → Err → falls back to 4 variants. English by default.
         let result = tools.insight_forge("graph1", "Alice workforce", "predict", "", 5).await;
 
-        // Fallback: exactly the 4 Chinese-variant sub-queries (or fewer if max < 4).
+        // Fallback: exactly the 4 variant sub-queries (or fewer if max < 4).
         assert!(!result.sub_queries.is_empty(), "sub_queries must not be empty");
         assert!(result.sub_queries.len() <= 5);
         assert_eq!(result.sub_queries[0], "Alice workforce");
-        assert!(result.sub_queries[1].contains("的主要参与者"), "second variant must match");
-        assert!(result.sub_queries[2].contains("的原因和影响"), "third variant must match");
-        assert!(result.sub_queries[3].contains("的发展过程"), "fourth variant must match");
+        assert!(
+            result.sub_queries[1].contains("Key participants in"),
+            "second variant must match"
+        );
+        assert!(
+            result.sub_queries[2].contains("Causes and impacts of"),
+            "third variant must match"
+        );
+        assert!(
+            result.sub_queries[3].contains("Development process of"),
+            "fourth variant must match"
+        );
         assert_eq!(result.query, "Alice workforce");
         assert_eq!(result.simulation_requirement, "predict");
+    }
+
+    #[tokio::test]
+    async fn test_insight_forge_keyword_fallback_structure_zh() {
+        crate::i18n::with_locale("zh".to_string(), async {
+            let g = fixture_graph();
+            let llm = StubLlm;
+            let tools = ReportTools::new(&g, &llm);
+            // StubLlm.chat_json → Err → falls back to the 4 Chinese variants.
+            let result = tools.insight_forge("graph1", "Alice workforce", "predict", "", 5).await;
+
+            assert!(!result.sub_queries.is_empty(), "sub_queries must not be empty");
+            assert!(result.sub_queries.len() <= 5);
+            assert_eq!(result.sub_queries[0], "Alice workforce");
+            assert!(result.sub_queries[1].contains("的主要参与者"), "second variant must match");
+            assert!(result.sub_queries[2].contains("的原因和影响"), "third variant must match");
+            assert!(result.sub_queries[3].contains("的发展过程"), "fourth variant must match");
+            assert_eq!(result.query, "Alice workforce");
+            assert_eq!(result.simulation_requirement, "predict");
+        })
+        .await;
     }
 
     // S-315 primary path: a SuccessLlm stub returns the JSON `sub_queries` shape.
@@ -4347,11 +4940,30 @@ mod tests {
             .execute_by_name_async("insight_forge", &params, "g", "s1", "req", "")
             .await;
         assert!(!result.is_empty(), "async insight_forge must produce non-empty output");
-        // Result is the InsightForgeResult.to_text() format.
+        // Result is the InsightForgeResult.to_text() format. English by default.
         assert!(
-            result.contains("未来预测深度分析") || result.contains("分析问题"),
+            result.contains("Future Prediction Deep Analysis")
+                || result.contains("Analysis question"),
             "expected insight forge header, got: {result}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_execute_by_name_async_insight_forge_uses_llm_path_zh() {
+        crate::i18n::with_locale("zh".to_string(), async {
+            let g = fixture_graph();
+            let llm = SuccessLlm::new(&["sub-query alpha", "sub-query beta"]);
+            let tools = ReportTools::new(&g, &llm);
+            let params = params_with("query", "Alice workforce");
+            let result = tools
+                .execute_by_name_async("insight_forge", &params, "g", "s1", "req", "")
+                .await;
+            assert!(
+                result.contains("未来预测深度分析") || result.contains("分析问题"),
+                "expected insight forge header, got: {result}"
+            );
+        })
+        .await;
     }
 
     // ── ReportTools::interview_agents (U-024) ───────────────────────────────
@@ -4368,8 +4980,21 @@ mod tests {
         let tools = ReportTools::new(&g, &llm); // runner: None
         let params = params_with("interview_topic", "What do students think?");
         let result = tools.execute_by_name("interview_agents", &params, "g", "s1", "req", "");
-        // The honest tolerated error text (Python `_execute_tool` try/except).
-        assert!(result.contains("工具执行失败"), "expected error text, got: {result}");
+        // The honest tolerated error text (English by default).
+        assert!(result.contains("Tool execution failed"), "expected error text, got: {result}");
+    }
+
+    #[tokio::test]
+    async fn test_interview_agents_sync_path_returns_honest_error_zh() {
+        crate::i18n::with_locale("zh".to_string(), async {
+            let g = fixture_graph();
+            let llm = StubLlm;
+            let tools = ReportTools::new(&g, &llm); // runner: None
+            let params = params_with("interview_topic", "What do students think?");
+            let result = tools.execute_by_name("interview_agents", &params, "g", "s1", "req", "");
+            assert!(result.contains("工具执行失败"), "expected error text, got: {result}");
+        })
+        .await;
     }
 
     // The async dispatch with NO runner still yields the honest error text (the
@@ -4383,7 +5008,23 @@ mod tests {
         let result = tools
             .execute_by_name_async("interview_agents", &params, "g", "s1", "req", "")
             .await;
-        assert!(result.contains("工具执行失败"), "expected error text, got: {result}");
+        // English by default.
+        assert!(result.contains("Tool execution failed"), "expected error text, got: {result}");
+    }
+
+    #[tokio::test]
+    async fn test_interview_agents_async_no_runner_returns_error_text_zh() {
+        crate::i18n::with_locale("zh".to_string(), async {
+            let g = fixture_graph();
+            let llm = StubLlm;
+            let tools = ReportTools::new(&g, &llm); // runner: None
+            let params = params_with("interview_topic", "topic");
+            let result = tools
+                .execute_by_name_async("interview_agents", &params, "g", "s1", "req", "")
+                .await;
+            assert!(result.contains("工具执行失败"), "expected error text, got: {result}");
+        })
+        .await;
     }
 
     // The async dispatcher delegates every NON-interview tool to the sync path.
@@ -4422,28 +5063,49 @@ mod tests {
         assert_eq!(d.len(), 6);
     }
 
-    #[test]
-    fn test_agent_interview_to_text_basic_format() {
-        let iv = AgentInterview {
+    // Chinese question/response are INPUT fixtures (an agent answering in Chinese);
+    // only the rendered labels are localized.
+    fn agent_interview_basic_fixture() -> AgentInterview {
+        AgentInterview {
             agent_name: "Bob".to_string(),
             agent_role: "工程师".to_string(),
             agent_bio: "background".to_string(),
             question: "你怎么看？".to_string(),
             response: "我觉得不错。".to_string(),
             key_quotes: vec![],
-        };
-        let txt = iv.to_text();
-        assert!(txt.contains("**Bob** (工程师)"));
-        assert!(txt.contains("_简介: background_"));
-        assert!(txt.contains("**Q:** 你怎么看？"));
-        assert!(txt.contains("**A:** 我觉得不错。"));
-        // No key-quote block when key_quotes is empty.
-        assert!(!txt.contains("**关键引言:**"));
+        }
     }
 
     #[test]
-    fn test_agent_interview_to_text_key_quote_cleaning() {
-        let iv = AgentInterview {
+    fn test_agent_interview_to_text_basic_format() {
+        let txt = agent_interview_basic_fixture().to_text();
+        // Input-derived parts stay; labels are English by default.
+        assert!(txt.contains("**Bob** (工程师)"));
+        assert!(txt.contains("_Bio: background_"));
+        assert!(txt.contains("**Q:** 你怎么看？"));
+        assert!(txt.contains("**A:** 我觉得不错。"));
+        // No key-quote block when key_quotes is empty.
+        assert!(!txt.contains("**Key Quotes:**"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_interview_to_text_basic_format_zh() {
+        crate::i18n::with_locale("zh".to_string(), async {
+            let txt = agent_interview_basic_fixture().to_text();
+            assert!(txt.contains("**Bob** (工程师)"));
+            assert!(txt.contains("_简介: background_"));
+            assert!(txt.contains("**Q:** 你怎么看？"));
+            assert!(txt.contains("**A:** 我觉得不错。"));
+            assert!(!txt.contains("**关键引言:**"));
+        })
+        .await;
+    }
+
+    // Chinese key_quotes are INPUT fixtures; the cleaning logic (strip quotes /
+    // leading punctuation, skip `问题N`, drop short) is locale-independent — only
+    // the `**Key Quotes:**` / `**关键引言:**` header is localized.
+    fn agent_interview_quote_fixture() -> AgentInterview {
+        AgentInterview {
             agent_name: "C".to_string(),
             agent_role: "r".to_string(),
             agent_bio: "b".to_string(),
@@ -4457,14 +5119,31 @@ mod tests {
                 // Too short (< 10 chars after cleaning) → dropped.
                 "短句".to_string(),
             ],
-        };
-        let txt = iv.to_text();
-        assert!(txt.contains("**关键引言:**"));
+        }
+    }
+
+    #[test]
+    fn test_agent_interview_to_text_key_quote_cleaning() {
+        let txt = agent_interview_quote_fixture().to_text();
+        // English header by default.
+        assert!(txt.contains("**Key Quotes:**"));
         assert!(txt.contains("这是一个足够长的引言内容"));
         // 问题3 quote skipped.
         assert!(!txt.contains("被跳过"));
         // Short quote dropped.
         assert!(!txt.contains("> \"短句\""));
+    }
+
+    #[tokio::test]
+    async fn test_agent_interview_to_text_key_quote_cleaning_zh() {
+        crate::i18n::with_locale("zh".to_string(), async {
+            let txt = agent_interview_quote_fixture().to_text();
+            assert!(txt.contains("**关键引言:**"));
+            assert!(txt.contains("这是一个足够长的引言内容"));
+            assert!(!txt.contains("被跳过"));
+            assert!(!txt.contains("> \"短句\""));
+        })
+        .await;
     }
 
     #[test]
@@ -4515,23 +5194,42 @@ mod tests {
 
     #[test]
     fn test_interview_result_to_text_empty_interviews() {
+        // "我的主题" is the INPUT topic; section labels are English by default.
         let r = InterviewResult::new("我的主题".to_string(), vec![]);
         let txt = r.to_text();
-        assert!(txt.contains("## 深度采访报告"));
-        assert!(txt.contains("**采访主题:** 我的主题"));
-        assert!(txt.contains("**采访人数:** 0 / 0 位模拟Agent"));
-        assert!(txt.contains("### 采访对象选择理由"));
-        // Empty reasoning → 自动选择 placeholder.
-        assert!(txt.contains("（自动选择）"));
-        // Empty interviews → 无采访记录.
-        assert!(txt.contains("（无采访记录）"));
-        // Empty summary → 无摘要.
-        assert!(txt.contains("### 采访摘要与核心观点"));
-        assert!(txt.contains("（无摘要）"));
+        assert!(txt.contains("## In-depth Interview Report"));
+        assert!(txt.contains("**Interview topic:** 我的主题"));
+        assert!(txt.contains("**Interviewees:** 0 / 0 simulated agents"));
+        assert!(txt.contains("### Rationale for Interviewee Selection"));
+        // Empty reasoning → auto-selected placeholder.
+        assert!(txt.contains("(auto-selected)"));
+        // Empty interviews → no-records placeholder.
+        assert!(txt.contains("(no interview records)"));
+        // Empty summary → no-summary placeholder.
+        assert!(txt.contains("### Interview Summary & Key Insights"));
+        assert!(txt.contains("(no summary)"));
     }
 
-    #[test]
-    fn test_interview_result_to_text_non_empty() {
+    #[tokio::test]
+    async fn test_interview_result_to_text_empty_interviews_zh() {
+        crate::i18n::with_locale("zh".to_string(), async {
+            let r = InterviewResult::new("我的主题".to_string(), vec![]);
+            let txt = r.to_text();
+            assert!(txt.contains("## 深度采访报告"));
+            assert!(txt.contains("**采访主题:** 我的主题"));
+            assert!(txt.contains("**采访人数:** 0 / 0 位模拟Agent"));
+            assert!(txt.contains("### 采访对象选择理由"));
+            assert!(txt.contains("（自动选择）"));
+            assert!(txt.contains("（无采访记录）"));
+            assert!(txt.contains("### 采访摘要与核心观点"));
+            assert!(txt.contains("（无摘要）"));
+        })
+        .await;
+    }
+
+    // All Chinese strings here are INPUT (topic/reasoning/summary/agent fields);
+    // only the section labels are localized.
+    fn interview_result_non_empty_fixture() -> InterviewResult {
         let mut r = InterviewResult::new("话题".to_string(), vec![]);
         r.total_agents = 3;
         r.interviewed_count = 1;
@@ -4545,15 +5243,37 @@ mod tests {
             response: "答复".to_string(),
             key_quotes: vec![],
         });
-        let txt = r.to_text();
-        assert!(txt.contains("**采访人数:** 1 / 3 位模拟Agent"));
+        r
+    }
+
+    #[test]
+    fn test_interview_result_to_text_non_empty() {
+        let txt = interview_result_non_empty_fixture().to_text();
+        // English labels by default; input-derived content stays.
+        assert!(txt.contains("**Interviewees:** 1 / 3 simulated agents"));
         assert!(txt.contains("因为相关"));
-        assert!(txt.contains("### 采访实录"));
-        assert!(txt.contains("#### 采访 #1: 受访者甲"));
+        assert!(txt.contains("### Interview Transcript"));
+        assert!(txt.contains("#### Interview #1: 受访者甲"));
         assert!(txt.contains("**受访者甲** (教师)"));
-        assert!(txt.contains("### 采访摘要与核心观点"));
+        assert!(txt.contains("### Interview Summary & Key Insights"));
         assert!(txt.contains("总结内容"));
-        assert!(!txt.contains("（无采访记录）"));
+        assert!(!txt.contains("(no interview records)"));
+    }
+
+    #[tokio::test]
+    async fn test_interview_result_to_text_non_empty_zh() {
+        crate::i18n::with_locale("zh".to_string(), async {
+            let txt = interview_result_non_empty_fixture().to_text();
+            assert!(txt.contains("**采访人数:** 1 / 3 位模拟Agent"));
+            assert!(txt.contains("因为相关"));
+            assert!(txt.contains("### 采访实录"));
+            assert!(txt.contains("#### 采访 #1: 受访者甲"));
+            assert!(txt.contains("**受访者甲** (教师)"));
+            assert!(txt.contains("### 采访摘要与核心观点"));
+            assert!(txt.contains("总结内容"));
+            assert!(!txt.contains("（无采访记录）"));
+        })
+        .await;
     }
 
     #[test]
@@ -4894,9 +5614,24 @@ mod tests {
         let llm = StubLlm;
         let tools = ReportTools::new(&g, &llm);
         let result = tools.execute_by_name("does_not_exist", &empty_params(), "g", "s1", "req", "");
-        // Byte-identical to Python: "未知工具: {name}。请使用以下工具之一: ..."
-        assert!(result.starts_with("未知工具: does_not_exist"));
+        // English by default: "Unknown tool: {name}. Please use one of the following tools: ..."
+        assert!(result.starts_with("Unknown tool: does_not_exist"));
         assert!(result.contains("insight_forge"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_by_name_unknown_tool_zh() {
+        crate::i18n::with_locale("zh".to_string(), async {
+            let g = fixture_graph();
+            let llm = StubLlm;
+            let tools = ReportTools::new(&g, &llm);
+            let result =
+                tools.execute_by_name("does_not_exist", &empty_params(), "g", "s1", "req", "");
+            // Byte-identical to Python: "未知工具: {name}。请使用以下工具之一: ..."
+            assert!(result.starts_with("未知工具: does_not_exist"));
+            assert!(result.contains("insight_forge"));
+        })
+        .await;
     }
 
     #[test]
@@ -4906,9 +5641,22 @@ mod tests {
         let tools = ReportTools::new(&g, &llm);
         let params = params_with("query", "Alice");
         let result = tools.execute_by_name("quick_search", &params, "g", "s1", "req", "");
-        // Returns text (the SearchResult.to_text())
+        // Returns text (the SearchResult.to_text()). English by default.
         assert!(!result.is_empty());
-        assert!(result.contains("搜索查询"));
+        assert!(result.contains("Search query"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_by_name_quick_search_zh() {
+        crate::i18n::with_locale("zh".to_string(), async {
+            let g = fixture_graph();
+            let llm = StubLlm;
+            let tools = ReportTools::new(&g, &llm);
+            let params = params_with("query", "Alice");
+            let result = tools.execute_by_name("quick_search", &params, "g", "s1", "req", "");
+            assert!(result.contains("搜索查询"));
+        })
+        .await;
     }
 
     #[test]
@@ -4919,8 +5667,21 @@ mod tests {
         let params = params_with("query", "works");
         let result = tools.execute_by_name("panorama_search", &params, "g", "s1", "req", "");
         assert!(!result.is_empty());
-        // panorama_search to_text() opens with "广度搜索结果" header
-        assert!(result.contains("广度搜索结果") || result.contains("查询:"));
+        // panorama_search to_text() opens with the breadth-search header. English by default.
+        assert!(result.contains("Breadth Search Results") || result.contains("Query:"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_by_name_panorama_search_zh() {
+        crate::i18n::with_locale("zh".to_string(), async {
+            let g = fixture_graph();
+            let llm = StubLlm;
+            let tools = ReportTools::new(&g, &llm);
+            let params = params_with("query", "works");
+            let result = tools.execute_by_name("panorama_search", &params, "g", "s1", "req", "");
+            assert!(result.contains("广度搜索结果") || result.contains("查询:"));
+        })
+        .await;
     }
 
     #[test]
@@ -4931,7 +5692,25 @@ mod tests {
         let params = params_with("query", "Alice relationships");
         let result = tools.execute_by_name("insight_forge", &params, "g", "s1", "test sim req", "");
         assert!(!result.is_empty());
-        assert!(result.contains("未来预测深度分析") || result.contains("分析问题"));
+        // English by default.
+        assert!(
+            result.contains("Future Prediction Deep Analysis")
+                || result.contains("Analysis question")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_by_name_insight_forge_zh() {
+        crate::i18n::with_locale("zh".to_string(), async {
+            let g = fixture_graph();
+            let llm = StubLlm;
+            let tools = ReportTools::new(&g, &llm);
+            let params = params_with("query", "Alice relationships");
+            let result =
+                tools.execute_by_name("insight_forge", &params, "g", "s1", "test sim req", "");
+            assert!(result.contains("未来预测深度分析") || result.contains("分析问题"));
+        })
+        .await;
     }
 
     #[test]
@@ -4942,8 +5721,21 @@ mod tests {
         let tools = ReportTools::new(&g, &llm);
         let params = params_with("interview_topic", "What do students think?");
         let result = tools.execute_by_name("interview_agents", &params, "g", "s1", "req", "");
-        // Must be the "工具执行失败: ..." text (not a panic)
-        assert!(result.contains("工具执行失败"), "expected error text, got: {}", result);
+        // Must be the "Tool execution failed: ..." text (not a panic). English by default.
+        assert!(result.contains("Tool execution failed"), "expected error text, got: {}", result);
+    }
+
+    #[tokio::test]
+    async fn test_execute_by_name_interview_agents_returns_error_text_zh() {
+        crate::i18n::with_locale("zh".to_string(), async {
+            let g = fixture_graph();
+            let llm = StubLlm;
+            let tools = ReportTools::new(&g, &llm);
+            let params = params_with("interview_topic", "What do students think?");
+            let result = tools.execute_by_name("interview_agents", &params, "g", "s1", "req", "");
+            assert!(result.contains("工具执行失败"), "expected error text, got: {}", result);
+        })
+        .await;
     }
 
     // ── Sub-cycle (c): back-compat redirects ─────────────────────────────────
@@ -4991,8 +5783,25 @@ mod tests {
         let params = params_with("query", "Alice");
         let result =
             tools.execute_by_name("get_simulation_context", &params, "g", "s1", "sim req", "");
-        // Should return InsightForge text
-        assert!(result.contains("未来预测深度分析") || result.contains("分析问题"));
+        // Should return InsightForge text. English by default.
+        assert!(
+            result.contains("Future Prediction Deep Analysis")
+                || result.contains("Analysis question")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_by_name_get_simulation_context_redirects_to_insight_forge_zh() {
+        crate::i18n::with_locale("zh".to_string(), async {
+            let g = fixture_graph();
+            let llm = StubLlm;
+            let tools = ReportTools::new(&g, &llm);
+            let params = params_with("query", "Alice");
+            let result =
+                tools.execute_by_name("get_simulation_context", &params, "g", "s1", "sim req", "");
+            assert!(result.contains("未来预测深度分析") || result.contains("分析问题"));
+        })
+        .await;
     }
 
     #[test]
@@ -5095,8 +5904,9 @@ mod tests {
 
     #[test]
     fn test_execute_quick_search_bad_limit_returns_failure_text() {
-        // End-to-end: a non-numeric `limit` makes quick_search fail with the Python-parity
-        // "工具执行失败: " prefix instead of silently running with the default.
+        // End-to-end: a non-numeric `limit` makes quick_search fail with the
+        // "Tool execution failed: " prefix (English by default) instead of silently
+        // running with the default.
         let g = fixture_graph();
         let llm = StubLlm;
         let tools = ReportTools::new(&g, &llm);
@@ -5104,7 +5914,22 @@ mod tests {
         p.insert("query".to_string(), serde_json::Value::String("x".to_string()));
         p.insert("limit".to_string(), serde_json::Value::String("abc".to_string()));
         let out = tools.execute_by_name("quick_search", &p, "g", "s", "req", "");
-        assert!(out.starts_with("工具执行失败: "), "got: {out}");
+        assert!(out.starts_with("Tool execution failed: "), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn test_execute_quick_search_bad_limit_returns_failure_text_zh() {
+        crate::i18n::with_locale("zh".to_string(), async {
+            let g = fixture_graph();
+            let llm = StubLlm;
+            let tools = ReportTools::new(&g, &llm);
+            let mut p = serde_json::Map::new();
+            p.insert("query".to_string(), serde_json::Value::String("x".to_string()));
+            p.insert("limit".to_string(), serde_json::Value::String("abc".to_string()));
+            let out = tools.execute_by_name("quick_search", &p, "g", "s", "req", "");
+            assert!(out.starts_with("工具执行失败: "), "got: {out}");
+        })
+        .await;
     }
 
     // max_agents cap at 10 (report_agent.py:1014: max_agents = min(max_agents, 10))
@@ -5121,8 +5946,8 @@ mod tests {
         params.insert("interview_topic".to_string(), serde_json::json!("topic"));
         params.insert("max_agents".to_string(), serde_json::json!("999")); // should be capped to 10
         let result = tools.execute_by_name("interview_agents", &params, "g", "s1", "req", "");
-        // Still returns error text (not a panic)
-        assert!(result.contains("工具执行失败"));
+        // Still returns error text (English by default), not a panic.
+        assert!(result.contains("Tool execution failed"));
     }
 
     // interview_topic falls back to "query" when not present (report_agent.py:1010)
@@ -5134,8 +5959,8 @@ mod tests {
         // Only "query" param, no "interview_topic"
         let params = params_with("query", "student opinions");
         let result = tools.execute_by_name("interview_agents", &params, "g", "s1", "req", "");
-        // Must return error-text (pending), not panic
-        assert!(result.contains("工具执行失败"));
+        // Must return error-text (pending, English by default), not panic.
+        assert!(result.contains("Tool execution failed"));
     }
 
     // ── Sub-cycle (c): get_tools_description ─────────────────────────────────
@@ -5143,17 +5968,32 @@ mod tests {
     #[test]
     fn test_get_tools_description_contains_all_tools() {
         let desc = get_tools_description();
-        assert!(desc.contains("可用工具："));
+        // English header by default.
+        assert!(desc.contains("Available tools:"));
         assert!(desc.contains("insight_forge"));
         assert!(desc.contains("panorama_search"));
         assert!(desc.contains("quick_search"));
         assert!(desc.contains("interview_agents"));
     }
 
+    #[tokio::test]
+    async fn test_get_tools_description_contains_all_tools_zh() {
+        crate::i18n::with_locale("zh".to_string(), async {
+            let desc = get_tools_description();
+            assert!(desc.contains("可用工具："));
+            assert!(desc.contains("insight_forge"));
+            assert!(desc.contains("panorama_search"));
+            assert!(desc.contains("quick_search"));
+            assert!(desc.contains("interview_agents"));
+        })
+        .await;
+    }
+
     #[test]
     fn test_get_tools_description_contains_params() {
         let desc = get_tools_description();
-        assert!(desc.contains("参数:"));
+        // English label by default.
+        assert!(desc.contains("Parameters:"));
         // insight_forge params
         assert!(desc.contains("report_context"));
         // panorama_search params
@@ -5162,6 +6002,19 @@ mod tests {
         assert!(desc.contains("limit"));
         // interview_agents params
         assert!(desc.contains("max_agents"));
+    }
+
+    #[tokio::test]
+    async fn test_get_tools_description_contains_params_zh() {
+        crate::i18n::with_locale("zh".to_string(), async {
+            let desc = get_tools_description();
+            assert!(desc.contains("参数:"));
+            assert!(desc.contains("report_context"));
+            assert!(desc.contains("include_expired"));
+            assert!(desc.contains("limit"));
+            assert!(desc.contains("max_agents"));
+        })
+        .await;
     }
 
     #[test]
@@ -5181,26 +6034,56 @@ mod tests {
 
     #[test]
     fn test_tool_desc_insight_forge_verbatim() {
-        assert!(TOOL_DESC_INSIGHT_FORGE.contains("深度洞察检索"));
-        assert!(TOOL_DESC_INSIGHT_FORGE.contains("自动将你的问题分解为多个子问题"));
-        assert!(TOOL_DESC_INSIGHT_FORGE.contains("关系链分析"));
+        // English by default (English-first).
+        assert!(tool_desc_insight_forge().contains("Deep Insight Retrieval"));
+        assert!(
+            tool_desc_insight_forge()
+                .contains("Automatically decompose your question into multiple sub-questions")
+        );
+        assert!(tool_desc_insight_forge().contains("Relationship-chain analysis"));
     }
 
     #[test]
     fn test_tool_desc_panorama_search_verbatim() {
-        assert!(TOOL_DESC_PANORAMA_SEARCH.contains("广度搜索"));
-        assert!(TOOL_DESC_PANORAMA_SEARCH.contains("区分当前有效的事实和历史/过期的事实"));
+        assert!(tool_desc_panorama_search().contains("Breadth Search"));
+        assert!(
+            tool_desc_panorama_search()
+                .contains("Distinguish currently valid facts from historical/expired facts")
+        );
     }
 
     #[test]
     fn test_tool_desc_quick_search_verbatim() {
-        assert!(TOOL_DESC_QUICK_SEARCH.contains("简单搜索"));
-        assert!(TOOL_DESC_QUICK_SEARCH.contains("与查询最相关的事实列表"));
+        assert!(tool_desc_quick_search().contains("Simple Search"));
+        assert!(tool_desc_quick_search().contains("A list of facts most relevant to the query"));
     }
 
     #[test]
     fn test_tool_desc_interview_agents_verbatim() {
-        assert!(TOOL_DESC_INTERVIEW_AGENTS.contains("深度采访"));
-        assert!(TOOL_DESC_INTERVIEW_AGENTS.contains("OASIS模拟环境正在运行"));
+        assert!(tool_desc_interview_agents().contains("In-depth Interview"));
+        assert!(
+            tool_desc_interview_agents()
+                .contains("The OASIS simulation environment must be running")
+        );
+    }
+
+    // zh arms — byte-identical to the upstream MiroFish literals.
+    #[tokio::test]
+    async fn test_tool_desc_verbatim_zh() {
+        crate::i18n::with_locale("zh".to_string(), async {
+            assert!(tool_desc_insight_forge().contains("深度洞察检索"));
+            assert!(tool_desc_insight_forge().contains("自动将你的问题分解为多个子问题"));
+            assert!(tool_desc_insight_forge().contains("关系链分析"));
+
+            assert!(tool_desc_panorama_search().contains("广度搜索"));
+            assert!(tool_desc_panorama_search().contains("区分当前有效的事实和历史/过期的事实"));
+
+            assert!(tool_desc_quick_search().contains("简单搜索"));
+            assert!(tool_desc_quick_search().contains("与查询最相关的事实列表"));
+
+            assert!(tool_desc_interview_agents().contains("深度采访"));
+            assert!(tool_desc_interview_agents().contains("OASIS模拟环境正在运行"));
+        })
+        .await;
     }
 }

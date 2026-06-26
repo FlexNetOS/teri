@@ -104,10 +104,17 @@ impl AgentActivity {
     /// Port of `_describe_create_post` (L64-68).
     fn describe_create_post(&self) -> String {
         let content = self.arg("content");
+        let zh = crate::i18n::get_locale() == "zh";
         if !content.is_empty() {
-            format!("发布了一条帖子：「{content}」")
-        } else {
+            if zh {
+                format!("发布了一条帖子：「{content}」")
+            } else {
+                format!("posted: \"{content}\"")
+            }
+        } else if zh {
             "发布了一条帖子".to_string()
+        } else {
+            "posted a post".to_string()
         }
     }
 
@@ -116,15 +123,30 @@ impl AgentActivity {
     fn describe_like_post(&self) -> String {
         let post_content = self.arg("post_content");
         let post_author = self.arg("post_author_name");
+        let zh = crate::i18n::get_locale() == "zh";
 
         if !post_content.is_empty() && !post_author.is_empty() {
-            format!("点赞了{post_author}的帖子：「{post_content}」")
+            if zh {
+                format!("点赞了{post_author}的帖子：「{post_content}」")
+            } else {
+                format!("liked {post_author}'s post: \"{post_content}\"")
+            }
         } else if !post_content.is_empty() {
-            format!("点赞了一条帖子：「{post_content}」")
+            if zh {
+                format!("点赞了一条帖子：「{post_content}」")
+            } else {
+                format!("liked a post: \"{post_content}\"")
+            }
         } else if !post_author.is_empty() {
-            format!("点赞了{post_author}的一条帖子")
-        } else {
+            if zh {
+                format!("点赞了{post_author}的一条帖子")
+            } else {
+                format!("liked a post by {post_author}")
+            }
+        } else if zh {
             "点赞了一条帖子".to_string()
+        } else {
+            "liked a post".to_string()
         }
     }
 
@@ -133,15 +155,30 @@ impl AgentActivity {
     fn describe_dislike_post(&self) -> String {
         let post_content = self.arg("post_content");
         let post_author = self.arg("post_author_name");
+        let zh = crate::i18n::get_locale() == "zh";
 
         if !post_content.is_empty() && !post_author.is_empty() {
-            format!("踩了{post_author}的帖子：「{post_content}」")
+            if zh {
+                format!("踩了{post_author}的帖子：「{post_content}」")
+            } else {
+                format!("disliked {post_author}'s post: \"{post_content}\"")
+            }
         } else if !post_content.is_empty() {
-            format!("踩了一条帖子：「{post_content}」")
+            if zh {
+                format!("踩了一条帖子：「{post_content}」")
+            } else {
+                format!("disliked a post: \"{post_content}\"")
+            }
         } else if !post_author.is_empty() {
-            format!("踩了{post_author}的一条帖子")
-        } else {
+            if zh {
+                format!("踩了{post_author}的一条帖子")
+            } else {
+                format!("disliked a post by {post_author}")
+            }
+        } else if zh {
             "踩了一条帖子".to_string()
+        } else {
+            "disliked a post".to_string()
         }
     }
 
@@ -150,15 +187,30 @@ impl AgentActivity {
     fn describe_repost(&self) -> String {
         let original_content = self.arg("original_content");
         let original_author = self.arg("original_author_name");
+        let zh = crate::i18n::get_locale() == "zh";
 
         if !original_content.is_empty() && !original_author.is_empty() {
-            format!("转发了{original_author}的帖子：「{original_content}」")
+            if zh {
+                format!("转发了{original_author}的帖子：「{original_content}」")
+            } else {
+                format!("reposted {original_author}'s post: \"{original_content}\"")
+            }
         } else if !original_content.is_empty() {
-            format!("转发了一条帖子：「{original_content}」")
+            if zh {
+                format!("转发了一条帖子：「{original_content}」")
+            } else {
+                format!("reposted a post: \"{original_content}\"")
+            }
         } else if !original_author.is_empty() {
-            format!("转发了{original_author}的一条帖子")
-        } else {
+            if zh {
+                format!("转发了{original_author}的一条帖子")
+            } else {
+                format!("reposted a post by {original_author}")
+            }
+        } else if zh {
             "转发了一条帖子".to_string()
+        } else {
+            "reposted a post".to_string()
         }
     }
 
@@ -178,19 +230,38 @@ impl AgentActivity {
         let quote_content_raw = self.arg("quote_content");
         let quote_content =
             if !quote_content_raw.is_empty() { quote_content_raw } else { self.arg("content") };
+        let zh = crate::i18n::get_locale() == "zh";
 
         let mut base = if !original_content.is_empty() && !original_author.is_empty() {
-            format!("引用了{original_author}的帖子「{original_content}」")
+            if zh {
+                format!("引用了{original_author}的帖子「{original_content}」")
+            } else {
+                format!("quoted {original_author}'s post \"{original_content}\"")
+            }
         } else if !original_content.is_empty() {
-            format!("引用了一条帖子「{original_content}」")
+            if zh {
+                format!("引用了一条帖子「{original_content}」")
+            } else {
+                format!("quoted a post \"{original_content}\"")
+            }
         } else if !original_author.is_empty() {
-            format!("引用了{original_author}的一条帖子")
-        } else {
+            if zh {
+                format!("引用了{original_author}的一条帖子")
+            } else {
+                format!("quoted a post by {original_author}")
+            }
+        } else if zh {
             "引用了一条帖子".to_string()
+        } else {
+            "quoted a post".to_string()
         };
 
         if !quote_content.is_empty() {
-            base.push_str(&format!("，并评论道：「{quote_content}」"));
+            if zh {
+                base.push_str(&format!("，并评论道：「{quote_content}」"));
+            } else {
+                base.push_str(&format!(", and commented: \"{quote_content}\""));
+            }
         }
         base
     }
@@ -198,10 +269,17 @@ impl AgentActivity {
     /// Port of `_describe_follow` (L129-135).
     fn describe_follow(&self) -> String {
         let target_user_name = self.arg("target_user_name");
+        let zh = crate::i18n::get_locale() == "zh";
         if !target_user_name.is_empty() {
-            format!("关注了用户「{target_user_name}」")
-        } else {
+            if zh {
+                format!("关注了用户「{target_user_name}」")
+            } else {
+                format!("followed user \"{target_user_name}\"")
+            }
+        } else if zh {
             "关注了一个用户".to_string()
+        } else {
+            "followed a user".to_string()
         }
     }
 
@@ -213,19 +291,36 @@ impl AgentActivity {
         let content = self.arg("content");
         let post_content = self.arg("post_content");
         let post_author = self.arg("post_author_name");
+        let zh = crate::i18n::get_locale() == "zh";
 
         if !content.is_empty() {
             if !post_content.is_empty() && !post_author.is_empty() {
-                format!("在{post_author}的帖子「{post_content}」下评论道：「{content}」")
+                if zh {
+                    format!("在{post_author}的帖子「{post_content}」下评论道：「{content}」")
+                } else {
+                    format!("commented on {post_author}'s post \"{post_content}\": \"{content}\"")
+                }
             } else if !post_content.is_empty() {
-                format!("在帖子「{post_content}」下评论道：「{content}」")
+                if zh {
+                    format!("在帖子「{post_content}」下评论道：「{content}」")
+                } else {
+                    format!("commented on the post \"{post_content}\": \"{content}\"")
+                }
             } else if !post_author.is_empty() {
-                format!("在{post_author}的帖子下评论道：「{content}」")
-            } else {
+                if zh {
+                    format!("在{post_author}的帖子下评论道：「{content}」")
+                } else {
+                    format!("commented on {post_author}'s post: \"{content}\"")
+                }
+            } else if zh {
                 format!("评论道：「{content}」")
+            } else {
+                format!("commented: \"{content}\"")
             }
-        } else {
+        } else if zh {
             "发表了评论".to_string()
+        } else {
+            "posted a comment".to_string()
         }
     }
 
@@ -234,15 +329,30 @@ impl AgentActivity {
     fn describe_like_comment(&self) -> String {
         let comment_content = self.arg("comment_content");
         let comment_author = self.arg("comment_author_name");
+        let zh = crate::i18n::get_locale() == "zh";
 
         if !comment_content.is_empty() && !comment_author.is_empty() {
-            format!("点赞了{comment_author}的评论：「{comment_content}」")
+            if zh {
+                format!("点赞了{comment_author}的评论：「{comment_content}」")
+            } else {
+                format!("liked {comment_author}'s comment: \"{comment_content}\"")
+            }
         } else if !comment_content.is_empty() {
-            format!("点赞了一条评论：「{comment_content}」")
+            if zh {
+                format!("点赞了一条评论：「{comment_content}」")
+            } else {
+                format!("liked a comment: \"{comment_content}\"")
+            }
         } else if !comment_author.is_empty() {
-            format!("点赞了{comment_author}的一条评论")
-        } else {
+            if zh {
+                format!("点赞了{comment_author}的一条评论")
+            } else {
+                format!("liked a comment by {comment_author}")
+            }
+        } else if zh {
             "点赞了一条评论".to_string()
+        } else {
+            "liked a comment".to_string()
         }
     }
 
@@ -251,15 +361,30 @@ impl AgentActivity {
     fn describe_dislike_comment(&self) -> String {
         let comment_content = self.arg("comment_content");
         let comment_author = self.arg("comment_author_name");
+        let zh = crate::i18n::get_locale() == "zh";
 
         if !comment_content.is_empty() && !comment_author.is_empty() {
-            format!("踩了{comment_author}的评论：「{comment_content}」")
+            if zh {
+                format!("踩了{comment_author}的评论：「{comment_content}」")
+            } else {
+                format!("disliked {comment_author}'s comment: \"{comment_content}\"")
+            }
         } else if !comment_content.is_empty() {
-            format!("踩了一条评论：「{comment_content}」")
+            if zh {
+                format!("踩了一条评论：「{comment_content}」")
+            } else {
+                format!("disliked a comment: \"{comment_content}\"")
+            }
         } else if !comment_author.is_empty() {
-            format!("踩了{comment_author}的一条评论")
-        } else {
+            if zh {
+                format!("踩了{comment_author}的一条评论")
+            } else {
+                format!("disliked a comment by {comment_author}")
+            }
+        } else if zh {
             "踩了一条评论".to_string()
+        } else {
+            "disliked a comment".to_string()
         }
     }
 
@@ -269,10 +394,13 @@ impl AgentActivity {
     fn describe_search(&self) -> String {
         let query_raw = self.arg("query");
         let query = if !query_raw.is_empty() { query_raw } else { self.arg("keyword") };
+        let zh = crate::i18n::get_locale() == "zh";
         if !query.is_empty() {
-            format!("搜索了「{query}」")
-        } else {
+            if zh { format!("搜索了「{query}」") } else { format!("searched for \"{query}\"") }
+        } else if zh {
             "进行了搜索".to_string()
+        } else {
+            "performed a search".to_string()
         }
     }
 
@@ -282,27 +410,45 @@ impl AgentActivity {
     fn describe_search_user(&self) -> String {
         let query_raw = self.arg("query");
         let query = if !query_raw.is_empty() { query_raw } else { self.arg("username") };
+        let zh = crate::i18n::get_locale() == "zh";
         if !query.is_empty() {
-            format!("搜索了用户「{query}」")
-        } else {
+            if zh {
+                format!("搜索了用户「{query}」")
+            } else {
+                format!("searched for user \"{query}\"")
+            }
+        } else if zh {
             "搜索了用户".to_string()
+        } else {
+            "searched for a user".to_string()
         }
     }
 
     /// Port of `_describe_mute` (L189-195).
     fn describe_mute(&self) -> String {
         let target_user_name = self.arg("target_user_name");
+        let zh = crate::i18n::get_locale() == "zh";
         if !target_user_name.is_empty() {
-            format!("屏蔽了用户「{target_user_name}」")
-        } else {
+            if zh {
+                format!("屏蔽了用户「{target_user_name}」")
+            } else {
+                format!("blocked user \"{target_user_name}\"")
+            }
+        } else if zh {
             "屏蔽了一个用户".to_string()
+        } else {
+            "blocked a user".to_string()
         }
     }
 
     /// Port of `_describe_generic` (L197-199).
     /// Fallback for unknown action types.
     fn describe_generic(&self) -> String {
-        format!("执行了{}操作", self.action_type)
+        if crate::i18n::get_locale() == "zh" {
+            format!("执行了{}操作", self.action_type)
+        } else {
+            format!("performed a {} action", self.action_type)
+        }
     }
 }
 
@@ -312,6 +458,17 @@ impl AgentActivity {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Run a (sync-bodied) future under an explicit `zh` locale scope so the episode
+    /// formatter renders Chinese. teri is English-first (`get_locale()` defaults to `"en"`),
+    /// so the plain `#[test]` cases below already exercise the English-default arms; these
+    /// zh variants prove the Chinese output is preserved (owner rule: no downgrade).
+    async fn with_zh<F, T>(f: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        crate::i18n::with_locale("zh".to_string(), f).await
+    }
 
     /// Build a test `AgentActivity` with the given `action_type` and JSON args object.
     fn activity(action_type: &str, args: serde_json::Value) -> AgentActivity {
@@ -338,7 +495,16 @@ mod tests {
     #[test]
     fn test_to_episode_text_full_format() {
         let a = activity("CREATE_POST", json!({"content": "hello"}));
-        assert_eq!(a.to_episode_text(), "Alice: 发布了一条帖子：「hello」");
+        assert_eq!(a.to_episode_text(), "Alice: posted: \"hello\"");
+    }
+
+    #[tokio::test]
+    async fn test_to_episode_text_full_format_zh() {
+        with_zh(async {
+            let a = activity("CREATE_POST", json!({"content": "hello"}));
+            assert_eq!(a.to_episode_text(), "Alice: 发布了一条帖子：「hello」");
+        })
+        .await;
     }
 
     // ── unknown action_type → generic ─────────────────────────────────────────
@@ -346,7 +512,16 @@ mod tests {
     #[test]
     fn test_unknown_action_type_generic() {
         let a = activity("DANCE", json!({}));
-        assert_eq!(a.to_episode_text(), "Alice: 执行了DANCE操作");
+        assert_eq!(a.to_episode_text(), "Alice: performed a DANCE action");
+    }
+
+    #[tokio::test]
+    async fn test_unknown_action_type_generic_zh() {
+        with_zh(async {
+            let a = activity("DANCE", json!({}));
+            assert_eq!(a.to_episode_text(), "Alice: 执行了DANCE操作");
+        })
+        .await;
     }
 
     // ── CREATE_POST ───────────────────────────────────────────────────────────
@@ -354,13 +529,31 @@ mod tests {
     #[test]
     fn test_create_post_with_content() {
         let a = activity("CREATE_POST", json!({"content": "大家好"}));
-        assert_eq!(a.to_episode_text(), "Alice: 发布了一条帖子：「大家好」");
+        assert_eq!(a.to_episode_text(), "Alice: posted: \"大家好\"");
+    }
+
+    #[tokio::test]
+    async fn test_create_post_with_content_zh() {
+        with_zh(async {
+            let a = activity("CREATE_POST", json!({"content": "大家好"}));
+            assert_eq!(a.to_episode_text(), "Alice: 发布了一条帖子：「大家好」");
+        })
+        .await;
     }
 
     #[test]
     fn test_create_post_no_content() {
         let a = activity("CREATE_POST", json!({}));
-        assert_eq!(a.to_episode_text(), "Alice: 发布了一条帖子");
+        assert_eq!(a.to_episode_text(), "Alice: posted a post");
+    }
+
+    #[tokio::test]
+    async fn test_create_post_no_content_zh() {
+        with_zh(async {
+            let a = activity("CREATE_POST", json!({}));
+            assert_eq!(a.to_episode_text(), "Alice: 发布了一条帖子");
+        })
+        .await;
     }
 
     // ── LIKE_POST (4 branches) ────────────────────────────────────────────────
@@ -368,25 +561,62 @@ mod tests {
     #[test]
     fn test_like_post_content_and_author() {
         let a = activity("LIKE_POST", json!({"post_content": "好文章", "post_author_name": "Bob"}));
-        assert_eq!(a.to_episode_text(), "Alice: 点赞了Bob的帖子：「好文章」");
+        assert_eq!(a.to_episode_text(), "Alice: liked Bob's post: \"好文章\"");
+    }
+
+    #[tokio::test]
+    async fn test_like_post_content_and_author_zh() {
+        with_zh(async {
+            let a =
+                activity("LIKE_POST", json!({"post_content": "好文章", "post_author_name": "Bob"}));
+            assert_eq!(a.to_episode_text(), "Alice: 点赞了Bob的帖子：「好文章」");
+        })
+        .await;
     }
 
     #[test]
     fn test_like_post_content_only() {
         let a = activity("LIKE_POST", json!({"post_content": "好文章"}));
-        assert_eq!(a.to_episode_text(), "Alice: 点赞了一条帖子：「好文章」");
+        assert_eq!(a.to_episode_text(), "Alice: liked a post: \"好文章\"");
+    }
+
+    #[tokio::test]
+    async fn test_like_post_content_only_zh() {
+        with_zh(async {
+            let a = activity("LIKE_POST", json!({"post_content": "好文章"}));
+            assert_eq!(a.to_episode_text(), "Alice: 点赞了一条帖子：「好文章」");
+        })
+        .await;
     }
 
     #[test]
     fn test_like_post_author_only() {
         let a = activity("LIKE_POST", json!({"post_author_name": "Bob"}));
-        assert_eq!(a.to_episode_text(), "Alice: 点赞了Bob的一条帖子");
+        assert_eq!(a.to_episode_text(), "Alice: liked a post by Bob");
+    }
+
+    #[tokio::test]
+    async fn test_like_post_author_only_zh() {
+        with_zh(async {
+            let a = activity("LIKE_POST", json!({"post_author_name": "Bob"}));
+            assert_eq!(a.to_episode_text(), "Alice: 点赞了Bob的一条帖子");
+        })
+        .await;
     }
 
     #[test]
     fn test_like_post_neither() {
         let a = activity("LIKE_POST", json!({}));
-        assert_eq!(a.to_episode_text(), "Alice: 点赞了一条帖子");
+        assert_eq!(a.to_episode_text(), "Alice: liked a post");
+    }
+
+    #[tokio::test]
+    async fn test_like_post_neither_zh() {
+        with_zh(async {
+            let a = activity("LIKE_POST", json!({}));
+            assert_eq!(a.to_episode_text(), "Alice: 点赞了一条帖子");
+        })
+        .await;
     }
 
     // ── DISLIKE_POST (4 branches) ─────────────────────────────────────────────
@@ -395,25 +625,64 @@ mod tests {
     fn test_dislike_post_content_and_author() {
         let a =
             activity("DISLIKE_POST", json!({"post_content": "差文章", "post_author_name": "Bob"}));
-        assert_eq!(a.to_episode_text(), "Alice: 踩了Bob的帖子：「差文章」");
+        assert_eq!(a.to_episode_text(), "Alice: disliked Bob's post: \"差文章\"");
+    }
+
+    #[tokio::test]
+    async fn test_dislike_post_content_and_author_zh() {
+        with_zh(async {
+            let a = activity(
+                "DISLIKE_POST",
+                json!({"post_content": "差文章", "post_author_name": "Bob"}),
+            );
+            assert_eq!(a.to_episode_text(), "Alice: 踩了Bob的帖子：「差文章」");
+        })
+        .await;
     }
 
     #[test]
     fn test_dislike_post_content_only() {
         let a = activity("DISLIKE_POST", json!({"post_content": "差文章"}));
-        assert_eq!(a.to_episode_text(), "Alice: 踩了一条帖子：「差文章」");
+        assert_eq!(a.to_episode_text(), "Alice: disliked a post: \"差文章\"");
+    }
+
+    #[tokio::test]
+    async fn test_dislike_post_content_only_zh() {
+        with_zh(async {
+            let a = activity("DISLIKE_POST", json!({"post_content": "差文章"}));
+            assert_eq!(a.to_episode_text(), "Alice: 踩了一条帖子：「差文章」");
+        })
+        .await;
     }
 
     #[test]
     fn test_dislike_post_author_only() {
         let a = activity("DISLIKE_POST", json!({"post_author_name": "Bob"}));
-        assert_eq!(a.to_episode_text(), "Alice: 踩了Bob的一条帖子");
+        assert_eq!(a.to_episode_text(), "Alice: disliked a post by Bob");
+    }
+
+    #[tokio::test]
+    async fn test_dislike_post_author_only_zh() {
+        with_zh(async {
+            let a = activity("DISLIKE_POST", json!({"post_author_name": "Bob"}));
+            assert_eq!(a.to_episode_text(), "Alice: 踩了Bob的一条帖子");
+        })
+        .await;
     }
 
     #[test]
     fn test_dislike_post_neither() {
         let a = activity("DISLIKE_POST", json!({}));
-        assert_eq!(a.to_episode_text(), "Alice: 踩了一条帖子");
+        assert_eq!(a.to_episode_text(), "Alice: disliked a post");
+    }
+
+    #[tokio::test]
+    async fn test_dislike_post_neither_zh() {
+        with_zh(async {
+            let a = activity("DISLIKE_POST", json!({}));
+            assert_eq!(a.to_episode_text(), "Alice: 踩了一条帖子");
+        })
+        .await;
     }
 
     // ── REPOST (4 branches) ───────────────────────────────────────────────────
@@ -424,25 +693,64 @@ mod tests {
             "REPOST",
             json!({"original_content": "原文", "original_author_name": "Carol"}),
         );
-        assert_eq!(a.to_episode_text(), "Alice: 转发了Carol的帖子：「原文」");
+        assert_eq!(a.to_episode_text(), "Alice: reposted Carol's post: \"原文\"");
+    }
+
+    #[tokio::test]
+    async fn test_repost_content_and_author_zh() {
+        with_zh(async {
+            let a = activity(
+                "REPOST",
+                json!({"original_content": "原文", "original_author_name": "Carol"}),
+            );
+            assert_eq!(a.to_episode_text(), "Alice: 转发了Carol的帖子：「原文」");
+        })
+        .await;
     }
 
     #[test]
     fn test_repost_content_only() {
         let a = activity("REPOST", json!({"original_content": "原文"}));
-        assert_eq!(a.to_episode_text(), "Alice: 转发了一条帖子：「原文」");
+        assert_eq!(a.to_episode_text(), "Alice: reposted a post: \"原文\"");
+    }
+
+    #[tokio::test]
+    async fn test_repost_content_only_zh() {
+        with_zh(async {
+            let a = activity("REPOST", json!({"original_content": "原文"}));
+            assert_eq!(a.to_episode_text(), "Alice: 转发了一条帖子：「原文」");
+        })
+        .await;
     }
 
     #[test]
     fn test_repost_author_only() {
         let a = activity("REPOST", json!({"original_author_name": "Carol"}));
-        assert_eq!(a.to_episode_text(), "Alice: 转发了Carol的一条帖子");
+        assert_eq!(a.to_episode_text(), "Alice: reposted a post by Carol");
+    }
+
+    #[tokio::test]
+    async fn test_repost_author_only_zh() {
+        with_zh(async {
+            let a = activity("REPOST", json!({"original_author_name": "Carol"}));
+            assert_eq!(a.to_episode_text(), "Alice: 转发了Carol的一条帖子");
+        })
+        .await;
     }
 
     #[test]
     fn test_repost_neither() {
         let a = activity("REPOST", json!({}));
-        assert_eq!(a.to_episode_text(), "Alice: 转发了一条帖子");
+        assert_eq!(a.to_episode_text(), "Alice: reposted a post");
+    }
+
+    #[tokio::test]
+    async fn test_repost_neither_zh() {
+        with_zh(async {
+            let a = activity("REPOST", json!({}));
+            assert_eq!(a.to_episode_text(), "Alice: 转发了一条帖子");
+        })
+        .await;
     }
 
     // ── QUOTE_POST (4-way base + quote_content suffix + or-fallback) ──────────
@@ -457,7 +765,29 @@ mod tests {
                 "quote_content": "我的评论"
             }),
         );
-        assert_eq!(a.to_episode_text(), "Alice: 引用了Carol的帖子「原文」，并评论道：「我的评论」");
+        assert_eq!(
+            a.to_episode_text(),
+            "Alice: quoted Carol's post \"原文\", and commented: \"我的评论\""
+        );
+    }
+
+    #[tokio::test]
+    async fn test_quote_post_content_author_and_quote_zh() {
+        with_zh(async {
+            let a = activity(
+                "QUOTE_POST",
+                json!({
+                    "original_content": "原文",
+                    "original_author_name": "Carol",
+                    "quote_content": "我的评论"
+                }),
+            );
+            assert_eq!(
+                a.to_episode_text(),
+                "Alice: 引用了Carol的帖子「原文」，并评论道：「我的评论」"
+            );
+        })
+        .await;
     }
 
     #[test]
@@ -466,46 +796,113 @@ mod tests {
             "QUOTE_POST",
             json!({"original_content": "原文", "original_author_name": "Carol"}),
         );
-        assert_eq!(a.to_episode_text(), "Alice: 引用了Carol的帖子「原文」");
+        assert_eq!(a.to_episode_text(), "Alice: quoted Carol's post \"原文\"");
+    }
+
+    #[tokio::test]
+    async fn test_quote_post_content_and_author_no_quote_zh() {
+        with_zh(async {
+            let a = activity(
+                "QUOTE_POST",
+                json!({"original_content": "原文", "original_author_name": "Carol"}),
+            );
+            assert_eq!(a.to_episode_text(), "Alice: 引用了Carol的帖子「原文」");
+        })
+        .await;
     }
 
     #[test]
     fn test_quote_post_original_content_only() {
         let a = activity("QUOTE_POST", json!({"original_content": "原文"}));
-        assert_eq!(a.to_episode_text(), "Alice: 引用了一条帖子「原文」");
+        assert_eq!(a.to_episode_text(), "Alice: quoted a post \"原文\"");
+    }
+
+    #[tokio::test]
+    async fn test_quote_post_original_content_only_zh() {
+        with_zh(async {
+            let a = activity("QUOTE_POST", json!({"original_content": "原文"}));
+            assert_eq!(a.to_episode_text(), "Alice: 引用了一条帖子「原文」");
+        })
+        .await;
     }
 
     #[test]
     fn test_quote_post_original_author_only() {
         let a = activity("QUOTE_POST", json!({"original_author_name": "Carol"}));
-        assert_eq!(a.to_episode_text(), "Alice: 引用了Carol的一条帖子");
+        assert_eq!(a.to_episode_text(), "Alice: quoted a post by Carol");
+    }
+
+    #[tokio::test]
+    async fn test_quote_post_original_author_only_zh() {
+        with_zh(async {
+            let a = activity("QUOTE_POST", json!({"original_author_name": "Carol"}));
+            assert_eq!(a.to_episode_text(), "Alice: 引用了Carol的一条帖子");
+        })
+        .await;
     }
 
     #[test]
     fn test_quote_post_neither_no_quote() {
         let a = activity("QUOTE_POST", json!({}));
-        assert_eq!(a.to_episode_text(), "Alice: 引用了一条帖子");
+        assert_eq!(a.to_episode_text(), "Alice: quoted a post");
+    }
+
+    #[tokio::test]
+    async fn test_quote_post_neither_no_quote_zh() {
+        with_zh(async {
+            let a = activity("QUOTE_POST", json!({}));
+            assert_eq!(a.to_episode_text(), "Alice: 引用了一条帖子");
+        })
+        .await;
     }
 
     /// quote_content absent but content present → or-fallback uses content.
     #[test]
     fn test_quote_post_or_fallback_uses_content() {
         let a = activity("QUOTE_POST", json!({"content": "备用评论"}));
-        assert_eq!(a.to_episode_text(), "Alice: 引用了一条帖子，并评论道：「备用评论」");
+        assert_eq!(a.to_episode_text(), "Alice: quoted a post, and commented: \"备用评论\"");
+    }
+
+    #[tokio::test]
+    async fn test_quote_post_or_fallback_uses_content_zh() {
+        with_zh(async {
+            let a = activity("QUOTE_POST", json!({"content": "备用评论"}));
+            assert_eq!(a.to_episode_text(), "Alice: 引用了一条帖子，并评论道：「备用评论」");
+        })
+        .await;
     }
 
     /// quote_content present (non-empty) → takes precedence over content.
     #[test]
     fn test_quote_post_or_fallback_quote_content_wins() {
         let a = activity("QUOTE_POST", json!({"quote_content": "优先评论", "content": "备用评论"}));
-        assert_eq!(a.to_episode_text(), "Alice: 引用了一条帖子，并评论道：「优先评论」");
+        assert_eq!(a.to_episode_text(), "Alice: quoted a post, and commented: \"优先评论\"");
+    }
+
+    #[tokio::test]
+    async fn test_quote_post_or_fallback_quote_content_wins_zh() {
+        with_zh(async {
+            let a =
+                activity("QUOTE_POST", json!({"quote_content": "优先评论", "content": "备用评论"}));
+            assert_eq!(a.to_episode_text(), "Alice: 引用了一条帖子，并评论道：「优先评论」");
+        })
+        .await;
     }
 
     /// quote_content is empty string → falls back to content (Python falsy or-chain).
     #[test]
     fn test_quote_post_or_fallback_empty_quote_content_uses_content() {
         let a = activity("QUOTE_POST", json!({"quote_content": "", "content": "备用评论"}));
-        assert_eq!(a.to_episode_text(), "Alice: 引用了一条帖子，并评论道：「备用评论」");
+        assert_eq!(a.to_episode_text(), "Alice: quoted a post, and commented: \"备用评论\"");
+    }
+
+    #[tokio::test]
+    async fn test_quote_post_or_fallback_empty_quote_content_uses_content_zh() {
+        with_zh(async {
+            let a = activity("QUOTE_POST", json!({"quote_content": "", "content": "备用评论"}));
+            assert_eq!(a.to_episode_text(), "Alice: 引用了一条帖子，并评论道：「备用评论」");
+        })
+        .await;
     }
 
     // ── FOLLOW ────────────────────────────────────────────────────────────────
@@ -513,13 +910,31 @@ mod tests {
     #[test]
     fn test_follow_with_name() {
         let a = activity("FOLLOW", json!({"target_user_name": "Dave"}));
-        assert_eq!(a.to_episode_text(), "Alice: 关注了用户「Dave」");
+        assert_eq!(a.to_episode_text(), "Alice: followed user \"Dave\"");
+    }
+
+    #[tokio::test]
+    async fn test_follow_with_name_zh() {
+        with_zh(async {
+            let a = activity("FOLLOW", json!({"target_user_name": "Dave"}));
+            assert_eq!(a.to_episode_text(), "Alice: 关注了用户「Dave」");
+        })
+        .await;
     }
 
     #[test]
     fn test_follow_no_name() {
         let a = activity("FOLLOW", json!({}));
-        assert_eq!(a.to_episode_text(), "Alice: 关注了一个用户");
+        assert_eq!(a.to_episode_text(), "Alice: followed a user");
+    }
+
+    #[tokio::test]
+    async fn test_follow_no_name_zh() {
+        with_zh(async {
+            let a = activity("FOLLOW", json!({}));
+            assert_eq!(a.to_episode_text(), "Alice: 关注了一个用户");
+        })
+        .await;
     }
 
     // ── CREATE_COMMENT (outer content branch + 4-way inner) ──────────────────
@@ -534,32 +949,88 @@ mod tests {
                 "post_author_name": "Eve"
             }),
         );
-        assert_eq!(a.to_episode_text(), "Alice: 在Eve的帖子「原帖」下评论道：「我的看法」");
+        assert_eq!(a.to_episode_text(), "Alice: commented on Eve's post \"原帖\": \"我的看法\"");
+    }
+
+    #[tokio::test]
+    async fn test_create_comment_content_post_content_and_author_zh() {
+        with_zh(async {
+            let a = activity(
+                "CREATE_COMMENT",
+                json!({
+                    "content": "我的看法",
+                    "post_content": "原帖",
+                    "post_author_name": "Eve"
+                }),
+            );
+            assert_eq!(a.to_episode_text(), "Alice: 在Eve的帖子「原帖」下评论道：「我的看法」");
+        })
+        .await;
     }
 
     #[test]
     fn test_create_comment_content_post_content_only() {
         let a = activity("CREATE_COMMENT", json!({"content": "我的看法", "post_content": "原帖"}));
-        assert_eq!(a.to_episode_text(), "Alice: 在帖子「原帖」下评论道：「我的看法」");
+        assert_eq!(a.to_episode_text(), "Alice: commented on the post \"原帖\": \"我的看法\"");
+    }
+
+    #[tokio::test]
+    async fn test_create_comment_content_post_content_only_zh() {
+        with_zh(async {
+            let a =
+                activity("CREATE_COMMENT", json!({"content": "我的看法", "post_content": "原帖"}));
+            assert_eq!(a.to_episode_text(), "Alice: 在帖子「原帖」下评论道：「我的看法」");
+        })
+        .await;
     }
 
     #[test]
     fn test_create_comment_content_post_author_only() {
         let a =
             activity("CREATE_COMMENT", json!({"content": "我的看法", "post_author_name": "Eve"}));
-        assert_eq!(a.to_episode_text(), "Alice: 在Eve的帖子下评论道：「我的看法」");
+        assert_eq!(a.to_episode_text(), "Alice: commented on Eve's post: \"我的看法\"");
+    }
+
+    #[tokio::test]
+    async fn test_create_comment_content_post_author_only_zh() {
+        with_zh(async {
+            let a = activity(
+                "CREATE_COMMENT",
+                json!({"content": "我的看法", "post_author_name": "Eve"}),
+            );
+            assert_eq!(a.to_episode_text(), "Alice: 在Eve的帖子下评论道：「我的看法」");
+        })
+        .await;
     }
 
     #[test]
     fn test_create_comment_content_no_post_info() {
         let a = activity("CREATE_COMMENT", json!({"content": "我的看法"}));
-        assert_eq!(a.to_episode_text(), "Alice: 评论道：「我的看法」");
+        assert_eq!(a.to_episode_text(), "Alice: commented: \"我的看法\"");
+    }
+
+    #[tokio::test]
+    async fn test_create_comment_content_no_post_info_zh() {
+        with_zh(async {
+            let a = activity("CREATE_COMMENT", json!({"content": "我的看法"}));
+            assert_eq!(a.to_episode_text(), "Alice: 评论道：「我的看法」");
+        })
+        .await;
     }
 
     #[test]
     fn test_create_comment_no_content() {
         let a = activity("CREATE_COMMENT", json!({}));
-        assert_eq!(a.to_episode_text(), "Alice: 发表了评论");
+        assert_eq!(a.to_episode_text(), "Alice: posted a comment");
+    }
+
+    #[tokio::test]
+    async fn test_create_comment_no_content_zh() {
+        with_zh(async {
+            let a = activity("CREATE_COMMENT", json!({}));
+            assert_eq!(a.to_episode_text(), "Alice: 发表了评论");
+        })
+        .await;
     }
 
     // ── LIKE_COMMENT (4 branches) ─────────────────────────────────────────────
@@ -570,25 +1041,64 @@ mod tests {
             "LIKE_COMMENT",
             json!({"comment_content": "好评论", "comment_author_name": "Frank"}),
         );
-        assert_eq!(a.to_episode_text(), "Alice: 点赞了Frank的评论：「好评论」");
+        assert_eq!(a.to_episode_text(), "Alice: liked Frank's comment: \"好评论\"");
+    }
+
+    #[tokio::test]
+    async fn test_like_comment_content_and_author_zh() {
+        with_zh(async {
+            let a = activity(
+                "LIKE_COMMENT",
+                json!({"comment_content": "好评论", "comment_author_name": "Frank"}),
+            );
+            assert_eq!(a.to_episode_text(), "Alice: 点赞了Frank的评论：「好评论」");
+        })
+        .await;
     }
 
     #[test]
     fn test_like_comment_content_only() {
         let a = activity("LIKE_COMMENT", json!({"comment_content": "好评论"}));
-        assert_eq!(a.to_episode_text(), "Alice: 点赞了一条评论：「好评论」");
+        assert_eq!(a.to_episode_text(), "Alice: liked a comment: \"好评论\"");
+    }
+
+    #[tokio::test]
+    async fn test_like_comment_content_only_zh() {
+        with_zh(async {
+            let a = activity("LIKE_COMMENT", json!({"comment_content": "好评论"}));
+            assert_eq!(a.to_episode_text(), "Alice: 点赞了一条评论：「好评论」");
+        })
+        .await;
     }
 
     #[test]
     fn test_like_comment_author_only() {
         let a = activity("LIKE_COMMENT", json!({"comment_author_name": "Frank"}));
-        assert_eq!(a.to_episode_text(), "Alice: 点赞了Frank的一条评论");
+        assert_eq!(a.to_episode_text(), "Alice: liked a comment by Frank");
+    }
+
+    #[tokio::test]
+    async fn test_like_comment_author_only_zh() {
+        with_zh(async {
+            let a = activity("LIKE_COMMENT", json!({"comment_author_name": "Frank"}));
+            assert_eq!(a.to_episode_text(), "Alice: 点赞了Frank的一条评论");
+        })
+        .await;
     }
 
     #[test]
     fn test_like_comment_neither() {
         let a = activity("LIKE_COMMENT", json!({}));
-        assert_eq!(a.to_episode_text(), "Alice: 点赞了一条评论");
+        assert_eq!(a.to_episode_text(), "Alice: liked a comment");
+    }
+
+    #[tokio::test]
+    async fn test_like_comment_neither_zh() {
+        with_zh(async {
+            let a = activity("LIKE_COMMENT", json!({}));
+            assert_eq!(a.to_episode_text(), "Alice: 点赞了一条评论");
+        })
+        .await;
     }
 
     // ── DISLIKE_COMMENT (4 branches) ──────────────────────────────────────────
@@ -599,25 +1109,64 @@ mod tests {
             "DISLIKE_COMMENT",
             json!({"comment_content": "差评论", "comment_author_name": "Frank"}),
         );
-        assert_eq!(a.to_episode_text(), "Alice: 踩了Frank的评论：「差评论」");
+        assert_eq!(a.to_episode_text(), "Alice: disliked Frank's comment: \"差评论\"");
+    }
+
+    #[tokio::test]
+    async fn test_dislike_comment_content_and_author_zh() {
+        with_zh(async {
+            let a = activity(
+                "DISLIKE_COMMENT",
+                json!({"comment_content": "差评论", "comment_author_name": "Frank"}),
+            );
+            assert_eq!(a.to_episode_text(), "Alice: 踩了Frank的评论：「差评论」");
+        })
+        .await;
     }
 
     #[test]
     fn test_dislike_comment_content_only() {
         let a = activity("DISLIKE_COMMENT", json!({"comment_content": "差评论"}));
-        assert_eq!(a.to_episode_text(), "Alice: 踩了一条评论：「差评论」");
+        assert_eq!(a.to_episode_text(), "Alice: disliked a comment: \"差评论\"");
+    }
+
+    #[tokio::test]
+    async fn test_dislike_comment_content_only_zh() {
+        with_zh(async {
+            let a = activity("DISLIKE_COMMENT", json!({"comment_content": "差评论"}));
+            assert_eq!(a.to_episode_text(), "Alice: 踩了一条评论：「差评论」");
+        })
+        .await;
     }
 
     #[test]
     fn test_dislike_comment_author_only() {
         let a = activity("DISLIKE_COMMENT", json!({"comment_author_name": "Frank"}));
-        assert_eq!(a.to_episode_text(), "Alice: 踩了Frank的一条评论");
+        assert_eq!(a.to_episode_text(), "Alice: disliked a comment by Frank");
+    }
+
+    #[tokio::test]
+    async fn test_dislike_comment_author_only_zh() {
+        with_zh(async {
+            let a = activity("DISLIKE_COMMENT", json!({"comment_author_name": "Frank"}));
+            assert_eq!(a.to_episode_text(), "Alice: 踩了Frank的一条评论");
+        })
+        .await;
     }
 
     #[test]
     fn test_dislike_comment_neither() {
         let a = activity("DISLIKE_COMMENT", json!({}));
-        assert_eq!(a.to_episode_text(), "Alice: 踩了一条评论");
+        assert_eq!(a.to_episode_text(), "Alice: disliked a comment");
+    }
+
+    #[tokio::test]
+    async fn test_dislike_comment_neither_zh() {
+        with_zh(async {
+            let a = activity("DISLIKE_COMMENT", json!({}));
+            assert_eq!(a.to_episode_text(), "Alice: 踩了一条评论");
+        })
+        .await;
     }
 
     // ── SEARCH_POSTS (query / keyword or-fallback) ────────────────────────────
@@ -625,34 +1174,79 @@ mod tests {
     #[test]
     fn test_search_posts_with_query() {
         let a = activity("SEARCH_POSTS", json!({"query": "Rust"}));
-        assert_eq!(a.to_episode_text(), "Alice: 搜索了「Rust」");
+        assert_eq!(a.to_episode_text(), "Alice: searched for \"Rust\"");
+    }
+
+    #[tokio::test]
+    async fn test_search_posts_with_query_zh() {
+        with_zh(async {
+            let a = activity("SEARCH_POSTS", json!({"query": "Rust"}));
+            assert_eq!(a.to_episode_text(), "Alice: 搜索了「Rust」");
+        })
+        .await;
     }
 
     /// query absent, keyword present → or-fallback uses keyword.
     #[test]
     fn test_search_posts_keyword_fallback() {
         let a = activity("SEARCH_POSTS", json!({"keyword": "开源"}));
-        assert_eq!(a.to_episode_text(), "Alice: 搜索了「开源」");
+        assert_eq!(a.to_episode_text(), "Alice: searched for \"开源\"");
+    }
+
+    #[tokio::test]
+    async fn test_search_posts_keyword_fallback_zh() {
+        with_zh(async {
+            let a = activity("SEARCH_POSTS", json!({"keyword": "开源"}));
+            assert_eq!(a.to_episode_text(), "Alice: 搜索了「开源」");
+        })
+        .await;
     }
 
     /// query is non-empty → takes precedence over keyword.
     #[test]
     fn test_search_posts_query_wins_over_keyword() {
         let a = activity("SEARCH_POSTS", json!({"query": "Rust", "keyword": "开源"}));
-        assert_eq!(a.to_episode_text(), "Alice: 搜索了「Rust」");
+        assert_eq!(a.to_episode_text(), "Alice: searched for \"Rust\"");
+    }
+
+    #[tokio::test]
+    async fn test_search_posts_query_wins_over_keyword_zh() {
+        with_zh(async {
+            let a = activity("SEARCH_POSTS", json!({"query": "Rust", "keyword": "开源"}));
+            assert_eq!(a.to_episode_text(), "Alice: 搜索了「Rust」");
+        })
+        .await;
     }
 
     /// query empty string → falls back to keyword.
     #[test]
     fn test_search_posts_empty_query_uses_keyword() {
         let a = activity("SEARCH_POSTS", json!({"query": "", "keyword": "开源"}));
-        assert_eq!(a.to_episode_text(), "Alice: 搜索了「开源」");
+        assert_eq!(a.to_episode_text(), "Alice: searched for \"开源\"");
+    }
+
+    #[tokio::test]
+    async fn test_search_posts_empty_query_uses_keyword_zh() {
+        with_zh(async {
+            let a = activity("SEARCH_POSTS", json!({"query": "", "keyword": "开源"}));
+            assert_eq!(a.to_episode_text(), "Alice: 搜索了「开源」");
+        })
+        .await;
     }
 
     #[test]
     fn test_search_posts_no_query_no_keyword() {
         let a = activity("SEARCH_POSTS", json!({}));
-        assert_eq!(a.to_episode_text(), "Alice: 进行了搜索");
+        assert_eq!(a.to_episode_text(), "Alice: performed a search");
+    }
+
+    #[tokio::test]
+    async fn test_search_posts_no_query_no_keyword_zh() {
+        with_zh(async {
+            let a = activity("SEARCH_POSTS", json!({}));
+            assert_eq!(a.to_episode_text(), "Alice: 进行了搜索");
+        })
+        .await;
     }
 
     // ── SEARCH_USER (query / username or-fallback) ────────────────────────────
@@ -660,34 +1254,79 @@ mod tests {
     #[test]
     fn test_search_user_with_query() {
         let a = activity("SEARCH_USER", json!({"query": "Alice"}));
-        assert_eq!(a.to_episode_text(), "Alice: 搜索了用户「Alice」");
+        assert_eq!(a.to_episode_text(), "Alice: searched for user \"Alice\"");
+    }
+
+    #[tokio::test]
+    async fn test_search_user_with_query_zh() {
+        with_zh(async {
+            let a = activity("SEARCH_USER", json!({"query": "Alice"}));
+            assert_eq!(a.to_episode_text(), "Alice: 搜索了用户「Alice」");
+        })
+        .await;
     }
 
     /// query absent, username present → or-fallback uses username.
     #[test]
     fn test_search_user_username_fallback() {
         let a = activity("SEARCH_USER", json!({"username": "Bob"}));
-        assert_eq!(a.to_episode_text(), "Alice: 搜索了用户「Bob」");
+        assert_eq!(a.to_episode_text(), "Alice: searched for user \"Bob\"");
+    }
+
+    #[tokio::test]
+    async fn test_search_user_username_fallback_zh() {
+        with_zh(async {
+            let a = activity("SEARCH_USER", json!({"username": "Bob"}));
+            assert_eq!(a.to_episode_text(), "Alice: 搜索了用户「Bob」");
+        })
+        .await;
     }
 
     /// query non-empty → takes precedence over username.
     #[test]
     fn test_search_user_query_wins_over_username() {
         let a = activity("SEARCH_USER", json!({"query": "Alice", "username": "Bob"}));
-        assert_eq!(a.to_episode_text(), "Alice: 搜索了用户「Alice」");
+        assert_eq!(a.to_episode_text(), "Alice: searched for user \"Alice\"");
+    }
+
+    #[tokio::test]
+    async fn test_search_user_query_wins_over_username_zh() {
+        with_zh(async {
+            let a = activity("SEARCH_USER", json!({"query": "Alice", "username": "Bob"}));
+            assert_eq!(a.to_episode_text(), "Alice: 搜索了用户「Alice」");
+        })
+        .await;
     }
 
     /// query empty string → falls back to username.
     #[test]
     fn test_search_user_empty_query_uses_username() {
         let a = activity("SEARCH_USER", json!({"query": "", "username": "Bob"}));
-        assert_eq!(a.to_episode_text(), "Alice: 搜索了用户「Bob」");
+        assert_eq!(a.to_episode_text(), "Alice: searched for user \"Bob\"");
+    }
+
+    #[tokio::test]
+    async fn test_search_user_empty_query_uses_username_zh() {
+        with_zh(async {
+            let a = activity("SEARCH_USER", json!({"query": "", "username": "Bob"}));
+            assert_eq!(a.to_episode_text(), "Alice: 搜索了用户「Bob」");
+        })
+        .await;
     }
 
     #[test]
     fn test_search_user_no_query_no_username() {
         let a = activity("SEARCH_USER", json!({}));
-        assert_eq!(a.to_episode_text(), "Alice: 搜索了用户");
+        assert_eq!(a.to_episode_text(), "Alice: searched for a user");
+    }
+
+    #[tokio::test]
+    async fn test_search_user_no_query_no_username_zh() {
+        with_zh(async {
+            let a = activity("SEARCH_USER", json!({}));
+            assert_eq!(a.to_episode_text(), "Alice: 搜索了用户");
+        })
+        .await;
     }
 
     // ── MUTE ─────────────────────────────────────────────────────────────────
@@ -695,13 +1334,31 @@ mod tests {
     #[test]
     fn test_mute_with_name() {
         let a = activity("MUTE", json!({"target_user_name": "Troll"}));
-        assert_eq!(a.to_episode_text(), "Alice: 屏蔽了用户「Troll」");
+        assert_eq!(a.to_episode_text(), "Alice: blocked user \"Troll\"");
+    }
+
+    #[tokio::test]
+    async fn test_mute_with_name_zh() {
+        with_zh(async {
+            let a = activity("MUTE", json!({"target_user_name": "Troll"}));
+            assert_eq!(a.to_episode_text(), "Alice: 屏蔽了用户「Troll」");
+        })
+        .await;
     }
 
     #[test]
     fn test_mute_no_name() {
         let a = activity("MUTE", json!({}));
-        assert_eq!(a.to_episode_text(), "Alice: 屏蔽了一个用户");
+        assert_eq!(a.to_episode_text(), "Alice: blocked a user");
+    }
+
+    #[tokio::test]
+    async fn test_mute_no_name_zh() {
+        with_zh(async {
+            let a = activity("MUTE", json!({}));
+            assert_eq!(a.to_episode_text(), "Alice: 屏蔽了一个用户");
+        })
+        .await;
     }
 
     // ── Serialization round-trip (serde) ──────────────────────────────────────
