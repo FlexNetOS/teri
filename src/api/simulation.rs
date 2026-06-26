@@ -718,7 +718,8 @@ async fn get_simulation_history(
                 .iter()
                 .take(3)
                 .map(|f| {
-                    let filename = f.get("filename").and_then(|v| v.as_str()).unwrap_or("未知文件");
+                    let filename =
+                        f.get("filename").and_then(|v| v.as_str()).unwrap_or("Unknown file");
                     let mut fm = Map::with_capacity(1);
                     fm.insert("filename".to_string(), Value::String(filename.to_string()));
                     Value::Object(fm)
@@ -884,7 +885,7 @@ async fn prepare_simulation_route(
         Ok(g) => g,
         Err(_) => {
             tracing::warn!(
-                "同步获取实体数量失败（将在后台任务中重试）: graph resolve failed for graph_id={}",
+                "Synchronous entity-count fetch failed (will retry in background task): graph resolve failed for graph_id={}",
                 sim_state.graph_id
             );
             crate::graph::KnowledgeGraph::new()
@@ -1888,13 +1889,19 @@ pub(crate) fn check_simulation_prepared(
     let raw = match std::fs::read_to_string(&state_file) {
         Ok(r) => r,
         Err(e) => {
-            return (false, serde_json::json!({"reason": format!("读取状态文件失败: {e}")}));
+            return (
+                false,
+                serde_json::json!({"reason": format!("Failed to read state file: {e}")}),
+            );
         }
     };
     let mut state_data: Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(e) => {
-            return (false, serde_json::json!({"reason": format!("读取状态文件失败: {e}")}));
+            return (
+                false,
+                serde_json::json!({"reason": format!("Failed to read state file: {e}")}),
+            );
         }
     };
 
@@ -1926,14 +1933,17 @@ pub(crate) fn check_simulation_prepared(
                 Ok(json_str) => {
                     if let Err(e) = std::fs::write(&state_file, json_str.as_bytes()) {
                         // Python :333-334: catch, log warn, continue
-                        tracing::warn!("自动更新状态失败: {e}");
+                        tracing::warn!("Auto status update failed: {e}");
                     } else {
                         effective_status = "ready".to_string();
-                        tracing::info!("自动更新模拟状态: {} preparing -> ready", simulation_id);
+                        tracing::info!(
+                            "Auto-updated simulation status: {} preparing -> ready",
+                            simulation_id
+                        );
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("自动更新状态失败: {e}");
+                    tracing::warn!("Auto status update failed: {e}");
                 }
             }
         }
@@ -1964,7 +1974,7 @@ pub(crate) fn check_simulation_prepared(
             false,
             serde_json::json!({
                 "reason": format!(
-                    "状态不在已准备列表中或config_generated为false: status={status}, config_generated={config_generated}"
+                    "Status not in the prepared list or config_generated is false: status={status}, config_generated={config_generated}"
                 ),
                 "status": status,
                 "config_generated": config_generated
@@ -2132,7 +2142,8 @@ async fn build_run_inputs(
         .ok_or_else(|| {
             ApiError::client(
                 StatusCode::BAD_REQUEST,
-                "模拟配置不存在，请先调用 /prepare 接口".to_string(),
+                "Simulation config does not exist; please call the /prepare endpoint first"
+                    .to_string(),
             )
         })?;
 
@@ -2291,7 +2302,7 @@ async fn start_simulation(
                 if force {
                     // Force-stop; warn on error, swallow (Python :1554-1558)
                     if let Err(e) = state.sim_runner.stop_simulation(id).await {
-                        tracing::warn!("停止模拟时出现警告: {e}");
+                        tracing::warn!("Warning while stopping simulation: {e}");
                     }
                 } else {
                     return Err(ApiError::client(
@@ -2305,7 +2316,7 @@ async fn start_simulation(
             if force {
                 let r = state.sim_runner.cleanup_simulation_logs(id).await;
                 if !r.success {
-                    tracing::warn!("清理日志时出现警告: {:?}", r.errors);
+                    tracing::warn!("Warning while cleaning up logs: {:?}", r.errors);
                 }
                 force_restarted = true;
             }
@@ -3030,10 +3041,16 @@ fn read_comments_response(
 // ---------------------------------------------------------------------------
 
 /// Interview prompt prefix (`simulation.py:23`).  Prepended so the agent replies with text instead
-/// of invoking tools.  The CJK literal is OBSERVABLE in the prompt sent to the agent — preserve
-/// it byte-for-byte.
-const INTERVIEW_PROMPT_PREFIX: &str =
+/// of invoking tools.  This text is OBSERVABLE in the prompt sent to the agent, so it is
+/// English-default with the Chinese (zh) variant preserved byte-for-byte.
+const INTERVIEW_PROMPT_PREFIX_ZH: &str =
     "结合你的人设、所有的过往记忆与行动，不调用任何工具直接用文本回复我：";
+const INTERVIEW_PROMPT_PREFIX_EN: &str = "Drawing on your persona and all of your past memories and actions, reply to me directly in plain text without calling any tools: ";
+
+/// Locale-selected interview prompt prefix (English default, Chinese for zh).
+fn interview_prompt_prefix() -> &'static str {
+    crate::i18n::localized(INTERVIEW_PROMPT_PREFIX_EN, INTERVIEW_PROMPT_PREFIX_ZH)
+}
 
 /// Port of `optimize_interview_prompt` (`simulation.py:28-43`).  Pure string: empty → unchanged;
 /// already-prefixed → unchanged (no double prefix); else prepend the prefix.
@@ -3041,10 +3058,11 @@ fn optimize_interview_prompt(prompt: &str) -> String {
     if prompt.is_empty() {
         return String::new();
     }
-    if prompt.starts_with(INTERVIEW_PROMPT_PREFIX) {
+    let prefix = interview_prompt_prefix();
+    if prompt.starts_with(prefix) {
         return prompt.to_string();
     }
-    format!("{INTERVIEW_PROMPT_PREFIX}{prompt}")
+    format!("{prefix}{prompt}")
 }
 
 /// Parse a `timeout` field (JSON number, seconds) with a default; non-finite/negative → default
@@ -6213,10 +6231,21 @@ mod tests {
     fn optimize_interview_prompt_behaviors() {
         assert_eq!(optimize_interview_prompt(""), "");
         let p = optimize_interview_prompt("你好");
-        assert!(p.starts_with(INTERVIEW_PROMPT_PREFIX), "prefix prepended");
+        // Default locale is English-first → the English prefix is prepended.
+        assert!(p.starts_with(INTERVIEW_PROMPT_PREFIX_EN), "prefix prepended");
         assert!(p.ends_with("你好"));
         // No double prefix.
         assert_eq!(optimize_interview_prompt(&p), p);
+    }
+
+    /// Under a zh locale the Chinese interview prefix is used (no downgrade).
+    #[tokio::test]
+    async fn optimize_interview_prompt_is_chinese_under_zh() {
+        let p = crate::i18n::with_locale("zh".to_string(), async {
+            optimize_interview_prompt("你好")
+        })
+        .await;
+        assert!(p.starts_with(INTERVIEW_PROMPT_PREFIX_ZH), "zh prefix prepended");
     }
 
     // --- /interview ---
@@ -8302,8 +8331,8 @@ mod tests {
         assert_eq!(files.len(), 3, "files must be capped at 3");
         assert_eq!(files[0]["filename"], "a.txt");
         assert_eq!(files[1]["filename"], "b.txt");
-        // third file has no filename key → 未知文件 default
-        assert_eq!(files[2]["filename"], "未知文件");
+        // third file has no filename key → "Unknown file" default
+        assert_eq!(files[2]["filename"], "Unknown file");
     }
 
     // =======================================================================

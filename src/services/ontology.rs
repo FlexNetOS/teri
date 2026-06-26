@@ -554,28 +554,46 @@ pub fn build_user_message(
     let combined_text: String = if original_length > MAX_TEXT_LENGTH_FOR_LLM {
         // Truncate to MAX chars (not bytes) — avoids slicing mid-UTF-8 sequence (py:244-246)
         let truncated: String = combined_raw.chars().take(MAX_TEXT_LENGTH_FOR_LLM).collect();
-        format!(
-            "{}\n\n...(原文共{}字，已截取前{}字用于本体分析)...",
-            truncated, original_length, MAX_TEXT_LENGTH_FOR_LLM
+        // Truncation notice is part of the LLM prompt → English-default, Chinese preserved for zh.
+        let notice = crate::i18n::localized(
+            "\n\n...(original text was {orig} chars; first {max} chars taken for ontology analysis)...",
+            "\n\n...(原文共{orig}字，已截取前{max}字用于本体分析)...",
         )
+        .replace("{orig}", &original_length.to_string())
+        .replace("{max}", &MAX_TEXT_LENGTH_FOR_LLM.to_string());
+        format!("{truncated}{notice}")
     } else {
         combined_raw
     };
 
-    // Build base message (py:248-255) — f-string port with exact format
+    // Build base message (py:248-255). Section headers are part of the LLM prompt →
+    // English-default, Chinese preserved for zh (zh output stays byte-identical to before).
     let mut message = format!(
-        "## 模拟需求\n\n{}\n\n## 文档内容\n\n{}\n",
-        simulation_requirement, combined_text
+        "{}\n\n{}\n\n{}\n\n{}\n",
+        crate::i18n::localized("## Simulation Requirements", "## 模拟需求"),
+        simulation_requirement,
+        crate::i18n::localized("## Document Content", "## 文档内容"),
+        combined_text
     );
 
     // Optional additional context (py:257-262)
     if let Some(ctx) = additional_context {
-        message.push_str(&format!("\n## 额外说明\n\n{}\n", ctx));
+        message.push_str(&format!(
+            "\n{}\n\n{}\n",
+            crate::i18n::localized("## Additional Notes", "## 额外说明"),
+            ctx
+        ));
     }
 
-    // Rules footer (py:264-273) — verbatim Chinese
-    message.push_str(
-        r#"
+    // Rules footer (py:264-273) — English-default, Chinese preserved for zh.
+    message.push_str(crate::i18n::localized(ONTOLOGY_RULES_FOOTER_EN, ONTOLOGY_RULES_FOOTER_ZH));
+
+    message
+}
+
+/// Ontology rules footer appended to the ontology user prompt (zh variant — byte-identical to the
+/// original `py:264-273` port).
+const ONTOLOGY_RULES_FOOTER_ZH: &str = r#"
 请根据以上内容，设计适合社会舆论模拟的实体类型和关系类型。
 
 **必须遵守的规则**：
@@ -584,11 +602,21 @@ pub fn build_user_message(
 3. 前8个是根据文本内容设计的具体类型
 4. 所有实体类型必须是现实中可以发声的主体，不能是抽象概念
 5. 属性名不能使用 name、uuid、group_id 等保留字，用 full_name、org_name 等替代
-"#,
-    );
+"#;
 
-    message
-}
+/// English (default) ontology rules footer. Faithful translation; the entity-type identifiers
+/// `Person`/`Organization` and reserved attribute names stay verbatim.
+const ONTOLOGY_RULES_FOOTER_EN: &str = r#"
+Based on the content above, design entity types and relation types suitable for social
+public-opinion simulation.
+
+**Rules you MUST follow**:
+1. Output exactly 10 entity types
+2. The last 2 must be the fallback types: Person (individual fallback) and Organization (organization fallback)
+3. The first 8 are concrete types designed from the text content
+4. Every entity type must be a real-world actor that can speak — never an abstract concept
+5. Attribute names must not use reserved words such as name, uuid, group_id — use full_name, org_name, etc. instead
+"#;
 
 // ============================================================================
 // S-179 — _validate_and_process
@@ -938,13 +966,27 @@ mod tests {
 
     #[test]
     fn build_user_message_no_truncation() {
+        // Default locale is English-first → English headers + rules footer.
         let texts = vec!["Hello world".to_string()];
         let msg = build_user_message(&texts, "Simulate public opinion", None);
-        assert!(msg.contains("## 模拟需求"));
+        assert!(msg.contains("## Simulation Requirements"));
         assert!(msg.contains("Simulate public opinion"));
-        assert!(msg.contains("## 文档内容"));
+        assert!(msg.contains("## Document Content"));
         assert!(msg.contains("Hello world"));
-        assert!(!msg.contains("## 额外说明"));
+        assert!(!msg.contains("## Additional Notes"));
+        assert!(msg.contains("Rules you MUST follow"));
+    }
+
+    #[tokio::test]
+    async fn build_user_message_is_chinese_under_zh() {
+        // zh locale → the Chinese headers + footer are preserved (no downgrade).
+        let msg = crate::i18n::with_locale("zh".to_string(), async {
+            build_user_message(&["你好".to_string()], "模拟舆情", Some("额外信息"))
+        })
+        .await;
+        assert!(msg.contains("## 模拟需求"));
+        assert!(msg.contains("## 文档内容"));
+        assert!(msg.contains("## 额外说明"));
         assert!(msg.contains("必须遵守的规则"));
     }
 
@@ -952,7 +994,7 @@ mod tests {
     fn build_user_message_with_additional_context() {
         let texts = vec!["content".to_string()];
         let msg = build_user_message(&texts, "req", Some("extra context here"));
-        assert!(msg.contains("## 额外说明"));
+        assert!(msg.contains("## Additional Notes"));
         assert!(msg.contains("extra context here"));
     }
 
@@ -960,23 +1002,23 @@ mod tests {
     fn build_user_message_without_additional_context() {
         let texts = vec!["content".to_string()];
         let msg = build_user_message(&texts, "req", None);
-        assert!(!msg.contains("## 额外说明"));
+        assert!(!msg.contains("## Additional Notes"));
     }
 
     #[test]
     fn build_user_message_truncation() {
-        // A string of 50001 'a' characters should be truncated to 50000 + notice
+        // A string of 50001 'a' characters should be truncated to 50000 + notice (English default)
         let long_text: String = "a".repeat(MAX_TEXT_LENGTH_FOR_LLM + 1);
         let original_len = long_text.chars().count();
         let texts = vec![long_text];
         let msg = build_user_message(&texts, "req", None);
         // The truncation notice must include the original length and the max
         assert!(
-            msg.contains(&format!("原文共{}字", original_len)),
+            msg.contains(&format!("original text was {} chars", original_len)),
             "should contain original char count"
         );
         assert!(
-            msg.contains(&format!("前{}字", MAX_TEXT_LENGTH_FOR_LLM)),
+            msg.contains(&format!("first {} chars", MAX_TEXT_LENGTH_FOR_LLM)),
             "should reference max chars"
         );
     }
@@ -984,14 +1026,14 @@ mod tests {
     #[test]
     fn build_user_message_truncation_with_chinese() {
         // Chinese chars are 3 bytes each but 1 char — test char-based truncation
-        // 50001 Chinese chars → should truncate at char 50000
+        // 50001 Chinese chars → should truncate at char 50000 (notice is English by default)
         let long_text: String = "中".repeat(MAX_TEXT_LENGTH_FOR_LLM + 1);
         let original_len = long_text.chars().count();
         assert_eq!(original_len, MAX_TEXT_LENGTH_FOR_LLM + 1);
         let texts = vec![long_text];
         let msg = build_user_message(&texts, "req", None);
-        assert!(msg.contains(&format!("原文共{}字", original_len)));
-        assert!(msg.contains(&format!("前{}字", MAX_TEXT_LENGTH_FOR_LLM)));
+        assert!(msg.contains(&format!("original text was {} chars", original_len)));
+        assert!(msg.contains(&format!("first {} chars", MAX_TEXT_LENGTH_FOR_LLM)));
     }
 
     #[test]
@@ -1000,7 +1042,7 @@ mod tests {
         let text: String = "x".repeat(MAX_TEXT_LENGTH_FOR_LLM);
         let texts = vec![text];
         let msg = build_user_message(&texts, "req", None);
-        assert!(!msg.contains("原文共"), "should NOT contain truncation notice");
+        assert!(!msg.contains("original text was"), "should NOT contain truncation notice");
     }
 
     #[test]

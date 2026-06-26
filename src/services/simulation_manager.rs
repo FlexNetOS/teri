@@ -1201,7 +1201,7 @@ impl SimulationManager {
         let mut state = match self.load_simulation_state(simulation_id)? {
             Some(s) => s,
             None => {
-                return Err(TeriError::Sim(format!("模拟不存在: {simulation_id}")));
+                return Err(TeriError::Sim(format!("Simulation does not exist: {simulation_id}")));
             }
         };
 
@@ -1260,7 +1260,10 @@ impl SimulationManager {
         // not an exception; the route layer gets Ok(state) with status=FAILED.
         if filtered.filtered_count == 0 {
             state.status = SimulationStatus::Failed;
-            state.error = Some("没有找到符合条件的实体，请检查图谱是否正确构建".to_string());
+            state.error = Some(
+                "No matching entities found; please verify the knowledge graph was built correctly"
+                    .to_string(),
+            );
             self.save_simulation_state(&mut state)?;
             return Ok(state);
         }
@@ -1274,7 +1277,11 @@ impl SimulationManager {
                     Ok(v) => v,
                     Err(e) => {
                         // Python L450-457: except Exception as e: … raise
-                        tracing::error!("模拟准备失败: {}, error={}", simulation_id, e);
+                        tracing::error!(
+                            "Simulation preparation failed: {}, error={}",
+                            simulation_id,
+                            e
+                        );
                         state.status = SimulationStatus::Failed;
                         state.error = Some(e.to_string());
                         // Best-effort save; if this fails too we still return original error.
@@ -1476,7 +1483,7 @@ impl SimulationManager {
         state.status = SimulationStatus::Ready;
         self.save_simulation_state(&mut state)?;
         tracing::info!(
-            "模拟准备完成: {}, entities={}, profiles={}",
+            "Simulation preparation complete: {}, entities={}, profiles={}",
             simulation_id,
             state.entities_count,
             state.profiles_count
@@ -1956,7 +1963,7 @@ pub(crate) async fn prepare_worker(
             // L599-608: fail_task + reload state → FAILED + error + save (best-effort).
             // (prepare_simulation also sets FAILED internally; the double-write is
             //  idempotent on disk and matches Python's two-layer FAILED-set.)
-            tracing::error!("准备模拟失败: {e}");
+            tracing::error!("Failed to prepare simulation: {e}");
             tm.fail_task(&task_id, e.to_string());
             if let Ok(Some(mut st)) = manager.get_simulation(&simulation_id) {
                 st.status = SimulationStatus::Failed;
@@ -2674,7 +2681,10 @@ mod prepare_tests {
 
         assert!(result.is_err(), "missing simulation must return Err");
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("模拟不存在"), "error must contain '模拟不存在': {msg}");
+        assert!(
+            msg.contains("Simulation does not exist"),
+            "error must contain 'Simulation does not exist': {msg}"
+        );
         assert!(msg.contains("sim_doesnotexist"), "error must contain the id: {msg}");
     }
 
@@ -2722,8 +2732,12 @@ mod prepare_tests {
             "zero entities must set status=FAILED"
         );
         assert!(
-            final_state.error.as_deref().unwrap_or("").contains("没有找到"),
-            "error message must mention 没有找到: {:?}",
+            final_state
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("No matching entities found"),
+            "error message must mention 'No matching entities found': {:?}",
             final_state.error
         );
 
