@@ -30,7 +30,29 @@
     "description": "Teri - 社交媒体舆论模拟系统"
   },
   "nav": {
-    "visitGithub": "访问我们的Github主页"
+    "visitGithub": "访问我们的Github主页",
+    "templates": "提示词模板"
+  },
+  "templates": {
+    "title": "提示词模板",
+    "subtitle": "驱动各流水线阶段的 LLM 提示词模板，按引擎编译时的原样展示。",
+    "loading": "正在加载模板...",
+    "empty": "暂无提示词模板。",
+    "loadError": "加载提示词模板失败。",
+    "sourcePath": "来源",
+    "backHome": "返回首页",
+    "stages": {
+      "1": "图谱构建",
+      "2": "环境准备",
+      "3": "模拟运行",
+      "4": "报告生成",
+      "5": "交互问答"
+    },
+    "kinds": {
+      "jinja": "Jinja",
+      "system_prompt": "系统提示词",
+      "user_prompt": "用户提示词"
+    }
   },
   "home": {
     "tagline": "简洁通用的群体智能引擎",

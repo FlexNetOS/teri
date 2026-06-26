@@ -30,7 +30,29 @@
     "description": "Teri - Social Media Opinion Simulation System"
   },
   "nav": {
-    "visitGithub": "Visit our Github page"
+    "visitGithub": "Visit our Github page",
+    "templates": "Prompt Templates"
+  },
+  "templates": {
+    "title": "Prompt Templates",
+    "subtitle": "The LLM prompt templates that drive each pipeline stage. Shown exactly as compiled into the engine.",
+    "loading": "Loading templates...",
+    "empty": "No prompt templates available.",
+    "loadError": "Failed to load prompt templates.",
+    "sourcePath": "Source",
+    "backHome": "Back to home",
+    "stages": {
+      "1": "Graph Build",
+      "2": "Env Setup",
+      "3": "Simulation",
+      "4": "Report",
+      "5": "Interaction"
+    },
+    "kinds": {
+      "jinja": "Jinja",
+      "system_prompt": "System Prompt",
+      "user_prompt": "User Prompt"
+    }
   },
   "home": {
     "tagline": "Concise & Universal Swarm Intelligence Engine",

@@ -5,6 +5,9 @@
       <div class="nav-brand">TERI</div>
       <div class="nav-links">
         <LanguageSwitcher />
+        <a class="github-link" @click="$router.push('/templates')" style="cursor: pointer;">
+          {{ $t('nav.templates') }}
+        </a>
         <a href="https://github.com/FlexNetOS/teri" target="_blank" class="github-link">
           {{ $t('nav.visitGithub') }} <span class="arrow">↗</span>
         </a>
