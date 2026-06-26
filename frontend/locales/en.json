@@ -210,6 +210,13 @@
     "generating": "Generating"
   },
   "step3": {
+    "godseyeTitle": "God's-eye Injection",
+    "godseyeHint": "Push a variable into the live world — applied at the next tick",
+    "godseyeVarPlaceholder": "variable (e.g. crisis_level)",
+    "godseyeValPlaceholder": "value",
+    "godseyeInject": "Inject",
+    "godseyeInjected": "Injected {variable} = {value}",
+    "godseyeError": "Injection failed — is the simulation still running?",
     "startGenerateReport": "Generate Report",
     "generatingReport": "Starting...",
     "waitingForActions": "Waiting for agent actions...",

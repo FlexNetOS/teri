@@ -103,6 +103,43 @@
       </div>
     </div>
 
+    <!-- God's-eye variable injection (live runs only) -->
+    <div class="godseye-panel" v-if="isRunning">
+      <div class="godseye-header">
+        <span class="godseye-title">⚡ {{ $t('step3.godseyeTitle') }}</span>
+        <span class="godseye-hint">{{ $t('step3.godseyeHint') }}</span>
+      </div>
+      <div class="godseye-controls">
+        <input
+          v-model="injectVar"
+          class="godseye-input"
+          :placeholder="$t('step3.godseyeVarPlaceholder')"
+          :disabled="injecting"
+          @keyup.enter="doInject"
+        />
+        <input
+          v-model="injectVal"
+          type="number"
+          step="any"
+          class="godseye-input godseye-num"
+          :placeholder="$t('step3.godseyeValPlaceholder')"
+          :disabled="injecting"
+          @keyup.enter="doInject"
+        />
+        <button class="godseye-btn" :disabled="!canInject || injecting" @click="doInject">
+          {{ $t('step3.godseyeInject') }}
+        </button>
+      </div>
+      <div v-if="injectedVars.length" class="godseye-log">
+        <span v-for="(iv, i) in injectedVars" :key="i" class="godseye-chip">
+          {{ iv.variable }} = {{ iv.value }}
+        </span>
+      </div>
+      <div v-if="injectMsg" class="godseye-msg" :class="{ 'is-error': injectError }">
+        {{ injectMsg }}
+      </div>
+    </div>
+
     <!-- Main Content: Dual Timeline -->
     <div class="main-content-area" ref="scrollContainer">
       <!-- Timeline Header -->
@@ -293,7 +330,8 @@ import {
   startSimulation,
   stopSimulation,
   getRunStatus,
-  getRunStatusDetail
+  getRunStatusDetail,
+  injectVariable
 } from '../api/simulation'
 import { generateReport } from '../api/report'
 
@@ -322,6 +360,43 @@ const isStarting = ref(false)
 const isStopping = ref(false)
 const startError = ref(null)
 const runStatus = ref({})
+
+// God's-eye variable injection (live runs only)
+const injectVar = ref('')
+const injectVal = ref(null)
+const injecting = ref(false)
+const injectedVars = ref([])
+const injectMsg = ref('')
+const injectError = ref(false)
+const isRunning = computed(
+  () => !!(runStatus.value.twitter_running || runStatus.value.reddit_running)
+)
+const canInject = computed(
+  () => injectVar.value.trim() !== '' && injectVal.value !== null && injectVal.value !== ''
+)
+const doInject = async () => {
+  if (!canInject.value || injecting.value || !props.simulationId) return
+  injecting.value = true
+  injectMsg.value = ''
+  injectError.value = false
+  const variable = injectVar.value.trim()
+  const value = Number(injectVal.value)
+  try {
+    await injectVariable(props.simulationId, variable, value)
+    injectedVars.value.unshift({ variable, value })
+    emit('add-log', `God's-eye injection: ${variable} = ${value}`)
+    injectMsg.value = t('step3.godseyeInjected', { variable, value })
+    injectVar.value = ''
+    injectVal.value = null
+  } catch (e) {
+    console.error('Injection failed:', e)
+    injectError.value = true
+    injectMsg.value = e?.message || t('step3.godseyeError')
+  } finally {
+    injecting.value = false
+  }
+}
+
 const allActions = ref([]) // 所有动作（增量累积）
 const actionIds = ref(new Set()) // 用于去重的动作ID集合
 const scrollContainer = ref(null)
@@ -1263,5 +1338,90 @@ onUnmounted(() => {
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
   margin-right: 6px;
+}
+
+/* God's-eye variable injection panel */
+.godseye-panel {
+  border: 1px solid #FF4500;
+  background: rgba(255, 69, 0, 0.04);
+  border-radius: 6px;
+  padding: 12px 16px;
+  margin: 0 0 12px 0;
+}
+.godseye-header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.godseye-title {
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 700;
+  font-size: 0.8rem;
+  color: #FF4500;
+  letter-spacing: 0.5px;
+}
+.godseye-hint {
+  font-size: 0.7rem;
+  color: #888;
+}
+.godseye-controls {
+  display: flex;
+  gap: 8px;
+}
+.godseye-input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid #ddd;
+  background: #fff;
+  padding: 8px 10px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  outline: none;
+}
+.godseye-input:focus {
+  border-color: #FF4500;
+}
+.godseye-num {
+  flex: 0 0 120px;
+}
+.godseye-btn {
+  border: 1px solid #FF4500;
+  background: #FF4500;
+  color: #fff;
+  padding: 8px 16px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: opacity 0.15s;
+}
+.godseye-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.godseye-log {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.godseye-chip {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  background: rgba(255, 69, 0, 0.12);
+  color: #FF4500;
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+.godseye-msg {
+  margin-top: 8px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem;
+  color: #2e7d32;
+}
+.godseye-msg.is-error {
+  color: #FF4500;
 }
 </style>

@@ -932,6 +932,11 @@ pub struct RunHandle {
     /// `/ticks/sse` feed can tail every `WorldSnapshot` the run produces. The `Arc` keeps the
     /// history alive for streaming consumers even after the engine is dropped at run end.
     snapshot_history: Arc<parking_lot::Mutex<Vec<crate::sim::WorldSnapshot>>>,
+    /// God's-eye runtime injection queue, shared with the engine (`SimEngine::with_injections`).
+    /// `SimulationRunner::inject_variable` pushes `(key, value)` here; the engine drains and applies
+    /// it at the next tick boundary. The `Arc` is cloned into the engine before it moves into the
+    /// spawned task, so this handle and the live run mutate the SAME queue.
+    injections: crate::sim::InjectionQueue,
 }
 
 impl RunHandle {
@@ -1300,6 +1305,11 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
         let RunInputs { mut engine, pool, graph, llm, boost_llm } = inputs;
         engine.with_shutdown(Arc::clone(&shutdown));
 
+        // God's-eye runtime injection queue: shared between this handle and the engine so a
+        // `POST /:id/inject` can push variables into the LIVE run (drained at each tick boundary).
+        let injections: crate::sim::InjectionQueue = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        engine.with_injections(Arc::clone(&injections));
+
         // Subscribe to the terminal completion signal (U-048) BEFORE the engine moves into the
         // spawned task — this receiver is the monitor's loop-exit signal, replacing Python's
         // `process.poll()` (DECISION-17 §17 Area 2). `watch` retains the final value, so even if
@@ -1359,6 +1369,7 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
             monitor: Some(monitor),
             graph_enabled,
             snapshot_history,
+            injections,
         };
 
         {
@@ -1383,6 +1394,33 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
     /// 6. Stop the graph-memory updater if enabled (L813-819).
     ///
     /// Returns the final STOPPED state.
+    /// God's-eye variable injection — push `(variable, value)` into a LIVE run.
+    ///
+    /// Looks up the running handle (held in `runs`, NOT removed — the run continues) and queues the
+    /// variable on its shared injection `Vec`. The engine drains the queue at its next tick boundary
+    /// and applies it via `WorldState::inject_variable`, so the value lands deterministically at a
+    /// round boundary and persists in `world.variables` (and every subsequent snapshot) thereafter.
+    ///
+    /// Returns the number of injections now pending for that run (≥1). Errors if the simulation has
+    /// no live in-memory handle (never started, already finished, or stopped) — you can only inject
+    /// into a currently-running simulation.
+    pub async fn inject_variable(
+        &self,
+        simulation_id: &str,
+        variable: String,
+        value: f32,
+    ) -> Result<usize> {
+        let runs = self.runs.lock().await;
+        let handle = runs.get(simulation_id).ok_or_else(|| {
+            TeriError::Sim(format!(
+                "Simulation is not running; cannot inject into it: {simulation_id}"
+            ))
+        })?;
+        let mut queue = handle.injections.lock();
+        queue.push((variable, value));
+        Ok(queue.len())
+    }
+
     pub async fn stop_simulation(&self, simulation_id: &str) -> Result<SimulationRunState> {
         // (1)/(2): validate existence + status against the LIVE handle's state.
         // Take the handle OUT of the map (we will await on its task — never hold the lock

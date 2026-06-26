@@ -155,6 +155,8 @@ pub fn simulation_router(state: Arc<ApiState>) -> Router {
         // Sub-cycle (g): lifecycle — start + stop.  Both are static paths; no capture conflicts.
         .route("/start", post(start_simulation))
         .route("/stop", post(stop_simulation))
+        // God's-eye runtime variable injection into a live run.
+        .route("/:simulation_id/inject", post(inject_variable_route))
         // Sub-cycle (h): poll-based run-status snapshots (NOT streaming).
         // Both under /:simulation_id; the 3-segment `/run-status/detail` (static seg2 "detail")
         // is distinct from the 2-segment `/run-status` by full-path match (axum 0.7).
@@ -2060,6 +2062,51 @@ async fn stop_simulation(
     Ok(Json(serde_json::json!({
         "success": true,
         "data": run_state.to_dict()
+    })))
+}
+
+/// `POST /api/simulation/:simulation_id/inject` — God's-eye variable injection into a LIVE run.
+///
+/// Body: `{"variable": "<name>", "value": <number>}`. The variable is queued on the running
+/// engine and applied at its next tick boundary (`WorldState::inject_variable`), persisting in
+/// `world.variables` (and every subsequent `/ticks/sse` snapshot) thereafter. 404 if the
+/// simulation has no live run (never started / already finished / stopped).
+async fn inject_variable_route(
+    State(state): State<Arc<ApiState>>,
+    Path(simulation_id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, ApiError> {
+    let data = body.map(|Json(v)| v).unwrap_or_else(|| serde_json::json!({}));
+
+    let variable = data
+        .get("variable")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ApiError::client(
+                StatusCode::BAD_REQUEST,
+                "non-empty string field 'variable' is required",
+            )
+        })?
+        .to_string();
+
+    let value = data.get("value").and_then(Value::as_f64).ok_or_else(|| {
+        ApiError::client(StatusCode::BAD_REQUEST, "numeric field 'value' is required")
+    })? as f32;
+
+    let pending = state
+        .sim_runner
+        .inject_variable(&simulation_id, variable.clone(), value)
+        .await
+        .map_err(|e| ApiError::client(StatusCode::NOT_FOUND, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "simulation_id": simulation_id,
+        "variable": variable,
+        "value": value,
+        "pending": pending,
     })))
 }
 
@@ -6258,6 +6305,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn inject_missing_variable_400() {
+        let (app, _t) = test_app();
+        let resp = app
+            .oneshot(post_json("/api/simulation/sim-x/inject", serde_json::json!({ "value": 1.0 })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn inject_missing_value_400() {
+        let (app, _t) = test_app();
+        let resp = app
+            .oneshot(post_json(
+                "/api/simulation/sim-x/inject",
+                serde_json::json!({ "variable": "crisis" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn inject_into_non_running_simulation_404() {
+        // A well-formed inject for a simulation with no live run → 404 (can only inject live).
+        let (app, _t) = test_app();
+        let resp = app
+            .oneshot(post_json(
+                "/api/simulation/sim-not-running/inject",
+                serde_json::json!({ "variable": "crisis", "value": 1.0 }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

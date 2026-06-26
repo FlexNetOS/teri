@@ -93,6 +93,17 @@ export const stopSimulation = (data) => {
 }
 
 /**
+ * God's-eye variable injection into a LIVE simulation. Applied at the engine's next tick boundary
+ * and persisted in world.variables thereafter. 404 if the simulation has no live run.
+ * @param {string} simulationId
+ * @param {string} variable - variable name
+ * @param {number} value - numeric value
+ */
+export const injectVariable = (simulationId, variable, value) => {
+  return service.post(`/api/simulation/${simulationId}/inject`, { variable, value })
+}
+
+/**
  * 获取模拟运行实时状态
  * @param {string} simulationId
  */
