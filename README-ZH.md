@@ -102,7 +102,7 @@ cargo run --release -- --help
 envctl run -- teri serve --addr 0.0.0.0:5001
 
 # Web UI（独立开发服务器）：
-cd frontend && npm install && npm run dev
+cd frontend && bun install && bun run dev
 ```
 
 **服务地址：**

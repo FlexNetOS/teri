@@ -123,7 +123,7 @@ report.
 envctl run -- teri serve --addr 0.0.0.0:5001
 
 # Web UI (separate dev server):
-cd frontend && npm install && npm run dev
+cd frontend && bun install && bun run dev
 ```
 
 **Service URLs:**
