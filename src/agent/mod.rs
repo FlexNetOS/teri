@@ -408,6 +408,35 @@ impl Agent {
         self.state = state;
     }
 
+    /// Build the per-agent "Knowledge Graph Context" lines from the agent's source entity's
+    /// immediate neighborhood, or `None` when there is nothing to add.
+    ///
+    /// Returns `None` (graph context omitted, prompt byte-identical to before) when: no graph was
+    /// provided, the agent has no `source_entity_uuid` (a generic / non-graph-derived agent), the
+    /// uuid does not parse, the entity is absent from this graph, or it has no relations. Otherwise
+    /// returns one line per relation — `EntityA --[Relation]--> EntityB` — so the agent can reason
+    /// over what the seed-derived graph says about the entity it personifies, during the run.
+    fn graph_context_section(&self, graph: Option<&KnowledgeGraph>) -> Option<String> {
+        let graph = graph?;
+        let uuid_str = self.persona.social.as_ref()?.source_entity_uuid.as_ref()?;
+        let entity_id = uuid::Uuid::parse_str(uuid_str).ok()?;
+        let source = graph.get_entity_by_id(entity_id)?;
+        let neighbors = graph.get_neighbor_relations(entity_id).ok()?;
+        if neighbors.is_empty() {
+            return None;
+        }
+        let mut lines = String::new();
+        for (neighbor, rel, is_outgoing) in neighbors {
+            let (from, to) = if is_outgoing {
+                (source.name.as_str(), neighbor.name.as_str())
+            } else {
+                (neighbor.name.as_str(), source.name.as_str())
+            };
+            lines.push_str(&format!("- {from} --[{}]--> {to}\n", rel.kind));
+        }
+        Some(lines)
+    }
+
     /// Pure read phase of a step: retrieve context, call LLM, return validated action.
     /// Does NOT mutate agent state or memory — safe to call concurrently across agents.
     /// Pair with `commit_action` to complete the step.
@@ -415,10 +444,13 @@ impl Agent {
         &self,
         world: &WorldState,
         feed: Option<&FeedSnapshot>,
+        graph: Option<&KnowledgeGraph>,
         llm: &L,
     ) -> Result<Action> {
         let relevant_memories = self.retrieve_relevant_memories(world);
-        let context = self.construct_context(world, &relevant_memories, feed);
+        let graph_context = self.graph_context_section(graph);
+        let context =
+            self.construct_context(world, &relevant_memories, feed, graph_context.as_deref());
         let action_str = self.generate_action_with_fallback(&context, llm).await?;
         // Robustness: a single unparseable LLM line must NOT abort the whole simulation (the run
         // loop propagates this `Result` via `?`). An action string we cannot classify is treated
@@ -449,7 +481,7 @@ impl Agent {
         // Construct context from world state + memories. `step` is the standalone single-agent
         // path (tests / non-social callers); it has no social feed, so pass `None` — the feed
         // section is omitted and the prompt is byte-identical to before the feed-back landed.
-        let context = self.construct_context(world, &relevant_memories, None);
+        let context = self.construct_context(world, &relevant_memories, None, None);
 
         // Set state to Acting
         self.set_state(AgentState::Acting);
@@ -543,6 +575,7 @@ impl Agent {
         world: &WorldState,
         memories: &[&MemoryEntry],
         feed: Option<&FeedSnapshot>,
+        graph_context: Option<&str>,
     ) -> String {
         let mut context = format!(
             "Agent: {}\nRole: {}\nState: {:?}\n\n",
@@ -580,6 +613,25 @@ impl Agent {
             for (key, value) in &world.variables {
                 context.push_str(&format!("- {}: {:.2}\n", key, value));
             }
+        }
+
+        // Add the per-agent knowledge-graph context (the source entity's neighborhood) so the
+        // agent reasons over what the seed-derived graph says about the entity it personifies.
+        // Bounded by a blank line so `parse_graph_context` (find "\n\n") delimits it exactly like
+        // the other sections. `None`/empty (every non-graph caller) appends NOTHING → byte-identical
+        // prompt, no regression.
+        if let Some(graph_context) = graph_context
+            && !graph_context.trim().is_empty()
+        {
+            if !context.ends_with("\n\n") {
+                context.push('\n');
+            }
+            context.push_str("Knowledge Graph Context:\n");
+            context.push_str(graph_context);
+            if !context.ends_with('\n') {
+                context.push('\n');
+            }
+            context.push('\n');
         }
 
         // Add the social feed (recency-ranked recent posts) so the agent can react to REAL posts.
@@ -1633,6 +1685,12 @@ impl PersonaGenerator {
         let user_name = Self::generate_username(entity_name);
         let created_at = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
+        // Anchor the persona to its source graph entity (its UUID) so the simulation can later fetch
+        // that entity's neighborhood and feed it to the agent as per-tick graph context. Previously
+        // hardcoded `None`, which severed the persona↔entity link — the swarm could never reason
+        // over the extracted graph during the run.
+        let source_entity_uuid = graph_ctx.map(|(_, e)| e.id.to_string());
+
         let default_bio = format!("{}: {}", entity_type, entity_name);
         let default_persona = if entity_summary.is_empty() {
             format!("{entity_name} is a {entity_type} participating in social discussions.")
@@ -1811,13 +1869,14 @@ impl PersonaGenerator {
                 profession,
                 interested_topics,
                 posting_style,
-                source_entity_uuid: None,
+                source_entity_uuid,
                 source_entity_type: Some(entity_type.to_string()),
                 created_at,
             })
         } else {
-            // Rule-based fallback — mirrors _generate_profile_rule_based
-            Ok(Self::generate_social_rule_based(
+            // Rule-based fallback — mirrors _generate_profile_rule_based. Carry the entity link
+            // through this path too, so a fallback persona is still graph-anchored.
+            let mut profile = Self::generate_social_rule_based(
                 entity_name,
                 entity_type,
                 entity_summary,
@@ -1825,7 +1884,9 @@ impl PersonaGenerator {
                 &user_name,
                 &created_at,
                 &mut rng,
-            ))
+            );
+            profile.source_entity_uuid = source_entity_uuid;
+            Ok(profile)
         }
     }
 
@@ -2236,6 +2297,7 @@ impl ActionGenerator {
         let world_variables = self.parse_world_variables(context);
         let world_tick = self.parse_world_tick(context);
         let feed_posts = self.parse_feed_posts(context);
+        let graph_context = self.parse_graph_context(context);
 
         // Convert HashMap to Vec of tuples for MiniJinja iteration
         let world_variables_seq: Vec<(String, f32)> = world_variables.into_iter().collect();
@@ -2283,6 +2345,7 @@ impl ActionGenerator {
             relevant_memories => relevant_memories,
             world_variables => world_variables_seq,
             feed_posts => feed_posts,
+            graph_context => graph_context,
         };
 
         let prompt = env
@@ -2422,6 +2485,30 @@ impl ActionGenerator {
             });
         }
         posts
+    }
+
+    /// Parse the "Knowledge Graph Context:" section emitted by `construct_context`. Each line is
+    /// `- <EntityA> --[<Relation>]--> <EntityB>`. Returns the relation descriptions (with the
+    /// leading `- ` stripped) for template iteration; an absent header / empty section yields an
+    /// empty Vec so the template's `{% if graph_context %}` section is skipped (no regression).
+    fn parse_graph_context(&self, context: &str) -> Vec<String> {
+        let mut rels = Vec::new();
+        let Some(start) = context.find("Knowledge Graph Context:") else {
+            return rels;
+        };
+        let section_start = start + "Knowledge Graph Context:".len();
+        let section_end = context[section_start..]
+            .find("\n\n")
+            .map(|i| section_start + i)
+            .unwrap_or(context.len());
+        for line in context[section_start..section_end].lines() {
+            if let Some(rest) = line.strip_prefix("- ")
+                && !rest.trim().is_empty()
+            {
+                rels.push(rest.to_string());
+            }
+        }
+        rels
     }
 }
 
@@ -3182,7 +3269,7 @@ mod tests {
         };
 
         // construct_context appends the feed section, then generate_prompt round-trips it.
-        let context = agent.construct_context(&world, &[], Some(&feed));
+        let context = agent.construct_context(&world, &[], Some(&feed), None);
         assert!(context.contains("Recent posts in your feed:"));
 
         let generator = ActionGenerator::new();
@@ -3201,7 +3288,7 @@ mod tests {
     fn test_no_feed_section_when_feed_is_none() {
         let agent = social_agent("Ada");
         let world = WorldState::new();
-        let context = agent.construct_context(&world, &[], None);
+        let context = agent.construct_context(&world, &[], None, None);
         assert!(!context.contains("Recent posts in your feed"));
         let generator = ActionGenerator::new();
         let prompt = generator.generate_prompt(&agent, &context).unwrap();
@@ -3295,6 +3382,85 @@ mod tests {
         assert!(
             !prompt.contains("Move(location)"),
             "social agent must not get the generic action menu: {prompt}"
+        );
+    }
+
+    /// Build a tiny graph (Jane Doe --WorksFor--> Acme Corp) plus the two entity ids.
+    fn graph_with_worksfor() -> (crate::graph::KnowledgeGraph, uuid::Uuid, uuid::Uuid) {
+        use crate::graph::{Entity, EntityKind, KnowledgeGraph, Relation, RelationKind};
+        let mut graph = KnowledgeGraph::new();
+        let acme =
+            Entity { id: Uuid::new_v4(), name: "Acme Corp".into(), kind: EntityKind::Organization };
+        let jane = Entity { id: Uuid::new_v4(), name: "Jane Doe".into(), kind: EntityKind::Person };
+        let (acme_id, jane_id) = (acme.id, jane.id);
+        let na = graph.add_entity(acme).unwrap();
+        let nj = graph.add_entity(jane).unwrap();
+        graph.add_relation(nj, na, Relation::new(RelationKind::WorksFor, 0.9).unwrap());
+        (graph, acme_id, jane_id)
+    }
+
+    fn agent_anchored_to(entity_id: uuid::Uuid) -> Agent {
+        let mut social = test_social_profile(Platform::Twitter);
+        social.source_entity_uuid = Some(entity_id.to_string());
+        Agent::new(Persona {
+            name: "Acme Corp".into(),
+            background: "b".into(),
+            traits: vec![],
+            role: "agent".into(),
+            social: Some(social),
+        })
+    }
+
+    /// An agent anchored to a graph entity gets that entity's neighborhood as graph context.
+    #[test]
+    fn graph_context_section_builds_neighbor_lines() {
+        let (graph, acme_id, _jane) = graph_with_worksfor();
+        let agent = agent_anchored_to(acme_id);
+        let section = agent.graph_context_section(Some(&graph)).expect("graph context present");
+        assert!(
+            section.contains("Jane Doe --[WorksFor]--> Acme Corp"),
+            "neighbor relation must be rendered: {section}"
+        );
+    }
+
+    /// No graph, no source entity, or an unknown entity → no graph context (prompt unchanged).
+    #[test]
+    fn graph_context_section_absent_cases_return_none() {
+        let (graph, acme_id, _) = graph_with_worksfor();
+
+        // No graph handle.
+        assert!(agent_anchored_to(acme_id).graph_context_section(None).is_none());
+
+        // Social profile but no source_entity_uuid.
+        let generic_social = Agent::new(Persona {
+            name: "x".into(),
+            background: "b".into(),
+            traits: vec![],
+            role: "agent".into(),
+            social: Some(test_social_profile(Platform::Twitter)),
+        });
+        assert!(generic_social.graph_context_section(Some(&graph)).is_none());
+
+        // Anchored to an id that is not in this graph.
+        let stranger = agent_anchored_to(Uuid::new_v4());
+        assert!(stranger.graph_context_section(Some(&graph)).is_none());
+    }
+
+    /// The graph-context section round-trips through `construct_context` → `generate_prompt` and
+    /// actually reaches the rendered prompt (not dropped by the re-parse).
+    #[test]
+    fn graph_context_reaches_the_rendered_prompt() {
+        let (graph, acme_id, _) = graph_with_worksfor();
+        let agent = agent_anchored_to(acme_id);
+        let world = WorldState::new();
+        let graph_section = agent.graph_context_section(Some(&graph));
+        let context = agent.construct_context(&world, &[], None, graph_section.as_deref());
+        assert!(context.contains("Knowledge Graph Context:"), "section in context: {context}");
+
+        let prompt = ActionGenerator::new().generate_prompt(&agent, &context).unwrap();
+        assert!(
+            prompt.contains("Jane Doe --[WorksFor]--> Acme Corp"),
+            "graph context must survive the generate_prompt re-parse: {prompt}"
         );
     }
 
