@@ -914,7 +914,7 @@ impl SimulationIPCClient {
         };
 
         // Log the send (mirrors Python logger.info(f"发送IPC命令: {command_type.value}, command_id=…"))
-        info!("发送IPC命令: {}, command_id={}", command_type.as_str(), command_id);
+        info!("Sending IPC command: {}, command_id={}", command_type.as_str(), command_id);
 
         // Create the oneshot reply pair
         let (reply_tx, reply_rx) = oneshot::channel::<IPCResponse>();
@@ -931,7 +931,7 @@ impl SimulationIPCClient {
             Ok(Ok(response)) => {
                 // Log the receipt (mirrors Python logger.info(f"收到IPC响应: command_id=…, status=…"))
                 info!(
-                    "收到IPC响应: command_id={}, status={}",
+                    "Received IPC response: command_id={}, status={}",
                     response.command_id,
                     response.status.as_str()
                 );
@@ -947,7 +947,7 @@ impl SimulationIPCClient {
                 // Mirrors Python:
                 //   logger.error(f"等待IPC响应超时: command_id={command_id}")
                 //   raise TimeoutError(f"等待命令响应超时 ({timeout}秒)")
-                error!("等待IPC响应超时: command_id={}", command_id);
+                error!("Timeout waiting for IPC response: command_id={}", command_id);
                 // `{:?}` on f64 matches Python's `str(float)` (shortest round-trip with
                 // trailing `.0` for integral values) → "60.0秒".  `[≠] U028-c1-TIMEOUTMSG-NUMFMT`:
                 // when the API route passes an INTEGER timeout (`data.get('timeout', 60)`), Python
@@ -958,7 +958,7 @@ impl SimulationIPCClient {
                 // status: Python raises `TimeoutError` here, which interview routes turn into a
                 // 504 and `close_simulation_env` swallows into a graceful 200.
                 Err(crate::error::TeriError::Timeout(format!(
-                    "等待命令响应超时 ({:?}秒)",
+                    "Timeout waiting for command response ({:?}s)",
                     timeout.as_secs_f64()
                 )))
             }
@@ -1580,7 +1580,7 @@ mod ipc_transport_tests {
             Err(crate::error::TeriError::Timeout(msg)) => {
                 // Must mention the timeout duration in the error message
                 assert!(
-                    msg.contains("秒") || msg.contains("timeout") || msg.contains("超时"),
+                    msg.to_lowercase().contains("timeout") || msg.contains('s'),
                     "error message should mention timeout, got: {msg}"
                 );
             }
