@@ -1043,6 +1043,282 @@ pub struct SimulationConfigGenerator<L: LlmClient> {
     pub base_url: String,
 }
 
+// ---------------------------------------------------------------------------
+// Locale-selectable LLM prompt bodies (English-default, Chinese under `zh`)
+// ---------------------------------------------------------------------------
+//
+// teri is English-first. The simulation-config generation prompts were authored
+// in Chinese; appending an English `get_language_instruction()` under a Chinese
+// body still biases the model toward Chinese, so the body itself must switch by
+// locale. Each prompt is hoisted to a `_ZH`/`_EN` pair and selected at the call
+// site with `crate::i18n::localized(EN, ZH)`.
+//
+// Substitution: the original sites used `format!` named-capture interpolation
+// (and `{{`/`}}` brace-escaping for the embedded JSON examples). Because
+// `localized()` returns a runtime `&'static str`, the call sites switch to
+// `String::replace("{token}", value)` — so the JSON braces here are SINGLE `{`/`}`
+// (a `.replace` template, not a `format!` template) and every substitution token
+// (`{context_truncated}`, `{max_agents_allowed}`, `{simulation_requirement}`,
+// `{type_info}`, `{entity_list_json}`, `{lang_instruction}`) is preserved verbatim.
+// The `_ZH` text is byte-identical to the prompt the LLM previously received at
+// runtime (i.e. after `format!` rendered `{{`→`{`); only the un-substituted tokens
+// remain as `{token}`. JSON field names (`poster_type`, `content`,
+// `narrative_direction`, `hot_topics`, `reasoning`, `agent_id`, `activity_level`,
+// `posts_per_hour`, `comments_per_hour`, `active_hours`, `response_delay_min`,
+// `response_delay_max`, `sentiment_bias`, `stance`, `influence_weight`) and entity
+// type identifiers (`University`, `GovernmentAgency`, `MediaOutlet`, `Student`,
+// `Person`, `Alumni`, `Official`) stay in English in BOTH variants.
+
+/// TIME-config user prompt body (Chinese). Tokens: `{context_truncated}`, `{max_agents_allowed}`.
+const TIME_CONFIG_USER_ZH: &str = r#"基于以下模拟需求，生成时间模拟配置。
+
+{context_truncated}
+
+## 任务
+请生成时间配置JSON。
+
+### 基本原则（仅供参考，需根据具体事件和参与群体灵活调整）：
+- 请根据模拟场景推断目标用户群体所在时区和作息习惯，以下为东八区(UTC+8)的参考示例
+- 凌晨0-5点几乎无人活动（活跃度系数0.05）
+- 早上6-8点逐渐活跃（活跃度系数0.4）
+- 工作时间9-18点中等活跃（活跃度系数0.7）
+- 晚间19-22点是高峰期（活跃度系数1.5）
+- 23点后活跃度下降（活跃度系数0.5）
+- 一般规律：凌晨低活跃、早间渐增、工作时段中等、晚间高峰
+- **重要**：以下示例值仅供参考，你需要根据事件性质、参与群体特点来调整具体时段
+  - 例如：学生群体高峰可能是21-23点；媒体全天活跃；官方机构只在工作时间
+  - 例如：突发热点可能导致深夜也有讨论，off_peak_hours 可适当缩短
+
+### 返回JSON格式（不要markdown）
+
+示例：
+{
+    "total_simulation_hours": 72,
+    "minutes_per_round": 60,
+    "agents_per_hour_min": 5,
+    "agents_per_hour_max": 50,
+    "peak_hours": [19, 20, 21, 22],
+    "off_peak_hours": [0, 1, 2, 3, 4, 5],
+    "morning_hours": [6, 7, 8],
+    "work_hours": [9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+    "reasoning": "针对该事件的时间配置说明"
+}
+
+字段说明：
+- total_simulation_hours (int): 模拟总时长，24-168小时，突发事件短、持续话题长
+- minutes_per_round (int): 每轮时长，30-120分钟，建议60分钟
+- agents_per_hour_min (int): 每小时最少激活Agent数（取值范围: 1-{max_agents_allowed}）
+- agents_per_hour_max (int): 每小时最多激活Agent数（取值范围: 1-{max_agents_allowed}）
+- peak_hours (int数组): 高峰时段，根据事件参与群体调整
+- off_peak_hours (int数组): 低谷时段，通常深夜凌晨
+- morning_hours (int数组): 早间时段
+- work_hours (int数组): 工作时段
+- reasoning (string): 简要说明为什么这样配置"#;
+
+/// TIME-config user prompt body (English). Faithful translation of [`TIME_CONFIG_USER_ZH`].
+const TIME_CONFIG_USER_EN: &str = r#"Based on the following simulation requirement, generate a time-simulation configuration.
+
+{context_truncated}
+
+## Task
+Generate the time configuration JSON.
+
+### Basic principles (for reference only; adjust flexibly based on the specific event and the participating groups):
+- Infer the target user group's time zone and daily-activity habits from the simulation scenario; the following is a reference example for the UTC+8 (East-8) zone
+- 0:00-5:00 almost no activity (activity coefficient 0.05)
+- 6:00-8:00 gradually becoming active (activity coefficient 0.4)
+- 9:00-18:00 working hours, moderate activity (activity coefficient 0.7)
+- 19:00-22:00 evening peak (activity coefficient 1.5)
+- After 23:00 activity declines (activity coefficient 0.5)
+- General pattern: low activity in the early morning, rising through the morning, moderate during working hours, peaking in the evening
+- **Important**: the example values below are for reference only; you must adjust the specific time slots based on the nature of the event and the characteristics of the participating groups
+  - For example: a student group may peak at 21:00-23:00; media are active all day; official institutions are active only during working hours
+  - For example: a breaking hot topic may drive discussion even late at night, so off_peak_hours may be shortened accordingly
+
+### Return JSON format (no markdown)
+
+Example:
+{
+    "total_simulation_hours": 72,
+    "minutes_per_round": 60,
+    "agents_per_hour_min": 5,
+    "agents_per_hour_max": 50,
+    "peak_hours": [19, 20, 21, 22],
+    "off_peak_hours": [0, 1, 2, 3, 4, 5],
+    "morning_hours": [6, 7, 8],
+    "work_hours": [9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+    "reasoning": "Explanation of the time configuration for this event"
+}
+
+Field descriptions:
+- total_simulation_hours (int): total simulation duration, 24-168 hours; short for breaking events, long for ongoing topics
+- minutes_per_round (int): duration per round, 30-120 minutes, 60 minutes recommended
+- agents_per_hour_min (int): minimum number of agents activated per hour (range: 1-{max_agents_allowed})
+- agents_per_hour_max (int): maximum number of agents activated per hour (range: 1-{max_agents_allowed})
+- peak_hours (int array): peak time slots, adjusted to the event's participating groups
+- off_peak_hours (int array): off-peak time slots, usually late night and early morning
+- morning_hours (int array): morning time slots
+- work_hours (int array): working time slots
+- reasoning (string): a brief explanation of why this configuration was chosen"#;
+
+/// TIME-config system prompt (Chinese). Token: `{lang_instruction}`.
+const TIME_CONFIG_SYSTEM_ZH: &str = "你是社交媒体模拟专家。返回纯JSON格式，时间配置需符合模拟场景中目标用户群体的作息习惯。\n\n{lang_instruction}";
+
+/// TIME-config system prompt (English). Faithful translation of [`TIME_CONFIG_SYSTEM_ZH`].
+const TIME_CONFIG_SYSTEM_EN: &str = "You are a social-media simulation expert. Return pure JSON format; the time configuration must match the daily-activity habits of the target user group in the simulation scenario.\n\n{lang_instruction}";
+
+/// EVENT-config user prompt body (Chinese).
+/// Tokens: `{simulation_requirement}`, `{context_truncated}`, `{type_info}`.
+const EVENT_CONFIG_USER_ZH: &str = r#"基于以下模拟需求，生成事件配置。
+
+模拟需求: {simulation_requirement}
+
+{context_truncated}
+
+## 可用实体类型及示例
+{type_info}
+
+## 任务
+请生成事件配置JSON：
+- 提取热点话题关键词
+- 描述舆论发展方向
+- 设计初始帖子内容，**每个帖子必须指定 poster_type（发布者类型）**
+
+**重要**: poster_type 必须从上面的"可用实体类型"中选择，这样初始帖子才能分配给合适的 Agent 发布。
+例如：官方声明应由 Official/University 类型发布，新闻由 MediaOutlet 发布，学生观点由 Student 发布。
+
+返回JSON格式（不要markdown）：
+{
+    "hot_topics": ["关键词1", "关键词2", ...],
+    "narrative_direction": "<舆论发展方向描述>",
+    "initial_posts": [
+        {"content": "帖子内容", "poster_type": "实体类型（必须从可用类型中选择）"},
+        ...
+    ],
+    "reasoning": "<简要说明>"
+}"#;
+
+/// EVENT-config user prompt body (English). Faithful translation of [`EVENT_CONFIG_USER_ZH`].
+const EVENT_CONFIG_USER_EN: &str = r#"Based on the following simulation requirement, generate an event configuration.
+
+Simulation requirement: {simulation_requirement}
+
+{context_truncated}
+
+## Available entity types and examples
+{type_info}
+
+## Task
+Generate the event configuration JSON:
+- Extract hot-topic keywords
+- Describe the direction in which public opinion will develop
+- Design the initial post content; **each post MUST specify a poster_type (the publisher type)**
+
+**Important**: poster_type must be chosen from the "available entity types" above, so that each initial post can be assigned to a suitable agent to publish.
+For example: official statements should be published by the Official/University type, news by MediaOutlet, and student opinions by Student.
+
+Return JSON format (no markdown):
+{
+    "hot_topics": ["keyword1", "keyword2", ...],
+    "narrative_direction": "<description of how public opinion develops>",
+    "initial_posts": [
+        {"content": "post content", "poster_type": "entity type (must be chosen from the available types)"},
+        ...
+    ],
+    "reasoning": "<brief explanation>"
+}"#;
+
+/// EVENT-config system prompt (Chinese). Token: `{lang_instruction}`.
+/// The trailing English IMPORTANT clause is preserved verbatim in both variants.
+const EVENT_CONFIG_SYSTEM_ZH: &str = "你是舆论分析专家。返回纯JSON格式。注意 poster_type 必须精确匹配可用实体类型。\n\n{lang_instruction}\nIMPORTANT: The 'poster_type' field value MUST be in English PascalCase exactly matching the available entity types. Only 'content', 'narrative_direction', 'hot_topics' and 'reasoning' fields should use the specified language.";
+
+/// EVENT-config system prompt (English). Faithful translation of [`EVENT_CONFIG_SYSTEM_ZH`];
+/// the trailing English IMPORTANT clause is identical to the Chinese variant.
+const EVENT_CONFIG_SYSTEM_EN: &str = "You are a public-opinion analysis expert. Return pure JSON format. Note that poster_type must exactly match an available entity type.\n\n{lang_instruction}\nIMPORTANT: The 'poster_type' field value MUST be in English PascalCase exactly matching the available entity types. Only 'content', 'narrative_direction', 'hot_topics' and 'reasoning' fields should use the specified language.";
+
+/// AGENT-config user prompt body (Chinese).
+/// Tokens: `{simulation_requirement}`, `{entity_list_json}`.
+const AGENT_CONFIG_USER_ZH: &str = r#"基于以下信息，为每个实体生成社交媒体活动配置。
+
+模拟需求: {simulation_requirement}
+
+## 实体列表
+```json
+{entity_list_json}
+```
+
+## 任务
+为每个实体生成活动配置，注意：
+- **时间符合目标用户群体作息**：以下为参考（东八区），请根据模拟场景调整
+- **官方机构**（University/GovernmentAgency）：活跃度低(0.1-0.3)，工作时间(9-17)活动，响应慢(60-240分钟)，影响力高(2.5-3.0)
+- **媒体**（MediaOutlet）：活跃度中(0.4-0.6)，全天活动(8-23)，响应快(5-30分钟)，影响力高(2.0-2.5)
+- **个人**（Student/Person/Alumni）：活跃度高(0.6-0.9)，主要晚间活动(18-23)，响应快(1-15分钟)，影响力低(0.8-1.2)
+- **公众人物/专家**：活跃度中(0.4-0.6)，影响力中高(1.5-2.0)
+
+返回JSON格式（不要markdown）：
+{
+    "agent_configs": [
+        {
+            "agent_id": <必须与输入一致>,
+            "activity_level": <0.0-1.0>,
+            "posts_per_hour": <发帖频率>,
+            "comments_per_hour": <评论频率>,
+            "active_hours": [<活跃小时列表，考虑中国人作息>],
+            "response_delay_min": <最小响应延迟分钟>,
+            "response_delay_max": <最大响应延迟分钟>,
+            "sentiment_bias": <-1.0到1.0>,
+            "stance": "<supportive/opposing/neutral/observer>",
+            "influence_weight": <影响力权重>
+        },
+        ...
+    ]
+}"#;
+
+/// AGENT-config user prompt body (English). Faithful translation of [`AGENT_CONFIG_USER_ZH`].
+const AGENT_CONFIG_USER_EN: &str = r#"Based on the following information, generate a social-media activity configuration for each entity.
+
+Simulation requirement: {simulation_requirement}
+
+## Entity list
+```json
+{entity_list_json}
+```
+
+## Task
+Generate an activity configuration for each entity. Note:
+- **Times should match the target user group's daily routine**: the following is a reference (UTC+8 / East-8 zone); adjust it to the simulation scenario
+- **Official institutions** (University/GovernmentAgency): low activity (0.1-0.3), active during working hours (9-17), slow response (60-240 minutes), high influence (2.5-3.0)
+- **Media** (MediaOutlet): moderate activity (0.4-0.6), active all day (8-23), fast response (5-30 minutes), high influence (2.0-2.5)
+- **Individuals** (Student/Person/Alumni): high activity (0.6-0.9), mainly active in the evening (18-23), fast response (1-15 minutes), low influence (0.8-1.2)
+- **Public figures/experts**: moderate activity (0.4-0.6), medium-to-high influence (1.5-2.0)
+
+Return JSON format (no markdown):
+{
+    "agent_configs": [
+        {
+            "agent_id": <must match the input>,
+            "activity_level": <0.0-1.0>,
+            "posts_per_hour": <posting frequency>,
+            "comments_per_hour": <commenting frequency>,
+            "active_hours": [<list of active hours, considering the target group's daily routine>],
+            "response_delay_min": <minimum response delay in minutes>,
+            "response_delay_max": <maximum response delay in minutes>,
+            "sentiment_bias": <-1.0 to 1.0>,
+            "stance": "<supportive/opposing/neutral/observer>",
+            "influence_weight": <influence weight>
+        },
+        ...
+    ]
+}"#;
+
+/// AGENT-config system prompt (Chinese). Token: `{lang_instruction}`.
+/// The trailing English IMPORTANT clause is preserved verbatim in both variants.
+const AGENT_CONFIG_SYSTEM_ZH: &str = "你是社交媒体行为分析专家。返回纯JSON，配置需符合模拟场景中目标用户群体的作息习惯。\n\n{lang_instruction}\nIMPORTANT: The 'stance' field value MUST be one of the English strings: 'supportive', 'opposing', 'neutral', 'observer'. All JSON field names and numeric values must remain unchanged. Only natural language text fields should use the specified language.";
+
+/// AGENT-config system prompt (English). Faithful translation of [`AGENT_CONFIG_SYSTEM_ZH`];
+/// the trailing English IMPORTANT clause is identical to the Chinese variant.
+const AGENT_CONFIG_SYSTEM_EN: &str = "You are a social-media behavior analysis expert. Return pure JSON; the configuration must match the daily-activity habits of the target user group in the simulation scenario.\n\n{lang_instruction}\nIMPORTANT: The 'stance' field value MUST be one of the English strings: 'supportive', 'opposing', 'neutral', 'observer'. All JSON field names and numeric values must remain unchanged. Only natural language text fields should use the specified language.";
+
 impl<L: LlmClient> SimulationConfigGenerator<L> {
     // -----------------------------------------------------------------------
     // Class constants (S-431..S-437)
@@ -1393,57 +1669,15 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
 
         let max_agents_allowed = (num_entities as f64 * 0.9).max(1.0) as usize;
 
-        let prompt = format!(
-            r#"基于以下模拟需求，生成时间模拟配置。
-
-{context_truncated}
-
-## 任务
-请生成时间配置JSON。
-
-### 基本原则（仅供参考，需根据具体事件和参与群体灵活调整）：
-- 请根据模拟场景推断目标用户群体所在时区和作息习惯，以下为东八区(UTC+8)的参考示例
-- 凌晨0-5点几乎无人活动（活跃度系数0.05）
-- 早上6-8点逐渐活跃（活跃度系数0.4）
-- 工作时间9-18点中等活跃（活跃度系数0.7）
-- 晚间19-22点是高峰期（活跃度系数1.5）
-- 23点后活跃度下降（活跃度系数0.5）
-- 一般规律：凌晨低活跃、早间渐增、工作时段中等、晚间高峰
-- **重要**：以下示例值仅供参考，你需要根据事件性质、参与群体特点来调整具体时段
-  - 例如：学生群体高峰可能是21-23点；媒体全天活跃；官方机构只在工作时间
-  - 例如：突发热点可能导致深夜也有讨论，off_peak_hours 可适当缩短
-
-### 返回JSON格式（不要markdown）
-
-示例：
-{{
-    "total_simulation_hours": 72,
-    "minutes_per_round": 60,
-    "agents_per_hour_min": 5,
-    "agents_per_hour_max": 50,
-    "peak_hours": [19, 20, 21, 22],
-    "off_peak_hours": [0, 1, 2, 3, 4, 5],
-    "morning_hours": [6, 7, 8],
-    "work_hours": [9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
-    "reasoning": "针对该事件的时间配置说明"
-}}
-
-字段说明：
-- total_simulation_hours (int): 模拟总时长，24-168小时，突发事件短、持续话题长
-- minutes_per_round (int): 每轮时长，30-120分钟，建议60分钟
-- agents_per_hour_min (int): 每小时最少激活Agent数（取值范围: 1-{max_agents_allowed}）
-- agents_per_hour_max (int): 每小时最多激活Agent数（取值范围: 1-{max_agents_allowed}）
-- peak_hours (int数组): 高峰时段，根据事件参与群体调整
-- off_peak_hours (int数组): 低谷时段，通常深夜凌晨
-- morning_hours (int数组): 早间时段
-- work_hours (int数组): 工作时段
-- reasoning (string): 简要说明为什么这样配置"#
-        );
+        // English-default body (zh users get the Chinese variant); tokens substituted via
+        // `.replace` since `localized()` returns a runtime `&str` (not a `format!` literal).
+        let prompt = crate::i18n::localized(TIME_CONFIG_USER_EN, TIME_CONFIG_USER_ZH)
+            .replace("{max_agents_allowed}", &max_agents_allowed.to_string())
+            .replace("{context_truncated}", &context_truncated);
 
         let lang_instruction = get_language_instruction();
-        let system_prompt = format!(
-            "你是社交媒体模拟专家。返回纯JSON格式，时间配置需符合模拟场景中目标用户群体的作息习惯。\n\n{lang_instruction}"
-        );
+        let system_prompt = crate::i18n::localized(TIME_CONFIG_SYSTEM_EN, TIME_CONFIG_SYSTEM_ZH)
+            .replace("{lang_instruction}", &lang_instruction);
 
         match self.call_llm_with_retry(&prompt, &system_prompt).await {
             Ok(v) => v,
@@ -1599,41 +1833,17 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
         let context_truncated: String =
             context.chars().take(Self::EVENT_CONFIG_CONTEXT_LENGTH).collect();
 
-        let prompt = format!(
-            r#"基于以下模拟需求，生成事件配置。
-
-模拟需求: {simulation_requirement}
-
-{context_truncated}
-
-## 可用实体类型及示例
-{type_info}
-
-## 任务
-请生成事件配置JSON：
-- 提取热点话题关键词
-- 描述舆论发展方向
-- 设计初始帖子内容，**每个帖子必须指定 poster_type（发布者类型）**
-
-**重要**: poster_type 必须从上面的"可用实体类型"中选择，这样初始帖子才能分配给合适的 Agent 发布。
-例如：官方声明应由 Official/University 类型发布，新闻由 MediaOutlet 发布，学生观点由 Student 发布。
-
-返回JSON格式（不要markdown）：
-{{
-    "hot_topics": ["关键词1", "关键词2", ...],
-    "narrative_direction": "<舆论发展方向描述>",
-    "initial_posts": [
-        {{"content": "帖子内容", "poster_type": "实体类型（必须从可用类型中选择）"}},
-        ...
-    ],
-    "reasoning": "<简要说明>"
-}}"#
-        );
+        // English-default body (zh users get the Chinese variant); tokens substituted via
+        // `.replace`. `{simulation_requirement}` is substituted last so it can never re-trigger
+        // an earlier token match if document/requirement text happens to contain one.
+        let prompt = crate::i18n::localized(EVENT_CONFIG_USER_EN, EVENT_CONFIG_USER_ZH)
+            .replace("{type_info}", &type_info)
+            .replace("{context_truncated}", &context_truncated)
+            .replace("{simulation_requirement}", simulation_requirement);
 
         let lang_instruction = get_language_instruction();
-        let system_prompt = format!(
-            "你是舆论分析专家。返回纯JSON格式。注意 poster_type 必须精确匹配可用实体类型。\n\n{lang_instruction}\nIMPORTANT: The 'poster_type' field value MUST be in English PascalCase exactly matching the available entity types. Only 'content', 'narrative_direction', 'hot_topics' and 'reasoning' fields should use the specified language."
-        );
+        let system_prompt = crate::i18n::localized(EVENT_CONFIG_SYSTEM_EN, EVENT_CONFIG_SYSTEM_ZH)
+            .replace("{lang_instruction}", &lang_instruction);
 
         match self.call_llm_with_retry(&prompt, &system_prompt).await {
             Ok(v) => v,
@@ -1829,7 +2039,9 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
     /// # Algorithm
     /// 1. Build `entity_list` (JSON array) with `agent_id = start_idx + i`,
     ///    `entity_name`, `entity_type`, `summary` truncated to `AGENT_SUMMARY_LENGTH` chars.
-    /// 2. Build prompt and system_prompt (byte-verbatim Chinese strings).
+    /// 2. Build prompt and system_prompt: English-default bodies (Chinese under the `zh`
+    ///    locale) from `AGENT_CONFIG_USER_*` / `AGENT_CONFIG_SYSTEM_*`, with substitution
+    ///    tokens filled via `.replace`.
     /// 3. Call `call_llm_with_retry(prompt, system_prompt)`.
     ///    - On success: build `llm_configs: HashMap<i64, Value>` keyed by agent_id.
     ///    - On ANY error: set `llm_configs = {}` and proceed with rule fallback (no fault).
@@ -1869,16 +2081,16 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
         let entity_list_json =
             serde_json::to_string_pretty(&entity_list).expect("entity_list is always serializable");
 
-        let prompt = format!(
-            "基于以下信息，为每个实体生成社交媒体活动配置。\n\n模拟需求: {simulation_requirement}\n\n## 实体列表\n```json\n{entity_list_json}\n```\n\n## 任务\n为每个实体生成活动配置，注意：\n- **时间符合目标用户群体作息**：以下为参考（东八区），请根据模拟场景调整\n- **官方机构**（University/GovernmentAgency）：活跃度低(0.1-0.3)，工作时间(9-17)活动，响应慢(60-240分钟)，影响力高(2.5-3.0)\n- **媒体**（MediaOutlet）：活跃度中(0.4-0.6)，全天活动(8-23)，响应快(5-30分钟)，影响力高(2.0-2.5)\n- **个人**（Student/Person/Alumni）：活跃度高(0.6-0.9)，主要晚间活动(18-23)，响应快(1-15分钟)，影响力低(0.8-1.2)\n- **公众人物/专家**：活跃度中(0.4-0.6)，影响力中高(1.5-2.0)\n\n返回JSON格式（不要markdown）：\n{{\n    \"agent_configs\": [\n        {{\n            \"agent_id\": <必须与输入一致>,\n            \"activity_level\": <0.0-1.0>,\n            \"posts_per_hour\": <发帖频率>,\n            \"comments_per_hour\": <评论频率>,\n            \"active_hours\": [<活跃小时列表，考虑中国人作息>],\n            \"response_delay_min\": <最小响应延迟分钟>,\n            \"response_delay_max\": <最大响应延迟分钟>,\n            \"sentiment_bias\": <-1.0到1.0>,\n            \"stance\": \"<supportive/opposing/neutral/observer>\",\n            \"influence_weight\": <影响力权重>\n        }},\n        ...\n    ]\n}}"
-        );
+        // English-default body (zh users get the Chinese variant); tokens substituted via
+        // `.replace`. `{simulation_requirement}` is substituted last so requirement text that
+        // happens to contain `{entity_list_json}` can never re-trigger an earlier token.
+        let prompt = crate::i18n::localized(AGENT_CONFIG_USER_EN, AGENT_CONFIG_USER_ZH)
+            .replace("{entity_list_json}", &entity_list_json)
+            .replace("{simulation_requirement}", simulation_requirement);
 
-        let base_system =
-            "你是社交媒体行为分析专家。返回纯JSON，配置需符合模拟场景中目标用户群体的作息习惯。";
         let lang_instruction = get_language_instruction();
-        let system_prompt = format!(
-            "{base_system}\n\n{lang_instruction}\nIMPORTANT: The 'stance' field value MUST be one of the English strings: 'supportive', 'opposing', 'neutral', 'observer'. All JSON field names and numeric values must remain unchanged. Only natural language text fields should use the specified language."
-        );
+        let system_prompt = crate::i18n::localized(AGENT_CONFIG_SYSTEM_EN, AGENT_CONFIG_SYSTEM_ZH)
+            .replace("{lang_instruction}", &lang_instruction);
 
         // Step 3 — call LLM; on ANY error fall back to empty map (rule generation below)
         let llm_configs: HashMap<i64, Value> =
@@ -3791,6 +4003,221 @@ mod generator_tests {
                 || reasoning.contains("成功")
                 || reasoning.contains("success"),
             "reasoning must contain common.success fallback when no reasoning key: {reasoning}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // English-default prompt localization (TIME / EVENT / AGENT config prompts)
+    // -----------------------------------------------------------------------
+
+    /// A mock LLM that records the exact `[system, user]` messages it last received,
+    /// so tests can assert which locale's prompt body was rendered and that every
+    /// substitution token was filled (no literal `{token}` left over).
+    struct CapturingLlm {
+        response: String,
+        last: std::sync::Mutex<Option<Vec<ChatMessage>>>,
+    }
+
+    impl CapturingLlm {
+        fn new(response: impl Into<String>) -> Self {
+            Self { response: response.into(), last: std::sync::Mutex::new(None) }
+        }
+
+        /// The captured system-role message body (messages[0]).
+        fn system_msg(&self) -> String {
+            self.last.lock().unwrap().as_ref().unwrap()[0].content.clone()
+        }
+
+        /// The captured user-role message body (messages[1]).
+        fn user_msg(&self) -> String {
+            self.last.lock().unwrap().as_ref().unwrap()[1].content.clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for CapturingLlm {
+        async fn complete(&self, _prompt: &str) -> crate::error::Result<String> {
+            Ok(self.response.clone())
+        }
+
+        async fn complete_json<T: DeserializeOwned>(
+            &self,
+            _prompt: &str,
+        ) -> crate::error::Result<T> {
+            serde_json::from_str(&self.response).map_err(|e| TeriError::Config(e.to_string()))
+        }
+
+        async fn stream(
+            &self,
+            _prompt: &str,
+        ) -> crate::error::Result<Pin<Box<dyn Stream<Item = crate::error::Result<String>> + Send>>>
+        {
+            unimplemented!("not needed for tests")
+        }
+
+        async fn chat(
+            &self,
+            messages: &[ChatMessage],
+            _opts: &ChatOptions,
+        ) -> crate::error::Result<String> {
+            *self.last.lock().unwrap() = Some(messages.to_vec());
+            Ok(self.response.clone())
+        }
+
+        async fn chat_json<T: DeserializeOwned>(
+            &self,
+            messages: &[ChatMessage],
+            opts: &ChatOptions,
+        ) -> crate::error::Result<T> {
+            let raw = self.chat(messages, opts).await?;
+            serde_json::from_str(&raw).map_err(|e| TeriError::Config(e.to_string()))
+        }
+    }
+
+    fn capturing_gen(response: impl Into<String>) -> SimulationConfigGenerator<CapturingLlm> {
+        SimulationConfigGenerator::new(CapturingLlm::new(response), "model-x", "http://localhost")
+    }
+
+    /// Default locale (en) → English EVENT prompt body, every token substituted.
+    #[tokio::test]
+    async fn event_config_prompt_is_english_by_default_and_substitutes_tokens() {
+        let g = capturing_gen(
+            r#"{"hot_topics":[],"narrative_direction":"","initial_posts":[],"reasoning":""}"#,
+        );
+        let entities = vec![make_node("Alice", vec!["Entity", "Student"], "d")];
+        let _ = g
+            .generate_event_config("CONTEXT_BODY", "MY_UNIQUE_REQUIREMENT", &entities)
+            .await;
+
+        let user = g.client.user_msg();
+        // English body selected, requirement + context substituted in.
+        assert!(
+            user.contains("Available entity types and examples"),
+            "expected English EVENT body: {user}"
+        );
+        assert!(
+            user.contains("MY_UNIQUE_REQUIREMENT"),
+            "simulation_requirement not substituted: {user}"
+        );
+        assert!(user.contains("CONTEXT_BODY"), "context not substituted: {user}");
+        // No leftover substitution tokens and no Chinese body.
+        assert!(!user.contains("{simulation_requirement}"), "leftover token: {user}");
+        assert!(!user.contains("{context_truncated}"), "leftover token: {user}");
+        assert!(!user.contains("{type_info}"), "leftover token: {user}");
+        assert!(
+            !user.contains("基于以下模拟需求"),
+            "should not use Chinese body by default: {user}"
+        );
+
+        let system = g.client.system_msg();
+        assert!(
+            system.contains("public-opinion analysis expert"),
+            "expected English EVENT system: {system}"
+        );
+        assert!(
+            !system.contains("{lang_instruction}"),
+            "lang_instruction token not substituted: {system}"
+        );
+        // The English IMPORTANT clause + field names are preserved verbatim.
+        assert!(system.contains("poster_type"), "IMPORTANT clause field name missing: {system}");
+        assert!(
+            system.contains("Only 'content', 'narrative_direction', 'hot_topics' and 'reasoning' fields should use the specified language."),
+            "IMPORTANT clause not preserved verbatim: {system}"
+        );
+    }
+
+    /// `zh` locale → Chinese EVENT prompt body, still token-substituted.
+    #[tokio::test]
+    async fn event_config_prompt_is_chinese_under_zh_locale() {
+        crate::i18n::with_locale("zh".to_string(), async {
+            let g = capturing_gen(
+                r#"{"hot_topics":[],"narrative_direction":"","initial_posts":[],"reasoning":""}"#,
+            );
+            let entities = vec![make_node("Alice", vec!["Entity", "Student"], "d")];
+            let _ = g.generate_event_config("CONTEXT_BODY", "MY_REQ", &entities).await;
+
+            let user = g.client.user_msg();
+            assert!(
+                user.contains("基于以下模拟需求"),
+                "expected Chinese EVENT body under zh: {user}"
+            );
+            assert!(user.contains("MY_REQ"), "requirement not substituted under zh: {user}");
+            assert!(!user.contains("{simulation_requirement}"), "leftover token under zh: {user}");
+
+            let system = g.client.system_msg();
+            assert!(
+                system.contains("你是舆论分析专家"),
+                "expected Chinese EVENT system under zh: {system}"
+            );
+            assert!(
+                !system.contains("{lang_instruction}"),
+                "lang_instruction not substituted under zh: {system}"
+            );
+        })
+        .await;
+    }
+
+    /// Default locale (en) → English TIME prompt body, both tokens substituted.
+    #[tokio::test]
+    async fn time_config_prompt_is_english_by_default_and_substitutes_tokens() {
+        let g = capturing_gen("{}");
+        let _ = g.generate_time_config("TIME_CONTEXT_BODY", 30).await;
+
+        let user = g.client.user_msg();
+        assert!(user.contains("Field descriptions:"), "expected English TIME body: {user}");
+        assert!(user.contains("TIME_CONTEXT_BODY"), "context not substituted: {user}");
+        assert!(!user.contains("{context_truncated}"), "leftover token: {user}");
+        assert!(!user.contains("{max_agents_allowed}"), "leftover token: {user}");
+        // max_agents_allowed = max(1, 30*0.9) = 27 appears in the range hints.
+        assert!(user.contains("range: 1-27"), "max_agents_allowed not substituted: {user}");
+        assert!(
+            !user.contains("基于以下模拟需求"),
+            "should not use Chinese body by default: {user}"
+        );
+
+        let system = g.client.system_msg();
+        assert!(
+            system.contains("social-media simulation expert"),
+            "expected English TIME system: {system}"
+        );
+        assert!(
+            !system.contains("{lang_instruction}"),
+            "lang_instruction not substituted: {system}"
+        );
+    }
+
+    /// Default locale (en) → English AGENT prompt body, both tokens substituted.
+    #[tokio::test]
+    async fn agent_config_prompt_is_english_by_default_and_substitutes_tokens() {
+        let g = capturing_gen(r#"{"agent_configs":[]}"#);
+        let entities = vec![make_node("Bob", vec!["Entity", "Student"], "summary text")];
+        let _ = g.generate_agent_configs_batch("ctx", &entities, 0, "AGENT_REQ_TOKEN").await;
+
+        let user = g.client.user_msg();
+        assert!(user.contains("## Entity list"), "expected English AGENT body: {user}");
+        assert!(
+            user.contains("AGENT_REQ_TOKEN"),
+            "simulation_requirement not substituted: {user}"
+        );
+        // entity_list_json substituted: the agent_id field from the serialized entity list.
+        assert!(user.contains("\"agent_id\""), "entity_list_json not substituted: {user}");
+        assert!(!user.contains("{simulation_requirement}"), "leftover token: {user}");
+        assert!(!user.contains("{entity_list_json}"), "leftover token: {user}");
+        assert!(!user.contains("基于以下信息"), "should not use Chinese body by default: {user}");
+
+        let system = g.client.system_msg();
+        assert!(
+            system.contains("social-media behavior analysis expert"),
+            "expected English AGENT system: {system}"
+        );
+        assert!(
+            !system.contains("{lang_instruction}"),
+            "lang_instruction not substituted: {system}"
+        );
+        // The stance IMPORTANT clause is preserved verbatim.
+        assert!(
+            system.contains("The 'stance' field value MUST be one of the English strings: 'supportive', 'opposing', 'neutral', 'observer'."),
+            "stance IMPORTANT clause not preserved: {system}"
         );
     }
 }

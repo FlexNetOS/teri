@@ -97,7 +97,7 @@ pub struct PredictionReport {
 // — the model conditions on it).
 // ============================================================================
 
-pub const PLAN_SYSTEM_PROMPT: &str = r#"你是一个「未来预测报告」的撰写专家，拥有对模拟世界的「上帝视角」——你可以洞察模拟中每一位Agent的行为、言论和互动。
+pub const PLAN_SYSTEM_PROMPT_ZH: &str = r#"你是一个「未来预测报告」的撰写专家，拥有对模拟世界的「上帝视角」——你可以洞察模拟中每一位Agent的行为、言论和互动。
 
 【核心理念】
 我们构建了一个模拟世界，并向其中注入了特定的「模拟需求」作为变量。模拟世界的演化结果，就是对未来可能发生情况的预测。你正在观察的不是"实验数据"，而是"未来的预演"。
@@ -135,7 +135,45 @@ pub const PLAN_SYSTEM_PROMPT: &str = r#"你是一个「未来预测报告」的�
 
 注意：sections数组最少2个，最多5个元素！"#;
 
-const PLAN_USER_PROMPT_TEMPLATE: &str = r#"【预测场景设定】
+pub const PLAN_SYSTEM_PROMPT_EN: &str = r#"You are an expert author of "future prediction reports", endowed with a "God's-eye view" of the simulated world — you can perceive the behavior, statements, and interactions of every Agent in the simulation.
+
+[Core Philosophy]
+We have built a simulated world and injected a specific "simulation requirement" into it as a variable. The evolved outcome of the simulated world is a prediction of what could happen in the future. What you are observing is not "experimental data" but "a rehearsal of the future".
+
+[Your Task]
+Author a "future prediction report" that answers:
+1. Under the conditions we set, what happened in the future?
+2. How did the various Agents (populations) react and act?
+3. What noteworthy future trends and risks does this simulation reveal?
+
+[Report Positioning]
+- ✅ This is a simulation-based future prediction report that reveals "if this, then what the future would look like"
+- ✅ Focus on the predicted outcomes: how events unfold, how groups react, emergent phenomena, latent risks
+- ✅ The Agents' words and deeds in the simulated world ARE the prediction of future population behavior
+- ❌ It is NOT an analysis of the current state of the real world
+- ❌ It is NOT a vague, general opinion summary
+
+[Section Count Limit]
+- At least 2 sections, at most 5 sections
+- No sub-sections needed; write the complete content directly within each section
+- Keep the content concise, focused on the core predictive findings
+- You design the section structure yourself based on the predicted outcomes
+
+Output the report outline in JSON format, structured as follows:
+{
+    "title": "Report title",
+    "summary": "Report summary (a one-sentence distillation of the core predictive finding)",
+    "sections": [
+        {
+            "title": "Section title",
+            "description": "Description of the section's content"
+        }
+    ]
+}
+
+Note: the sections array must have at least 2 and at most 5 elements!"#;
+
+const PLAN_USER_PROMPT_TEMPLATE_ZH: &str = r#"【预测场景设定】
 我们向模拟世界注入的变量（模拟需求）：{simulation_requirement}
 
 【模拟世界规模】
@@ -156,6 +194,27 @@ const PLAN_USER_PROMPT_TEMPLATE: &str = r#"【预测场景设定】
 
 【再次提醒】报告章节数量：最少2个，最多5个，内容要精炼聚焦于核心预测发现。"#;
 
+const PLAN_USER_PROMPT_TEMPLATE_EN: &str = r#"[Prediction Scenario Setup]
+The variable (simulation requirement) we injected into the simulated world: {simulation_requirement}
+
+[Scale of the Simulated World]
+- Number of entities participating in the simulation: {total_nodes}
+- Number of relationships formed between entities: {total_edges}
+- Distribution of entity types: {entity_types}
+- Number of active Agents: {total_entities}
+
+[Sample of Some Future Facts Predicted by the Simulation]
+{related_facts_json}
+
+Examine this rehearsal of the future from a "God's-eye view":
+1. Under the conditions we set, what state did the future present?
+2. How did the various populations (Agents) react and act?
+3. What noteworthy future trends does this simulation reveal?
+
+Based on the predicted outcomes, design the most fitting section structure for the report.
+
+[Reminder] Report section count: at least 2, at most 5; keep the content concise and focused on the core predictive findings."#;
+
 // ============================================================================
 // Sub-cycle (e): Section-generation prompt constants
 //
@@ -164,7 +223,7 @@ const PLAN_USER_PROMPT_TEMPLATE: &str = r#"【预测场景设定】
 // `{}` placeholders are filled by `format!` / `.replace(...)` at call time.
 // ============================================================================
 
-pub const SECTION_SYSTEM_PROMPT_TEMPLATE: &str = r#"你是一个「未来预测报告」的撰写专家，正在撰写报告的一个章节。
+pub const SECTION_SYSTEM_PROMPT_TEMPLATE_ZH: &str = r#"你是一个「未来预测报告」的撰写专家，正在撰写报告的一个章节。
 
 报告标题: {report_title}
 报告摘要: {report_summary}
@@ -317,7 +376,160 @@ pub const SECTION_SYSTEM_PROMPT_TEMPLATE: &str = r#"你是一个「未来预测�
 6. 【避免重复】仔细阅读下方已完成的章节内容，不要重复描述相同的信息
 7. 【再次强调】不要添加任何标题！用**粗体**代替小节标题"#;
 
-const SECTION_USER_PROMPT_TEMPLATE: &str = r#"已完成的章节内容（请仔细阅读，避免重复）：
+pub const SECTION_SYSTEM_PROMPT_TEMPLATE_EN: &str = r##"You are an expert author of "future prediction reports", and you are now writing one section of the report.
+
+Report title: {report_title}
+Report summary: {report_summary}
+Prediction scenario (simulation requirement): {simulation_requirement}
+
+The section you are to write now: {section_title}
+
+═══════════════════════════════════════════════════════════════
+[Core Philosophy]
+═══════════════════════════════════════════════════════════════
+
+The simulated world is a rehearsal of the future. We injected specific conditions (the simulation requirement) into the simulated world;
+the behavior and interactions of the Agents in the simulation ARE the prediction of future population behavior.
+
+Your task is to:
+- Reveal what happened in the future under the conditions set
+- Predict how the various populations (Agents) reacted and acted
+- Discover noteworthy future trends, risks, and opportunities
+
+❌ Do NOT write it as an analysis of the current state of the real world
+✅ DO focus on "what the future will look like" — the simulation result IS the predicted future
+
+═══════════════════════════════════════════════════════════════
+[The Most Important Rules - Must Be Obeyed]
+═══════════════════════════════════════════════════════════════
+
+1. [You MUST call tools to observe the simulated world]
+   - You are observing a rehearsal of the future from a "God's-eye view"
+   - All content must come from events and Agent words/deeds that occurred in the simulated world
+   - You are forbidden from using your own knowledge to write the report content
+   - Each section must call tools at least 3 times (at most 5) to observe the simulated world, which represents the future
+
+2. [You MUST quote the Agents' original words and deeds]
+   - The Agents' statements and behavior are predictions of future population behavior
+   - Present these predictions in the report using quotation format, for example:
+     > "A certain type of population would say: the original content..."
+   - These quotes are the core evidence of the simulation's prediction
+
+3. [Language consistency - quoted content must be translated into the report language]
+   - The content returned by tools may contain expressions in a language different from the report language
+   - The report must be written entirely in the language consistent with the language specified by the user
+   - When you quote tool-returned content in another language, you must translate it into the report language before writing it in
+   - Keep the original meaning unchanged when translating, and ensure the wording is natural and fluent
+   - This rule applies to both the body text and the quote blocks (> format)
+
+4. [Faithfully present the predicted outcomes]
+   - The report content must reflect the future-representing simulation results in the simulated world
+   - Do not add information that does not exist in the simulation
+   - If information on some aspect is insufficient, state so honestly
+
+═══════════════════════════════════════════════════════════════
+[⚠️ Formatting Rules - Extremely Important!]
+═══════════════════════════════════════════════════════════════
+
+[One section = the smallest content unit]
+- Each section is the smallest chunk unit of the report
+- ❌ Do NOT use any Markdown headings within a section (#, ##, ###, #### etc.)
+- ❌ Do NOT add a section main title at the start of the content
+- ✅ The section title is added automatically by the system; you only write the pure body content
+- ✅ Use **bold**, paragraph breaks, quotes, and lists to organize content, but do not use headings
+
+[Correct example]
+```
+This section analyzes the opinion-propagation dynamics of the event. Through in-depth analysis of the simulation data, we found...
+
+**Initial Ignition Phase**
+
+As the front line of public opinion, the microblog platform carried the core function of breaking the news first:
+
+> "The microblog platform contributed 68% of the initial volume..."
+
+**Emotion-Amplification Phase**
+
+The short-video platform further amplified the event's impact:
+
+- Strong visual impact
+- High emotional resonance
+```
+
+[Incorrect example]
+```
+## Executive Summary          ← Wrong! Do not add any heading
+### 1. Initial Phase          ← Wrong! Do not use ### to divide sub-sections
+#### 1.1 Detailed Analysis    ← Wrong! Do not use #### to subdivide
+
+This section analyzes...
+```
+
+═══════════════════════════════════════════════════════════════
+[Available Retrieval Tools] (call 3-5 times per section)
+═══════════════════════════════════════════════════════════════
+
+{tools_description}
+
+[Tool-use advice - please mix different tools, do not use only one kind]
+- insight_forge: Deep insight analysis; automatically decomposes the question and retrieves facts and relations across multiple dimensions
+- panorama_search: Wide-angle panoramic search; understand the full picture, timeline, and evolution of an event
+- quick_search: Quickly verify a specific information point
+- interview_agents: Interview simulation Agents to obtain first-person viewpoints and authentic reactions of different roles
+
+═══════════════════════════════════════════════════════════════
+[Workflow]
+═══════════════════════════════════════════════════════════════
+
+In each reply you may do only ONE of the following two things (never both at once):
+
+Option A - Call a tool:
+Output your thinking, then call one tool using the following format:
+<tool_call>
+{{"name": "tool_name", "parameters": {{"param_name": "param_value"}}}}
+</tool_call>
+The system will execute the tool and return the result to you. You do not need to, and must not, write the tool result yourself.
+
+Option B - Output the final content:
+When you have obtained enough information through tools, output the section content starting with "Final Answer:".
+
+⚠️ Strictly forbidden:
+- Forbidden to include both a tool call and a Final Answer in a single reply
+- Forbidden to fabricate the tool result (Observation) yourself; all tool results are injected by the system
+- At most one tool call per reply
+
+═══════════════════════════════════════════════════════════════
+[Section Content Requirements]
+═══════════════════════════════════════════════════════════════
+
+1. The content must be based on the simulation data retrieved by tools
+2. Quote the original text extensively to demonstrate the simulation effect
+3. Use Markdown formatting (but headings are forbidden):
+   - Use **bold text** to mark key points (in place of sub-headings)
+   - Use lists (- or 1.2.3.) to organize key points
+   - Use blank lines to separate different paragraphs
+   - ❌ Forbidden to use #, ##, ###, #### or any heading syntax
+4. [Quote format rule - must be its own paragraph]
+   A quote must stand as its own paragraph, with one blank line before and after, and must not be mixed into a paragraph:
+
+   ✅ Correct format:
+   ```
+   The school's response was considered to lack substance.
+
+   > "The school's response pattern appeared rigid and slow in the fast-changing social-media environment."
+
+   This assessment reflected the public's widespread dissatisfaction.
+   ```
+
+   ❌ Incorrect format:
+   ```
+   The school's response was considered to lack substance.> "The school's response pattern..." This assessment reflected...
+   ```
+5. Maintain logical coherence with the other sections
+6. [Avoid repetition] Read the already-completed section content below carefully, and do not repeat the same information
+7. [Emphasizing again] Do not add any headings! Use **bold** in place of sub-section titles"##;
+
+const SECTION_USER_PROMPT_TEMPLATE_ZH: &str = r#"已完成的章节内容（请仔细阅读，避免重复）：
 {previous_content}
 
 ═══════════════════════════════════════════════════════════════
@@ -341,7 +553,31 @@ const SECTION_USER_PROMPT_TEMPLATE: &str = r#"已完成的章节内容（请仔�
 2. 然后调用工具（Action）获取模拟数据
 3. 收集足够信息后输出 Final Answer（纯正文，无任何标题）"#;
 
-const REACT_OBSERVATION_TEMPLATE: &str = r#"Observation（检索结果）:
+const SECTION_USER_PROMPT_TEMPLATE_EN: &str = r##"Already-completed section content (please read carefully to avoid repetition):
+{previous_content}
+
+═══════════════════════════════════════════════════════════════
+[Current Task] Write the section: {section_title}
+═══════════════════════════════════════════════════════════════
+
+[Important Reminders]
+1. Read the already-completed sections above carefully, and avoid repeating the same content!
+2. You must call tools to obtain simulation data before starting
+3. Please mix different tools, do not use only one kind
+4. The report content must come from retrieval results; do not use your own knowledge
+
+[⚠️ Format Warning - Must Be Obeyed]
+- ❌ Do not write any heading (#, ##, ###, #### none are allowed)
+- ❌ Do not write "{section_title}" as the opening
+- ✅ The section title is added automatically by the system
+- ✅ Write the body directly, using **bold** in place of sub-section titles
+
+Please begin:
+1. First think (Thought) about what information this section needs
+2. Then call a tool (Action) to obtain simulation data
+3. After gathering enough information, output Final Answer (pure body, without any heading)"##;
+
+const REACT_OBSERVATION_TEMPLATE_ZH: &str = r#"Observation（检索结果）:
 
 ═══ 工具 {tool_name} 返回 ═══
 {result}
@@ -352,19 +588,44 @@ const REACT_OBSERVATION_TEMPLATE: &str = r#"Observation（检索结果）:
 - 如果需要更多信息：调用一个工具继续检索
 ═══════════════════════════════════════════════════════════════"#;
 
-const REACT_INSUFFICIENT_TOOLS_MSG: &str = "【注意】你只调用了{tool_calls_count}次工具，至少需要{min_tool_calls}次。\
+const REACT_OBSERVATION_TEMPLATE_EN: &str = r#"Observation (retrieval result):
+
+═══ Tool {tool_name} returned ═══
+{result}
+
+═══════════════════════════════════════════════════════════════
+Tools called {tool_calls_count}/{max_tool_calls} times (used: {used_tools_str}){unused_hint}
+- If the information is sufficient: output the section content starting with "Final Answer:" (you must quote the original text above)
+- If more information is needed: call a tool to continue retrieving
+═══════════════════════════════════════════════════════════════"#;
+
+const REACT_INSUFFICIENT_TOOLS_MSG_ZH: &str = "【注意】你只调用了{tool_calls_count}次工具，至少需要{min_tool_calls}次。\
      请再调用工具获取更多模拟数据，然后再输出 Final Answer。{unused_hint}";
 
-const REACT_INSUFFICIENT_TOOLS_MSG_ALT: &str = "当前只调用了 {tool_calls_count} 次工具，至少需要 {min_tool_calls} 次。\
+const REACT_INSUFFICIENT_TOOLS_MSG_EN: &str = "[Note] You have only called tools {tool_calls_count} time(s), but at least {min_tool_calls} are required. \
+     Please call tools again to obtain more simulation data, and only then output Final Answer. {unused_hint}";
+
+const REACT_INSUFFICIENT_TOOLS_MSG_ALT_ZH: &str = "当前只调用了 {tool_calls_count} 次工具，至少需要 {min_tool_calls} 次。\
      请调用工具获取模拟数据。{unused_hint}";
 
-const REACT_TOOL_LIMIT_MSG: &str = "工具调用次数已达上限（{tool_calls_count}/{max_tool_calls}），不能再调用工具。\
+const REACT_INSUFFICIENT_TOOLS_MSG_ALT_EN: &str = "Only {tool_calls_count} tool call(s) have been made so far, but at least {min_tool_calls} are required. \
+     Please call tools to obtain simulation data. {unused_hint}";
+
+const REACT_TOOL_LIMIT_MSG_ZH: &str = "工具调用次数已达上限（{tool_calls_count}/{max_tool_calls}），不能再调用工具。\
      请立即基于已获取的信息，以 \"Final Answer:\" 开头输出章节内容。";
 
-const REACT_UNUSED_TOOLS_HINT: &str =
+const REACT_TOOL_LIMIT_MSG_EN: &str = "The number of tool calls has reached the limit ({tool_calls_count}/{max_tool_calls}); no more tool calls are allowed. \
+     Please immediately, based on the information already obtained, output the section content starting with \"Final Answer:\".";
+
+const REACT_UNUSED_TOOLS_HINT_ZH: &str =
     "\n💡 你还没有使用过: {unused_list}，建议尝试不同工具获取多角度信息";
 
-const REACT_FORCE_FINAL_MSG: &str = "已达到工具调用限制，请直接输出 Final Answer: 并生成章节内容。";
+const REACT_UNUSED_TOOLS_HINT_EN: &str = "\n💡 You have not used yet: {unused_list}; consider trying different tools to obtain multi-angle information";
+
+const REACT_FORCE_FINAL_MSG_ZH: &str =
+    "已达到工具调用限制，请直接输出 Final Answer: 并生成章节内容。";
+
+const REACT_FORCE_FINAL_MSG_EN: &str = "The tool-call limit has been reached; please directly output Final Answer: and generate the section content.";
 
 // ============================================================================
 // Sub-cycle (i): Chat prompt constants
@@ -385,7 +646,7 @@ const REACT_FORCE_FINAL_MSG: &str = "已达到工具调用限制，请直接输�
 ///
 /// Placeholders: `{simulation_requirement}`, `{report_content}`, `{tools_description}`.
 /// All other `{` / `}` are literal (the embedded JSON-call example).
-pub const CHAT_SYSTEM_PROMPT_TEMPLATE: &str = r#"你是一个简洁高效的模拟预测助手。
+pub const CHAT_SYSTEM_PROMPT_TEMPLATE_ZH: &str = r#"你是一个简洁高效的模拟预测助手。
 
 【背景】
 预测条件: {simulation_requirement}
@@ -411,6 +672,37 @@ pub const CHAT_SYSTEM_PROMPT_TEMPLATE: &str = r#"你是一个简洁高效的模�
 - 简洁直接，不要长篇大论
 - 使用 > 格式引用关键内容
 - 优先给出结论，再解释原因"#;
+
+/// System prompt for the chat method — English variant (see `CHAT_SYSTEM_PROMPT_TEMPLATE_ZH`).
+///
+/// Placeholders: `{simulation_requirement}`, `{report_content}`, `{tools_description}`.
+/// All other `{` / `}` are literal (the embedded JSON-call example).
+pub const CHAT_SYSTEM_PROMPT_TEMPLATE_EN: &str = r#"You are a concise and efficient simulation-prediction assistant.
+
+[Background]
+Prediction condition: {simulation_requirement}
+
+[Already-Generated Analysis Report]
+{report_content}
+
+[Rules]
+1. Prefer to answer questions based on the report content above
+2. Answer the question directly; avoid lengthy chains of reasoning
+3. Only call tools to retrieve more data when the report content is insufficient to answer
+4. Answers should be concise, clear, and well-organized
+
+[Available Tools] (use only when needed, call at most 1-2 times)
+{tools_description}
+
+[Tool-Call Format]
+<tool_call>
+{"name": "tool_name", "parameters": {"param_name": "param_value"}}
+</tool_call>
+
+[Answer Style]
+- Concise and direct; do not be long-winded
+- Use the > format to quote key content
+- Give the conclusion first, then explain the reason"#;
 
 /// Suffix appended to the tool-observation user message in the chat ReACT loop
 /// (report_agent.py:857).
@@ -754,7 +1046,11 @@ impl ReportAgent {
         }
 
         // Step 4: build system prompt
-        let system_prompt = format!("{}\n\n{}", PLAN_SYSTEM_PROMPT, get_language_instruction());
+        let system_prompt = format!(
+            "{}\n\n{}",
+            crate::i18n::localized(PLAN_SYSTEM_PROMPT_EN, PLAN_SYSTEM_PROMPT_ZH),
+            get_language_instruction()
+        );
 
         // Step 5: build user prompt
         let user_prompt = match Self::build_plan_user_prompt(&self.simulation_requirement, &context)
@@ -887,7 +1183,9 @@ impl ReportAgent {
                 .map_err(|e| TeriError::Report(format!("JSON serialization failed: {e}")))?
         };
 
-        let prompt = PLAN_USER_PROMPT_TEMPLATE
+        let template =
+            crate::i18n::localized(PLAN_USER_PROMPT_TEMPLATE_EN, PLAN_USER_PROMPT_TEMPLATE_ZH);
+        let prompt = template
             .replace("{simulation_requirement}", simulation_requirement)
             .replace("{total_nodes}", &total_nodes.to_string())
             .replace("{total_edges}", &total_edges.to_string())
@@ -987,7 +1285,11 @@ impl ReportAgent {
 
         // ── Build system prompt ──────────────────────────────────────────────
         let tools_desc = get_tools_description();
-        let system_prompt = SECTION_SYSTEM_PROMPT_TEMPLATE
+        let template = crate::i18n::localized(
+            SECTION_SYSTEM_PROMPT_TEMPLATE_EN,
+            SECTION_SYSTEM_PROMPT_TEMPLATE_ZH,
+        );
+        let system_prompt = template
             .replace("{report_title}", &outline.title)
             .replace("{report_summary}", &outline.summary)
             .replace("{simulation_requirement}", &self.simulation_requirement)
@@ -1020,7 +1322,11 @@ impl ReportAgent {
             parts.join("\n\n---\n\n")
         };
 
-        let user_prompt = SECTION_USER_PROMPT_TEMPLATE
+        let template = crate::i18n::localized(
+            SECTION_USER_PROMPT_TEMPLATE_EN,
+            SECTION_USER_PROMPT_TEMPLATE_ZH,
+        );
+        let user_prompt = template
             .replace("{previous_content}", &previous_content)
             .replace("{section_title}", &section.title);
 
@@ -1181,7 +1487,11 @@ impl ReportAgent {
                     } else {
                         String::new()
                     };
-                    let msg = REACT_INSUFFICIENT_TOOLS_MSG
+                    let template = crate::i18n::localized(
+                        REACT_INSUFFICIENT_TOOLS_MSG_EN,
+                        REACT_INSUFFICIENT_TOOLS_MSG_ZH,
+                    );
+                    let msg = template
                         .replace("{tool_calls_count}", &tool_calls_count.to_string())
                         .replace("{min_tool_calls}", &min_tool_calls.to_string())
                         .replace("{unused_hint}", &unused_hint);
@@ -1220,7 +1530,9 @@ impl ReportAgent {
                 if tool_calls_count >= MAX_TOOL_CALLS_PER_SECTION {
                     // Quota exhausted (report_agent.py:1406-1416)
                     messages.push(ChatMessage::assistant(&response));
-                    let msg = REACT_TOOL_LIMIT_MSG
+                    let template =
+                        crate::i18n::localized(REACT_TOOL_LIMIT_MSG_EN, REACT_TOOL_LIMIT_MSG_ZH);
+                    let msg = template
                         .replace("{tool_calls_count}", &tool_calls_count.to_string())
                         .replace("{max_tool_calls}", &MAX_TOOL_CALLS_PER_SECTION.to_string());
                     messages.push(ChatMessage::user(msg));
@@ -1291,7 +1603,11 @@ impl ReportAgent {
                     .collect();
                 let unused_hint_obs =
                     if !unused_obs.is_empty() && tool_calls_count < MAX_TOOL_CALLS_PER_SECTION {
-                        REACT_UNUSED_TOOLS_HINT.replace("{unused_list}", &unused_obs.join("、"))
+                        let template = crate::i18n::localized(
+                            REACT_UNUSED_TOOLS_HINT_EN,
+                            REACT_UNUSED_TOOLS_HINT_ZH,
+                        );
+                        template.replace("{unused_list}", &unused_obs.join("、"))
                     } else {
                         String::new()
                     };
@@ -1305,7 +1621,11 @@ impl ReportAgent {
                 let used_tools_joined = used_tools_str.join(", ");
 
                 messages.push(ChatMessage::assistant(&response));
-                let obs_msg = REACT_OBSERVATION_TEMPLATE
+                let template = crate::i18n::localized(
+                    REACT_OBSERVATION_TEMPLATE_EN,
+                    REACT_OBSERVATION_TEMPLATE_ZH,
+                );
+                let obs_msg = template
                     .replace("{tool_name}", &call.name)
                     .replace("{result}", &result)
                     .replace("{tool_calls_count}", &tool_calls_count.to_string())
@@ -1329,7 +1649,11 @@ impl ReportAgent {
                 } else {
                     String::new()
                 };
-                let msg = REACT_INSUFFICIENT_TOOLS_MSG_ALT
+                let template = crate::i18n::localized(
+                    REACT_INSUFFICIENT_TOOLS_MSG_ALT_EN,
+                    REACT_INSUFFICIENT_TOOLS_MSG_ALT_ZH,
+                );
+                let msg = template
                     .replace("{tool_calls_count}", &tool_calls_count.to_string())
                     .replace("{min_tool_calls}", &min_tool_calls.to_string())
                     .replace("{unused_hint}", &unused_hint_s3);
@@ -1367,7 +1691,10 @@ impl ReportAgent {
             "{}",
             t_args("report.sectionMaxIter", &[("title", &section.title)])
         );
-        messages.push(ChatMessage::user(REACT_FORCE_FINAL_MSG));
+        messages.push(ChatMessage::user(crate::i18n::localized(
+            REACT_FORCE_FINAL_MSG_EN,
+            REACT_FORCE_FINAL_MSG_ZH,
+        )));
 
         let force_response = llm.chat(&messages, &opts).await;
 
@@ -2188,7 +2515,9 @@ impl ReportAgent {
 
         // Three sequential .replace() calls — safe because the slot names never
         // collide with the literal JSON-example braces in the template.
-        let system_prompt = CHAT_SYSTEM_PROMPT_TEMPLATE
+        let template =
+            crate::i18n::localized(CHAT_SYSTEM_PROMPT_TEMPLATE_EN, CHAT_SYSTEM_PROMPT_TEMPLATE_ZH);
+        let system_prompt = template
             .replace("{simulation_requirement}", &self.simulation_requirement)
             .replace("{report_content}", &report_content_display)
             .replace("{tools_description}", &get_tools_description());
@@ -4959,7 +5288,7 @@ Final Answer: This is premature."#;
         let report_content = "test report";
         let tools_desc = "tool1: does X";
 
-        let rendered = CHAT_SYSTEM_PROMPT_TEMPLATE
+        let rendered = CHAT_SYSTEM_PROMPT_TEMPLATE_EN
             .replace("{simulation_requirement}", sim_req)
             .replace("{report_content}", report_content)
             .replace("{tools_description}", tools_desc);
@@ -4981,6 +5310,126 @@ Final Answer: This is premature."#;
         assert!(!rendered.contains("{simulation_requirement}"), "no unresolved slot");
         assert!(!rendered.contains("{report_content}"), "no unresolved slot");
         assert!(!rendered.contains("{tools_description}"), "no unresolved slot");
+    }
+
+    // ========================================================================
+    // English-default prompt localization (en by default / zh override).
+    //
+    // teri is English-first: `crate::i18n::localized(EN, ZH)` returns the EN body
+    // for every locale except an explicit "zh". These tests pin that contract for
+    // the report prompts and prove token substitution survives the locale switch.
+    // ========================================================================
+
+    /// Run a future under an explicit locale scope (test helper).
+    async fn under_locale<F, T>(locale: &str, f: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        crate::i18n::with_locale(locale.to_string(), f).await
+    }
+
+    #[test]
+    fn plan_system_prompt_is_english_by_default() {
+        // Outside any with_locale scope → English-first.
+        let p = crate::i18n::localized(PLAN_SYSTEM_PROMPT_EN, PLAN_SYSTEM_PROMPT_ZH);
+        assert_eq!(p, PLAN_SYSTEM_PROMPT_EN);
+        assert!(p.contains("God's-eye view"), "English plan system prompt expected by default");
+        assert!(!p.contains("上帝视角"), "must not fall back to the Chinese variant by default");
+    }
+
+    #[tokio::test]
+    async fn plan_system_prompt_is_chinese_under_zh() {
+        let p = under_locale("zh", async {
+            crate::i18n::localized(PLAN_SYSTEM_PROMPT_EN, PLAN_SYSTEM_PROMPT_ZH)
+        })
+        .await;
+        assert_eq!(p, PLAN_SYSTEM_PROMPT_ZH);
+        assert!(p.contains("上帝视角"), "Chinese plan system prompt expected under zh");
+    }
+
+    #[test]
+    fn chat_system_prompt_is_english_by_default() {
+        let p =
+            crate::i18n::localized(CHAT_SYSTEM_PROMPT_TEMPLATE_EN, CHAT_SYSTEM_PROMPT_TEMPLATE_ZH);
+        assert_eq!(p, CHAT_SYSTEM_PROMPT_TEMPLATE_EN);
+        assert!(p.contains("concise and efficient simulation-prediction assistant"));
+        assert!(
+            !p.contains("简洁高效的模拟预测助手"),
+            "must not be the Chinese variant by default"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_system_prompt_is_chinese_under_zh() {
+        let p = under_locale("zh", async {
+            crate::i18n::localized(CHAT_SYSTEM_PROMPT_TEMPLATE_EN, CHAT_SYSTEM_PROMPT_TEMPLATE_ZH)
+        })
+        .await;
+        assert_eq!(p, CHAT_SYSTEM_PROMPT_TEMPLATE_ZH);
+        assert!(
+            p.contains("简洁高效的模拟预测助手"),
+            "Chinese chat system prompt expected under zh"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_system_prompt_substitutes_tokens_under_both_locales() {
+        // The rendered prompt must carry the substituted VALUES, not the literal {tokens},
+        // under both the default (en) and the zh override.
+        for loc in ["en", "zh"] {
+            let rendered = under_locale(loc, async {
+                let template = crate::i18n::localized(
+                    CHAT_SYSTEM_PROMPT_TEMPLATE_EN,
+                    CHAT_SYSTEM_PROMPT_TEMPLATE_ZH,
+                );
+                template
+                    .replace("{simulation_requirement}", "SIMREQ_MARK")
+                    .replace("{report_content}", "REPORT_MARK")
+                    .replace("{tools_description}", "TOOLS_MARK")
+            })
+            .await;
+            assert!(rendered.contains("SIMREQ_MARK"), "{loc}: simulation_requirement substituted");
+            assert!(rendered.contains("REPORT_MARK"), "{loc}: report_content substituted");
+            assert!(rendered.contains("TOOLS_MARK"), "{loc}: tools_description substituted");
+            assert!(!rendered.contains("{simulation_requirement}"), "{loc}: no literal slot");
+            assert!(!rendered.contains("{report_content}"), "{loc}: no literal slot");
+            assert!(!rendered.contains("{tools_description}"), "{loc}: no literal slot");
+            // The single-brace JSON-call example stays literal (replace must not touch it).
+            assert!(rendered.contains("{\"name\""), "{loc}: JSON-call example brace intact");
+        }
+    }
+
+    #[test]
+    fn section_system_prompt_substitutes_all_tokens_english_default() {
+        let template = crate::i18n::localized(
+            SECTION_SYSTEM_PROMPT_TEMPLATE_EN,
+            SECTION_SYSTEM_PROMPT_TEMPLATE_ZH,
+        );
+        let rendered = template
+            .replace("{report_title}", "TITLE_MARK")
+            .replace("{report_summary}", "SUMMARY_MARK")
+            .replace("{simulation_requirement}", "SIMREQ_MARK")
+            .replace("{section_title}", "SECTION_MARK")
+            .replace("{tools_description}", "TOOLS_MARK");
+        // English by default.
+        assert!(rendered.contains("God's-eye view"), "English section system prompt by default");
+        for mark in ["TITLE_MARK", "SUMMARY_MARK", "SIMREQ_MARK", "SECTION_MARK", "TOOLS_MARK"] {
+            assert!(rendered.contains(mark), "{mark} must be substituted");
+        }
+        for slot in [
+            "{report_title}",
+            "{report_summary}",
+            "{simulation_requirement}",
+            "{section_title}",
+            "{tools_description}",
+        ] {
+            assert!(!rendered.contains(slot), "no literal {slot} must remain");
+        }
+        // The doubled-brace tool-call example survives untouched.
+        assert!(
+            rendered.contains("{{\"name\""),
+            "section tool-call example double-braces intact"
+        );
     }
 
     // (i)-8: ChatResponse.to_dict — key order response, tool_calls, sources.
