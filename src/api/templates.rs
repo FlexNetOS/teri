@@ -9,13 +9,14 @@
 //! Sources (read directly, the SAME paths/consts the engine uses):
 //! - jinja (via `include_str!`): `templates/persona_gen.jinja` (stage 2),
 //!   `templates/agent_action.jinja` (stage 3), `templates/report_gen.jinja` (stage 4).
-//! - system-prompt consts: `crate::services::ontology::ONTOLOGY_SYSTEM_PROMPT` (stage 1),
-//!   `crate::report::{PLAN_SYSTEM_PROMPT, SECTION_SYSTEM_PROMPT_TEMPLATE}` (stage 4),
-//!   `crate::report::CHAT_SYSTEM_PROMPT_TEMPLATE` (stage 5).
+//! - system-prompt consts (the English-default `_EN` variant — each prompt now has an `_EN`/`_ZH`
+//!   pair selected at runtime by `crate::i18n::localized`; the viewer shows the English reference):
+//!   `crate::services::ontology::ONTOLOGY_SYSTEM_PROMPT_EN` (stage 1),
+//!   `crate::report::{PLAN_SYSTEM_PROMPT_EN, SECTION_SYSTEM_PROMPT_TEMPLATE_EN}` (stage 4),
+//!   `crate::report::CHAT_SYSTEM_PROMPT_TEMPLATE_EN` (stage 5).
 //!
-//! The prompt text is exposed AS-IS (currently Chinese; translation is out of scope — flagged
-//! as a follow-up). Stage labels: 1 Graph Build, 2 Env Setup, 3 Simulation, 4 Report,
-//! 5 Interaction.
+//! The prompt text is exposed in English (the `_EN` default; zh users get the `_ZH` body at
+//! render time). Stage labels: 1 Graph Build, 2 Env Setup, 3 Simulation, 4 Report, 5 Interaction.
 
 use std::sync::Arc;
 
@@ -61,8 +62,8 @@ pub fn all_templates() -> Vec<TemplateDescriptor> {
             step_label: "Graph Build",
             kind: "system_prompt",
             name: "Ontology generation system prompt",
-            source_path: "src/services/ontology.rs::ONTOLOGY_SYSTEM_PROMPT",
-            content: crate::services::ontology::ONTOLOGY_SYSTEM_PROMPT,
+            source_path: "src/services/ontology.rs::ONTOLOGY_SYSTEM_PROMPT_EN",
+            content: crate::services::ontology::ONTOLOGY_SYSTEM_PROMPT_EN,
         },
         // ── Stage 2: Env Setup ──
         TemplateDescriptor {
@@ -100,8 +101,8 @@ pub fn all_templates() -> Vec<TemplateDescriptor> {
             step_label: "Report",
             kind: "system_prompt",
             name: "Report plan system prompt",
-            source_path: "src/report/mod.rs::PLAN_SYSTEM_PROMPT",
-            content: crate::report::PLAN_SYSTEM_PROMPT,
+            source_path: "src/report/mod.rs::PLAN_SYSTEM_PROMPT_EN",
+            content: crate::report::PLAN_SYSTEM_PROMPT_EN,
         },
         TemplateDescriptor {
             id: "report_section_system",
@@ -109,8 +110,8 @@ pub fn all_templates() -> Vec<TemplateDescriptor> {
             step_label: "Report",
             kind: "system_prompt",
             name: "Report section system prompt",
-            source_path: "src/report/mod.rs::SECTION_SYSTEM_PROMPT_TEMPLATE",
-            content: crate::report::SECTION_SYSTEM_PROMPT_TEMPLATE,
+            source_path: "src/report/mod.rs::SECTION_SYSTEM_PROMPT_TEMPLATE_EN",
+            content: crate::report::SECTION_SYSTEM_PROMPT_TEMPLATE_EN,
         },
         // ── Stage 5: Interaction ──
         TemplateDescriptor {
@@ -119,8 +120,8 @@ pub fn all_templates() -> Vec<TemplateDescriptor> {
             step_label: "Interaction",
             kind: "system_prompt",
             name: "Report chat system prompt",
-            source_path: "src/report/mod.rs::CHAT_SYSTEM_PROMPT_TEMPLATE",
-            content: crate::report::CHAT_SYSTEM_PROMPT_TEMPLATE,
+            source_path: "src/report/mod.rs::CHAT_SYSTEM_PROMPT_TEMPLATE_EN",
+            content: crate::report::CHAT_SYSTEM_PROMPT_TEMPLATE_EN,
         },
     ]
 }

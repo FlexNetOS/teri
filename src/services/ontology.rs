@@ -6,7 +6,7 @@
 //!
 //! | Source symbol | Lines | Rust symbol |
 //! |---|---|---|
-//! | S-172 `ONTOLOGY_SYSTEM_PROMPT` | 30-173 | `ONTOLOGY_SYSTEM_PROMPT` const |
+//! | S-172 `ONTOLOGY_SYSTEM_PROMPT` | 30-173 | `ONTOLOGY_SYSTEM_PROMPT_ZH`/`_EN` consts + `ontology_system_prompt()` selector |
 //! | S-173 `_to_pascal_case` | 16-26 | `to_pascal_case` fn |
 //! | S-174 `OntologyGenerator` | 176 | `OntologyGenerator` struct |
 //! | S-175 `__init__` | 182-183 | `OntologyGenerator::new` |
@@ -110,16 +110,22 @@ pub fn to_pascal_case(name: &str) -> String {
 }
 
 // ============================================================================
-// S-172 — ONTOLOGY_SYSTEM_PROMPT
+// S-172 — ONTOLOGY_SYSTEM_PROMPT (EN default / ZH variant, selected by locale)
 // ============================================================================
 
-/// System prompt for ontology generation.
+/// System prompt for ontology generation — Chinese variant (served to `zh` users).
 ///
 /// Port of MiroFish `ontology_generator.py:30-173` `ONTOLOGY_SYSTEM_PROMPT`.
 /// Ported VERBATIM — the LLM behavior depends on the exact prompt text,
 /// including all Chinese characters, the JSON format block, design guidelines,
 /// and entity/relation reference lists.
-pub const ONTOLOGY_SYSTEM_PROMPT: &str = r#"你是一个专业的知识图谱本体设计专家。你的任务是分析给定的文本内容和模拟需求，设计适合**社交媒体舆论模拟**的实体类型和关系类型。
+///
+/// teri is English-first: the active prompt body is selected by
+/// [`ontology_system_prompt`], which returns [`ONTOLOGY_SYSTEM_PROMPT_EN`] for every
+/// locale except an explicit `"zh"` (which gets this const). The two bodies are kept
+/// structurally identical — same sections, JSON block, and entity/relation reference
+/// lists — so swapping the natural language never changes the contract.
+pub const ONTOLOGY_SYSTEM_PROMPT_ZH: &str = r#"你是一个专业的知识图谱本体设计专家。你的任务是分析给定的文本内容和模拟需求，设计适合**社交媒体舆论模拟**的实体类型和关系类型。
 
 **重要：你必须输出有效的JSON格式数据，不要输出任何其他内容。**
 
@@ -264,6 +270,167 @@ B. **具体类型（8个，根据文本内容设计）**：
 - COMPETES_WITH: 竞争
 "#;
 
+/// System prompt for ontology generation — English variant (teri's default).
+///
+/// Faithful, professional English translation of [`ONTOLOGY_SYSTEM_PROMPT_ZH`]: the same
+/// sections, bullet lists, JSON format block, design guidelines, and entity/relation
+/// reference lists, structurally identical so the two bodies share one contract. Every
+/// literal token the code substitutes or the LLM must echo is preserved verbatim — the
+/// JSON field names (`entity_types`/`name`/`description`/`attributes`/`type`/`examples`/
+/// `edge_types`/`source_targets`/`source`/`target`/`analysis_summary`), the casing tokens
+/// (`PascalCase`/`snake_case`/`UPPER_SNAKE_CASE`), and the English entity/relation
+/// identifiers (`Person`, `Organization`, `Student`, `University`, `GovernmentAgency`,
+/// `MediaOutlet`, `WORKS_FOR`, …) are NOT translated.
+pub const ONTOLOGY_SYSTEM_PROMPT_EN: &str = r#"You are a professional knowledge-graph ontology design expert. Your task is to analyze the given text content and simulation requirement, and design entity types and relation types suitable for **social-media public-opinion simulation**.
+
+**IMPORTANT: You must output valid JSON-formatted data, and nothing else.**
+
+## Core Task Background
+
+We are building a **social-media public-opinion simulation system**. In this system:
+- Each entity is an "account" or "actor" that can speak, interact, and spread information on social media
+- Entities influence, repost, comment on, and respond to one another
+- We need to simulate how the various parties react during a public-opinion event and how information propagates
+
+Therefore, **an entity must be a real-world actor that actually exists and can speak and interact on social media**:
+
+**It can be**:
+- A specific individual (a public figure, a party to the event, an opinion leader, an expert or scholar, an ordinary person)
+- A company or business (including its official account)
+- An organization (a university, an association, an NGO, a labor union, etc.)
+- A government department or regulatory body
+- A media organization (a newspaper, a TV station, a self-media outlet, a website)
+- A social-media platform itself
+- A representative of a specific group (e.g. an alumni association, a fan club, a rights-advocacy group, etc.)
+
+**It cannot be**:
+- An abstract concept (such as "public opinion", "emotion", "trend")
+- A theme/topic (such as "academic integrity", "education reform")
+- A viewpoint/stance (such as "the supporting side", "the opposing side")
+
+## Output Format
+
+Please output JSON format, containing the following structure:
+
+```json
+{
+    "entity_types": [
+        {
+            "name": "Entity type name (English, PascalCase)",
+            "description": "Short description (English, no more than 100 characters)",
+            "attributes": [
+                {
+                    "name": "Attribute name (English, snake_case)",
+                    "type": "text",
+                    "description": "Attribute description"
+                }
+            ],
+            "examples": ["example entity 1", "example entity 2"]
+        }
+    ],
+    "edge_types": [
+        {
+            "name": "Relation type name (English, UPPER_SNAKE_CASE)",
+            "description": "Short description (English, no more than 100 characters)",
+            "source_targets": [
+                {"source": "source entity type", "target": "target entity type"}
+            ],
+            "attributes": []
+        }
+    ],
+    "analysis_summary": "A brief analytical note on the text content"
+}
+```
+
+## Design Guidelines (extremely important!)
+
+### 1. Entity Type Design - must be strictly followed
+
+**Quantity requirement: there must be exactly 10 entity types**
+
+**Hierarchy requirement (must include both specific types and fallback types)**:
+
+Your 10 entity types must include the following hierarchy:
+
+A. **Fallback types (must be included, placed as the last 2 in the list)**:
+   - `Person`: The fallback type for any individual natural person. When a person does not belong to any more specific person type, classify them here.
+   - `Organization`: The fallback type for any organization. When an organization does not belong to any more specific organization type, classify it here.
+
+B. **Specific types (8, designed according to the text content)**:
+   - For the main roles appearing in the text, design more specific types
+   - For example: if the text concerns an academic event, you can have `Student`, `Professor`, `University`
+   - For example: if the text concerns a business event, you can have `Company`, `CEO`, `Employee`
+
+**Why fallback types are needed**:
+- Various people will appear in the text, such as "a primary/secondary school teacher", "passer-by A", "a certain netizen"
+- If no dedicated type matches them, they should be classified under `Person`
+- Likewise, small organizations, temporary groups, etc. should be classified under `Organization`
+
+**Design principles for specific types**:
+- Identify the high-frequency or key role types from the text
+- Each specific type should have a clear boundary, avoiding overlap
+- The description must clearly explain how this type differs from the fallback type
+
+### 2. Relation Type Design
+
+- Quantity: 6-10
+- Relations should reflect the real connections in social-media interaction
+- Ensure that the relations' source_targets cover the entity types you define
+
+### 3. Attribute Design
+
+- 1-3 key attributes per entity type
+- **Note**: Attribute names cannot use `name`, `uuid`, `group_id`, `created_at`, `summary` (these are system reserved words)
+- Recommended: `full_name`, `title`, `role`, `position`, `location`, `description`, etc.
+
+## Entity Type Reference
+
+**Person class (specific)**:
+- Student: a student
+- Professor: a professor/scholar
+- Journalist: a journalist
+- Celebrity: a celebrity/influencer
+- Executive: an executive
+- Official: a government official
+- Lawyer: a lawyer
+- Doctor: a doctor
+
+**Person class (fallback)**:
+- Person: any natural person (use when not belonging to the specific types above)
+
+**Organization class (specific)**:
+- University: a university
+- Company: a company/business
+- GovernmentAgency: a government agency
+- MediaOutlet: a media organization
+- Hospital: a hospital
+- School: a primary/secondary school
+- NGO: a non-governmental organization
+
+**Organization class (fallback)**:
+- Organization: any organization (use when not belonging to the specific types above)
+
+## Relation Type Reference
+
+- WORKS_FOR: works for
+- STUDIES_AT: studies at
+- AFFILIATED_WITH: affiliated with
+- REPRESENTS: represents
+- REGULATES: regulates
+- REPORTS_ON: reports on
+- COMMENTS_ON: comments on
+- RESPONDS_TO: responds to
+- SUPPORTS: supports
+- OPPOSES: opposes
+- COLLABORATES_WITH: collaborates with
+- COMPETES_WITH: competes with
+"#;
+
+/// English-default ontology system prompt (zh users get the Chinese variant).
+pub fn ontology_system_prompt() -> &'static str {
+    crate::i18n::localized(ONTOLOGY_SYSTEM_PROMPT_EN, ONTOLOGY_SYSTEM_PROMPT_ZH)
+}
+
 // ============================================================================
 // S-177 — MAX_TEXT_LENGTH_FOR_LLM
 // ============================================================================
@@ -337,7 +504,8 @@ impl<L: LlmClient> OntologyGenerator<L> {
         // Step 3: system prompt with IMPORTANT English suffix (ported verbatim from py:210)
         let system_prompt = format!(
             "{}\n\n{}\nIMPORTANT: Entity type names MUST be in English PascalCase (e.g., 'PersonEntity', 'MediaOrganization'). Relationship type names MUST be in English UPPER_SNAKE_CASE (e.g., 'WORKS_FOR'). Attribute names MUST be in English snake_case. Only description fields and analysis_summary should use the specified language above.",
-            ONTOLOGY_SYSTEM_PROMPT, lang_instruction
+            ontology_system_prompt(),
+            lang_instruction
         );
 
         // Step 4: call chat_json with temperature=0.3, max_tokens=4096
@@ -1136,5 +1304,72 @@ mod tests {
         let result = validate_and_process(input);
         let attrs = result["edge_types"][0]["attributes"].as_array().unwrap();
         assert_eq!(attrs[0]["name"], "entity_summary");
+    }
+
+    // =========================================================================
+    // S-172 — ontology_system_prompt locale selection (English-default)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn ontology_system_prompt_defaults_to_english() {
+        // Outside any with_locale scope, the locale is "en" (teri ships English-first),
+        // so the selector returns the English body verbatim.
+        let prompt = ontology_system_prompt();
+        assert_eq!(prompt, ONTOLOGY_SYSTEM_PROMPT_EN);
+        // Sanity: the English body carries the English heading and reference identifiers,
+        // and none of the Chinese prose of the zh variant.
+        assert!(prompt.contains("## Core Task Background"));
+        assert!(prompt.contains("there must be exactly 10 entity types"));
+        assert!(!prompt.contains("核心任务背景"));
+    }
+
+    #[tokio::test]
+    async fn ontology_system_prompt_english_under_explicit_en_and_other_locales() {
+        // Explicit en → English.
+        let en =
+            crate::i18n::with_locale("en".to_string(), async { ontology_system_prompt() }).await;
+        assert_eq!(en, ONTOLOGY_SYSTEM_PROMPT_EN);
+        // Any non-zh locale falls through to the English default arm.
+        let fr =
+            crate::i18n::with_locale("fr".to_string(), async { ontology_system_prompt() }).await;
+        assert_eq!(fr, ONTOLOGY_SYSTEM_PROMPT_EN);
+    }
+
+    #[tokio::test]
+    async fn ontology_system_prompt_chinese_under_zh_locale() {
+        // Under an explicit zh scope, the selector returns the byte-identical Chinese variant.
+        let prompt =
+            crate::i18n::with_locale("zh".to_string(), async { ontology_system_prompt() }).await;
+        assert_eq!(prompt, ONTOLOGY_SYSTEM_PROMPT_ZH);
+        // Sanity: the zh body carries the Chinese heading and instruction.
+        assert!(prompt.contains("核心任务背景"));
+        assert!(prompt.contains("必须正好10个实体类型"));
+    }
+
+    #[tokio::test]
+    async fn ontology_prompt_variants_preserve_shared_contract_tokens() {
+        // Both bodies must keep every token the code substitutes or the LLM must echo:
+        // JSON field names, casing tokens, and the English entity/relation identifiers.
+        for prompt in [ONTOLOGY_SYSTEM_PROMPT_EN, ONTOLOGY_SYSTEM_PROMPT_ZH] {
+            for token in [
+                "entity_types",
+                "edge_types",
+                "source_targets",
+                "analysis_summary",
+                "PascalCase",
+                "snake_case",
+                "UPPER_SNAKE_CASE",
+                "Person",
+                "Organization",
+                "University",
+                "GovernmentAgency",
+                "MediaOutlet",
+                "Student",
+                "WORKS_FOR",
+                "COMPETES_WITH",
+            ] {
+                assert!(prompt.contains(token), "prompt variant missing token: {token}");
+            }
+        }
     }
 }

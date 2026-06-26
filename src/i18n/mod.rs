@@ -289,6 +289,21 @@ pub fn get_language_instruction() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// localized — English-default prompt-body selection
+// ---------------------------------------------------------------------------
+
+/// Select between an English and a Chinese variant of a prompt BODY by the active locale.
+///
+/// teri is English-first (`get_locale()` defaults to `"en"`): returns `en` for every locale
+/// except an explicit `"zh"`, which returns `zh`. Use this for the LLM system/user prompt
+/// bodies that must be authored per-locale — appending an English `get_language_instruction()`
+/// under a Chinese prompt body still biases the model toward Chinese, so the body itself has to
+/// switch. Both arms are `&'static str` so callers stay allocation-free.
+pub fn localized(en: &'static str, zh: &'static str) -> &'static str {
+    if get_locale() == "zh" { zh } else { en }
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -335,6 +350,18 @@ mod tests {
         // After the scope, task-local is unset again → English-first default.
         let locale = get_locale();
         assert_eq!(locale, "en");
+    }
+
+    #[tokio::test]
+    async fn localized_picks_english_by_default_and_chinese_under_zh() {
+        // No locale scope → English-first.
+        assert_eq!(localized("EN", "ZH"), "EN");
+        // Explicit en scope → English.
+        assert_eq!(run_with("en", async { localized("EN", "ZH") }).await, "EN");
+        // Explicit zh scope → Chinese.
+        assert_eq!(run_with("zh", async { localized("EN", "ZH") }).await, "ZH");
+        // Any non-zh locale falls through to English (the default arm).
+        assert_eq!(run_with("fr", async { localized("EN", "ZH") }).await, "EN");
     }
 
     // -----------------------------------------------------------------------
