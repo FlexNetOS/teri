@@ -66,3 +66,16 @@ out/
 # Copilot Superpowers - installed skills (local only, not tracked by git)
 .agent/skills/
 .agent/skills-catalog.md
+
+# Vendored pebesen subsystem (community platform) — build/tooling artifacts
+pebesen/frontend/node_modules/
+pebesen/frontend/.svelte-kit/
+pebesen/frontend/build/
+pebesen/frontend/dist/
+pebesen/.venv/
+pebesen/**/__pycache__/
+
+# teri web UI (Vue 3 SPA in frontend/) — build/tooling artifacts only; src is tracked
+/frontend/node_modules/
+/frontend/dist/
+/frontend/.vite/

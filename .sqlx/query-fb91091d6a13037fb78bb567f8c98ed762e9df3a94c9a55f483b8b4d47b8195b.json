@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT s.id, s.space_id, s.name, s.description, s.visibility as \"visibility: StreamVisibility\", s.created_at\n            FROM streams s\n            WHERE s.space_id = $1\n            AND (\n                s.visibility = 'public'\n                OR EXISTS (\n                    SELECT 1 FROM memberships m\n                    WHERE m.space_id = s.space_id AND m.user_id = $2\n                )\n            )\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "space_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "visibility: StreamVisibility",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "fb91091d6a13037fb78bb567f8c98ed762e9df3a94c9a55f483b8b4d47b8195b"
+}

@@ -1,0 +1,14 @@
+[package]
+name = "pebesen-bin"
+license = "MIT"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "pebesen"
+path = "src/main.rs"
+
+[dependencies]
+pebesen-intelligence = { path = "../intelligence" }
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }

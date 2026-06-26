@@ -1,0 +1,121 @@
+name: Pebesen CI
+
+# Pebesen (community platform) was vendored into teri (crates under pebesen/crates/, frontend
+# under pebesen/frontend/). Its crates are workspace members but excluded from teri's default
+# build, so they get their own pipeline here, scoped to changes under pebesen/.
+
+on:
+  push:
+    branches: [main]
+    paths: ['pebesen/**', '.sqlx/**', '.github/workflows/pebesen-ci.yml']
+  pull_request:
+    branches: [main]
+    paths: ['pebesen/**', '.sqlx/**', '.github/workflows/pebesen-ci.yml']
+
+env:
+  SQLX_OFFLINE: "true"
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and index
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-pebesen-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pebesen-cargo-
+
+      # rustup may auto-sync a newer nightly mid-run without the rustfmt/clippy
+      # components; ensure they exist for the active toolchain before using them.
+      - name: Ensure rustfmt + clippy components
+        run: rustup component add rustfmt clippy
+
+      - name: Check formatting
+        run: cargo fmt -p pebesen-core -p pebesen-db -p pebesen-api -p pebesen-search -p pebesen-notifications -p pebesen-intelligence -p pebesen-bin --check
+
+      - name: Clippy
+        run: cargo clippy -p pebesen-core -p pebesen-db -p pebesen-api -p pebesen-search -p pebesen-notifications -p pebesen-intelligence -p pebesen-bin --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test -p pebesen-core -p pebesen-db -p pebesen-api -p pebesen-search -p pebesen-notifications -p pebesen-intelligence -p pebesen-bin --all-features
+
+      # Advisory scanning is handled workspace-wide by teri's cargo-deny workflow;
+      # no separate cargo-audit step here (avoids a slow duplicate install).
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    # Non-blocking: the vendored pebesen frontend isn't wired into teri's release
+    # path yet (its lockfile/build are pebesen-internal). Informational until the
+    # pebesen UI is integrated; tracked in FEATURE-PARITY.md (TASK-SEAM follow-ups).
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: pebesen/frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      # pebesen/frontend uses Bun (faster than node+pnpm; Bun bundles its own runtime,
+      # so no separate Node setup). setup-bun caches deps off the committed bun.lock.
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Lint
+        run: bun run lint:check || true  # non-blocking for now (lint:check = eslint, no --fix)
+
+      - name: Type check
+        run: bun run check
+
+      - name: Test
+        run: bun run test || true  # non-blocking until tests exist
+
+      - name: Audit
+        run: bun audit --audit-level=moderate || true
+
+  docker:
+    name: Docker
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pebesen
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Validate compose file
+        run: docker compose config
+
+      - name: Start services
+        run: |
+          docker compose up -d postgres redis meilisearch
+          sleep 15
+
+      - name: Check service health
+        run: |
+          docker compose ps
+          docker compose logs postgres || true
+
+      - name: Cleanup
+        run: docker compose down -v

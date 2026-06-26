@@ -1,0 +1,64 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: mixed-line-ending
+
+  - repo: local
+    hooks:
+      - id: rust-fmt
+        name: rust-fmt
+        entry: cargo fmt --all --
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: rust-clippy
+        name: rust-clippy
+        entry: cargo clippy --all-targets --all-features -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-audit
+        name: cargo-audit
+        entry: cargo audit
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-check
+        name: cargo-check
+        entry: cargo check --all-features
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+  - repo: local
+    hooks:
+      - id: eslint-frontend
+        name: eslint-frontend
+        entry: python3 scripts/pre-commit-hooks.py eslint
+        language: system
+        files: '^frontend/.*\.(js|ts|svelte)$'
+        pass_filenames: false
+
+      - id: svelte-check
+        name: svelte-check
+        entry: python3 scripts/pre-commit-hooks.py svelte-check
+        language: system
+        files: '^frontend/.*\.(svelte|ts)$'
+        pass_filenames: false
+
+      - id: prettier-frontend
+        name: prettier-frontend
+        entry: python3 scripts/pre-commit-hooks.py prettier
+        language: system
+        files: '^frontend/.*\.(js|ts|svelte|json|css|md)$'
+        pass_filenames: false

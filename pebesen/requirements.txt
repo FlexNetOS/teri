@@ -1,0 +1,7 @@
+# Pre-commit hooks and development tools
+pre-commit>=4.5.0
+
+# Optional: Additional Python tools for development
+# black>=24.0.0      # Code formatting (if needed)
+# isort>=5.12.0      # Import sorting (if needed)
+# pytest>=8.0.0     # Testing (if needed)
