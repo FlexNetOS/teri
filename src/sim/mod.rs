@@ -939,6 +939,19 @@ impl SimEngine {
         self.completion_tx.subscribe()
     }
 
+    /// Fire the terminal completion signal on an **aborted** run (engine error).
+    ///
+    /// The normal completion send lives at the success tail of `run_with_boost` and is skipped
+    /// when the run returns `Err` (a per-round log write / `flush_final` / extraction failure).
+    /// Without a signal the monitor — whose only loop-exit is the completion watch — polls forever
+    /// and the run is stuck `Running`. The runner calls this on the engine's error path so the
+    /// monitor unblocks, runs its cleanup, and (seeing no `simulation_end` record) marks the run
+    /// `Failed`. `total_ticks` is the snapshots committed so far (best-effort; the run is partial).
+    pub fn signal_aborted(&self) {
+        let total_ticks = self.snapshot_history.lock().len() as u32;
+        let _ = self.completion_tx.send(Some(SimCompletion { total_ticks }));
+    }
+
     pub async fn run<L: crate::llm::LlmClient>(
         &self,
         pool: &mut crate::agent::AgentPool,
