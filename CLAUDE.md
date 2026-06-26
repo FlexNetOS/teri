@@ -86,10 +86,13 @@ sim-config generation, native in-process `SimEngine` (two-phase ticks, dual Twit
 graph-memory write-back), ReACT `ReportAgent` + graph tools (InsightForge analog), interview/chat
 endpoints, the axum HTTP server, embeddings + real cosine semantic recall (redb), LLM adapters.
 
-**The one remaining placeholder is the `teri run` CLI composition** (`main.rs` still bails
-`Pipeline not yet implemented`); plus a short named gap list (provider selection hardcoded to
-OpenAI, Anthropic/Gemini streaming framing, live SSE endpoints, agent LTM write-back from the sim
-loop, i18n en/zh-only). The authoritative parity verification is **`RUNBOOK.md` §12**.
+**`teri run` is now fully wired** (`main.rs` → `pipeline::run_pipeline`, the in-process
+`seed → graph → agents → sim → report` composition, tested in `tests/pipeline_run.rs`). The former
+gap list is also closed: runtime provider selection (`build_llm` → `ProviderAdapter::from_config`),
+native Anthropic/Gemini streaming, live `text/event-stream` routes, agent-LTM write-back from the
+sim loop, English-default i18n (en/zh), and per-tick knowledge-graph context for agents all landed.
+The remaining backlog (i18n breadth beyond en/zh, `/api/graph/data` `links` shape, the
+`scheduled_events` stub) is in **`RUNBOOK.md` §13**; the parity verification is **`RUNBOOK.md` §12**.
 
 The build order lives in `~/Desktop/meta/MIROFISH-PORT-PLAN.md` (P1 wire-the-spine → P2
 parity-core → P3 serve+estate → P4 scale+provenance) — extend that plan; its **parity matrix is
