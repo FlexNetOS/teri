@@ -136,5 +136,18 @@ cargo fmt --all && cargo clippy --all-targets -- -D warnings
 ./target/debug/teri --help  # MUST work keyless (exit 0) — regression-probe this after CLI changes
 ```
 
+## Living research map (auto-refreshed each session)
+
+`scripts/gen-research-map.sh` regenerates `code-research/references/research-ledger.md` — an
+always-current structural map of the repo (entry points, module inventory, HTTP route count,
+test-fn count, code-intelligence stats). It is **gitignored and regenerated at every session
+start** (wired into `.codex/hooks.json` SessionStart → `teri-context-session-start.sh`, which
+also surfaces a one-line pointer into agent context). Run it by hand anytime; add `--reindex`
+to rebuild the `git-kb code` index first.
+
+Treat the map as a **navigation aid**, not a source of truth — the authoritative parity verdict
+and capability matrix live in `RUNBOOK.md` §12, architecture/guards in this file. Never hand-edit
+the generated ledger (edits are overwritten); change `scripts/gen-research-map.sh` instead.
+
 CLI exit codes: usage errors = 2 (clap), runtime errors = 1, success/help = 0. Config loads only
 inside commands — never before argument parsing.

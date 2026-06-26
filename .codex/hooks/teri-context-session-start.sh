@@ -4,8 +4,14 @@ set -euo pipefail
 root="$(rtk git rev-parse --show-toplevel 2>/dev/null || printf '%s\n' "$PWD")"
 cd "$root"
 
+# Refresh the always-current research navigation map (gitignored, regenerated each session)
+# and capture its one-line summary so the context below can point the agent at the live map.
+TERI_RESEARCH_MAP_SUMMARY="$(bash "$root/scripts/gen-research-map.sh" 2>/dev/null || true)"
+export TERI_RESEARCH_MAP_SUMMARY
+
 rtk python3 - <<'PY'
 import json
+import os
 from pathlib import Path
 
 root = Path.cwd()
@@ -60,6 +66,10 @@ if hits:
     lines.append("- Stale doc markers found: " + "; ".join(hits))
 else:
     lines.append("- No known stale teri-run/provider/test-count phrases found in README.md, RUNBOOK.md, or CLAUDE.md.")
+
+rmap = os.environ.get("TERI_RESEARCH_MAP_SUMMARY", "").strip()
+if rmap:
+    lines.append("- " + rmap + " — consult it for the current module/route/entry-point map.")
 
 print(json.dumps({
     "hookSpecificOutput": {
