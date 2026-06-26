@@ -77,6 +77,7 @@ import { getProject, getGraphData } from '../api/graph'
 import { getSimulation, getSimulationConfig, stopSimulation, closeSimulationEnv, getEnvStatus } from '../api/simulation'
 import LanguageSwitcher from '../components/LanguageSwitcher.vue'
 import { useI18n } from 'vue-i18n'
+import { openSse } from '../api/sse'
 
 const { t } = useI18n()
 const route = useRoute()
@@ -274,21 +275,44 @@ const refreshGraph = () => {
 }
 
 // --- Auto Refresh Logic ---
+// SSE-first: teri streams live sim ticks on /ticks/sse, so the graph re-renders the moment a
+// tick lands (graph-memory write-back happens per tick) instead of on MiroFish's blind 30s poll.
+// If the SSE stream can't connect, fall back to the original 30s interval.
 let graphRefreshTimer = null
+let ticksSse = null
 
-const startGraphRefresh = () => {
+const startPollingFallback = () => {
   if (graphRefreshTimer) return
-  addLog(t('log.graphRealtimeRefreshStart'))
   // 立即刷新一次，然后每30秒刷新
   graphRefreshTimer = setInterval(refreshGraph, 30000)
 }
 
+const startGraphRefresh = () => {
+  if (ticksSse || graphRefreshTimer) return
+  addLog(t('log.graphRealtimeRefreshStart'))
+  if (!currentSimulationId.value) {
+    startPollingFallback()
+    return
+  }
+  ticksSse = openSse(`/api/simulation/${currentSimulationId.value}/ticks/sse`, {
+    events: {
+      // Each tick advances the world (and its graph memory) — refresh the graph view to match.
+      tick: () => refreshGraph(),
+    },
+    onFallback: startPollingFallback,
+  })
+}
+
 const stopGraphRefresh = () => {
+  if (ticksSse) {
+    ticksSse()
+    ticksSse = null
+  }
   if (graphRefreshTimer) {
     clearInterval(graphRefreshTimer)
     graphRefreshTimer = null
-    addLog(t('log.graphRealtimeRefreshStop'))
   }
+  addLog(t('log.graphRealtimeRefreshStop'))
 }
 
 watch(isSimulating, (newValue) => {

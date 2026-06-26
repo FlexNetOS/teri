@@ -356,8 +356,9 @@ fn allowed_file(filename: &str) -> bool {
 /// `OntologyGenerator<L: LlmClient>` is generic, so tests can inject any
 /// `LlmClient` impl directly by calling the inner logic (`generate_ontology_inner`)
 /// instead of this axum handler.  The axum handler itself uses `build_llm` (concrete
-/// `OpenAiAdapter`) and is tested end-to-end in the happy-path test only when a real
-/// LLM endpoint is not available by asserting the pre-LLM validation paths.
+/// `ProviderAdapter`, provider-selected per S9 / TASK-SIM-4) and is tested end-to-end in the
+/// happy-path test only when a real LLM endpoint is not available by asserting the pre-LLM
+/// validation paths.
 async fn generate_ontology(
     State(state): State<Arc<ApiState>>,
     mut multipart: Multipart,

@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 220" role="img" aria-label="Teri">
+  <title>Teri</title>
+  <desc>A school of small anchovies forming one larger fish — emergent swarm intelligence.</desc>
+  <defs>
+    <linearGradient id="teriFade" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#FF4500" stop-opacity="0.35"/>
+      <stop offset="0.55" stop-color="#FF4500" stop-opacity="0.8"/>
+      <stop offset="1" stop-color="#FF4500" stop-opacity="1"/>
+    </linearGradient>
+  </defs>
+
+  <!-- The emergent silhouette: many small fish arranged into one big fish pointing forward.
+       Each <use> is a single anchovy; density rises toward the head (right) so the school
+       reads as a coherent body + tail. -->
+  <g fill="url(#teriFade)">
+    <!-- a single anchovy glyph: teardrop body + forked tail -->
+    <symbol id="fish" viewBox="0 0 24 12">
+      <path d="M2 6 Q9 0 18 6 Q9 12 2 6 Z"/>
+      <path d="M2 6 L-3 2 L-1 6 L-3 10 Z"/>
+      <circle cx="15" cy="6" r="1" fill="#1a1a1a"/>
+    </symbol>
+
+    <!-- tail of the big fish (left) -->
+    <use href="#fish" x="18" y="86" width="22" height="11"/>
+    <use href="#fish" x="20" y="104" width="22" height="11"/>
+    <use href="#fish" x="22" y="122" width="22" height="11"/>
+
+    <!-- lower body -->
+    <use href="#fish" x="60" y="60" width="24" height="12"/>
+    <use href="#fish" x="64" y="84" width="24" height="12"/>
+    <use href="#fish" x="66" y="108" width="24" height="12"/>
+    <use href="#fish" x="64" y="132" width="24" height="12"/>
+    <use href="#fish" x="60" y="156" width="24" height="12"/>
+
+    <!-- mid body -->
+    <use href="#fish" x="108" y="48" width="26" height="13"/>
+    <use href="#fish" x="112" y="74" width="26" height="13"/>
+    <use href="#fish" x="114" y="100" width="26" height="13"/>
+    <use href="#fish" x="114" y="126" width="26" height="13"/>
+    <use href="#fish" x="112" y="152" width="26" height="13"/>
+    <use href="#fish" x="108" y="178" width="26" height="13"/>
+
+    <!-- shoulder -->
+    <use href="#fish" x="160" y="58" width="28" height="14"/>
+    <use href="#fish" x="164" y="86" width="28" height="14"/>
+    <use href="#fish" x="166" y="114" width="28" height="14"/>
+    <use href="#fish" x="164" y="142" width="28" height="14"/>
+    <use href="#fish" x="160" y="170" width="28" height="14"/>
+
+    <!-- head, narrowing to the snout (right) -->
+    <use href="#fish" x="212" y="80" width="30" height="15"/>
+    <use href="#fish" x="214" y="106" width="30" height="15"/>
+    <use href="#fish" x="212" y="132" width="30" height="15"/>
+    <use href="#fish" x="258" y="104" width="32" height="16"/>
+  </g>
+
+  <!-- wordmark -->
+  <text x="310" y="128" font-family="Inter, 'Noto Sans SC', system-ui, sans-serif"
+        font-size="84" font-weight="800" letter-spacing="-2" fill="#1a1a1a">teri</text>
+  <circle cx="500" cy="64" r="7" fill="#FF4500"/>
+</svg>

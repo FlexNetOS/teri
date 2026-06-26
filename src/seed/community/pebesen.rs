@@ -252,7 +252,7 @@ impl CommunityAdapter for PebesenAdapter {
             topics.iter().filter(|t| t.status.eq_ignore_ascii_case("open")).count() as u64;
 
         // Recent topics, freshest first. Topics without a timestamp sort last.
-        topics.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+        topics.sort_by_key(|t| std::cmp::Reverse(t.last_active));
         topics.truncate(self.recent_topic_limit);
 
         Ok(CommunitySignal {

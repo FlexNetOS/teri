@@ -36,17 +36,21 @@ adapters with retry/backoff), `embedding.rs` (`EmbeddingClient`, semantic recall
 
 **"Can teri simulate anything?" — yes, today, through the REST API.** Every pipeline stage
 (graph build → environment prep → simulation → report → deep interaction) is implemented and
-tested (**1629 tests**), and reachable by driving `teri serve`'s `/api/*` endpoints in sequence
+tested (the full `cargo test` suite is green, 1700+ tests), and reachable both one-shot via
+`teri run` and by driving `teri serve`'s `/api/*` endpoints in sequence
 (§8). The full MiroFish parity verification is in **§12**.
 
+- **`teri run`** — **works today.** Preflights the backend (§6), selects the configured provider
+  via `build_provider_llm`, and runs the one-shot `seed -> graph -> agents -> sim -> report`
+  pipeline through `pipeline::run_pipeline`.
 - **`teri serve`** — **works today.** Preflights the backend (§6), then boots the axum REST
   server (`/health` + the three `/api/*` blueprints). **This is the supported way to run a full
   simulation today**: `POST /api/graph/ontology/generate` → `/build` → `/api/simulation/create`
   → `/prepare` → `/start` → `/api/report/generate` → `/api/report/chat`.
-- **`teri run`** — **preflights, then bails** with `Pipeline not yet implemented`. The engine
-  stages it would call all exist and are tested; only the **CLI one-shot composition** of them is
-  unwired (see [Known gaps](#13-known-gaps--not-yet-wired) — the last `not implemented`). Use
-  `run` today to validate config/backend; use `serve` + the API to actually simulate.
+- **`teri run`** — **works today.** Preflights the backend (§6), then runs the in-process one-shot
+  `seed → graph → agents → sim → report` composition (`main.rs` → `pipeline::run_pipeline`,
+  tested in `tests/pipeline_run.rs`) and writes a `verdict.json` summary. Use `serve` + the API for
+  the interactive studio; use `run` for a single CLI prediction.
 - **Both** `run` and `serve` run the **same fail-closed guard** (§6) before doing work — `serve`
   refuses to *boot* against a stub/unreachable backend.
 
@@ -56,7 +60,7 @@ tested (**1629 tests**), and reachable by driving `teri serve`'s `/api/*` endpoi
 
 | Requirement | Notes |
 |-------------|-------|
-| **Rust toolchain** | stable; build with `cargo build --release` |
+| **Rust toolchain** | **floating `nightly`** (pinned by `rust-toolchain.toml`; auto-selected — no `+nightly` needed). The single resolved toolchain for teri; see §3.1. |
 | **A real OpenAI-compatible LLM backend** | local (shimmy/ruvllm/Ollama/LM Studio/vLLM) or hosted (OpenAI/Anthropic/Gemini). **Stub/canned backends are refused** — see §6. |
 | **An LLM API key** *(for hosted backends)* | injected via envctl or a dev `.env`; **never** exported in a shell profile. Local keyless backends need none. |
 | **envctl** *(recommended)* | vault-held secret injection — `envctl run -- teri …` |
@@ -75,6 +79,53 @@ cargo build --release            # binary at ./target/release/teri
 CLI exit codes: usage errors = `2` (clap), runtime errors = `1`, success/help = `0`.
 Config loads **only inside commands**, never before argument parsing — so `--help`/`--version`
 work with no secrets present.
+
+---
+
+## 3.1 Toolchain (single floating nightly + optional GPU / perf paths)
+
+teri builds on **one** toolchain: **floating `nightly`**, pinned by `rust-toolchain.toml`
+(`channel = "nightly"`, `edition 2024`). It is *floating* — always the latest nightly, refreshed
+on the meta cadence, **never** date-pinned — and there is **no stable fallback**: nightly is
+mandatory (it's a hard requirement of the optional CUDA path), not weighed against stable. `cargo`
+auto-selects it inside the repo, so `+nightly` is never needed.
+
+Only **always-available** components (`rustfmt`, `clippy`) are hard-pinned in
+`rust-toolchain.toml`. A component listed there that a given nightly didn't build is a *fatal*
+rustup error, so the sometimes-missing backend below is deliberately **not** pinned.
+
+**Codegen backend (`rustc_codegen_gcc`, optional, perf).** LLVM stays the **default** codegen so
+`cargo`/CI stay portable. For a GCC-codegen perf build:
+
+```bash
+rustup component add rustc-codegen-gcc            # not built for every nightly — add on demand
+RUSTFLAGS="-Zcodegen-backend=gcc" cargo build --release
+```
+
+**Linker + compiler cache (`wild` + `kache`, meta-tree only).** Inside the meta workspace teri
+inherits `meta/.cargo/config.toml` (`linker = clang`, `-Clink-arg=--ld-path=wild`,
+`rustc-wrapper = kache`) — a perf path, not a correctness one. teri ships **no** repo-local
+`.cargo/config.toml`, so a **standalone** checkout (and GitHub-hosted CI, which clones teri alone)
+builds with the default LLVM linker and no wrapper. This split is intentional: it keeps standalone
+CI and `scripts/preflight.sh` in agreement (both default-linker) while the meta tree gets the fast
+path. The toolchain + caches are owned by **meta/envctl paths**, not user-global `~/.rustup`.
+
+**GPU codegen ([NVlabs/cuda-oxide](https://github.com/NVlabs/cuda-oxide), optional, perf).** This is
+*not* a CUDA-driver-bindings crate — it's a **custom `rustc` backend that compiles GPU kernels in
+pure Rust** (`Rust → MIR → Pliron IR → LLVM IR → PTX`), built with `cargo oxide build`. Single-source
+(host + device in one file), generic kernels, device intrinsics, async layer. It's the **third
+codegen backend** on teri's single nightly toolchain — LLVM (default), `rustc_codegen_gcc` (CPU perf,
+above), and cuda-oxide (GPU). A custom rustc backend is exactly why teri **must** be nightly.
+
+- License: Apache-2.0 (the `cuda-bindings` crate is under the NVIDIA Software License) — *not* GPL.
+- `llc`: the pipeline prefers `llc` from the Rust toolchain and auto-discovers `llc-22`/`llc-21` on
+  `PATH`; pin one with `CUDA_OXIDE_LLC=$(command -v llc-21)`. The meta `llvm-clang` component
+  provides `llc` (also wild's link driver + libclang for bindgen), so the meta tree already has it.
+
+**Status:** the cuda-oxide *toolchain path* (above) is what teri's GPU acceleration will be built
+with. teri ships **no** GPU kernels yet, so there is no GPU build target in this slice and the
+default/CI build is unaffected. Authoring teri's first cuda-oxide kernels (and a `cargo oxide build`
+target) is a follow-up feature — tracked separately, not part of this toolchain slice.
 
 ---
 
@@ -199,7 +250,7 @@ GRAPH_BACKEND=native LLM_BASE_URL=http://127.0.0.1:11435/v1 \
 ```
 Bind precedence: `--addr` → `FLASK_HOST`:`FLASK_PORT` → `0.0.0.0:5001`.
 
-### Run a simulation (preflight-only today)
+### Run a simulation (full in-process pipeline)
 ```bash
 env-ctl run --provider <p> -- teri run \
   --seed ./examples/seed.txt \
@@ -207,9 +258,10 @@ env-ctl run --provider <p> -- teri run \
   --agents 100
 ```
 Flags: `-s/--seed <path|url>` (required), `-q/--query <text>` (required),
-`-a/--agents <n>` (default `100`). Today this validates config + backend then returns
-`Pipeline not yet implemented` — see [Known gaps](#13-known-gaps--not-yet-wired). To run a full
-simulation now, use `teri serve` + the API sequence (§1, §8).
+`-a/--agents <n>` (default `100`), `-o/--out <path>` (optional `verdict.json`). This validates
+config + backend, then runs the full in-process `seed → graph → agents → sim → report` pipeline
+and prints a summary (and writes `verdict.json` when `--out` is given). For the interactive studio,
+use `teri serve` + the API sequence (§1, §8).
 
 ---
 
@@ -300,7 +352,7 @@ backgrounding. Launch with the Bash tool's `run_in_background: true` **and**
 | `REFUSING stub inference backend at … (matched "…")` | guard's 1-token probe returned canned stub text (§6) | serve a real GGUF model or repoint `LLM_BASE_URL`; **don't** weaken the guard |
 | `inference backend unreachable at …/models: …` | backend down or wrong `LLM_BASE_URL` (refused fail-closed) | start the backend (`shimmy serve` with a GGUF) or fix `LLM_BASE_URL` |
 | `backend at … lists no models` | backend reachable but serves nothing | load a real model before running/serving |
-| `Pipeline not yet implemented` | expected on `teri run` after the guard passes | the CLI one-shot composition is unwired (§13) — run the full pipeline via `teri serve` + the API sequence (§1, §8) |
+| `teri run` produces no `verdict.json` | `--out` not passed | `teri run` prints its summary to stdout; pass `-o/--out <path>` to also persist `verdict.json`. The one-shot `seed → graph → agents → sim → report` pipeline is fully wired (`main.rs` → `pipeline::run_pipeline`); for the interactive studio use `teri serve` + the API sequence (§1, §8) |
 | `--help` needs a key / fails keyless | regression: config loaded before arg-parse | config must load **inside** the command; fix and re-probe `teri --help` |
 | Server won't bind | port in use / blocking socket | choose a free `--addr`; `pkill -f 'teri serve'` |
 | `ZEP_API_KEY` error under default backend | only Zep needs it | ensure `GRAPH_BACKEND=native` (the keyless default) |
@@ -311,9 +363,10 @@ backgrounding. Launch with the Bash tool's `run_in_background: true` **and**
 ## 12. MiroFish parity & capability matrix (verification)
 
 **Verdict:** teri **includes or upgrades essentially every MiroFish component.** Of MiroFish's
-five stages and their services, all are implemented and tested in teri (**1629 tests**); several
+five stages and their services, all are implemented and tested in teri (the full `cargo test`
+suite is green, 1700+ tests); several
 are re-architected to be *stronger* (native, keyless, single-binary). The remaining items are a
-short, named list of wiring gaps (§13), none of which block simulating through the REST API.
+short, named list of wiring gaps (§13), none of which block one-shot CLI or REST simulation.
 
 **Method:** the authoritative `666ghj/MiroFish` GitHub source (the ground truth DeepWiki is
 generated from) was inventoried component-by-component, then each was located in current teri
@@ -372,7 +425,7 @@ work and lists them as "missing" — they are now real).
 | MiroFish component | teri | Evidence |
 |---|---|---|
 | LLM orchestration (OpenAI-compatible) | ✅ + `max_tokens` sent | `llm.rs` OpenAI/Anthropic/Gemini adapters, retry/backoff, `strip_think`/JSON-fence |
-| — runtime provider selection | ⚠️ **hardcoded OpenAI** | `api/mod.rs` `build_llm` always returns `OpenAiAdapter`; Anthropic/Gemini compile+unit-test but are never selected |
+| — runtime provider selection | ✅ **provider-selected** | `api/mod.rs` `build_llm`/`build_provider_llm` return a `ProviderAdapter` chosen from config (`ProviderAdapter::from_config` on `config.llm.provider`); the serve runtime is `SimulationRunner<ProviderAdapter>` and the `run` pipeline monomorphizes over it — OpenAI/Anthropic/Gemini are all selectable |
 | — Anthropic/Gemini streaming | ⚠️ assume OpenAI SSE framing | `llm.rs` `stream()` (non-streaming paths fine) |
 | Semantic search (Zep hybrid cross-encoder) | ⬆️ **native** embeddings + cosine | `embedding.rs` `EmbeddingClient` + `memory::query_vec_similarity` real cosine over redb vector store (keyless) |
 | HTTP API (3 blueprints, ~60 routes) | ✅ | `server.rs` axum boot + `api/{graph,simulation,report}.rs`; `/graph/data` uses `edges` (not D3 `links`) ⚠️ |
@@ -397,32 +450,36 @@ D3-shape JSON seam. These are **architecture choices, not gaps**.
 4. **In-process mpsc/oneshot IPC** (vs filesystem 2-process dir IPC).
 5. **json + url seed ingestion** (MiroFish: pdf/md/txt only); temporal graph edges; JSON+bincode.
 6. **Backend honesty guard** — refuses stub/unreachable backends before any work (MiroFish has none).
-7. **Type-safe, 1629 tests**, fail-closed throughout.
+7. **Type-safe, full `cargo test` suite green (1700+ tests)**, fail-closed throughout.
 
 ---
 
 ## 13. Known gaps / not-yet-wired
 
 Operate with these in mind (state of `main`, 2026-06). None block simulating via the REST API
-(§1, §8); they are the honest backlog from the §12 verification:
+(§1, §8); they are the honest backlog from the §12 verification.
 
-- **`teri run` CLI composition** — the one remaining `Pipeline not yet implemented`. Every engine
-  stage exists and is tested; only the CLI one-shot `seed → graph → agents → sim → report` wiring
-  is unbuilt. The full pipeline already runs via `serve` + the API sequence.
-- **Runtime provider selection** — `api/mod.rs::build_llm` hardcodes `OpenAiAdapter`; the
-  Anthropic/Gemini adapters are dead at runtime until selection is wired (small, high-value).
-- **Anthropic/Gemini streaming** — `stream()` parses OpenAI SSE framing; native event/JSON-array
-  framing is a TODO (non-streaming completion works).
-- **Live SSE endpoints** — `*-log/stream` return one-shot JSON; `api/streaming.rs` + `report/sink.rs`
-  infra is ready but unwired to a `text/event-stream` route.
-- **Agent LTM/vector write-back from the sim loop** — the redb store + cosine recall are real and
-  tested, but no sim-path code calls `write_ltm`/`write_vec_text` (graph-memory write-back *is* wired).
-- **i18n coverage** — `en`/`zh` only vs MiroFish's 7 locales.
+**Closed since the original list (kept here so the record is honest — these are NO LONGER gaps):**
+`teri run` is fully wired (`main.rs` → `pipeline::run_pipeline`, the in-process
+`seed → graph → agents → sim → report` composition, tested in `tests/pipeline_run.rs`); runtime
+provider selection picks the adapter from `config.llm.provider` (`api/mod.rs::build_llm` →
+`ProviderAdapter::from_config`); the Anthropic/Gemini adapters stream with their **native** SSE
+framing; live `text/event-stream` routes exist (`/ticks/sse`, the report `/events` + log SSE
+feeds); the agent-LTM/vector write-back runs from the live sim loop (`AgentMemoryWriter` via the
+monitor); and each agent now reads per-tick **knowledge-graph context** in `prepare_action` (the
+graph is no longer write-only during the run).
+
+**Still open:**
+- **i18n coverage** — `en`/`zh` only vs MiroFish's 7 locales (English is now the default; see §4).
 - **`/api/graph/data` shape** — emits `edges`, not D3-conventional `links` (1-line affordance for
   a D3 consumer).
+- **`scheduled_events`** — the sim-config field is parsed-then-discarded (always `vec![]`); timed
+  mid-run event injection is an intentional MiroFish-parity stub, not yet wired to the engine.
 - **Persona detail** — influence/reaction live on the sim-config layer, not the profile; individual
   vs institutional is behavioral (entity-type branching), not a stored `account_type` flag.
-- **README config table** — stale defaults; this runbook's §4 is authoritative.
+- **Specialized solvers and calibration** — teri's agentic world model does not replace physics,
+  epidemiology, markets, weather, supply-chain, adversarial-security, or other domain engines, and
+  report confidence is not calibrated probability.
 
 The phased build order (P1 wire-the-spine → P2 parity-core → P3 serve+estate → P4
 scale+provenance) lives at `~/Desktop/meta/MIROFISH-PORT-PLAN.md`. That file's **parity matrix is
@@ -446,4 +503,4 @@ stale** (2026-06-12); §12 here is the current verification — extend the plan,
 
 ---
 
-*License: MIT. Teri is an independent rewrite of MiroFish — parity by spec, never by code copy.*
+*License: AGPL-3.0-or-later. Teri is an independent rewrite of MiroFish — parity by spec, never by code copy.*

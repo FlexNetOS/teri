@@ -65,8 +65,9 @@ use serde_json::Value;
 // ---------------------------------------------------------------------------
 
 tokio::task_local! {
-    /// Task-local locale string.  Set via [`with_locale`].  Defaults to `"zh"` when unset
-    /// (matching Python's `getattr(_thread_local, 'locale', 'zh')`).
+    /// Task-local locale string.  Set via [`with_locale`].  Defaults to `"en"` when unset
+    /// (teri ships English-first; Chinese is served when a request asks for it via
+    /// `Accept-Language` or a `with_locale("zh", …)` scope).
     pub static LOCALE: String;
 }
 
@@ -160,13 +161,16 @@ where
 /// already see the request locale — no explicit request-context check is needed here.
 ///
 /// **Branch 2 — task-local fallback (fully implemented):**
-/// Reads the `LOCALE` task-local; defaults to `"zh"` when unset, matching Python's
-/// `getattr(_thread_local, 'locale', 'zh')`.
+/// Reads the `LOCALE` task-local; defaults to `"en"` when unset. teri ships English-first
+/// (the owner-facing default), so any code path that runs outside an HTTP request scope
+/// (background sim/report tasks, the CLI pipeline) renders English unless a locale was
+/// explicitly propagated. Chinese remains fully supported via the request-context branch
+/// (`Accept-Language: zh`) and the frontend language switcher.
 ///
 /// Note: the task-local branch returns the stored value **as-is**, without validating against
-/// `translations()`.  Only the request-context branch validates (matching Python exactly).
+/// `translations()`.  Only the request-context branch validates.
 pub fn get_locale() -> String {
-    LOCALE.try_with(|l| l.clone()).unwrap_or_else(|_| "zh".to_string())
+    LOCALE.try_with(|l| l.clone()).unwrap_or_else(|_| "en".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -260,7 +264,7 @@ fn traverse(root: &Value, key: &str) -> Option<String> {
 /// Returns the LLM language instruction for the current locale.
 ///
 /// Looks up `languages.json[locale].llmInstruction`, falling back to
-/// `languages["zh"].llmInstruction`, then hard-defaulting to `"请使用中文回答。"`.
+/// `languages["en"].llmInstruction`, then hard-defaulting to `"Please respond in English."`.
 ///
 /// Note: `languages.json` has 7 entries (zh/en/es/fr/pt/ru/de) — all 7 are embedded.
 /// The lookup uses whatever locale `get_locale()` returns (including the 5 non-translation
@@ -276,12 +280,12 @@ pub fn get_language_instruction() -> String {
         .map(str::to_string)
         .or_else(|| {
             langs
-                .get("zh")
+                .get("en")
                 .and_then(|lc| lc.get("llmInstruction"))
                 .and_then(Value::as_str)
                 .map(str::to_string)
         })
-        .unwrap_or_else(|| "请使用中文回答。".to_string())
+        .unwrap_or_else(|| "Please respond in English.".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -305,10 +309,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn get_locale_defaults_to_zh_when_unset() {
-        // Outside any with_locale scope, LOCALE task-local is unset → "zh"
+    async fn get_locale_defaults_to_en_when_unset() {
+        // Outside any with_locale scope, LOCALE task-local is unset → "en" (English-first).
         let locale = get_locale();
-        assert_eq!(locale, "zh");
+        assert_eq!(locale, "en");
     }
 
     #[tokio::test]
@@ -327,10 +331,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_locale_reverts_after_scope_ends() {
-        run_with("en", async {}).await;
-        // After the scope, task-local is unset again.
+        run_with("zh", async {}).await;
+        // After the scope, task-local is unset again → English-first default.
         let locale = get_locale();
-        assert_eq!(locale, "zh");
+        assert_eq!(locale, "en");
     }
 
     // -----------------------------------------------------------------------
@@ -339,14 +343,14 @@ mod tests {
 
     #[tokio::test]
     async fn t_exact_key_hit_zh_default() {
-        // LOCALE unset → zh → progress.taskComplete = "任务完成"
-        let msg = t("progress.taskComplete");
+        // Under an explicit zh scope → progress.taskComplete = "任务完成".
+        let msg = run_with("zh", async { t("progress.taskComplete") }).await;
         assert_eq!(msg, "任务完成");
     }
 
     #[tokio::test]
     async fn t_exact_key_hit_zh_task_failed() {
-        let msg = t("progress.taskFailed");
+        let msg = run_with("zh", async { t("progress.taskFailed") }).await;
         assert_eq!(msg, "任务失败");
     }
 
@@ -356,8 +360,8 @@ mod tests {
 
     #[tokio::test]
     async fn t_nested_key_traversal_api() {
-        // api.projectNotFound exists in zh.json
-        let msg = t("api.projectNotFound");
+        // api.projectNotFound exists in zh.json (tested under an explicit zh scope).
+        let msg = run_with("zh", async { t("api.projectNotFound") }).await;
         assert_eq!(msg, "项目不存在: {id}");
     }
 
@@ -420,19 +424,22 @@ mod tests {
 
     #[tokio::test]
     async fn t_args_interpolation_single_placeholder() {
-        // progress.buildFailed = "构建失败: {error}" (in zh.json under api.buildFailed)
-        // Use api.buildFailed which is "构建失败: {error}" in zh.json
-        let msg = t_args("api.buildFailed", &[("error", &"timeout")]);
+        // api.buildFailed = "构建失败: {error}" in zh.json (tested under an explicit zh scope).
+        let msg =
+            run_with("zh", async { t_args("api.buildFailed", &[("error", &"timeout")]) }).await;
         assert_eq!(msg, "构建失败: timeout");
     }
 
     #[tokio::test]
     async fn t_args_interpolation_multi_placeholder() {
-        // progress.sendingBatch = "发送第 {current}/{total} 批数据 ({chunks} 块)..."
-        let msg = t_args(
-            "progress.sendingBatch",
-            &[("current", &1i32), ("total", &5i32), ("chunks", &10i32)],
-        );
+        // progress.sendingBatch = "发送第 {current}/{total} 批数据 ({chunks} 块)..." (zh scope).
+        let msg = run_with("zh", async {
+            t_args(
+                "progress.sendingBatch",
+                &[("current", &1i32), ("total", &5i32), ("chunks", &10i32)],
+            )
+        })
+        .await;
         assert_eq!(msg, "发送第 1/5 批数据 (10 块)...");
     }
 
@@ -457,9 +464,16 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn get_language_instruction_default_zh() {
-        // LOCALE unset → zh → "请使用中文回答。"
+    async fn get_language_instruction_default_en() {
+        // LOCALE unset → en → "Please respond in English." (English-first default).
         let instr = get_language_instruction();
+        assert_eq!(instr, "Please respond in English.");
+    }
+
+    #[tokio::test]
+    async fn get_language_instruction_explicit_zh() {
+        // Chinese instruction still served under an explicit zh scope.
+        let instr = run_with("zh", async { get_language_instruction() }).await;
         assert_eq!(instr, "请使用中文回答。");
     }
 
@@ -482,9 +496,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_language_instruction_unknown_locale_falls_back_to_zh() {
+    async fn get_language_instruction_unknown_locale_falls_back_to_en() {
+        // An unknown locale (not in languages.json) falls back to the English-first default.
         let instr = run_with("xx", async { get_language_instruction() }).await;
-        assert_eq!(instr, "请使用中文回答。");
+        assert_eq!(instr, "Please respond in English.");
     }
 
     // -----------------------------------------------------------------------

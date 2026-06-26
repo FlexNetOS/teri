@@ -8,8 +8,9 @@
 //! ## Sub-cycle (a) — ApiState runtime-state extension + router skeleton + nest
 //!
 //! DECISION-U026-1: `ApiState` now carries the shared simulation runtime registry
-//! (`sim_manager: Arc<SimulationManager>` + `sim_runner: Arc<SimulationRunner<OpenAiAdapter>>`)
-//! — concrete monomorphization at the state-construction boundary (see `src/api/mod.rs`).
+//! (`sim_manager: Arc<SimulationManager>` + `sim_runner: Arc<SimulationRunner<ProviderAdapter>>`)
+//! — concrete enum-dispatch monomorphization at the state-construction boundary (S9 / TASK-SIM-4:
+//! serve is provider-agnostic — OpenAI / Anthropic / Gemini; see `src/api/mod.rs`).
 //! `simulation_router` is nested under `/api/simulation` in `server.rs`.
 //!
 //! ## Sub-cycle (c) — THIS landing: `POST /create`, `GET /:id`, `GET /list`
@@ -1852,7 +1853,7 @@ pub(crate) fn check_simulation_prepared(
 
     // Step 1: directory missing (Python :262-263)
     if !sim_dir.exists() {
-        return (false, serde_json::json!({"reason": "模拟目录不存在"}));
+        return (false, serde_json::json!({"reason": crate::i18n::t("api.simDirNotExist")}));
     }
 
     // Step 2: required files check (Python :266-288)
@@ -1875,7 +1876,7 @@ pub(crate) fn check_simulation_prepared(
         return (
             false,
             serde_json::json!({
-                "reason": "缺少必要文件",
+                "reason": crate::i18n::t("api.missingRequiredFiles"),
                 "missing_files": missing_files,
                 "existing_files": existing_files
             }),
@@ -2109,7 +2110,7 @@ async fn build_run_inputs(
     graph_id: Option<&str>,
 ) -> Result<
     (
-        RunInputs<crate::llm::OpenAiAdapter>,
+        RunInputs<crate::llm::ProviderAdapter>,
         Option<Arc<tokio::sync::Mutex<KnowledgeGraph>>>,
     ),
     ApiError,
@@ -2178,21 +2179,30 @@ async fn build_run_inputs(
     let pool = crate::services::oasis_profile_export::load_agent_pool(&sim_dir, platform)
         .map_err(ApiError::server)?;
 
-    // llm: always OpenAiAdapter (the concrete monomorphization, DECISION-U025-1).
+    // llm: the provider-selected `ProviderAdapter` (S9 / TASK-SIM-4 — serve is provider-agnostic;
+    // `build_llm` picks OpenAI / Anthropic / Gemini from `config.llm.provider`). Single concrete
+    // type, so it lives in the non-generic runner state.
     let llm = Arc::new(crate::api::build_llm(&state.config));
 
     // Dual-LLM boost (U-030 S-934): ONLY for a parallel run, and ONLY when `LLM_BOOST_API_KEY` is
     // configured — reddit agents then run against the boost client, twitter against `llm`
     // (`create_model(use_boost=True/False)` per coroutine). Single-platform runs and an unconfigured
     // boost → `None` → every agent uses `llm` (byte-identical to before).
+    //
+    // The boost wire format is OpenAI-compatible (`build_boost_llm` returns `OpenAiAdapter`), but
+    // `SimulationRunner<L>` uses ONE `L` for both the main and boost client, so the boost is wrapped
+    // as `ProviderAdapter::Openai(..)` to match `llm`'s `ProviderAdapter` type (S9 / TASK-SIM-4).
+    // Only the type changes — the boost still drives an OpenAI-compatible endpoint as before.
     let boost_llm = if platform == "parallel" {
-        crate::api::build_boost_llm(&state.config).map(Arc::new)
+        crate::api::build_boost_llm(&state.config)
+            .map(|a| Arc::new(crate::llm::ProviderAdapter::Openai(a)))
     } else {
         None
     };
 
-    // graph + the updater's shared write-handle. The engine reads `graph` (currently a no-op);
-    // the updater (U-021) writes the `Arc<Mutex<_>>` clone.
+    // graph + the updater's shared write-handle. The engine reads `graph` per tick — each agent's
+    // `prepare_action` builds "Knowledge Graph Context" from its source entity's neighborhood; the
+    // updater (U-021) writes the `Arc<Mutex<_>>` clone.
     let (graph, graph_for_updater) = if enable_graph_memory_update {
         let gid = graph_id.ok_or_else(|| {
             ApiError::client(
@@ -2429,6 +2439,30 @@ const MAX_TICK_SSE_POLLS: u32 = 2400;
 /// Zero-evidence polls tolerated before declaring the sim id unknown (12 × 250ms = ~3s).
 const TICK_UNKNOWN_GRACE: u32 = 12;
 
+/// Build a `tick` SSE event from a snapshot, falling back to the bare tick number on a
+/// serialization failure (the wire shape stays `event: tick`).
+fn tick_event(snap: &crate::sim::WorldSnapshot) -> Event {
+    Event::default()
+        .event("tick")
+        .json_data(snap)
+        .unwrap_or_else(|_| Event::default().event("tick").data(snap.tick.to_string()))
+}
+
+/// Clone the snapshots appended past `emitted` (the new tail slice), holding the `parking_lot`
+/// lock only for the clone — never across a yield/await.
+fn drain_fresh_ticks(
+    history: &Option<std::sync::Arc<parking_lot::Mutex<Vec<crate::sim::WorldSnapshot>>>>,
+    emitted: usize,
+) -> Vec<crate::sim::WorldSnapshot> {
+    match history {
+        Some(h) => {
+            let guard = h.lock();
+            if guard.len() > emitted { guard[emitted..].to_vec() } else { Vec::new() }
+        }
+        None => Vec::new(),
+    }
+}
+
 /// GET /:simulation_id/ticks/sse — live `text/event-stream` feed of the run's WorldSnapshots.
 /// Replays the full tick history on connect, then streams new ticks until the run reaches a
 /// terminal `runner_status`, then `done` + close.
@@ -2449,21 +2483,17 @@ async fn get_sim_ticks_sse_route(
                 history = state.sim_runner.snapshot_history(&simulation_id).await;
             }
 
-            // 1) Emit any ticks appended since the cursor. Lock, clone the new slice, release
-            //    (never hold the parking_lot lock across the yield/await).
-            if let Some(h) = &history {
-                let fresh: Vec<crate::sim::WorldSnapshot> = {
-                    let guard = h.lock();
-                    if guard.len() > emitted { guard[emitted..].to_vec() } else { Vec::new() }
-                };
+            // 1) Emit any ticks appended since the cursor.
+            let fresh = drain_fresh_ticks(&history, emitted);
+            if !fresh.is_empty() {
                 for snap in fresh {
-                    let ev = Event::default()
-                        .event("tick")
-                        .json_data(&snap)
-                        .unwrap_or_else(|_| Event::default().event("tick").data(snap.tick.to_string()));
-                    yield Ok(ev);
+                    yield Ok(tick_event(&snap));
                     emitted += 1;
                 }
+                // The safety ceiling (step 4) measures STALL time, not total lifetime: a run that
+                // is still emitting ticks must not be force-closed with a `timeout`. Reset the
+                // stall counter whenever progress is made (mirrors `unknown_polls` in step 3).
+                polls = 0;
             }
 
             // 2) Terminal runner_status → flush done-frame and close.
@@ -2474,6 +2504,14 @@ async fn get_sim_ticks_sse_route(
                 Some(RunnerStatus::Completed | RunnerStatus::Stopped | RunnerStatus::Failed)
             );
             if terminal {
+                // Final drain BEFORE the done-frame: the engine may have pushed the last tick(s)
+                // AFTER step 1's drain but BEFORE this status read (the engine and the monitor that
+                // flips the status are independent tasks with no ordering barrier). Without this
+                // re-drain those ticks are lost and `ticks` undercounts the run.
+                for snap in drain_fresh_ticks(&history, emitted) {
+                    yield Ok(tick_event(&snap));
+                    emitted += 1;
+                }
                 let label = status.map(|s| s.as_str()).unwrap_or("completed");
                 let done = Event::default()
                     .event("done")
@@ -2572,12 +2610,11 @@ async fn run_status(
 // One-shot detailed snapshot with embedded action lists (reads the U-047 actions.jsonl tail).
 // Query param: `platform` (twitter|reddit, optional) — filters all_actions + recent_actions.
 //
-// `[!] U026-h-ACTIONS-PRODUCER-PENDING`: the action lists come from `get_all_actions`, which
-// reads `{sim_dir}/{platform}/actions.jsonl`.  teri's SimEngine does not yet WRITE that log
-// (producer lands with U-028/029/030 platform runners), so on a started run the lists are
-// currently empty — a FAITHFUL no-op on a missing file (Python's reader also yields [] when the
-// file is absent), NOT a dropped feature.  The full route assembly + filter logic is ported and
-// proven now; the lists populate when the producer lands.
+// The action lists come from `get_all_actions`, which reads `{sim_dir}/{platform}/actions.jsonl`.
+// teri's SimEngine WRITES that log on the live run/serve path (the `RunProducer` /
+// `PlatformActionLogger` installed via `engine.with_producer`, U-028/029/030), so a started run
+// populates these lists. A missing file still yields `[]` (a faithful no-op, matching Python's
+// reader) — e.g. before the first action is logged.
 //
 // Source assembly (simulation.py:1857-1878):
 //   result = run_state.to_dict()
@@ -2676,11 +2713,11 @@ async fn run_status_detail(
 // Sub-cycle (i) — world-state read routes: actions / timeline / agent-stats
 //   (simulation.py:1864-1980). Primitives ported + parity-verified in U-022(d).
 //
-// `[!] U026-i-PRODUCER-PENDING` (informational, NOT a port bug): all three read the
-// actions.jsonl tail (via SimulationRunner readers).  teri's SimEngine does not yet WRITE
-// that log (producer lands U-028/029/030), so they return the FAITHFUL empty contract — a
-// sim that produced no actions yields count 0 / empty lists.  Identical to Python on an
-// absent log.  Routes port + verify against THAT contract now.
+// (informational, NOT a port bug): all three read the actions.jsonl tail (via SimulationRunner
+// readers).  teri's SimEngine WRITES that log on the live run/serve path (the `RunProducer`
+// installed via `engine.with_producer`), so a run that produced actions populates these. A sim
+// that produced no actions (or before the first log line) yields count 0 / empty lists —
+// identical to Python on an absent log.
 //
 // Flask `type=int` graceful-fallback (same convention as U-025 graph `?limit`): an absent
 // OR unparseable int param falls back to its default (NOT a 400).
@@ -3419,7 +3456,7 @@ async fn close_env_route(
                 "success": true,
                 "data": {
                     "success": true,
-                    "message": "环境关闭命令已发送（等待响应超时，环境可能正在关闭）"
+                    "message": crate::i18n::t("api.closeEnvSentTimeout")
                 }
             })));
         }
@@ -3433,7 +3470,7 @@ async fn close_env_route(
     let completed = resp.status == CommandStatus::Completed;
     let mut result = serde_json::Map::new();
     result.insert("success".into(), Value::Bool(completed));
-    result.insert("message".into(), Value::String("环境关闭命令已发送".to_string()));
+    result.insert("message".into(), Value::String(crate::i18n::t("api.closeEnvSent")));
     result.insert("result".into(), resp.result.clone().map(Value::Object).unwrap_or(Value::Null));
     result.insert("timestamp".into(), Value::String(resp.timestamp.clone()));
 
@@ -5367,6 +5404,49 @@ mod tests {
         );
     }
 
+    /// `drain_fresh_ticks` is the slice mechanism behind both the step-1 stream and the terminal
+    /// final-drain. It must return exactly the tail past the cursor — this is what lets the
+    /// terminal pass pick up a last tick that landed after step 1 (the dropped-final-tick bug).
+    #[test]
+    fn drain_fresh_ticks_returns_only_the_tail_past_the_cursor() {
+        fn snap(tick: u32) -> crate::sim::WorldSnapshot {
+            crate::sim::WorldSnapshot {
+                tick,
+                agents: Default::default(),
+                events: Vec::new(),
+                variables: Default::default(),
+            }
+        }
+        let history = std::sync::Arc::new(parking_lot::Mutex::new(vec![snap(0), snap(1), snap(2)]));
+        let some = Some(history.clone());
+
+        // From cursor 0: all three.
+        let all = drain_fresh_ticks(&some, 0);
+        assert_eq!(all.iter().map(|s| s.tick).collect::<Vec<_>>(), vec![0, 1, 2]);
+
+        // From cursor 2: only the last — the exact "final tick landed after step 1's drain" case.
+        let tail = drain_fresh_ticks(&some, 2);
+        assert_eq!(tail.iter().map(|s| s.tick).collect::<Vec<_>>(), vec![2]);
+
+        // Cursor at/past the end: nothing (no panic on the boundary).
+        assert!(drain_fresh_ticks(&some, 3).is_empty());
+        assert!(drain_fresh_ticks(&some, 99).is_empty());
+
+        // A late push is visible to a subsequent drain (proves the terminal re-drain catches it).
+        history.lock().push(snap(3));
+        assert_eq!(
+            drain_fresh_ticks(&some, 3).iter().map(|s| s.tick).collect::<Vec<_>>(),
+            vec![3],
+            "the terminal final-drain must capture a tick pushed after the prior cursor"
+        );
+    }
+
+    /// No live history handle → empty drain (the connect-before-handle window), no panic.
+    #[test]
+    fn drain_fresh_ticks_none_history_is_empty() {
+        assert!(drain_fresh_ticks(&None, 0).is_empty());
+    }
+
     /// GET /:id/run-status/detail — no run_state → 200 with the 5-key idle stub.
     #[tokio::test]
     async fn run_status_detail_idle_stub_when_no_run_state() {
@@ -6005,6 +6085,107 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["data"]["count"], 2, "filtered to post_id 10");
+    }
+
+    /// PRODUCER → READER end-to-end (S8 / TASK-SIM-3): produce the social DB the way the LIVE
+    /// runtime does — drive a `SocialWorldSet::new(<sim_dir>, …)` (the exact type + path the
+    /// run/serve path installs via `engine.with_social`) → apply real posts/comments → `flush_final`
+    /// → then read it back through the SAME `/posts` + `/comments` HTTP handlers the reader path
+    /// uses. This closes the loop the hand-built-DB tests above do NOT: it proves the producer's
+    /// landing path equals the reader's `social_db_path`, the producer's DDL is consumable by the
+    /// reader's `SELECT *`, and the `sqlite` feature wires BOTH halves — the thing that was never
+    /// verified end-to-end before the feature was enabled by default.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn producer_db_is_readable_through_handlers_end_to_end() {
+        use crate::agent::Platform;
+        use crate::sim::social_world::SocialWorldSet;
+        use crate::sim::{SocialAction, TargetKind};
+
+        let (state, _tmp) = test_state();
+        let simulation_id = "sim_e2e";
+
+        // Land the DB at EXACTLY the dir the reader resolves: the manager's `get_simulation_dir`
+        // (== `oasis_simulation_data_dir/<id>`, the same base `social_db_path` joins). Producing
+        // through this path-resolver — not a hand-rolled join — is what proves path alignment.
+        let sim_dir = state.sim_manager.get_simulation_dir(simulation_id).unwrap();
+
+        // Produce via the runtime substrate, then flush like the run loop's `flush_final`.
+        {
+            let mut set = SocialWorldSet::new([Platform::Reddit], &sim_dir).unwrap();
+            {
+                let w = set.world_mut(Platform::Reddit).unwrap();
+                let p1 = w.create_post(7, "hello from the producer", "2025-12-01T10:00:00");
+                w.create_post(7, "second post", "2025-12-01T10:01:00");
+                w.apply(
+                    8,
+                    &SocialAction::Like {
+                        target_kind: TargetKind::Post,
+                        target_id: p1.to_string(),
+                    },
+                    "2025-12-01T10:02:00",
+                );
+                w.apply(
+                    8,
+                    &SocialAction::Comment {
+                        post_id: p1.to_string(),
+                        content: "a real comment".into(),
+                    },
+                    "2025-12-01T10:03:00",
+                );
+            }
+            set.flush_final().unwrap();
+        }
+
+        // The file MUST be at the reader's resolved path (producer-path == reader-path).
+        let reader_path = social_db_path(&state, simulation_id, "reddit_simulation.db");
+        assert!(reader_path.exists(), "producer DB must land at the reader's social_db_path");
+
+        let app = crate::server::create_app(state);
+
+        // READ BACK through the /posts handler — populated, content matches, DESC ordering.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_e2e/posts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        let data = &json["data"];
+        assert_eq!(data["platform"], "reddit");
+        assert_eq!(data["total"], 2, "both producer posts are readable");
+        assert_eq!(data["count"], 2);
+        // ORDER BY created_at DESC → "second post" (10:01) before "hello…" (10:00).
+        assert_eq!(data["posts"][0]["content"], "second post");
+        assert_eq!(data["posts"][1]["content"], "hello from the producer");
+        // The like applied by the producer survives the round-trip.
+        let post1 = data["posts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["post_id"] == 1)
+            .expect("producer post_id 1 present");
+        assert_eq!(post1["num_likes"], 1, "producer-applied like is readable");
+
+        // READ BACK through the /comments handler — the producer comment on post 1 is populated.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/simulation/sim_e2e/comments?post_id=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["data"]["count"], 1, "producer comment is readable");
+        assert_eq!(json["data"]["comments"][0]["content"], "a real comment");
     }
 
     // -----------------------------------------------------------------------
@@ -6989,7 +7170,8 @@ mod tests {
         config.oasis_simulation_data_dir = tmp.path().join("sims").to_string_lossy().to_string();
         let (ok, info) = crate::api::simulation::check_simulation_prepared(&config, "sim_missing");
         assert!(!ok);
-        assert!(info["reason"].as_str().unwrap().contains("不存在"));
+        // English-first default (no request locale in this unit test) → the i18n value.
+        assert_eq!(info["reason"].as_str().unwrap(), "Simulation directory does not exist.");
     }
 
     /// check_simulation_prepared: missing required files → (false, missing_files)

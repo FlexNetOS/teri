@@ -2,10 +2,14 @@
 name = "teri"
 version = "0.1.0"
 edition = "2024"
-authors = ["Kresna Sucandra"]
+authors = ["FlexNetOS <team@flexnetos.com>"]
 description = "Teri — A Rust-native Swarm Intelligence Prediction Engine"
-license = "MIT"
-repository = "https://github.com/SHA888/teri"
+# AGPL-3.0-or-later (owner decision 2026-06-24): copyleft with the network-use clause, so anyone who
+# runs a modified teri as a service must share their source — reciprocity, no freeloaders. Keeps
+# faith with MiroFish's upstream AGPL intent (teri is its Rust rewrite). The prior `MIT` here was
+# stale attribution from the original poor port and is corrected.
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/FlexNetOS/teri"
 keywords = ["swarm", "multi-agent", "simulation", "llm", "prediction"]
 categories = ["simulation", "science"]
 
@@ -115,7 +119,13 @@ lto = "thin"
 codegen-units = 1
 
 [features]
-default = []
+# `sqlite` is ON by default (S8 / TASK-SIM-3): a normal `cargo build` / `teri serve` then BOTH
+# produces the social world to `{sim_dir}/{platform}_simulation.db` (via the `SocialDbWriter`
+# producer installed on the live run/serve path) AND reads it back through the `/posts` +
+# `/comments` readers — the full producer→path→schema→reader loop, verified end-to-end. rusqlite is
+# `bundled`, so CI's C toolchain compiles it with no system-sqlite dependency. Build WITHOUT the DB
+# (the honest-500 + no-DB-empty contracts still hold) via `--no-default-features`.
+default = ["sqlite"]
 sqlite = ["rusqlite"]
 
 [workspace]

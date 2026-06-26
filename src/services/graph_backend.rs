@@ -394,11 +394,14 @@ pub struct GraphSearchCtx {
 
 /// The LLM monomorphization the trait operates over.
 ///
-/// `ApiState` fixes the concrete LLM adapter to `OpenAiAdapter` (DECISION-U026-1: `LlmClient`
-/// is not dyn-compatible and axum state cannot be generic). The trait pins the same concrete
-/// type so it stays **object-safe** — `Box<dyn GraphBackend>` is constructible — while still
-/// reusing the generic `ReportTools<'_, L>` surface.
-pub type BackendLlm = crate::llm::OpenAiAdapter;
+/// `ApiState` fixes the concrete LLM adapter to the enum-dispatch
+/// [`crate::llm::ProviderAdapter`] (S9 / TASK-SIM-4: serve is provider-agnostic — OpenAI /
+/// Anthropic / Gemini selected from `config.llm.provider`; DECISION-U026-1 preserved:
+/// `LlmClient` is not dyn-compatible and axum state cannot be generic, so a single concrete
+/// enum type is used instead of `dyn`). The trait pins the same concrete type so it stays
+/// **object-safe** — `Box<dyn GraphBackend>` is constructible — while still reusing the
+/// generic `ReportTools<'_, L>` surface.
+pub type BackendLlm = crate::llm::ProviderAdapter;
 
 /// The graph-backend abstraction. [`NativeGraphBackend`] is the default; [`ZepGraphBackend`] is
 /// the no-downgrade seam (today it delegates to the same native graph — there is no live Zep

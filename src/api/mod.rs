@@ -233,20 +233,24 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// Construct an `OpenAiAdapter` from teri config for use within a single request.
-#[allow(dead_code)] // Used by sub-cycles (c)–(f); not yet called by (b)-only routes
+/// Construct the serve-path LLM adapter from teri config for use within a single request.
+///
+/// S9 / TASK-SIM-4: returns the enum-dispatch [`crate::llm::ProviderAdapter`] selected by
+/// `config.llm.provider`, so `teri serve` is provider-agnostic (OpenAI-compatible / Anthropic /
+/// Gemini) — exactly like the `run` pipeline. This is the single serve-path monomorphization
+/// site: every handler, the `SimulationRunner`, and `ReportTools<BackendLlm>` flow through the
+/// one concrete `ProviderAdapter` type. **No downgrade**: an OpenAI-configured serve yields
+/// `ProviderAdapter::Openai(OpenAiAdapter::new(..))`, byte-identical to the prior behavior.
 ///
 /// Per-request construction is cheap (`reqwest::Client::new()` — no network, no handshake).
 /// Mirrors MiroFish's pattern of constructing `OntologyGenerator()` / `GraphBuilderService()`
 /// fresh inside each handler (graph.py:217, 390, 581, 609) — **not a downgrade**.
 ///
-/// DECISION-U025-1: `ApiState` carries no LLM client because `LlmClient` has generic methods
-/// that are NOT dyn-compatible, and axum state cannot be generic.  Construct per-request.
-///
-/// `[!] U025-CLONE`: derive `Clone` on `OpenAiAdapter` is deferred to sub-cycle (c/d) when
-/// `build_graph_async`/spawn need it by value.  The project routes don't spawn — no Clone needed.
-pub(crate) fn build_llm(config: &crate::Config) -> crate::llm::OpenAiAdapter {
-    crate::llm::OpenAiAdapter::new(&config.llm)
+/// DECISION-U025-1 preserved: `ApiState` carries no LLM client because `LlmClient` has generic
+/// methods that are NOT dyn-compatible, and axum state cannot be generic. Enum dispatch (not
+/// `dyn`) is what lets a single concrete type satisfy the generic `complete_json<T>`.
+pub(crate) fn build_llm(config: &crate::Config) -> crate::llm::ProviderAdapter {
+    crate::llm::ProviderAdapter::from_config(&config.llm)
 }
 
 /// FIX-3 (provider selection): build the LLM adapter selected by `config.llm.provider`,
@@ -255,13 +259,12 @@ pub(crate) fn build_llm(config: &crate::Config) -> crate::llm::OpenAiAdapter {
 /// (`teri::pipeline::run_pipeline`), where the whole graph→persona→sim→report chain is
 /// monomorphized over one concrete `L`.
 ///
-/// Why this is separate from [`build_llm`]: `ApiState`/`serve` are monomorphized over the
-/// concrete `OpenAiAdapter` (DECISION-U025-1 — `LlmClient` is not dyn-compatible and axum
-/// state cannot be generic), so the long-lived server path stays OpenAI-compatible. The
-/// `run` pipeline has no such constraint, so it picks the real provider here. For the
-/// OpenAI-compatible providers (openai/ollama/lmstudio/vllm — distinguished by `base_url`)
-/// the two functions produce the identical OpenAI adapter; only `anthropic`/`gemini`
-/// diverge, and those genuinely require their own wire format.
+/// Why this still exists alongside [`build_llm`]: both now return the same enum-dispatch
+/// [`crate::llm::ProviderAdapter`] selected from `config.llm.provider` (S9 / TASK-SIM-4 made
+/// `build_llm`/`serve` provider-agnostic too — `ApiState` monomorphizes over `ProviderAdapter`,
+/// not `OpenAiAdapter`). `build_provider_llm` is retained as the named selection seam for the
+/// in-process `run` pipeline and logs the chosen provider; `build_llm` is the per-request
+/// serve-path constructor. They are functionally equivalent today.
 pub fn build_provider_llm(config: &crate::Config) -> crate::llm::ProviderAdapter {
     let adapter = crate::llm::ProviderAdapter::from_config(&config.llm);
     tracing::info!(provider = ?adapter.provider(), "LLM provider selected for run pipeline");
@@ -309,13 +312,16 @@ pub struct ApiState {
     pub sim_manager: std::sync::Arc<crate::services::simulation_manager::SimulationManager>,
     /// U-026: shared simulation runner — owns the live `runs` handle map, so a sim started
     /// by `POST /simulation/start` is visible to later `GET /:id/run-status` / `POST /stop`
-    /// on subsequent requests. Concrete monomorphization over `OpenAiAdapter`
-    /// (DECISION-U026-1): `LlmClient` is not dyn-compatible and axum state cannot be generic,
-    /// but `build_llm()` always yields `OpenAiAdapter`, so `SimulationRunner<OpenAiAdapter>`
-    /// is a single concrete type that lives in non-generic state. DECISION-U025-1 preserved
-    /// (no `dyn`, no generic `ApiState`).
+    /// on subsequent requests. Concrete monomorphization over the enum-dispatch
+    /// [`crate::llm::ProviderAdapter`] (S9 / TASK-SIM-4): `LlmClient` is not dyn-compatible and
+    /// axum state cannot be generic, but `build_llm()` yields the single concrete
+    /// `ProviderAdapter` (selected from `config.llm.provider`), so
+    /// `SimulationRunner<ProviderAdapter>` is a single concrete type that lives in non-generic
+    /// state and dispatches to OpenAI / Anthropic / Gemini at runtime. DECISION-U025-1 preserved
+    /// (no `dyn`, no generic `ApiState`); the enum handles the generic `complete_json<T>` that
+    /// `dyn` cannot.
     pub sim_runner: std::sync::Arc<
-        crate::services::simulation_runner::SimulationRunner<crate::llm::OpenAiAdapter>,
+        crate::services::simulation_runner::SimulationRunner<crate::llm::ProviderAdapter>,
     >,
     /// Workstream B: shared redb vector store for graph entity/edge embeddings, namespaced
     /// per `graph_id`. Built once from `config.persistence.memory_db_path` so build-time
@@ -358,9 +364,10 @@ impl ApiState {
                     store: store.clone(),
                 });
         // Graph-memory manager (U-021) registry — builds per-platform updaters lazily; the
-        // concrete `OpenAiAdapter` monomorphization is fixed here at the state boundary.
+        // concrete `ProviderAdapter` monomorphization is fixed here at the state boundary
+        // (S9 / TASK-SIM-4), matching the runner so the updater's `L` aligns with `sim_runner`.
         let graph_mgr = std::sync::Arc::new(crate::services::graph_memory::GraphMemoryManager::<
-            crate::llm::OpenAiAdapter,
+            crate::llm::ProviderAdapter,
         >::with_vector_index(vector_index));
         // Agent LTM write-back: reuse the shared graph-vector store + embedder so the monitor
         // persists each agent utterance as chronological + semantic memory (per-agent namespace,
@@ -407,6 +414,76 @@ mod tests {
         let req = ChatRequest { message: "Hello".to_string(), agent_id: Some(Uuid::new_v4()) };
 
         assert_eq!(req.message, "Hello");
+    }
+
+    /// S9 / TASK-SIM-4: `build_llm` is the single serve-path LLM-selection seam. It must pick the
+    /// adapter from `config.llm.provider` (the SAME selection the `run` pipeline uses), proving
+    /// `teri serve` is no longer hardwired to OpenAI. Construction-level only — no live API calls
+    /// (the backend-honesty guard blocks real calls anyway, and `ProviderAdapter::from_config`
+    /// performs no I/O).
+    #[test]
+    fn build_llm_selects_provider_from_config() {
+        use crate::config::LlmProvider;
+        use crate::llm::ProviderAdapter;
+
+        let cases = [
+            (LlmProvider::Openai, "openai"),
+            (LlmProvider::Anthropic, "anthropic"),
+            (LlmProvider::Gemini, "gemini"),
+        ];
+        for (provider, label) in cases {
+            let mut config = crate::Config::build_test();
+            config.llm.provider = provider;
+            let adapter = build_llm(&config);
+            // The constructed adapter dispatches to the configured provider...
+            assert_eq!(
+                adapter.provider(),
+                provider,
+                "build_llm should select {label} from config.llm.provider",
+            );
+            // ...and is the matching enum variant (not always OpenAI as before).
+            match (provider, &adapter) {
+                (LlmProvider::Openai, ProviderAdapter::Openai(_))
+                | (LlmProvider::Anthropic, ProviderAdapter::Anthropic(_))
+                | (LlmProvider::Gemini, ProviderAdapter::Gemini(_)) => {}
+                _ => panic!("build_llm returned the wrong ProviderAdapter variant for {label}"),
+            }
+        }
+    }
+
+    /// S9 / TASK-SIM-4: `ApiState::new` builds successfully under a non-OpenAI provider, so the
+    /// long-lived serve runtime (`sim_runner: SimulationRunner<ProviderAdapter>`) is genuinely
+    /// provider-agnostic — not just the per-request `build_llm`. A regression here (e.g. a
+    /// re-pinned `OpenAiAdapter` monomorphization) would fail to compile, so this also guards the
+    /// type wiring at runtime.
+    #[test]
+    fn api_state_constructs_under_anthropic_and_gemini() {
+        use crate::config::LlmProvider;
+        for provider in [LlmProvider::Anthropic, LlmProvider::Gemini] {
+            let mut config = crate::Config::build_test();
+            config.llm.provider = provider;
+            let state = ApiState::new(config);
+            // The runner's LLM type is the enum-dispatch ProviderAdapter; constructing it under a
+            // non-OpenAI provider proves serve is no longer hardwired to OpenAI.
+            assert_eq!(state.config.llm.provider, provider);
+        }
+    }
+
+    /// S9 / TASK-SIM-4: the dual-LLM boost wire format stays OpenAI-compatible
+    /// (`build_boost_llm` returns `OpenAiAdapter`), but the serve runner uses ONE `L` for both
+    /// main + boost, so the boost is wrapped as `ProviderAdapter::Openai` at the call site. This
+    /// asserts the wrap produces the OpenAI variant (the only correct boost type).
+    #[test]
+    fn boost_wrap_is_provider_adapter_openai() {
+        use crate::config::LlmProvider;
+        use crate::llm::{OpenAiAdapter, ProviderAdapter};
+
+        let config = crate::Config::build_test();
+        // Mirror the simulation.rs:2189 call site: wrap the OpenAI boost adapter.
+        let boost: OpenAiAdapter = OpenAiAdapter::new(&config.llm);
+        let wrapped = ProviderAdapter::Openai(boost);
+        assert_eq!(wrapped.provider(), LlmProvider::Openai);
+        assert!(matches!(wrapped, ProviderAdapter::Openai(_)));
     }
 
     #[test]

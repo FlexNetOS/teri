@@ -1346,6 +1346,10 @@ impl SimulationManager {
             parallel_profile_count,
             rt_ref,
             &mut profile_progress,
+            // TASK-SIM-6 #5: no recall source wired into the batch path yet; persona context
+            // uses the in-process graph (parts 1-3). Live `GraphSemanticRecall` wiring is a
+            // follow-up — the param is plumbed so it can be supplied without an API change.
+            None,
         )
         .await;
 
@@ -1842,10 +1846,10 @@ pub fn spawn_prepare_simulation(
     defined_entity_types: Option<Vec<String>>,
     use_llm_for_profiles: bool,
     parallel_profile_count: usize,
-    llm: crate::llm::OpenAiAdapter,
+    llm: crate::llm::ProviderAdapter,
     graph: crate::graph::KnowledgeGraph,
     config_generator: crate::services::simulation_config::SimulationConfigGenerator<
-        crate::llm::OpenAiAdapter,
+        crate::llm::ProviderAdapter,
     >,
 ) -> String {
     // Capture locale before spawning (L504-505: thread-local capture).
@@ -1899,10 +1903,10 @@ pub(crate) async fn prepare_worker(
     defined_entity_types: Option<Vec<String>>,
     use_llm_for_profiles: bool,
     parallel_profile_count: usize,
-    llm: crate::llm::OpenAiAdapter,
+    llm: crate::llm::ProviderAdapter,
     graph: crate::graph::KnowledgeGraph,
     config_generator: crate::services::simulation_config::SimulationConfigGenerator<
-        crate::llm::OpenAiAdapter,
+        crate::llm::ProviderAdapter,
     >,
 ) {
     use crate::task::{TaskManager, TaskStatus};
