@@ -461,7 +461,7 @@ where
     let sim_dir = sim_manager.get_simulation_dir(simulation_id)?;
     let sim_config = sim_manager
         .get_simulation_config(simulation_id)?
-        .ok_or_else(|| TeriError::Sim("模拟配置不存在，请先调用 /prepare 接口".to_string()))?;
+        .ok_or_else(|| TeriError::Sim(crate::i18n::t("api.configNotFound")))?;
 
     let mut engine = SimEngine::new(SimConfig::from_simulation_config(&sim_config, None, 8));
     engine.with_activation(Arc::new(TimeActivationPolicy::from_config(&sim_config, None)));

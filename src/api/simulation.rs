@@ -1853,7 +1853,7 @@ pub(crate) fn check_simulation_prepared(
 
     // Step 1: directory missing (Python :262-263)
     if !sim_dir.exists() {
-        return (false, serde_json::json!({"reason": "模拟目录不存在"}));
+        return (false, serde_json::json!({"reason": crate::i18n::t("api.simDirNotExist")}));
     }
 
     // Step 2: required files check (Python :266-288)
@@ -1876,7 +1876,7 @@ pub(crate) fn check_simulation_prepared(
         return (
             false,
             serde_json::json!({
-                "reason": "缺少必要文件",
+                "reason": crate::i18n::t("api.missingRequiredFiles"),
                 "missing_files": missing_files,
                 "existing_files": existing_files
             }),
@@ -3456,7 +3456,7 @@ async fn close_env_route(
                 "success": true,
                 "data": {
                     "success": true,
-                    "message": "环境关闭命令已发送（等待响应超时，环境可能正在关闭）"
+                    "message": crate::i18n::t("api.closeEnvSentTimeout")
                 }
             })));
         }
@@ -3470,7 +3470,7 @@ async fn close_env_route(
     let completed = resp.status == CommandStatus::Completed;
     let mut result = serde_json::Map::new();
     result.insert("success".into(), Value::Bool(completed));
-    result.insert("message".into(), Value::String("环境关闭命令已发送".to_string()));
+    result.insert("message".into(), Value::String(crate::i18n::t("api.closeEnvSent")));
     result.insert("result".into(), resp.result.clone().map(Value::Object).unwrap_or(Value::Null));
     result.insert("timestamp".into(), Value::String(resp.timestamp.clone()));
 
@@ -7170,7 +7170,8 @@ mod tests {
         config.oasis_simulation_data_dir = tmp.path().join("sims").to_string_lossy().to_string();
         let (ok, info) = crate::api::simulation::check_simulation_prepared(&config, "sim_missing");
         assert!(!ok);
-        assert!(info["reason"].as_str().unwrap().contains("不存在"));
+        // English-first default (no request locale in this unit test) → the i18n value.
+        assert_eq!(info["reason"].as_str().unwrap(), "Simulation directory does not exist.");
     }
 
     /// check_simulation_prepared: missing required files → (false, missing_files)
