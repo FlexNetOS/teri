@@ -1,4 +1,5 @@
 pub mod graph;
+pub mod prompt_templates;
 pub mod report;
 pub mod simulation;
 pub mod streaming;

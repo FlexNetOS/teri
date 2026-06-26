@@ -129,6 +129,55 @@
         <!-- 右栏：交互控制台 -->
         <div class="right-panel">
           <div class="console-box">
+            <!-- 模板下拉：加载已保存的提示词+种子，或将当前另存为模板 -->
+            <div class="console-section">
+              <div class="console-header">
+                <span class="console-label">{{ $t('home.templatesLabel') }}</span>
+              </div>
+              <div class="template-bar">
+                <select
+                  v-model="selectedTemplateId"
+                  class="template-select"
+                  :disabled="loading || templateBusy"
+                  @change="onTemplatePick"
+                >
+                  <option value="">{{ $t('home.templatePlaceholder') }}</option>
+                  <option v-for="t in templates" :key="t.id" :value="t.id">{{ t.name }}</option>
+                </select>
+                <button
+                  type="button"
+                  class="template-save-btn"
+                  :disabled="loading || templateBusy"
+                  @click="toggleSaveRow"
+                >
+                  {{ $t('home.saveTemplate') }}
+                </button>
+              </div>
+              <div v-if="showSaveRow" class="template-save-row">
+                <input
+                  v-model="newTemplateName"
+                  class="template-name-input"
+                  :placeholder="$t('home.templateNamePlaceholder')"
+                  :disabled="templateBusy"
+                  @keyup.enter="saveCurrentTemplate"
+                />
+                <button
+                  type="button"
+                  class="template-confirm-btn"
+                  :disabled="!newTemplateName.trim() || templateBusy"
+                  @click="saveCurrentTemplate"
+                >
+                  {{ $t('home.save') }}
+                </button>
+                <button type="button" class="template-cancel-btn" :disabled="templateBusy" @click="toggleSaveRow">
+                  {{ $t('home.cancel') }}
+                </button>
+              </div>
+              <div v-if="templateMsg" class="template-msg" :class="{ 'is-error': templateError }">
+                {{ templateMsg }}
+              </div>
+            </div>
+
             <!-- 上传区域 -->
             <div class="console-section">
               <div class="console-header">
@@ -215,7 +264,8 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import HistoryDatabase from '../components/HistoryDatabase.vue'
 import LanguageSwitcher from '../components/LanguageSwitcher.vue'
@@ -223,8 +273,15 @@ import LanguageSwitcher from '../components/LanguageSwitcher.vue'
 // it statically forced Rollup to keep pendingUpload in the main chunk and emitted a dual-import
 // warning; static everywhere is consistent and warning-free.
 import { setPendingUpload } from '../store/pendingUpload'
+import {
+  listPromptTemplates,
+  getPromptTemplate,
+  savePromptTemplate,
+  seedAsFile
+} from '../api/promptTemplates'
 
 const router = useRouter()
+const { t } = useI18n()
 
 // 表单数据
 const formData = ref({
@@ -246,6 +303,93 @@ const fileInput = ref(null)
 const canSubmit = computed(() => {
   return formData.value.simulationRequirement.trim() !== '' && files.value.length > 0
 })
+
+// ── 提示词模板（服务端 /api/prompt-templates）──────────────────────────────
+const templates = ref([])          // 已保存模板列表
+const selectedTemplateId = ref('')  // 当前下拉选中
+const showSaveRow = ref(false)      // 是否显示“另存为”输入行
+const newTemplateName = ref('')     // 新模板名
+const templateBusy = ref(false)     // 加载/保存进行中
+const templateMsg = ref('')         // 提示信息
+const templateError = ref(false)
+
+const setTemplateMsg = (msg, isError = false) => {
+  templateMsg.value = msg
+  templateError.value = isError
+}
+
+// 进入页面即拉取已保存模板（失败静默——空列表也是合法首次状态）
+const refreshTemplates = async () => {
+  try {
+    const list = await listPromptTemplates()
+    templates.value = Array.isArray(list) ? list : []
+  } catch (e) {
+    console.error('Failed to list prompt templates:', e)
+  }
+}
+onMounted(refreshTemplates)
+
+// 选择一个模板：回填提示词，并把种子文件重建为 File 后填入上传列表
+const onTemplatePick = async () => {
+  const id = selectedTemplateId.value
+  if (!id || loading.value) return
+  templateBusy.value = true
+  setTemplateMsg('')
+  try {
+    const tpl = await getPromptTemplate(id)
+    formData.value.simulationRequirement = tpl.prompt || ''
+    const rebuilt = []
+    for (const filename of tpl.seeds || []) {
+      try {
+        rebuilt.push(await seedAsFile(id, filename))
+      } catch (e) {
+        console.error('Failed to load seed', filename, e)
+      }
+    }
+    files.value = rebuilt
+    setTemplateMsg(t('home.templateLoaded', { name: tpl.name, count: rebuilt.length }))
+  } catch (e) {
+    console.error('Failed to load template:', e)
+    setTemplateMsg(t('home.templateLoadError'), true)
+  } finally {
+    templateBusy.value = false
+  }
+}
+
+// 切换“另存为”输入行
+const toggleSaveRow = () => {
+  showSaveRow.value = !showSaveRow.value
+  setTemplateMsg('')
+  if (showSaveRow.value && !newTemplateName.value) {
+    // 预填一个名字以减少输入
+    newTemplateName.value = formData.value.simulationRequirement.trim().slice(0, 40)
+  }
+}
+
+// 将当前提示词 + 种子文件另存为命名模板
+const saveCurrentTemplate = async () => {
+  const name = newTemplateName.value.trim()
+  if (!name || templateBusy.value) return
+  // 模板 = 提示词 + 种子；两者都需具备
+  if (formData.value.simulationRequirement.trim() === '' || files.value.length === 0) {
+    setTemplateMsg(t('home.templateNeedsPromptSeed'), true)
+    return
+  }
+  templateBusy.value = true
+  try {
+    const res = await savePromptTemplate(name, formData.value.simulationRequirement, files.value)
+    await refreshTemplates()
+    selectedTemplateId.value = res?.template?.id || ''
+    showSaveRow.value = false
+    newTemplateName.value = ''
+    setTemplateMsg(t('home.templateSaved', { name }))
+  } catch (e) {
+    console.error('Failed to save template:', e)
+    setTemplateMsg(t('home.templateSaveError'), true)
+  } finally {
+    templateBusy.value = false
+  }
+}
 
 // 触发文件选择
 const triggerFileInput = () => {
@@ -826,6 +970,101 @@ const startSimulation = () => {
   font-family: var(--font-mono);
   font-size: 0.7rem;
   color: #AAA;
+}
+
+/* ── Prompt-template dropdown ── */
+.template-bar {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.template-select {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--border);
+  background: var(--white);
+  padding: 10px 12px;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--black);
+  outline: none;
+  cursor: pointer;
+}
+
+.template-select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.template-save-btn,
+.template-confirm-btn,
+.template-cancel-btn {
+  border: 1px solid var(--black);
+  background: var(--white);
+  color: var(--black);
+  padding: 10px 14px;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s, color 0.15s;
+}
+
+.template-save-btn:hover:not(:disabled),
+.template-confirm-btn:hover:not(:disabled) {
+  background: var(--black);
+  color: var(--white);
+}
+
+.template-confirm-btn {
+  background: var(--black);
+  color: var(--white);
+}
+
+.template-cancel-btn {
+  border-color: var(--border);
+  color: var(--gray-text);
+}
+
+.template-save-btn:disabled,
+.template-confirm-btn:disabled,
+.template-cancel-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.template-save-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.template-name-input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--border);
+  background: var(--white);
+  padding: 10px 12px;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  outline: none;
+}
+
+.template-name-input:focus {
+  border-color: var(--black);
+}
+
+.template-msg {
+  margin-top: 8px;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--gray-text);
+}
+
+.template-msg.is-error {
+  color: var(--orange);
 }
 
 .start-engine-btn {

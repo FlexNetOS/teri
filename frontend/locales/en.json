@@ -91,7 +91,18 @@
     "promptPlaceholder": "// Describe your simulation or prediction requirement in natural language",
     "engineBadge": "Engine: Teri-V1.0",
     "startEngine": "Start Engine",
-    "initializing": "Initializing..."
+    "initializing": "Initializing...",
+    "templatesLabel": ">_ 00 / Templates",
+    "templatePlaceholder": "Load a saved template…",
+    "saveTemplate": "+ Save current…",
+    "templateNamePlaceholder": "Template name",
+    "save": "Save",
+    "cancel": "Cancel",
+    "templateSaved": "Saved template \"{name}\"",
+    "templateLoaded": "Loaded \"{name}\" — {count} seed file(s)",
+    "templateNeedsPromptSeed": "Add a prompt and at least one seed file before saving",
+    "templateSaveError": "Could not save template",
+    "templateLoadError": "Could not load template"
   },
   "main": {
     "layoutGraph": "Graph",
