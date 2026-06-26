@@ -77,7 +77,8 @@ in spirit; they still govern every change.
 
 A Rust rewrite of MiroFish (AGPL upstream; teri is itself licensed AGPL-3.0-or-later, keeping faith
 with that copyleft intent — see LICENSE). The five-stage pipeline mirrors upstream: seed → graph → agents → sim →
-report. **1629 tests green** (was ~140 at the 2026-06-12 snapshot). All five stages and their
+report. **The full `cargo test` suite is green (1700+ tests)** (was ~140 at the 2026-06-12
+snapshot). All five stages and their
 services are implemented and tested, and the **full pipeline runs today via `teri serve` + the
 REST API** (`/api/graph` build → `/api/simulation` prepare/start → `/api/report` generate/chat).
 Real today: seed ingestion (pdf/md/txt/json/url), `KnowledgeGraph::build` orchestration (LLM
