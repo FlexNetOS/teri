@@ -97,7 +97,7 @@ pub struct PredictionReport {
 // — the model conditions on it).
 // ============================================================================
 
-const PLAN_SYSTEM_PROMPT: &str = r#"你是一个「未来预测报告」的撰写专家，拥有对模拟世界的「上帝视角」——你可以洞察模拟中每一位Agent的行为、言论和互动。
+pub const PLAN_SYSTEM_PROMPT: &str = r#"你是一个「未来预测报告」的撰写专家，拥有对模拟世界的「上帝视角」——你可以洞察模拟中每一位Agent的行为、言论和互动。
 
 【核心理念】
 我们构建了一个模拟世界，并向其中注入了特定的「模拟需求」作为变量。模拟世界的演化结果，就是对未来可能发生情况的预测。你正在观察的不是"实验数据"，而是"未来的预演"。
@@ -164,7 +164,7 @@ const PLAN_USER_PROMPT_TEMPLATE: &str = r#"【预测场景设定】
 // `{}` placeholders are filled by `format!` / `.replace(...)` at call time.
 // ============================================================================
 
-const SECTION_SYSTEM_PROMPT_TEMPLATE: &str = r#"你是一个「未来预测报告」的撰写专家，正在撰写报告的一个章节。
+pub const SECTION_SYSTEM_PROMPT_TEMPLATE: &str = r#"你是一个「未来预测报告」的撰写专家，正在撰写报告的一个章节。
 
 报告标题: {report_title}
 报告摘要: {report_summary}
@@ -385,7 +385,7 @@ const REACT_FORCE_FINAL_MSG: &str = "已达到工具调用限制，请直接输�
 ///
 /// Placeholders: `{simulation_requirement}`, `{report_content}`, `{tools_description}`.
 /// All other `{` / `}` are literal (the embedded JSON-call example).
-const CHAT_SYSTEM_PROMPT_TEMPLATE: &str = r#"你是一个简洁高效的模拟预测助手。
+pub const CHAT_SYSTEM_PROMPT_TEMPLATE: &str = r#"你是一个简洁高效的模拟预测助手。
 
 【背景】
 预测条件: {simulation_requirement}

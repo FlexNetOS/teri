@@ -2,6 +2,7 @@ pub mod graph;
 pub mod report;
 pub mod simulation;
 pub mod streaming;
+pub mod templates;
 
 use axum::{
     http::StatusCode,
