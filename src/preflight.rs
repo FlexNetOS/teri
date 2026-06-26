@@ -75,6 +75,61 @@ pub fn parse_probe_content(body: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Pull `choices[0].delta.content` out of a single streaming chunk object, if present.
+/// Streaming chunks carry the text under `delta` (not `message`); the role-only first
+/// chunk has `content: null`, which `as_str()` skips.
+fn chunk_delta_content(chunk: &serde_json::Value) -> Option<&str> {
+    chunk
+        .get("choices")?
+        .as_array()?
+        .first()?
+        .get("delta")?
+        .get("content")?
+        .as_str()
+}
+
+/// Extract the probe completion text from a raw chat-completions response body,
+/// tolerating BOTH framings teri's backends use:
+///
+/// - **Single JSON object** (`choices[0].message.content`) — OpenAI/ollama/vLLM
+///   when `stream` is unset, the classic non-streaming response.
+/// - **SSE stream** (`data: {…delta.content…}` lines ending in `data: [DONE]`) —
+///   shimmy's OpenAI-compatible endpoint ALWAYS streams, even when `stream` is
+///   not requested, so the probe receives `text/event-stream` rather than a JSON
+///   object. Without this branch `resp.json()` fails with "non-JSON" and the
+///   guard wrongly rejects a perfectly real shimmy backend.
+///
+/// Mirrors the SSE parsing of the main streaming client (`llm.rs`): split on
+/// lines, `strip_prefix("data:")` (the space is optional per the SSE spec),
+/// skip blanks and the `[DONE]` sentinel, concatenate every `delta.content`.
+/// Returns the empty string when nothing parses (the caller treats empty as
+/// "no usable completion", which is itself a refusal upstream).
+pub fn extract_probe_text(raw: &str) -> String {
+    if raw.trim_start().starts_with("data:") {
+        let mut out = String::new();
+        for line in raw.lines() {
+            let Some(data) = line.strip_prefix("data:").map(str::trim) else { continue };
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) else { continue };
+            if let Some(text) = chunk_delta_content(&chunk) {
+                out.push_str(text);
+            }
+        }
+        return out;
+    }
+
+    // Non-streaming JSON object: prefer message.content, fall back to a lone
+    // delta.content (some backends emit a single streaming-shaped object).
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(body) => parse_probe_content(&body)
+            .or_else(|| chunk_delta_content(&body).map(str::to_string))
+            .unwrap_or_default(),
+        Err(_) => String::new(),
+    }
+}
+
 /// Pick the model to probe with: the configured one when the backend serves
 /// it, otherwise the first served model (with a warning) — a probe against a
 /// model the backend doesn't have would fail for the wrong reason.
@@ -155,11 +210,15 @@ pub async fn verify_backend(llm: &LlmConfig) -> Result<BackendIdentity> {
              (model '{probe_model}'; served models: {models:?})"
         )));
     }
-    let body: serde_json::Value = resp
-        .json()
+    // shimmy's OpenAI-compatible endpoint ALWAYS streams (SSE) even when `stream`
+    // is unset, so we read the body as text and parse both framings (SSE deltas or
+    // a single JSON object) rather than assuming `resp.json()` — which would reject
+    // a real shimmy backend with "non-JSON".
+    let raw = resp
+        .text()
         .await
-        .map_err(|e| TeriError::Config(format!("probe returned non-JSON: {e}")))?;
-    let probe_text = parse_probe_content(&body).unwrap_or_default();
+        .map_err(|e| TeriError::Config(format!("probe response unreadable at {chat_url}: {e}")))?;
+    let probe_text = extract_probe_text(&raw);
 
     if let Some(marker) = detect_stub_text(&probe_text) {
         return Err(TeriError::Config(format!(
@@ -282,6 +341,89 @@ mod tests {
         let err = verify_backend(&cfg).await.unwrap_err();
         assert!(matches!(err, TeriError::Config(_)));
         assert!(err.to_string().contains("unreachable"), "got: {err}");
+    }
+
+    /// shimmy's OpenAI endpoint ALWAYS streams SSE (even with `stream` unset),
+    /// so the probe receives `data: {…delta…}` chunks, not a JSON object. The
+    /// guard must parse them and pass a real backend — the whole point of using
+    /// shimmy instead of ollama.
+    #[tokio::test]
+    async fn verify_backend_passes_sse_streaming_backend() {
+        let server = MockServer::start();
+        let models = server.mock(|when, then| {
+            when.method(GET).path("/models");
+            then.status(200)
+                .body(r#"{"object":"list","data":[{"id":"m","object":"model"}]}"#);
+        });
+        // First chunk is role-only (content:null), then the content token, then [DONE].
+        let chat = server.mock(|when, then| {
+            when.method(POST).path("/chat/completions");
+            then.status(200).header("content-type", "text/event-stream").body(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null}}]}\n\n\
+                 data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"pong\"}}]}\n\n\
+                 data: [DONE]\n\n",
+            );
+        });
+
+        let identity = verify_backend(&probe_config(&server)).await.expect("sse backend passes");
+        assert_eq!(identity.models, vec!["m".to_string()]);
+        assert_eq!(identity.probe_text, "pong");
+        models.assert();
+        chat.assert();
+    }
+
+    /// A streaming backend whose concatenated deltas spell canned stub text is
+    /// still refused — the SSE path must not become a hole in the honesty guard.
+    #[tokio::test]
+    async fn verify_backend_refuses_canned_sse_probe() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/models");
+            then.status(200)
+                .body(r#"{"object":"list","data":[{"id":"m","object":"model"}]}"#);
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/chat/completions");
+            then.status(200).header("content-type", "text/event-stream").body(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Full transformer \"}}]}\n\n\
+                 data: {\"choices\":[{\"delta\":{\"content\":\"inference coming soon!\"}}]}\n\n\
+                 data: [DONE]\n\n",
+            );
+        });
+
+        let err = verify_backend(&probe_config(&server)).await.unwrap_err();
+        assert!(matches!(err, TeriError::Config(_)));
+        assert!(err.to_string().contains("REFUSING stub"), "got: {err}");
+    }
+
+    // ── extract_probe_text (both framings) ──────────────
+
+    #[test]
+    fn extract_probe_text_parses_sse_deltas() {
+        let raw = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":null}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n\
+                   data: [DONE]\n\n";
+        assert_eq!(extract_probe_text(raw), "Hello world");
+    }
+
+    #[test]
+    fn extract_probe_text_parses_data_with_no_space() {
+        // The SSE space after `data:` is optional; shimmy/compliant servers may omit it.
+        let raw = "data:{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n";
+        assert_eq!(extract_probe_text(raw), "hi");
+    }
+
+    #[test]
+    fn extract_probe_text_parses_json_object() {
+        let raw = r#"{"choices":[{"message":{"role":"assistant","content":"Pong!"}}]}"#;
+        assert_eq!(extract_probe_text(raw), "Pong!");
+    }
+
+    #[test]
+    fn extract_probe_text_empty_on_garbage() {
+        assert_eq!(extract_probe_text("not json, not sse"), "");
+        assert_eq!(extract_probe_text(""), "");
     }
 
     // ── detect_stub_text ───────────────────────────────
