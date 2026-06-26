@@ -998,6 +998,38 @@ pub struct RunInputs<L: LlmClient + Send + Sync + 'static> {
 /// `runs` is a `tokio::sync::Mutex` so it can be held across `.await` only where necessary.
 /// Lifecycle methods that must `.await` on a handle (stop, cleanup) **take the handle out of
 /// the map first**, drop the lock, then await — never holding the lock across the abort/join.
+/// RAII reservation of a `simulation_id` in [`SimulationRunner::starting`].
+///
+/// [`acquire`](StartGuard::acquire) returns `None` if another `start_simulation` for the same id
+/// is already in flight; otherwise it inserts the id and the returned guard removes it on `Drop`
+/// (every exit path — `Ok`, early `Err`, or a `?` mid-setup), so a failed start never wedges the
+/// id permanently.
+struct StartGuard<'a> {
+    set: &'a std::sync::Mutex<std::collections::HashSet<String>>,
+    id: String,
+}
+
+impl<'a> StartGuard<'a> {
+    fn acquire(
+        set: &'a std::sync::Mutex<std::collections::HashSet<String>>,
+        id: &str,
+    ) -> Option<Self> {
+        let mut guard = set.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.contains(id) {
+            return None;
+        }
+        guard.insert(id.to_string());
+        Some(Self { set, id: id.to_string() })
+    }
+}
+
+impl Drop for StartGuard<'_> {
+    fn drop(&mut self) {
+        let mut guard = self.set.lock().unwrap_or_else(|e| e.into_inner());
+        guard.remove(&self.id);
+    }
+}
+
 pub struct SimulationRunner<L: LlmClient + Send + Sync + 'static> {
     /// Root simulation-data directory — teri analog of `RUN_STATE_DIR`
     /// (`os.path.join(dirname(__file__), '../../uploads/simulations')`). S-600.
@@ -1006,6 +1038,13 @@ pub struct SimulationRunner<L: LlmClient + Send + Sync + 'static> {
     /// Per-run state + task + shutdown flag, keyed by `simulation_id`. Folds the six Python
     /// class-level dicts (S-602/603/604/605/606/607/608) into one map of owned handles.
     runs: tokio::sync::Mutex<std::collections::HashMap<String, RunHandle>>,
+    /// Simulation ids whose `start_simulation` is mid-flight. Reserved before the run-state check
+    /// and released only after the handle is registered in `runs`, closing the check-then-register
+    /// TOCTOU where two concurrent `POST /start` for the same id could both spawn an engine (the
+    /// loser's `RunHandle` would then be dropped, detaching — not aborting — its tasks, leaving an
+    /// orphan engine writing the same `actions.jsonl`). A plain sync mutex: the critical sections
+    /// (insert/remove) are tiny and never span an `.await`.
+    starting: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Graph-memory manager (U-021) — the runner calls `create_updater`/`stop_updater`/
     /// `stop_all` exactly where MiroFish calls `ZepGraphMemoryManager.*`.
     graph_mgr: Arc<GraphMemoryManager<L>>,
@@ -1033,6 +1072,7 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
         Self {
             sim_data_dir: sim_data_dir.into(),
             runs: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            starting: std::sync::Mutex::new(std::collections::HashSet::new()),
             graph_mgr,
             manager,
             cleanup_done: AtomicBool::new(false),
@@ -1134,6 +1174,14 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
         inputs: RunInputs<L>,
         graph_for_updater: Option<Arc<tokio::sync::Mutex<crate::graph::KnowledgeGraph>>>,
     ) -> Result<SimulationRunState> {
+        // (0) Reserve this id for the whole start so two concurrent `/start` for the same
+        // simulation cannot both pass the check below and spawn duplicate engines. Held (RAII)
+        // until this function returns — past the `runs.insert` at the end. Released on any error
+        // path too, so a failed start never wedges the id.
+        let _start_guard = StartGuard::acquire(&self.starting, simulation_id).ok_or_else(|| {
+            TeriError::Sim(format!("simulation start already in progress: {simulation_id}"))
+        })?;
+
         // (1) Reject if already running (L335-337).
         if let Some(existing) = self.get_run_state(simulation_id).await?
             && matches!(existing.runner_status, RunnerStatus::Running | RunnerStatus::Starting)
@@ -1651,7 +1699,17 @@ async fn run_sim_body<L: LlmClient + Send + Sync + 'static>(
     ipc_server.start();
 
     if let Err(e) = engine.run_with_boost(&mut pool, &graph, &*llm, boost_llm.as_deref()).await {
-        tracing::error!("模拟运行失败: {}", e);
+        tracing::error!("simulation run failed: {e}");
+        // Fail-closed teardown. On the success tail the engine fires the completion watch; on
+        // error it never does, so the monitor (whose only loop-exit IS that watch) would poll
+        // forever and `get_run_state` would report `Running` indefinitely while two tasks leak.
+        // Fire the signal so the monitor unblocks, runs its cleanup, and marks the run `Failed`
+        // (no `simulation_end` record was written). Then return WITHOUT entering the
+        // wait-for-commands loop — a failed run has no live env to interview, so lingering would
+        // only keep this task (and its engine) alive needlessly.
+        engine.signal_aborted();
+        ipc_server.stop();
+        return;
     }
 
     // ---------------------------------------------------------------------------------------
@@ -2353,8 +2411,22 @@ async fn monitor_simulation<L: LlmClient + Send + Sync + 'static>(
         let mut state = ctx.state.lock().await;
         state.twitter_running = false;
         state.reddit_running = false;
+        // Fail-closed terminal transition. The COMPLETED transition happens inside
+        // `read_action_log` on the `simulation_end` record; a cooperative stop sets `Stopped`.
+        // If neither happened the status is still `Running` here — i.e. the engine aborted
+        // (`run_sim_body` fired `signal_aborted` without writing `simulation_end`) or otherwise
+        // ended without a terminal record. Mark it `Failed` so the run is observably terminal
+        // instead of a perpetual `Running`. A clean finish (Completed) / cooperative stop
+        // (Stopped) is never overwritten.
+        if state.runner_status == RunnerStatus::Running {
+            tracing::warn!(
+                "simulation ended without a terminal record — marking Failed: {}",
+                ctx.simulation_id
+            );
+            state.runner_status = RunnerStatus::Failed;
+        }
         if let Err(e) = save_run_state(&ctx.sim_data_dir, &state) {
-            tracing::warn!("保存运行状态失败: {}, error={}", ctx.simulation_id, e);
+            tracing::warn!("save run state failed: {}, error={}", ctx.simulation_id, e);
         }
     }
 
@@ -4246,6 +4318,36 @@ mod lifecycle_tests {
         assert!(format!("{}", res.err().unwrap()).contains("模拟已在运行中"));
     }
 
+    #[tokio::test]
+    async fn start_rejects_concurrent_duplicate_via_start_guard() {
+        // Regression for the duplicate-start TOCTOU: while one start is mid-flight (its id reserved
+        // in `starting`), a second start for the SAME id must be rejected — so two concurrent
+        // `/start` cannot both spawn an engine writing the same actions.jsonl.
+        let (runner, dir, _m) = make_runner("dup_start_guard");
+        write_config(&dir, "sim-x", 1, 30);
+
+        // Simulate the first start being mid-flight by holding its reservation.
+        let guard = StartGuard::acquire(&runner.starting, "sim-x").expect("first reservation");
+
+        let err = runner
+            .start_simulation("sim-x", "twitter", Some(1), false, None, run_inputs(1), None)
+            .await
+            .expect_err("a start while another is in progress for the same id must be rejected");
+        assert!(matches!(err, TeriError::Sim(_)), "expected a Sim error, got: {err:?}");
+
+        // Releasing the reservation lets a fresh start proceed.
+        drop(guard);
+        let ok = runner
+            .start_simulation("sim-x", "twitter", Some(1), false, None, run_inputs(1), None)
+            .await;
+        assert!(ok.is_ok(), "start must succeed once the reservation is released: {ok:?}");
+
+        // Let the short run wind down, then tear down the spawned tasks.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        runner.cleanup_all().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // -----------------------------------------------------------------------
     // get_running_simulations
     // -----------------------------------------------------------------------
@@ -5194,6 +5296,58 @@ mod monitor_tests {
 
         // The final pass still read the action even though the loop never polled.
         assert_eq!(state.lock().await.recent_actions.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn monitor_marks_failed_when_run_ends_without_terminal_record() {
+        // Regression for the hung-run bug: an engine error fires the completion watch (via
+        // `signal_aborted`) but writes NO `simulation_end` record, so `read_action_log` never sets
+        // COMPLETED. A run that was Running at the monitor's exit must be marked Failed (terminal),
+        // not left Running forever.
+        let sim_id = "aborted";
+        let (ctx, dir, state, _g) = make_ctx("aborted", sim_id, false);
+        // The run was in progress when the engine aborted.
+        state.lock().await.runner_status = RunnerStatus::Running;
+
+        // Completion fires (as signal_aborted does) but there is NO simulation_end record on disk.
+        let (_tx, rx) =
+            tokio::sync::watch::channel(Some(crate::sim::SimCompletion { total_ticks: 0 }));
+        let monitor = tokio::spawn(monitor_simulation(ctx, rx));
+        tokio::time::timeout(Duration::from_secs(3), monitor)
+            .await
+            .expect("monitor must exit")
+            .expect("no panic");
+
+        let s = state.lock().await;
+        assert_eq!(
+            s.runner_status,
+            RunnerStatus::Failed,
+            "a run that ended without a terminal record must be marked Failed, not left Running"
+        );
+        assert!(!s.twitter_running);
+        assert!(!s.reddit_running);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn monitor_does_not_override_completed_status() {
+        // The Failed transition must NOT clobber a clean finish: if the run already reached
+        // Completed (the `simulation_end` final-pass transition), the monitor leaves it Completed.
+        let sim_id = "completed-keep";
+        let (ctx, dir, state, _g) = make_ctx("completed_keep", sim_id, false);
+        state.lock().await.runner_status = RunnerStatus::Completed;
+
+        let (_tx, rx) =
+            tokio::sync::watch::channel(Some(crate::sim::SimCompletion { total_ticks: 1 }));
+        let monitor = tokio::spawn(monitor_simulation(ctx, rx));
+        tokio::time::timeout(Duration::from_secs(3), monitor)
+            .await
+            .expect("exit")
+            .expect("ok");
+
+        assert_eq!(state.lock().await.runner_status, RunnerStatus::Completed);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
