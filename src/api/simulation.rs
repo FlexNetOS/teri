@@ -2438,6 +2438,30 @@ const MAX_TICK_SSE_POLLS: u32 = 2400;
 /// Zero-evidence polls tolerated before declaring the sim id unknown (12 × 250ms = ~3s).
 const TICK_UNKNOWN_GRACE: u32 = 12;
 
+/// Build a `tick` SSE event from a snapshot, falling back to the bare tick number on a
+/// serialization failure (the wire shape stays `event: tick`).
+fn tick_event(snap: &crate::sim::WorldSnapshot) -> Event {
+    Event::default()
+        .event("tick")
+        .json_data(snap)
+        .unwrap_or_else(|_| Event::default().event("tick").data(snap.tick.to_string()))
+}
+
+/// Clone the snapshots appended past `emitted` (the new tail slice), holding the `parking_lot`
+/// lock only for the clone — never across a yield/await.
+fn drain_fresh_ticks(
+    history: &Option<std::sync::Arc<parking_lot::Mutex<Vec<crate::sim::WorldSnapshot>>>>,
+    emitted: usize,
+) -> Vec<crate::sim::WorldSnapshot> {
+    match history {
+        Some(h) => {
+            let guard = h.lock();
+            if guard.len() > emitted { guard[emitted..].to_vec() } else { Vec::new() }
+        }
+        None => Vec::new(),
+    }
+}
+
 /// GET /:simulation_id/ticks/sse — live `text/event-stream` feed of the run's WorldSnapshots.
 /// Replays the full tick history on connect, then streams new ticks until the run reaches a
 /// terminal `runner_status`, then `done` + close.
@@ -2458,21 +2482,17 @@ async fn get_sim_ticks_sse_route(
                 history = state.sim_runner.snapshot_history(&simulation_id).await;
             }
 
-            // 1) Emit any ticks appended since the cursor. Lock, clone the new slice, release
-            //    (never hold the parking_lot lock across the yield/await).
-            if let Some(h) = &history {
-                let fresh: Vec<crate::sim::WorldSnapshot> = {
-                    let guard = h.lock();
-                    if guard.len() > emitted { guard[emitted..].to_vec() } else { Vec::new() }
-                };
+            // 1) Emit any ticks appended since the cursor.
+            let fresh = drain_fresh_ticks(&history, emitted);
+            if !fresh.is_empty() {
                 for snap in fresh {
-                    let ev = Event::default()
-                        .event("tick")
-                        .json_data(&snap)
-                        .unwrap_or_else(|_| Event::default().event("tick").data(snap.tick.to_string()));
-                    yield Ok(ev);
+                    yield Ok(tick_event(&snap));
                     emitted += 1;
                 }
+                // The safety ceiling (step 4) measures STALL time, not total lifetime: a run that
+                // is still emitting ticks must not be force-closed with a `timeout`. Reset the
+                // stall counter whenever progress is made (mirrors `unknown_polls` in step 3).
+                polls = 0;
             }
 
             // 2) Terminal runner_status → flush done-frame and close.
@@ -2483,6 +2503,14 @@ async fn get_sim_ticks_sse_route(
                 Some(RunnerStatus::Completed | RunnerStatus::Stopped | RunnerStatus::Failed)
             );
             if terminal {
+                // Final drain BEFORE the done-frame: the engine may have pushed the last tick(s)
+                // AFTER step 1's drain but BEFORE this status read (the engine and the monitor that
+                // flips the status are independent tasks with no ordering barrier). Without this
+                // re-drain those ticks are lost and `ticks` undercounts the run.
+                for snap in drain_fresh_ticks(&history, emitted) {
+                    yield Ok(tick_event(&snap));
+                    emitted += 1;
+                }
                 let label = status.map(|s| s.as_str()).unwrap_or("completed");
                 let done = Event::default()
                     .event("done")
@@ -5374,6 +5402,49 @@ mod tests {
             body.contains(r#"data: {"status":"completed","ticks":0}"#),
             "done event must include terminal status and tick count: {body}"
         );
+    }
+
+    /// `drain_fresh_ticks` is the slice mechanism behind both the step-1 stream and the terminal
+    /// final-drain. It must return exactly the tail past the cursor — this is what lets the
+    /// terminal pass pick up a last tick that landed after step 1 (the dropped-final-tick bug).
+    #[test]
+    fn drain_fresh_ticks_returns_only_the_tail_past_the_cursor() {
+        fn snap(tick: u32) -> crate::sim::WorldSnapshot {
+            crate::sim::WorldSnapshot {
+                tick,
+                agents: Default::default(),
+                events: Vec::new(),
+                variables: Default::default(),
+            }
+        }
+        let history = std::sync::Arc::new(parking_lot::Mutex::new(vec![snap(0), snap(1), snap(2)]));
+        let some = Some(history.clone());
+
+        // From cursor 0: all three.
+        let all = drain_fresh_ticks(&some, 0);
+        assert_eq!(all.iter().map(|s| s.tick).collect::<Vec<_>>(), vec![0, 1, 2]);
+
+        // From cursor 2: only the last — the exact "final tick landed after step 1's drain" case.
+        let tail = drain_fresh_ticks(&some, 2);
+        assert_eq!(tail.iter().map(|s| s.tick).collect::<Vec<_>>(), vec![2]);
+
+        // Cursor at/past the end: nothing (no panic on the boundary).
+        assert!(drain_fresh_ticks(&some, 3).is_empty());
+        assert!(drain_fresh_ticks(&some, 99).is_empty());
+
+        // A late push is visible to a subsequent drain (proves the terminal re-drain catches it).
+        history.lock().push(snap(3));
+        assert_eq!(
+            drain_fresh_ticks(&some, 3).iter().map(|s| s.tick).collect::<Vec<_>>(),
+            vec![3],
+            "the terminal final-drain must capture a tick pushed after the prior cursor"
+        );
+    }
+
+    /// No live history handle → empty drain (the connect-before-handle window), no panic.
+    #[test]
+    fn drain_fresh_ticks_none_history_is_empty() {
+        assert!(drain_fresh_ticks(&None, 0).is_empty());
     }
 
     /// GET /:id/run-status/detail — no run_state → 200 with the 5-key idle stub.
