@@ -13,7 +13,11 @@ export default defineConfig({
     }
   },
   server: {
-    port: 3000,
+    // 8374 = "TERI" on a phone keypad — deliberately uncommon to dodge the 3000/3001/5173
+    // collision zone. strictPort fails loudly on a conflict instead of silently wandering to a
+    // neighbouring port (which makes the dev URL unpredictable). Override per-run with --port.
+    port: 8374,
+    strictPort: true,
     open: true,
     proxy: {
       // Dev proxy: relative /api requests → teri serve (default addr 0.0.0.0:5001)
