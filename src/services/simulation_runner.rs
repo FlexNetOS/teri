@@ -1402,21 +1402,43 @@ impl<L: LlmClient + Send + Sync + 'static> SimulationRunner<L> {
     /// round boundary and persists in `world.variables` (and every subsequent snapshot) thereafter.
     ///
     /// Returns the number of injections now pending for that run (≥1). Errors if the simulation has
-    /// no live in-memory handle (never started, already finished, or stopped) — you can only inject
-    /// into a currently-running simulation.
+    /// no live in-memory handle (never started, or stopped/cleaned-up) — you can only inject into a
+    /// currently-running simulation.
+    ///
+    /// A naturally-completed (or stopped/failed) run keeps its handle in `runs` until
+    /// `stop`/`cleanup` removes it — and the spawned task itself outlives the engine's tick loop
+    /// (it stays alive to serve IPC interview round-trips), so `JoinHandle::is_finished()` is NOT a
+    /// reliable "will this ever drain" signal. The authoritative signal is the run's
+    /// `runner_status`: only a `Running` engine is still ticking and will drain the queue. Once the
+    /// monitor flips the status to `Completed` (or it is `Stopped`/`Failed`), an injection would be
+    /// a silent no-op, so we reject it as a misleading success.
     pub async fn inject_variable(
         &self,
         simulation_id: &str,
         variable: String,
         value: f32,
     ) -> Result<usize> {
-        let runs = self.runs.lock().await;
-        let handle = runs.get(simulation_id).ok_or_else(|| {
-            TeriError::Sim(format!(
-                "Simulation is not running; cannot inject into it: {simulation_id}"
-            ))
-        })?;
-        let mut queue = handle.injections.lock();
+        // Clone the shared handles out under the `runs` lock, then release it before awaiting on the
+        // per-run state mutex (never hold the contended `runs` lock across an `.await`).
+        let (injections, state) = {
+            let runs = self.runs.lock().await;
+            let handle = runs.get(simulation_id).ok_or_else(|| {
+                TeriError::Sim(format!(
+                    "Simulation is not running; cannot inject into it: {simulation_id}"
+                ))
+            })?;
+            (Arc::clone(&handle.injections), Arc::clone(&handle.state))
+        };
+
+        let status = state.lock().await.runner_status.clone();
+        if status != RunnerStatus::Running {
+            return Err(TeriError::Sim(format!(
+                "Simulation is not actively running (status: {}); injection would never be applied: {simulation_id}",
+                status.as_str()
+            )));
+        }
+
+        let mut queue = injections.lock();
         queue.push((variable, value));
         Ok(queue.len())
     }
@@ -4250,6 +4272,74 @@ mod lifecycle_tests {
         let log = sim_dir.join("twitter").join("actions.jsonl");
         let content = std::fs::read_to_string(&log).expect("actions.jsonl written by the producer");
         assert!(content.contains("simulation_end"), "actions.jsonl must contain simulation_end");
+    }
+
+    /// God's-eye injection is accepted while a run is actively Running (the engine will drain the
+    /// queue). A no-producer run keeps `runner_status = Running` (the monitor never sees a
+    /// `simulation_end` record), so the handle stays injectable and the pending count grows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inject_into_running_run_is_accepted() {
+        let (runner, dir, _mgr) = make_runner("inject_running");
+        write_config(&dir, "sim-run", 1, 30);
+        runner
+            .start_simulation("sim-run", "twitter", None, false, None, run_inputs(50), None)
+            .await
+            .expect("start should succeed");
+
+        let pending = runner
+            .inject_variable("sim-run", "crisis".into(), 0.9)
+            .await
+            .expect("injection into a running sim is accepted");
+        assert!(pending >= 1, "an accepted injection increments the pending count");
+
+        // Unknown id → the distinct not-running error (guard didn't break that path).
+        let err = runner
+            .inject_variable("does-not-exist", "x".into(), 1.0)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not running"), "unknown id → not-running error, got: {err}");
+
+        runner.stop_simulation("sim-run").await.ok();
+    }
+
+    /// Verify-driven upgrade: a COMPLETED run keeps its handle in `runs` until stop/cleanup, but its
+    /// engine tick loop is over (the task stays alive only to serve IPC), so an injection would be a
+    /// silent no-op. `inject_variable` must REJECT it — the `runner_status` is the authoritative
+    /// signal, NOT `JoinHandle::is_finished()` (the task outlives the engine loop).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inject_into_completed_run_is_rejected() {
+        let (runner, dir, _mgr) = make_runner("inject_completed");
+        write_config(&dir, "sim-fin", 1, 30); // 2 rounds
+        let sim_dir = dir.join("sim-fin");
+        let inputs = run_inputs_with_producer(2, &sim_dir, "twitter");
+        runner
+            .start_simulation("sim-fin", "twitter", None, false, None, inputs, None)
+            .await
+            .expect("start should succeed");
+
+        // Wait until the producer's `simulation_end` drives the monitor → COMPLETED.
+        let mut completed = false;
+        for _ in 0..50 {
+            if let Some(rs) = runner.get_run_state("sim-fin").await.unwrap()
+                && rs.runner_status == RunnerStatus::Completed
+            {
+                completed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(completed, "producer run must reach COMPLETED");
+
+        let err = runner
+            .inject_variable("sim-fin", "crisis".into(), 0.9)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not actively running"),
+            "injecting into a COMPLETED run must be rejected, got: {err}"
+        );
     }
 
     /// U-030 cycle B end-to-end: a PARALLEL run with a dual-logger producer writes BOTH
