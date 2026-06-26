@@ -67,19 +67,21 @@ Pipeline is wired end-to-end (ontology → graph build → entity read → perso
 config-generation layer is value-exact. Gaps are concentrated in **persona generation quality**.
 
 ### Teri must build
-1. **Persona memory injection** *(highest sim-quality impact)* — teri's English persona prompt
-   (`agent/mod.rs:1404-1426`) omits the 个人记忆/机构记忆 section that ties each agent to the event
-   and its prior actions/reactions (`oasis_profile_generator.py:710,759`). This *is* the stage-1
-   "individual/collective memory injection."
-2. **Bilingual two-prompt persona strategy** — individual-vs-group prompt selection, system prompt,
-   `response_format=json_object`, temperature ramp (0.7−attempt×0.1), 3-attempt loop,
-   `finish_reason=="length"` truncation detection (`oasis_profile_generator.py:497-772`). Teri does
-   a single English single-shot prompt.
-3. **Persona randomization** — restore random counter ranges (karma 500-5000, etc.) and random
-   age/gender/mbti/country in rule-based branches (`oasis_profile_generator.py:262-265,786-845`).
-   Teri uses fixed/deterministic values → profiles aren't varied.
+1. **Persona memory injection** *(highest sim-quality impact)* — ✅ **LANDED (S6/TASK-SIM-1).**
+   Both persona frames now carry a memory section (个人记忆 for individuals, 机构记忆 for
+   institutions) grounded in the entity summary + graph-neighbor context
+   (`oasis_profile_generator.py:710,759`). This *was* the stage-1 "individual/collective memory injection."
+2. **Bilingual two-prompt persona strategy** — ✅ **LANDED (S6/TASK-SIM-1)** except finish_reason.
+   Individual-vs-group prompt selection, system prompt, temperature ramp (0.7−attempt×0.1) over a
+   3-attempt loop are wired through the existing `chat()` API (`oasis_profile_generator.py:497-772`).
+   `finish_reason=="length"` truncation detection needs an `LlmClient` API change and is DEFERRED to
+   **S11 / TASK-SIM-6 #7** (`// S11:` comment at the call site).
+3. **Persona randomization** — ✅ **LANDED (S6/TASK-SIM-1).** Random counter ranges (karma 500-5000,
+   etc.) + random age/gender/mbti/country via a seedable `StdRng` in the rule-based / default
+   branches; institutions keep MiroFish's fixed values (`oasis_profile_generator.py:262-265,786-845`).
 4. **Constants + missing branches** — `MBTI_TYPES`/`COUNTRIES`/`INDIVIDUAL`/`GROUP_ENTITY_TYPES`
-   (`oasis_profile_generator.py:156-179`); add `socialmediaplatform` arm, split `mediaoutlet`.
+   added in S6 (`oasis_profile_generator.py:156-179`); still TODO: add `socialmediaplatform` arm,
+   split `mediaoutlet`.
 5. **Per-entity context search enrichment** (`_search_zep_for_entity`,
    `oasis_profile_generator.py:286-412`) — wire teri's semantic-recall/graph-search to enrich
    persona context (fact dedup in `_build_entity_context`).
@@ -186,12 +188,24 @@ Status: ☑ done · ☐ open. Priority groups top→bottom.
 
 ### Web UI (structural gap — LANDED, follow-ups open)
 - ☑ **TASK-UI-0** — copy + wire the Vue 3 SPA into `frontend/`; production build green. *(5c26f1f)*
-- ☐ **TASK-UI-1** — live smoke test: `teri serve` + `npm run dev`, drive all 5 steps end-to-end
-  against the running engine; fix any envelope/field/CORS mismatch the static build can't catch.
-- ☐ **TASK-UI-2** — adopt teri's SSE endpoints in the UI (EventSource for `/agent-log/sse`,
-  `/console-log/sse`, `/events`, `/ticks/sse`) replacing MiroFish's `from_line`/30s polling.
-- ☐ **TASK-UI-3** — teri-native branding pass (replace the renamed MiroFish logo with a teri mark);
-  split the large d3 chunk; resolve the `pendingUpload.js` dual-import warning.
+- ☑ **TASK-UI-1** — UI↔engine API contract gate landed as `tests/ui_api_contract.rs`: boots the real
+  `create_app` router and asserts, for an LLM-free endpoint of each of the 5 wizard steps, the exact
+  contract the axios layer depends on — `{success,data}`/`{success:false,error}` envelope, CORS
+  scoped to `/api/*` (not `/health`), `Accept-Language` (en/zh) honored, teri-branded `/health`. All
+  assertions pass against the running engine on the first run (no mismatch found); the one-time manual
+  smoke is now a regression gate. *(S1)*
+- ☑ **TASK-UI-2** — UI adopts teri's SSE endpoints via a shared `api/sse.js` (`openSse` helper with
+  named-event handlers + automatic polling fallback on connection failure). `Step4Report.vue` now
+  streams `/agent-log/sse` + `/console-log/sse` (the per-log handlers were extracted so SSE and the
+  polling fallback share one code path); `SimulationRunView.vue` streams `/ticks/sse` to refresh the
+  graph per tick instead of MiroFish's blind 30s poll. Each stream falls back to the original
+  `from_line`/30s polling if SSE can't connect (no-downgrade). `npm run build` green. *(S2)*
+- ☑ **TASK-UI-3** — UI polish: (1) native teri SVG mark (a school of anchovies forming one larger
+  fish — the swarm-emergence metaphor) replaces the 600 kB renamed-MiroFish jpeg (now inlined,
+  ~2.5 kB); (2) `vite.config` `manualChunks` splits d3 (62 kB) + the Vue framework (158 kB) out of
+  the entry chunk (524→305 kB), clearing the >500 kB warning; (3) Home.vue's dynamic
+  `pendingUpload` import made static to match siblings, clearing the dual-import warning.
+  `npm run build` now green with **zero warnings**. *(S3)*
 
 ### teri↔pebesen community seam (structural gap — LANDED, follow-ups open)
 - ☑ **TASK-SEAM-0** — `CommunityAdapter`/`CommunityFeedback` + `PebesenAdapter`/`PebesenFeedback`
@@ -201,31 +215,141 @@ Status: ☑ done · ☐ open. Priority groups top→bottom.
   (`pebesen` binary, `/health` verified live). The loop is LIVE end-to-end over HTTP.
   *(Follow-on: mount the DB-backed `pebesen-api` routes alongside it once that crate exposes a
   `Router` + `DATABASE_URL`.)*
-- ☐ **TASK-SEAM-2** — sqlx/postgres-backed `IntelligenceStore` (make it a trait, in-memory + Postgres
-  impls; tables `predictions`, `prediction_actions` per the inline `// SQLX SLOT:` markers).
-- 🟡 **TASK-SEAM-3** — loop E2E: feedback half DONE (`tests/community_loop_e2e.rs` — teri feedback →
-  real receiver → store → action → calibration, over real HTTP; ingest via mocked pebesen read API).
-  Remaining: the LLM-backed pipeline middle (signal → seed → …pipeline… → report → feedback) as a
-  gated integration test against a mock inference backend.
+- ☑ **TASK-SEAM-2** — `PredictionStore` async trait (`async-trait`) with two impls: the existing
+  in-memory `IntelligenceStore` (additive — its sync API and all current callers, incl. the http
+  router + teri E2E, are untouched) and a new feature-gated `pg::PgStore` (sqlx 0.8) over tables
+  `predictions` + `prediction_actions` (DDL = `pg::SCHEMA`, per the `// SQLX SLOT:` markers). The
+  `accuracy`/`confidence_adjustment` math is factored into `SpaceCalibration::from_counts` so the SQL
+  aggregate and the in-memory fold can't diverge. Queries are sqlx **runtime** queries (no `query!`
+  macro) → compiles in CI under `--all-features` with **no** live DB / `.sqlx` cache. One shared
+  `tests/store_behavior.rs` contract runs against in-memory (always) and `PgStore` (gated on
+  `TEST_DATABASE_URL`). 8 lib + 2 behavior tests green; clippy `--all-features --all-targets` clean. *(S4)*
+- ☑ **TASK-SEAM-3** — loop E2E complete. The feedback + ingest ends were already covered by
+  `tests/community_loop_e2e.rs`; the **middle** is now covered by `tests/community_pipeline_e2e.rs`:
+  a pebesen signal → `signal_to_seed_document` → temp seed file → real `pipeline::run_pipeline`
+  (seed→graph→persona→sim→report, injected mock `LlmClient`) → a `TopicSignal` derived from the
+  report → `PebesenFeedback` push → live in-process receiver → asserted to land scoped to the
+  originating space. Proves the whole loop in one pass; runs offline+deterministic (the injected
+  adapter bypasses no guard — the backend-honesty guard only gates real `teri run`/`serve`). Passes
+  (full pipeline, ~36s). *(S5)*
 
 ### Autonomy (L2–L5, see docs/AGENTIC-STORY.md)
-- ☐ **TASK-AUTO-1** — autonomy orchestrator (DECIDE layer): watch adapters, debounce signal deltas
-  into `(seed, query)` jobs, schedule headless `pipeline::run_pipeline` runs under a compute budget,
-  with continuity/resume + witnessed audit trail.
-- ☐ **TASK-AUTO-2** — calibration loop: turn actioned/accurate outcomes into per-community confidence
-  weights (persist in redb); upgrades report `confidence` from synthesized metadata → calibrated.
+- ☑ **TASK-AUTO-1** — autonomy orchestrator (DECIDE layer) landed in `src/autonomy/` (re-exported in
+  `lib.rs`). Wires the loop's SENSE→DECIDE→PREDICT spine above `pipeline.rs` as a pure library module
+  (no CLI wiring this slice; the `teri autonomy` subcommand attach point is noted at the foot of
+  `autonomy/mod.rs`). Pieces: **SENSE** drives `CommunityAdapter::fetch_domains/fetch_signal`;
+  `SignalFingerprint` (`fingerprint.rs`) is the **debounce** key over salient signal fields
+  (counts + recent-topic `(id,status)`; excludes `captured_at`/`last_active` jitter). **DECIDE** =
+  `DecidePolicy` trait + `DefaultDecidePolicy` (templated engagement/health trend question over a
+  horizon) + `build_job` pairing the adapter's `to_seed_document` seed with the policy query.
+  **PREDICT** = `PredictionJobRunner` trait (`runner.rs`); `PipelineJobRunner` stages the seed to a
+  temp file and calls `pipeline::run_pipeline` (provider-selected LLM, inherits the backend guard),
+  tests inject a fake. **Budget** (`max_runs_per_tick`/`max_concurrent`, normalized) caps runs and
+  reports the rest as `deferred` (never silent); concurrency bounded by `buffer_unordered`.
+  **Continuity** = `OrchestratorState` behind a `StateStore` trait (`InMemoryStateStore` for tests,
+  `JsonFileStateStore` atomic-write checkpoint for prod) — a restart on an unchanged signal does not
+  re-run; a failed run does not advance its fingerprint (retried next tick). **Audit** = structured
+  `tracing` per decision + a `TickReport` (sensed/changed/ran/deferred/errors) with per-domain error
+  isolation. `Orchestrator::tick()` is the unit of behavior; `run_forever(interval)` loops it. 20 new
+  unit tests (debounce / one-job / budget-cap / persist-reload continuity / per-domain isolation /
+  retry / policy-query / report-shape / budget normalization). **Left for S13 (TASK-AUTO-2):** the L3
+  `CommunityFeedback` ACT push and L4 per-community confidence calibration — `// SEAM(S13)` marker in
+  `mod.rs` marks the hook point inside the per-run record loop. *(S12)*
+- ☑ **TASK-AUTO-2** — calibration loop (LEARN layer, L4) landed in `src/autonomy/calibration.rs`
+  (re-exported via `autonomy::mod`). `CommunityCalibration` folds per-domain `scored`/`accurate`
+  counts → `accuracy` → `confidence_weight` via `confidence_weight_from_counts(scored, accurate) =
+  (0.5 + accuracy).clamp(0.5, 1.5)`, neutral `1.0` when nothing scored — **byte-identical** to
+  pebesen's `IntelligenceStore::calibration` inline arithmetic (`pebesen/crates/intelligence/src/
+  lib.rs`; pebesen has no `from_counts` ctor, so parity is by replicated arithmetic + the
+  cross-checking test `weight_matches_pebesen_for_the_same_counts` over a 0..=10 grid). `apply(domain,
+  raw) = (raw * weight).clamp(0.0, 1.0)` (clamp documented: weight >1 can't push confidence past 1.0).
+  **Store backend: redb** (`RedbCalibrationStore`, single `autonomy_calibration` table `domain_id ->
+  serde_json(stats)`, mirrors `memory::MemoryStore`'s redb idiom) — the ledger specified redb and it
+  is already teri's persistence engine; `InMemoryCalibrationStore` for tests. Both behind a
+  `CalibrationStore` trait mirroring `StateStore`. **Wired** into `Orchestrator` (both calibration +
+  feedback optional, builder-style `.with_calibration`/`.with_feedback` → absent = byte-identical
+  pre-S13 behavior, no-downgrade): at the `// SEAM(S13)` marker each completed run derives a
+  domain-scoped `SpaceHealthRisk` whose confidence is **calibrated** by the domain's weight and pushed
+  via the optional `CommunityFeedback` (L3 ACT). **LEARN input** = `Orchestrator::record_outcome(
+  domain_id, accurate)` (public entry point; persists through the store). Synthesized-confidence
+  caveat softened in README §Status + the `TopicSignal`/`ContributorTrajectory`/`SpaceHealthRisk`/
+  `PredictionReport` confidence doc-comments (honest: calibrated only where outcomes recorded, neutral
+  otherwise). 13 new tests (no-evidence-identity / ceiling+clamp / floor / mixed / pebesen-parity /
+  in-mem + redb round-trip across restart / deletion-reconcile / orchestrator applies stored weight /
+  uncalibrated-identity / no-op-without-wiring / record_outcome durability). **Remaining thin
+  connector:** the LEARN-input *puller* — pulling actioned/accurate verdicts from pebesen's
+  `/calibration` (or its `CommunityFeedback` acks) and calling `record_outcome` — is a deployment-
+  wiring concern (noted at the foot of `autonomy/mod.rs`), as is the `teri autonomy` CLI attach. *(S13)*
 
 ### Simulation fidelity & refinements (engine — open)
-- ☐ **TASK-SIM-1** — persona memory injection + bilingual two-prompt strategy + randomization
+- ☑ **TASK-SIM-1** — persona memory injection + bilingual two-prompt strategy + randomization
   (Stage 1-2 #1-3) — biggest simulation-fidelity gap.
-- ☐ **TASK-SIM-2** — per-platform action split + enriched `action_args` (Stage 3 #1-2).
-- ☐ **TASK-SIM-3** — social-DB producer + `sqlite`-default serve (Stage 4-5 #1) — unlocks
-  posts/comments/history.
-- ☐ **TASK-SIM-4** — provider-agnostic `serve` ApiState (Stage 4-5 #2) — Anthropic/Gemini under serve.
-- ☐ **TASK-SIM-5** — `register_cleanup` shutdown hook (Stage 3 #3) — no orphaned sims.
-- ☐ **TASK-SIM-6** — persona/config `json_object`+`finish_reason`, ontology reserved-names/edge
-  constraints, per-entity search enrichment (Stage 1-2 #4-7).
+  - _S6 landed (2026-06-23):_ `PersonaGenerator::generate_social` now drives the LLM via the
+    existing `chat(&[ChatMessage], &ChatOptions)` API with a system prompt + a SELECTED user
+    prompt (individual vs group, via `is_individual_entity`/`GROUP_ENTITY_TYPES`) and a 3-attempt
+    retry loop with the `temp = 0.7 - attempt*0.1` ramp. Both persona frames carry a memory
+    section — personal-memory (个人记忆) for individuals, institutional-memory (机构记忆) for
+    groups — grounded in the entity summary + graph-neighbor context (#1). `generate_social_rule_based`
+    and the LLM-path numeric defaults now randomize via a seedable `StdRng` (karma 500-5000,
+    friends 50-500, followers 100-1000, statuses 100-2000; age/gender/mbti/country drawn from the
+    new `MBTI_TYPES`/`COUNTRIES` tables — institutions keep MiroFish's fixed age=30/other/ISTJ) (#3).
+    `finish_reason=="length"` truncation detection needs an `LlmClient` API change and is DEFERRED
+    to **S11 / TASK-SIM-6 #7** (marked with an `// S11:` comment at the call site). +8 tests.
+- ☑ **TASK-SIM-2** — per-platform action split + enriched `action_args` (Stage 3 #1-2). S7:
+    (#1) added a decision-time platform gate (`Platform::allows_action` + `Agent::gate_platform_action`)
+    that coerces any action outside the agent's platform set to `DO_NOTHING` — the behavioural
+    equivalent of MiroFish only OFFERING `TWITTER_ACTIONS`/`REDDIT_ACTIONS` via `available_actions`;
+    static sets asserted equal to `Config.oasis_twitter_actions`/`oasis_reddit_actions`. (#2) added
+    `SocialAction::oasis_action_args_enriched(&SocialWorld)` resolving `post_content`/`author_name`/
+    `comment_content`/`quote_content`/`target_user_name` from the social-world post/comment/user
+    graph; wired the log site to enrich when the platform world is installed (structural-only path
+    unchanged with no world). Replaced the stale `[≠]U028-OASIS-INTERNALS` comment. +17 tests.
+- ☑ **TASK-SIM-3** — social-DB producer + `sqlite`-default serve (Stage 4-5 #1) — unlocks
+  posts/comments/history. Flipped `Cargo.toml` `default = ["sqlite"]` so a normal `cargo build` /
+  `teri serve` BOTH produces `{sim_dir}/{platform}_simulation.db` (the `SocialDbWriter` producer is
+  already installed on the live run/serve path via `engine.with_social` at `api/simulation.rs` and
+  `pipeline.rs` — verified, not newly wired) AND reads it back through `/posts` + `/comments`.
+  Added a producer→handler end-to-end test (`producer_db_is_readable_through_handlers_end_to_end`):
+  produces via the runtime `SocialWorldSet` at the manager's `get_simulation_dir` and reads back
+  through the HTTP handlers — proves producer-path == reader `social_db_path`, DDL == reader needs,
+  and the feature wires both halves. No-DB-empty + honest-500 (`--no-default-features`) contracts
+  preserved.
+- ☑ **TASK-SIM-4** — provider-agnostic `serve` ApiState (Stage 4-5 #2) — Anthropic/Gemini under serve. `ApiState`/runner monomorphized over `ProviderAdapter` (enum dispatch) instead of `OpenAiAdapter`; `build_llm` + `BackendLlm` now provider-selected from `config.llm.provider`; boost wrapped as `ProviderAdapter::Openai`. No-downgrade (OpenAI byte-identical). S9.
+- ☑ **TASK-SIM-5** — `register_cleanup` shutdown hook: **already landed** (the ledger was stale).
+  `server::serve` wires `axum::serve(...).with_graceful_shutdown(...)` so SIGTERM/SIGINT/SIGHUP
+  (SIGTERM/SIGHUP unix-only; Ctrl-C elsewhere) route to `SimulationRunner::cleanup_all().await`
+  (terminate running sims cooperative-then-abort, persist STOPPED) before the socket stops accepting,
+  plus an atexit-style backup `cleanup_all` on the non-signal exit path (`cleanup_all` is idempotent
+  via a `cleanup_done` compare-exchange). Verified at `src/server.rs` (`serve()` ~271-352) and the 4
+  `cleanup_all_*` tests in `simulation_runner.rs` (idempotent / terminates+records / preserves
+  finished / stops-running-skips-finished). *(S10 — verification slice, no code change)*
+- ☑ **TASK-SIM-6** — persona/config `json_object`+`finish_reason`, ontology reserved-names/edge
+  constraints, per-entity search enrichment (Stage 1-2 #4-7). *(S11)*
+  - **#7 (added)** — `ChatOptions` gained `response_format: Option<ResponseFormat>` (`ResponseFormat::JsonObject`
+    → OpenAI `{"type":"json_object"}`; Anthropic → JSON-sentinel turn; Gemini → `responseMimeType`).
+    New `LlmClient::chat_with_meta` returns `ChatCompletion { content, finish_reason }`; the OpenAI
+    adapter surfaces `finish_reason` (warns on `"length"`). The persona loop now requests JSON mode
+    and, on a `"length"` truncation, repairs via `fix_truncated_json` then parses (retrying the
+    attempt if even the repair is unparseable) — matching `oasis_profile_generator.py:536-547`. The
+    `chat_json` structured callers (ontology / sim-config) already force JSON mode internally.
+    *Already present in S6:* the 3-attempt temperature-ramp loop + JSON-salvage fallback + the
+    hardcoded `chat_json` `response_format`.
+  - **#5 (added)** — `EntityFactRecall` trait + `RecalledEntityFacts`; `generate_social_with_recall`
+    appends semantically-recalled facts/summaries (deduped against the graph-derived relationship
+    lines, capped 15 facts / 10 summaries) — the part-4 `_search_zep_for_entity` half
+    (`oasis_profile_generator.py:286-485`). Concrete `GraphSemanticRecall` adapter bridges
+    `ReportTools::search_graph_semantic` (edges→facts, nodes→summaries). Threaded through
+    `generate_profiles_from_entities` as an optional param (live batch-path wiring is a follow-up;
+    `None` → byte-identical to today). *Already present:* in-process parts 1-3 of `_build_entity_context`.
+  - **#6 (added)** — reserved attribute-name remap (`safe_attr_name`: `name`/`uuid`/`group_id`/
+    `name_embedding`/`summary`/`created_at` → `entity_*`, case-insensitive) for entity & edge
+    attributes in `validate_and_process` (`graph_builder.py:217-264`). *Already present:* type-name
+    PascalCase/UPPER_SNAKE remap + `source_targets` source/target remap.
+  - **#4 (added)** — distinct rule-based `mediaoutlet | socialmediaplatform` branch (profession
+    "Media", news-focused bio/persona/interests; `oasis_profile_generator.py:810-820`), placed
+    before the generic group branch. *Already present (S6):* `MBTI_TYPES` / `COUNTRIES` constants.
 
 ### Doc debt
-- ☐ **TASK-DOC-1** — refresh the stale `TODO.md` (dated 2026-06-12, says "pipeline pending") — point
-  it at this ledger or rewrite against current code state.
+- ☑ **TASK-DOC-1** — refreshed the stale `TODO.md` (was dated 2026-06-12, claimed "pipeline pending"):
+  rewritten as a current-state pointer to this ledger + `SPRINT.md`. The final sprint plan
+  (`SPRINT.md`, S0–S14) now sequences this backlog. *(S0)*

@@ -394,6 +394,7 @@ import { ref, computed, watch, onMounted, onUnmounted, nextTick, h, reactive } f
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { getAgentLog, getConsoleLog } from '../api/report'
+import { openSse } from '../api/sse'
 
 const router = useRouter()
 const { t } = useI18n()
@@ -2017,66 +2018,75 @@ const getLogLevelClass = (log) => {
   return ''
 }
 
-// Polling
+// Live feed transport handles. SSE is preferred (teri exposes /agent-log/sse +
+// /console-log/sse); polling timers are the fallback when SSE can't be established.
 let agentLogTimer = null
 let consoleLogTimer = null
+let agentLogSse = null
+let consoleLogSse = null
+
+// Apply a single agent-log entry. Shared by the SSE `log` handler and the polling fallback so
+// the two transports stay behaviorally identical (DRY).
+const applyAgentLog = (log) => {
+  agentLogs.value.push(log)
+
+  if (log.action === 'planning_complete' && log.details?.outline) {
+    reportOutline.value = log.details.outline
+  }
+
+  if (log.action === 'section_start') {
+    currentSectionIndex.value = log.section_index
+  }
+
+  // section_complete - 章节生成完成
+  if (log.action === 'section_complete') {
+    if (log.details?.content) {
+      generatedSections.value[log.section_index] = log.details.content
+      // 自动展开刚生成的章节
+      expandedContent.value.add(log.section_index - 1)
+      currentSectionIndex.value = null
+    }
+  }
+
+  if (log.action === 'report_complete') {
+    isComplete.value = true
+    currentSectionIndex.value = null  // 确保清除 loading 状态
+    emit('update-status', 'completed')
+    stopLiveFeed()
+    // 滚动逻辑统一在追加后的 nextTick 中处理
+  }
+
+  if (log.action === 'report_start') {
+    startTime.value = new Date(log.timestamp)
+  }
+}
+
+const scrollAgentPanel = () => {
+  nextTick(() => {
+    if (rightPanel.value) {
+      // 如果任务已完成，滚动到顶部；否则滚动到底部跟随最新日志
+      if (isComplete.value) {
+        rightPanel.value.scrollTop = 0
+      } else {
+        rightPanel.value.scrollTop = rightPanel.value.scrollHeight
+      }
+    }
+  })
+}
 
 const fetchAgentLog = async () => {
   if (!props.reportId) return
-  
+
   try {
     const res = await getAgentLog(props.reportId, agentLogLine.value)
-    
+
     if (res.success && res.data) {
       const newLogs = res.data.logs || []
-      
-      if (newLogs.length > 0) {
-        newLogs.forEach(log => {
-          agentLogs.value.push(log)
-          
-          if (log.action === 'planning_complete' && log.details?.outline) {
-            reportOutline.value = log.details.outline
-          }
-          
-          if (log.action === 'section_start') {
-            currentSectionIndex.value = log.section_index
-          }
 
-          // section_complete - 章节生成完成
-          if (log.action === 'section_complete') {
-            if (log.details?.content) {
-              generatedSections.value[log.section_index] = log.details.content
-              // 自动展开刚生成的章节
-              expandedContent.value.add(log.section_index - 1)
-              currentSectionIndex.value = null
-            }
-          }
-          
-          if (log.action === 'report_complete') {
-            isComplete.value = true
-            currentSectionIndex.value = null  // 确保清除 loading 状态
-            emit('update-status', 'completed')
-            stopPolling()
-            // 滚动逻辑统一在循环结束后的 nextTick 中处理
-          }
-          
-          if (log.action === 'report_start') {
-            startTime.value = new Date(log.timestamp)
-          }
-        })
-        
+      if (newLogs.length > 0) {
+        newLogs.forEach(applyAgentLog)
         agentLogLine.value = res.data.from_line + newLogs.length
-        
-        nextTick(() => {
-          if (rightPanel.value) {
-            // 如果任务已完成，滚动到顶部；否则滚动到底部跟随最新日志
-            if (isComplete.value) {
-              rightPanel.value.scrollTop = 0
-            } else {
-              rightPanel.value.scrollTop = rightPanel.value.scrollHeight
-            }
-          }
-        })
+        scrollAgentPanel()
       }
     }
   } catch (err) {
@@ -2129,24 +2139,32 @@ const extractFinalContent = (response) => {
   return null
 }
 
+const scrollConsolePanel = () => {
+  nextTick(() => {
+    if (logContent.value) {
+      logContent.value.scrollTop = logContent.value.scrollHeight
+    }
+  })
+}
+
+const applyConsoleLog = (line) => {
+  consoleLogs.value.push(line)
+  scrollConsolePanel()
+}
+
 const fetchConsoleLog = async () => {
   if (!props.reportId) return
-  
+
   try {
     const res = await getConsoleLog(props.reportId, consoleLogLine.value)
-    
+
     if (res.success && res.data) {
       const newLogs = res.data.logs || []
-      
+
       if (newLogs.length > 0) {
         consoleLogs.value.push(...newLogs)
         consoleLogLine.value = res.data.from_line + newLogs.length
-        
-        nextTick(() => {
-          if (logContent.value) {
-            logContent.value.scrollTop = logContent.value.scrollHeight
-          }
-        })
+        scrollConsolePanel()
       }
     }
   } catch (err) {
@@ -2154,13 +2172,16 @@ const fetchConsoleLog = async () => {
   }
 }
 
-const startPolling = () => {
-  if (agentLogTimer || consoleLogTimer) return
-  
+// --- Polling fallback (per-stream, started only if the SSE stream can't connect) ---
+const startAgentPolling = () => {
+  if (agentLogTimer) return
   fetchAgentLog()
-  fetchConsoleLog()
-  
   agentLogTimer = setInterval(fetchAgentLog, 2000)
+}
+
+const startConsolePolling = () => {
+  if (consoleLogTimer) return
+  fetchConsoleLog()
   consoleLogTimer = setInterval(fetchConsoleLog, 1500)
 }
 
@@ -2175,16 +2196,53 @@ const stopPolling = () => {
   }
 }
 
+// --- Live feed: SSE-first, polling fallback (teri exposes /agent-log/sse + /console-log/sse,
+// replacing MiroFish's from_line increment polling). Each stream falls back independently. ---
+const startLiveFeed = () => {
+  if (!props.reportId) return
+  agentLogSse = openSse(`/api/report/${props.reportId}/agent-log/sse`, {
+    events: {
+      log: (e) => {
+        try {
+          applyAgentLog(JSON.parse(e.data))
+          scrollAgentPanel()
+        } catch (err) {
+          console.warn('Bad agent-log SSE payload:', err)
+        }
+      },
+    },
+    onFallback: startAgentPolling,
+  })
+  consoleLogSse = openSse(`/api/report/${props.reportId}/console-log/sse`, {
+    events: {
+      log: (e) => applyConsoleLog(e.data),
+    },
+    onFallback: startConsolePolling,
+  })
+}
+
+const stopLiveFeed = () => {
+  if (agentLogSse) {
+    agentLogSse()
+    agentLogSse = null
+  }
+  if (consoleLogSse) {
+    consoleLogSse()
+    consoleLogSse = null
+  }
+  stopPolling()
+}
+
 // Lifecycle
 onMounted(() => {
   if (props.reportId) {
     addLog(`Report Agent initialized: ${props.reportId}`)
-    startPolling()
+    startLiveFeed()
   }
 })
 
 onUnmounted(() => {
-  stopPolling()
+  stopLiveFeed()
 })
 
 watch(() => props.reportId, (newId) => {
@@ -2201,8 +2259,9 @@ watch(() => props.reportId, (newId) => {
     collapsedSections.value = new Set()
     isComplete.value = false
     startTime.value = null
-    
-    startPolling()
+
+    stopLiveFeed()
+    startLiveFeed()
   }
 }, { immediate: true })
 </script>

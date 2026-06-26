@@ -34,10 +34,9 @@ api = (root / "src/api/mod.rs").read_text(encoding="utf-8", errors="replace")
 
 run_is_wired = "build_provider_llm" in main and "run_pipeline" in main
 pipeline_exists = "pub async fn run_pipeline" in pipeline
-server_openai_concrete = (
-    "pub(crate) fn build_llm" in api
-    and "OpenAiAdapter" in api
-    and "SimulationRunner<OpenAiAdapter>" in api
+server_provider_polymorphic = (
+    "build_provider_llm" in api
+    and "SimulationRunner<ProviderAdapter>" in api
 )
 
 lines = [
@@ -54,8 +53,8 @@ if run_is_wired and pipeline_exists:
 else:
     lines.append("- Warning: re-check run wiring before documenting teri run; source truth did not match the expected run_pipeline call.")
 
-if server_openai_concrete:
-    lines.append("- Source truth: serve/API still builds an OpenAiAdapter-backed ApiState; run uses provider selection, but server-wide provider polymorphism is narrower.")
+if server_provider_polymorphic:
+    lines.append("- Source truth: serve/API builds a provider-polymorphic ApiState (SimulationRunner<ProviderAdapter>); run uses provider selection via build_provider_llm.")
 
 if hits:
     lines.append("- Stale doc markers found: " + "; ".join(hits))
