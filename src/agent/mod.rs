@@ -1,15 +1,47 @@
 use crate::error::{Result, TeriError};
 use crate::graph::{Entity, KnowledgeGraph, Relation};
-use crate::llm::LlmClient;
+use crate::llm::{ChatMessage, ChatOptions, LlmClient, ResponseFormat};
 use crate::sim::social_world::FeedSnapshot;
 use crate::sim::{Action, SocialAction, TargetKind, WorldState};
 use chrono::Utc;
 use minijinja::{Environment, context};
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
+
+/// Facts + node summaries semantically recalled about a single entity.
+///
+/// # MiroFish parity (TASK-SIM-6 #5)
+/// Mirrors the `{"facts": [...], "node_summaries": [...]}` dict returned by
+/// `OasisProfileGenerator._search_zep_for_entity` (oasis_profile_generator.py:286-412).
+/// `facts` are edge facts; `node_summaries` are related-node summaries / names.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecalledEntityFacts {
+    pub facts: Vec<String>,
+    pub node_summaries: Vec<String>,
+}
+
+/// A source of semantically-recalled facts about an entity, used to enrich the persona
+/// prompt (TASK-SIM-6 #5 — the part-4 "Zep hybrid search" half of `_build_entity_context`).
+///
+/// teri's analog of Zep's graph hybrid search is the embedding-cosine recall over the
+/// graph's vector namespace ([`ReportTools::search_graph_semantic`] +
+/// [`GraphSearchLens`](crate::services::zep_tools::GraphSearchLens)). A wired implementation
+/// runs that search; a stub implementation feeds fixed facts in tests. When no recall source
+/// is supplied to `generate_social`, this enrichment is skipped entirely and the persona
+/// context is byte-identical to the pre-S11 (parts 1-3 only) behaviour (no-downgrade).
+#[async_trait::async_trait]
+pub trait EntityFactRecall: Send + Sync {
+    /// Recall facts/summaries relevant to `entity_name`. Implementations should fail soft
+    /// (return [`RecalledEntityFacts::default`]) rather than erroring — a recall miss must
+    /// never abort persona generation, matching MiroFish's best-effort Zep search.
+    async fn recall(&self, entity_name: &str) -> RecalledEntityFacts;
+}
 
 /// Social media platform a `SocialProfile` belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,6 +49,54 @@ use uuid::Uuid;
 pub enum Platform {
     Twitter,
     Reddit,
+}
+
+/// Per-platform allowed social-action names (TASK-SIM-2 #1). Mirrors MiroFish's
+/// `TWITTER_ACTIONS` / `REDDIT_ACTIONS` (`run_parallel_simulation.py:178-202`), which it passes as
+/// `available_actions` to the OASIS agent-graph generator so the LLM is only ever OFFERED its
+/// platform's actions. teri's LLM can emit any action string, so we gate at validation time
+/// instead: an action not in the agent's platform set is coerced to `DO_NOTHING` (the
+/// behaviourally-equivalent outcome of "never offered" — it produces no social effect).
+///
+/// Kept as a static set rather than threading `Config` to every agent; `Platform::allowed_actions`
+/// is asserted equal to `Config.oasis_twitter_actions` / `oasis_reddit_actions` by
+/// `config.rs` so the two never drift. NOTE: MiroFish's lists include `REFRESH` (Reddit) and
+/// `DO_NOTHING`, neither of which is an agent-selectable `SocialAction` variant in teri (REFRESH is
+/// a FILTERED_ACTION never recorded; DO_NOTHING is the fallback target). Both are still listed so
+/// the set equals the config list verbatim.
+const TWITTER_ALLOWED_ACTIONS: &[&str] =
+    &["CREATE_POST", "LIKE_POST", "REPOST", "FOLLOW", "DO_NOTHING", "QUOTE_POST"];
+
+const REDDIT_ALLOWED_ACTIONS: &[&str] = &[
+    "LIKE_POST",
+    "DISLIKE_POST",
+    "CREATE_POST",
+    "CREATE_COMMENT",
+    "LIKE_COMMENT",
+    "DISLIKE_COMMENT",
+    "SEARCH_POSTS",
+    "SEARCH_USER",
+    "TREND",
+    "REFRESH",
+    "DO_NOTHING",
+    "FOLLOW",
+    "MUTE",
+];
+
+impl Platform {
+    /// The OASIS action-name strings this platform offers (the static mirror of the config lists).
+    pub fn allowed_actions(self) -> &'static [&'static str] {
+        match self {
+            Platform::Twitter => TWITTER_ALLOWED_ACTIONS,
+            Platform::Reddit => REDDIT_ALLOWED_ACTIONS,
+        }
+    }
+
+    /// Whether `action_type` (an OASIS `ACTION_TYPE_MAP` value, e.g. `CREATE_COMMENT`) is offered
+    /// on this platform.
+    pub fn allows_action(self, action_type: &str) -> bool {
+        self.allowed_actions().contains(&action_type)
+    }
 }
 
 /// Social-media–specific profile data for a simulated agent.
@@ -328,6 +408,35 @@ impl Agent {
         self.state = state;
     }
 
+    /// Build the per-agent "Knowledge Graph Context" lines from the agent's source entity's
+    /// immediate neighborhood, or `None` when there is nothing to add.
+    ///
+    /// Returns `None` (graph context omitted, prompt byte-identical to before) when: no graph was
+    /// provided, the agent has no `source_entity_uuid` (a generic / non-graph-derived agent), the
+    /// uuid does not parse, the entity is absent from this graph, or it has no relations. Otherwise
+    /// returns one line per relation — `EntityA --[Relation]--> EntityB` — so the agent can reason
+    /// over what the seed-derived graph says about the entity it personifies, during the run.
+    fn graph_context_section(&self, graph: Option<&KnowledgeGraph>) -> Option<String> {
+        let graph = graph?;
+        let uuid_str = self.persona.social.as_ref()?.source_entity_uuid.as_ref()?;
+        let entity_id = uuid::Uuid::parse_str(uuid_str).ok()?;
+        let source = graph.get_entity_by_id(entity_id)?;
+        let neighbors = graph.get_neighbor_relations(entity_id).ok()?;
+        if neighbors.is_empty() {
+            return None;
+        }
+        let mut lines = String::new();
+        for (neighbor, rel, is_outgoing) in neighbors {
+            let (from, to) = if is_outgoing {
+                (source.name.as_str(), neighbor.name.as_str())
+            } else {
+                (neighbor.name.as_str(), source.name.as_str())
+            };
+            lines.push_str(&format!("- {from} --[{}]--> {to}\n", rel.kind));
+        }
+        Some(lines)
+    }
+
     /// Pure read phase of a step: retrieve context, call LLM, return validated action.
     /// Does NOT mutate agent state or memory — safe to call concurrently across agents.
     /// Pair with `commit_action` to complete the step.
@@ -335,10 +444,13 @@ impl Agent {
         &self,
         world: &WorldState,
         feed: Option<&FeedSnapshot>,
+        graph: Option<&KnowledgeGraph>,
         llm: &L,
     ) -> Result<Action> {
         let relevant_memories = self.retrieve_relevant_memories(world);
-        let context = self.construct_context(world, &relevant_memories, feed);
+        let graph_context = self.graph_context_section(graph);
+        let context =
+            self.construct_context(world, &relevant_memories, feed, graph_context.as_deref());
         let action_str = self.generate_action_with_fallback(&context, llm).await?;
         // Robustness: a single unparseable LLM line must NOT abort the whole simulation (the run
         // loop propagates this `Result` via `?`). An action string we cannot classify is treated
@@ -369,7 +481,7 @@ impl Agent {
         // Construct context from world state + memories. `step` is the standalone single-agent
         // path (tests / non-social callers); it has no social feed, so pass `None` — the feed
         // section is omitted and the prompt is byte-identical to before the feed-back landed.
-        let context = self.construct_context(world, &relevant_memories, None);
+        let context = self.construct_context(world, &relevant_memories, None, None);
 
         // Set state to Acting
         self.set_state(AgentState::Acting);
@@ -463,6 +575,7 @@ impl Agent {
         world: &WorldState,
         memories: &[&MemoryEntry],
         feed: Option<&FeedSnapshot>,
+        graph_context: Option<&str>,
     ) -> String {
         let mut context = format!(
             "Agent: {}\nRole: {}\nState: {:?}\n\n",
@@ -500,6 +613,25 @@ impl Agent {
             for (key, value) in &world.variables {
                 context.push_str(&format!("- {}: {:.2}\n", key, value));
             }
+        }
+
+        // Add the per-agent knowledge-graph context (the source entity's neighborhood) so the
+        // agent reasons over what the seed-derived graph says about the entity it personifies.
+        // Bounded by a blank line so `parse_graph_context` (find "\n\n") delimits it exactly like
+        // the other sections. `None`/empty (every non-graph caller) appends NOTHING → byte-identical
+        // prompt, no regression.
+        if let Some(graph_context) = graph_context
+            && !graph_context.trim().is_empty()
+        {
+            if !context.ends_with("\n\n") {
+                context.push('\n');
+            }
+            context.push_str("Knowledge Graph Context:\n");
+            context.push_str(graph_context);
+            if !context.ends_with('\n') {
+                context.push('\n');
+            }
+            context.push('\n');
         }
 
         // Add the social feed (recency-ranked recent posts) so the agent can react to REAL posts.
@@ -585,7 +717,7 @@ impl Agent {
             // Args parsed as key=value pairs; bare values accepted for single-field actions.
             let social = self.parse_social_action(action_type, content);
             if let Some(sa) = social {
-                return Ok(Action::Social(sa));
+                return Ok(Action::Social(self.gate_platform_action(sa)));
             }
 
             return Err(TeriError::Agent(format!("Unknown action type: {}", action_type)));
@@ -650,6 +782,26 @@ impl Agent {
             "TREND" | "trend" => Some(SocialAction::Trend),
             "DO_NOTHING" => Some(SocialAction::DoNothing),
             _ => None,
+        }
+    }
+
+    /// Gate a parsed social action against the agent's platform allowed-set (TASK-SIM-2 #1).
+    ///
+    /// MiroFish only OFFERS each agent its platform's actions (`TWITTER_ACTIONS` / `REDDIT_ACTIONS`
+    /// → `available_actions`), so a Twitter agent can never select e.g. `CREATE_COMMENT`. teri's LLM
+    /// can emit any name, so an action outside the agent's platform set is coerced to
+    /// `DO_NOTHING` — the behaviourally-equivalent "no social effect" outcome of an action that was
+    /// never offered.
+    ///
+    /// A generic (non-social) agent has no platform; its actions are never gated (they are not
+    /// social actions anyway). `DO_NOTHING` itself is in both platform sets, so coercion is
+    /// idempotent and never loops.
+    fn gate_platform_action(&self, sa: SocialAction) -> SocialAction {
+        match self.persona.social.as_ref() {
+            Some(profile) if !profile.platform.allows_action(sa.oasis_action_type()) => {
+                SocialAction::DoNothing
+            }
+            _ => sa,
         }
     }
 
@@ -893,6 +1045,77 @@ impl PersonaGenerator {
                 Self::new()
             }
         }
+    }
+
+    // ===== TASK-SIM-1 (S6): persona-generation fidelity constants =====
+    //
+    // Mirrors `oasis_profile_generator.py:156-179`. Used by the rule-based randomization
+    // (gap #3) and the two-prompt individual-vs-group selection (gap #2).
+
+    /// MBTI personality types — drawn at random for rule-based individual personas.
+    /// Mirrors `OasisProfileGenerator.MBTI_TYPES` (oasis_profile_generator.py:156-161).
+    const MBTI_TYPES: [&'static str; 16] = [
+        "INTJ", "INTP", "ENTJ", "ENTP", "INFJ", "INFP", "ENFJ", "ENFP", "ISTJ", "ISFJ", "ESTJ",
+        "ESFJ", "ISTP", "ISFP", "ESTP", "ESFP",
+    ];
+
+    /// Common countries — drawn at random for rule-based personas.
+    /// Mirrors `OasisProfileGenerator.COUNTRIES` (oasis_profile_generator.py:164-167).
+    const COUNTRIES: [&'static str; 11] = [
+        "China",
+        "US",
+        "UK",
+        "Japan",
+        "Germany",
+        "France",
+        "Canada",
+        "Australia",
+        "Brazil",
+        "India",
+        "South Korea",
+    ];
+
+    /// Individual (person-like) entity types → generate a concrete personal persona.
+    /// Mirrors `OasisProfileGenerator.INDIVIDUAL_ENTITY_TYPES` (oasis_profile_generator.py:170-173).
+    const INDIVIDUAL_ENTITY_TYPES: [&'static str; 10] = [
+        "student",
+        "alumni",
+        "professor",
+        "person",
+        "publicfigure",
+        "expert",
+        "faculty",
+        "official",
+        "journalist",
+        "activist",
+    ];
+
+    /// Group / institutional entity types → generate a representative institutional account.
+    /// Mirrors `OasisProfileGenerator.GROUP_ENTITY_TYPES` (oasis_profile_generator.py:176-179).
+    const GROUP_ENTITY_TYPES: [&'static str; 9] = [
+        "university",
+        "governmentagency",
+        "organization",
+        "ngo",
+        "mediaoutlet",
+        "company",
+        "institution",
+        "group",
+        "community",
+    ];
+
+    /// Whether `entity_type` denotes an individual (person-like) entity.
+    /// Mirrors `_is_individual_entity` (oasis_profile_generator.py:489-491).
+    fn is_individual_entity(entity_type: &str) -> bool {
+        let t = entity_type.to_lowercase();
+        Self::INDIVIDUAL_ENTITY_TYPES.contains(&t.as_str())
+    }
+
+    /// Whether `entity_type` denotes a group / institutional entity.
+    /// Mirrors `_is_group_entity` (oasis_profile_generator.py:493-495).
+    fn is_group_entity(entity_type: &str) -> bool {
+        let t = entity_type.to_lowercase();
+        Self::GROUP_ENTITY_TYPES.contains(&t.as_str())
     }
 
     /// Create a new PersonaGenerator with a custom template string
@@ -1273,12 +1496,21 @@ impl PersonaGenerator {
     /// - Part 2: related edges — relationship/fact lines (S-356, was previously dropped)
     /// - Part 3: related nodes (neighbor names + kinds from `KnowledgeGraph::get_neighbors`)
     ///
-    /// The Zep-search half (part 4, `_search_zep_for_entity`) is `[≠]` (S-355) and is not
-    /// ported — teri uses an in-process graph.
+    /// The Zep-search half (part 4, `_search_zep_for_entity`) is wired separately via the
+    /// optional [`EntityFactRecall`] source in
+    /// [`generate_social_with_recall`](Self::generate_social_with_recall) (TASK-SIM-6 #5).
     ///
-    /// Returns an empty string if the entity has no neighbors (graceful flat fallback).
-    fn build_entity_context(graph: &KnowledgeGraph, entity: &Entity) -> String {
+    /// Returns the entity-context string plus the set of graph-derived relationship/fact lines
+    /// (TASK-SIM-6 #5: `existing_facts`, oasis_profile_generator.py:435), used to dedup
+    /// semantically-recalled facts. Returns an empty string if the entity has no neighbors
+    /// (graceful flat fallback).
+    fn build_entity_context_with_facts(
+        graph: &KnowledgeGraph,
+        entity: &Entity,
+    ) -> (String, std::collections::HashSet<String>) {
         let mut context_parts: Vec<String> = Vec::new();
+        let mut existing_facts: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         // Part 1: entity attributes — in teri's Entity model, the main attributes are
         // `name` and `kind`; we surface them as a context section.
@@ -1291,12 +1523,9 @@ impl PersonaGenerator {
         // emit a fact line if the relation carries a fact, else a directional arrow line.
         //
         // In teri, `Relation` carries no free-text fact field (facts are derived from entity
-        // summaries passed in by the caller), so this section always emits directional lines:
-        //   - outgoing: entity --[RelationKind]--> (neighbor)
-        //   - incoming: (neighbor) --[RelationKind]--> entity
-        //
-        // The `_fact_for_relation` helper is called with the relation to allow future enrichment.
-        // `existing_facts` dedup set from MiroFish is not needed here (no free-text facts).
+        // summaries passed in by the caller), so this section always emits directional lines.
+        // Each emitted line (minus its leading "- ") is recorded in `existing_facts` so that
+        // part-4 recall enrichment can dedup against the graph-derived relationships.
         let neighbor_relations = graph.get_neighbor_relations(entity.id).unwrap_or_default();
         if !neighbor_relations.is_empty() {
             let relationships: Vec<String> = neighbor_relations
@@ -1306,6 +1535,9 @@ impl PersonaGenerator {
                 })
                 .collect();
             if !relationships.is_empty() {
+                for line in &relationships {
+                    existing_facts.insert(line.trim_start_matches("- ").to_string());
+                }
                 context_parts.push(format!(
                     "### Related Facts and Relationships\n{}",
                     relationships.join("\n")
@@ -1322,7 +1554,39 @@ impl PersonaGenerator {
             context_parts.push(format!("### Related Entities\n{}", related_info.join("\n")));
         }
 
-        context_parts.join("\n\n")
+        (context_parts.join("\n\n"), existing_facts)
+    }
+
+    /// Format recalled facts/summaries into the part-4 enrichment sections, deduped against
+    /// `existing_facts`. Mirrors oasis_profile_generator.py:478-485:
+    /// - facts not already present → "### Recalled Facts" (capped at 15, matching `[:15]`)
+    /// - node summaries → "### Recalled Related Nodes" (capped at 10, matching `[:10]`)
+    ///
+    /// Returns an empty string when there is nothing new to add.
+    fn format_recalled_facts(
+        recalled: &RecalledEntityFacts,
+        existing_facts: &std::collections::HashSet<String>,
+    ) -> String {
+        let mut parts: Vec<String> = Vec::new();
+
+        let new_facts: Vec<&String> = recalled
+            .facts
+            .iter()
+            .filter(|f| !existing_facts.contains(*f))
+            .take(15)
+            .collect();
+        if !new_facts.is_empty() {
+            let lines: Vec<String> = new_facts.iter().map(|f| format!("- {}", f)).collect();
+            parts.push(format!("### Recalled Facts\n{}", lines.join("\n")));
+        }
+
+        if !recalled.node_summaries.is_empty() {
+            let lines: Vec<String> =
+                recalled.node_summaries.iter().take(10).map(|s| format!("- {}", s)).collect();
+            parts.push(format!("### Recalled Related Nodes\n{}", lines.join("\n")));
+        }
+
+        parts.join("\n\n")
     }
 
     /// Formats one relationship line for Part 2 of `build_entity_context`.
@@ -1373,6 +1637,9 @@ impl PersonaGenerator {
     /// `graph_ctx`: optional `(&KnowledgeGraph, &Entity)` — when provided, enriches the LLM
     /// prompt with neighbor context from the graph (ports S-356 `_build_entity_context`).
     /// When `None`, the profile is generated from the flat summary alone (backward-compatible).
+    ///
+    /// Delegates to [`generate_social_with_recall`](Self::generate_social_with_recall) with no
+    /// recall source — i.e. the persona context uses only the in-process graph (parts 1-3).
     pub async fn generate_social<L: LlmClient>(
         &self,
         entity_name: &str,
@@ -1382,8 +1649,47 @@ impl PersonaGenerator {
         llm: &L,
         graph_ctx: Option<(&KnowledgeGraph, &Entity)>,
     ) -> Result<SocialProfile> {
+        self.generate_social_with_recall(
+            entity_name,
+            entity_type,
+            entity_summary,
+            platform,
+            llm,
+            graph_ctx,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`generate_social`](Self::generate_social), but with an optional semantic-recall
+    /// source that enriches the persona context with facts about the entity (TASK-SIM-6 #5 —
+    /// the part-4 "Zep hybrid search" half of `_build_entity_context`,
+    /// oasis_profile_generator.py:475-485).
+    ///
+    /// `recall`: when `Some`, the recalled facts/summaries are appended to the entity context
+    /// AFTER the in-process graph parts (1-3), with the same dedup MiroFish applies — facts
+    /// already present in the graph-derived "Related Facts and Relationships" section are
+    /// dropped (oasis_profile_generator.py:480). When `None`, the context is byte-identical to
+    /// `generate_social` (no-downgrade).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn generate_social_with_recall<L: LlmClient>(
+        &self,
+        entity_name: &str,
+        entity_type: &str,
+        entity_summary: &str,
+        platform: Platform,
+        llm: &L,
+        graph_ctx: Option<(&KnowledgeGraph, &Entity)>,
+        recall: Option<&dyn EntityFactRecall>,
+    ) -> Result<SocialProfile> {
         let user_name = Self::generate_username(entity_name);
         let created_at = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+        // Anchor the persona to its source graph entity (its UUID) so the simulation can later fetch
+        // that entity's neighborhood and feed it to the agent as per-tick graph context. Previously
+        // hardcoded `None`, which severed the persona↔entity link — the swarm could never reason
+        // over the extracted graph during the run.
+        let source_entity_uuid = graph_ctx.map(|(_, e)| e.id.to_string());
 
         let default_bio = format!("{}: {}", entity_type, entity_name);
         let default_persona = if entity_summary.is_empty() {
@@ -1392,70 +1698,125 @@ impl PersonaGenerator {
             entity_summary.to_string()
         };
 
-        // S-356: build entity context from graph neighbors (enrichment)
-        let entity_context = match graph_ctx {
-            Some((graph, entity)) => {
-                let ctx = Self::build_entity_context(graph, entity);
-                if ctx.is_empty() { String::new() } else { format!("\n\nEntity context:\n{}", ctx) }
-            }
-            None => String::new(),
+        // S-356: build entity context from graph neighbors (enrichment).
+        // TASK-SIM-6 #5: also collect the graph-derived facts so we can dedup recalled facts
+        // against them (oasis_profile_generator.py:435,480 — `existing_facts`).
+        let (mut graph_context, existing_facts) = match graph_ctx {
+            Some((graph, entity)) => Self::build_entity_context_with_facts(graph, entity),
+            None => (String::new(), std::collections::HashSet::new()),
         };
 
-        let prompt = format!(
-            r#"Generate a social media profile for a simulated agent based on the following entity.
-Return a JSON object with these fields:
-- bio: short public bio string (200 chars, displayed on profile page)
-- persona: detailed personality description string (used in LLM system prompt)
-- karma: integer (Reddit score, default 1000)
-- friend_count: integer (accounts followed, default 100)
-- follower_count: integer (followers, default 150)
-- statuses_count: integer (posts made, default 500)
-- age: integer or null
-- gender: "male", "female", or "other" (null if unknown)
-- mbti: MBTI type string or null (e.g. "INTJ")
-- country: country name string or null
-- profession: profession string or null
-- interested_topics: array of strings
-- posting_style: short description of posting tone and frequency
-
-Entity name: {entity_name}
-Entity type: {entity_type}
-Entity summary: {entity_summary}{entity_context}
-Platform: {platform}
-
-Return only valid JSON."#,
-            entity_name = entity_name,
-            entity_type = entity_type,
-            entity_summary = entity_summary,
-            entity_context = entity_context,
-            platform = match platform {
-                Platform::Twitter => "Twitter",
-                Platform::Reddit => "Reddit",
-            },
-        );
-
-        // Try LLM → parse → salvage (S-360/S-361) → rule-based
-        let profile_data = match llm.complete(&prompt).await {
-            Ok(response) => {
-                // First attempt: direct parse
-                match serde_json::from_str::<serde_json::Value>(&response) {
-                    Ok(v) => Some(v),
-                    Err(_) => {
-                        // Salvage attempt (S-360 + S-361): try_fix_json before rule-based
-                        Self::try_fix_json(&response, entity_name, entity_type, entity_summary).map(
-                            |mut v| {
-                                // Strip internal _fixed marker before use
-                                if let Some(m) = v.as_object_mut() {
-                                    m.remove("_fixed");
-                                }
-                                v
-                            },
-                        )
-                    }
+        // TASK-SIM-6 #5: part-4 semantic recall enrichment (deduped). Best-effort: a recall
+        // miss leaves the context unchanged. Mirrors oasis_profile_generator.py:475-485.
+        if let Some(recall_source) = recall {
+            let recalled = recall_source.recall(entity_name).await;
+            let enrichment = Self::format_recalled_facts(&recalled, &existing_facts);
+            if !enrichment.is_empty() {
+                if graph_context.is_empty() {
+                    graph_context = enrichment;
+                } else {
+                    graph_context.push_str("\n\n");
+                    graph_context.push_str(&enrichment);
                 }
             }
-            Err(_) => None,
+        }
+
+        let entity_context = if graph_context.is_empty() {
+            String::new()
+        } else {
+            format!("\n\nEntity context:\n{}", graph_context)
         };
+
+        // TASK-SIM-1 gap #2: individual-vs-group prompt SELECTION
+        // (mirrors `_generate_profile_with_llm` :513-522, where `is_individual =
+        // _is_individual_entity(entity_type)` is the positive test — known INDIVIDUAL types get the
+        // personal framing; everything else, including the GROUP set and unknown types, gets the
+        // institutional framing).
+        let is_individual = Self::is_individual_entity(entity_type);
+        let system_prompt = Self::persona_system_prompt();
+        let user_prompt = Self::build_persona_prompt(
+            entity_name,
+            entity_type,
+            entity_summary,
+            &entity_context,
+            platform,
+            is_individual,
+        );
+
+        // TASK-SIM-1 gap #2: 3-attempt retry loop with temperature ramp `0.7 - attempt*0.1`
+        // (mirrors `_generate_profile_with_llm` :524-581). Uses the EXISTING `chat()` API with a
+        // system + user message vector and per-attempt `ChatOptions { temperature }`.
+        //
+        // Try LLM → parse → salvage (S-360/S-361) → next attempt → rule-based.
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut profile_data: Option<serde_json::Value> = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            let temperature = 0.7 - (attempt as f32) * 0.1;
+            let messages =
+                [ChatMessage::system(system_prompt), ChatMessage::user(user_prompt.clone())];
+            // TASK-SIM-6 #7: request the structured-output (JSON-object) shape — mirrors
+            // `response_format={"type":"json_object"}` (oasis_profile_generator.py:536). No
+            // max_tokens (let the model run free, like MiroFish :538).
+            let opts = ChatOptions {
+                temperature: Some(temperature),
+                max_tokens: None,
+                response_format: Some(ResponseFormat::JsonObject),
+            };
+            // TASK-SIM-6 #7: use the truncation-aware entry point so we can detect a
+            // `finish_reason == "length"` cutoff (mirrors oasis_profile_generator.py:544-547).
+            match llm.chat_with_meta(&messages, &opts).await {
+                Ok(completion) => {
+                    let truncated = completion.is_truncated();
+                    let response = completion.content;
+                    if truncated {
+                        // Truncated by the token cap: close the open braces/brackets/strings
+                        // before parsing (mirrors `_fix_truncated_json`, :545-547), then let
+                        // the normal parse → salvage path run on the repaired content. If even
+                        // the repair is unparseable, fall through to the next (lower-temp) attempt
+                        // — MiroFish's loop retries truncated attempts the same way.
+                        let repaired = Self::fix_truncated_json(&response);
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&repaired) {
+                            profile_data = Some(v);
+                            break;
+                        }
+                        if let Some(mut v) =
+                            Self::try_fix_json(&repaired, entity_name, entity_type, entity_summary)
+                        {
+                            if let Some(m) = v.as_object_mut() {
+                                m.remove("_fixed");
+                            }
+                            profile_data = Some(v);
+                            break;
+                        }
+                        // Still unparseable after repair: treat as a failed attempt, retry.
+                        continue;
+                    }
+                    // First attempt: direct parse.
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&response) {
+                        profile_data = Some(v);
+                        break;
+                    }
+                    // Salvage attempt (S-360 + S-361): try_fix_json before retrying.
+                    if let Some(mut v) =
+                        Self::try_fix_json(&response, entity_name, entity_type, entity_summary)
+                    {
+                        // Strip internal _fixed marker before use.
+                        if let Some(m) = v.as_object_mut() {
+                            m.remove("_fixed");
+                        }
+                        profile_data = Some(v);
+                        break;
+                    }
+                    // Unparseable + unsalvageable: fall through to the next attempt.
+                }
+                // LLM error: fall through to the next attempt.
+                Err(_) => continue,
+            }
+        }
+
+        // Seedable RNG (gap #3): entropy in production. Used to randomize numeric counts whose
+        // values are absent from the LLM JSON, and to drive the rule-based fallback.
+        let mut rng = StdRng::from_entropy();
 
         if let Some(data) = profile_data {
             let bio = data["bio"]
@@ -1468,11 +1829,17 @@ Return only valid JSON."#,
                 .filter(|s| !s.is_empty())
                 .unwrap_or(&default_persona)
                 .to_string();
-            let karma = data["karma"].as_i64().unwrap_or(1000);
-            let friend_count = data["friend_count"].as_i64().unwrap_or(100);
-            let follower_count = data["follower_count"].as_i64().unwrap_or(150);
+            // TASK-SIM-1 gap #3: when the LLM omits a numeric count, draw from the same randomized
+            // ranges MiroFish uses in `generate_profile_from_entity` :262-265 (karma 500-5000,
+            // friends 50-500, followers 100-1000, statuses 100-2000) — NOT a fixed default.
+            let karma = data["karma"].as_i64().unwrap_or_else(|| rng.gen_range(500..=5000));
+            let friend_count =
+                data["friend_count"].as_i64().unwrap_or_else(|| rng.gen_range(50..=500));
+            let follower_count =
+                data["follower_count"].as_i64().unwrap_or_else(|| rng.gen_range(100..=1000));
             let following_count = friend_count; // Twitter model: following ≈ friend_count
-            let statuses_count = data["statuses_count"].as_i64().unwrap_or(500);
+            let statuses_count =
+                data["statuses_count"].as_i64().unwrap_or_else(|| rng.gen_range(100..=2000));
             let age = data["age"].as_u64().map(|v| v as u32);
             let gender = data["gender"].as_str().map(|s| s.to_string());
             let mbti = data["mbti"].as_str().map(|s| s.to_string());
@@ -1502,29 +1869,187 @@ Return only valid JSON."#,
                 profession,
                 interested_topics,
                 posting_style,
-                source_entity_uuid: None,
+                source_entity_uuid,
                 source_entity_type: Some(entity_type.to_string()),
                 created_at,
             })
         } else {
-            // Rule-based fallback — mirrors _generate_profile_rule_based
-            Ok(Self::generate_social_rule_based(
+            // Rule-based fallback — mirrors _generate_profile_rule_based. Carry the entity link
+            // through this path too, so a fallback persona is still graph-anchored.
+            let mut profile = Self::generate_social_rule_based(
                 entity_name,
                 entity_type,
                 entity_summary,
                 platform,
                 &user_name,
                 &created_at,
-            ))
+                &mut rng,
+            );
+            profile.source_entity_uuid = source_entity_uuid;
+            Ok(profile)
         }
+    }
+
+    /// System prompt for persona generation.
+    ///
+    /// Mirrors `_get_system_prompt` (oasis_profile_generator.py:672-675). Per the S6 spec the
+    /// prompt text itself is not zh/en-localized here (that's the i18n axis tracked separately);
+    /// we preserve the INTENT: instruct the model to act as a user-profile-generation expert and
+    /// emit valid JSON with no unescaped newlines in string values.
+    fn persona_system_prompt() -> &'static str {
+        "You are an expert at generating social-media user profiles. Produce a detailed, realistic \
+         persona for opinion-dynamics simulation that faithfully reflects the real-world entity. \
+         You MUST return a single valid JSON object; string values must not contain unescaped \
+         newlines."
+    }
+
+    /// Build the user prompt for persona generation, selecting the individual-vs-group framing.
+    ///
+    /// Mirrors `_build_individual_persona_prompt` (:677-724) and `_build_group_persona_prompt`
+    /// (:726-772). TASK-SIM-1 gap #1: BOTH framings include a memory section — an individual gets
+    /// a 个人记忆 (personal-memory) framing tying the person to the event and their prior
+    /// actions/reactions; a group/institution gets a 机构记忆 (institutional-memory) framing doing
+    /// the same for the organization. The memory section is built from the available event/entity
+    /// context (the entity summary + graph-neighbor context already assembled into `entity_context`).
+    fn build_persona_prompt(
+        entity_name: &str,
+        entity_type: &str,
+        entity_summary: &str,
+        entity_context: &str,
+        platform: Platform,
+        is_individual: bool,
+    ) -> String {
+        let platform_name = match platform {
+            Platform::Twitter => "Twitter",
+            Platform::Reddit => "Reddit",
+        };
+        // Mirrors the Python `context[:3000]` truncation guard (:688, :737).
+        let context_str: String = entity_context.chars().take(3000).collect();
+
+        if is_individual {
+            // Individual persona — mirrors `_build_individual_persona_prompt`. The persona spec
+            // enumerates the same sub-sections, including the personal-memory (个人记忆) section
+            // that ties the person to the event and their existing actions/reactions (:710).
+            format!(
+                r#"Generate a detailed social-media user persona for an INDIVIDUAL entity, staying as faithful as possible to the real-world entity.
+
+Entity name: {entity_name}
+Entity type: {entity_type}
+Entity summary: {entity_summary}{context_block}
+Platform: {platform_name}
+
+Return a JSON object with these fields:
+1. bio: short public bio string (~200 chars, displayed on the profile page)
+2. persona: a detailed, single-paragraph personality description that includes:
+   - Basic info (age, profession, education, location)
+   - Background (key experiences, this person's connection to the event, social relationships)
+   - Personality (MBTI type, core traits, how they express emotion)
+   - Social-media behavior (posting frequency, content preferences, interaction style, language quirks)
+   - Stance (attitude toward the topic; what content would anger or move them)
+   - Distinctive features (catchphrases, notable experiences, personal hobbies)
+   - Personal memory (an important part of the persona: describe this individual's connection to the event, and the actions and reactions this individual has ALREADY taken in the event)
+3. karma: integer (Reddit-style score)
+4. friend_count: integer (accounts followed)
+5. follower_count: integer (followers)
+6. statuses_count: integer (posts made)
+7. age: integer
+8. gender: "male", "female", or "other"
+9. mbti: MBTI type string (e.g. "INTJ")
+10. country: country name string
+11. profession: profession string
+12. interested_topics: array of strings
+13. posting_style: short description of posting tone and frequency
+
+Important:
+- Every field value must be a string or number; do not use unescaped newlines.
+- persona must be one coherent block of text.
+- Keep content consistent with the entity information.
+- Return only valid JSON."#,
+                entity_name = entity_name,
+                entity_type = entity_type,
+                entity_summary = entity_summary,
+                context_block = Self::memory_context_block(&context_str),
+                platform_name = platform_name,
+            )
+        } else {
+            // Group/institutional persona — mirrors `_build_group_persona_prompt`. Includes the
+            // institutional-memory (机构记忆) section tying the institution to the event and its
+            // existing actions/reactions (:759).
+            format!(
+                r#"Generate a detailed social-media ACCOUNT persona for a GROUP / INSTITUTIONAL entity, staying as faithful as possible to the real-world entity.
+
+Entity name: {entity_name}
+Entity type: {entity_type}
+Entity summary: {entity_summary}{context_block}
+Platform: {platform_name}
+
+Return a JSON object with these fields:
+1. bio: official account bio (~200 chars, professional and measured)
+2. persona: a detailed, single-paragraph account description that includes:
+   - Institutional basics (formal name, nature of the institution, founding background, main functions)
+   - Account positioning (account type, target audience, core purpose)
+   - Voice/style (language characteristics, common phrasing, taboo topics)
+   - Content profile (content types, posting frequency, active periods)
+   - Stance (the official position on the core topic; how it handles controversy)
+   - Notes (the profile of the group it represents, operational habits)
+   - Institutional memory (an important part of the persona: describe this institution's connection to the event, and the actions and reactions this institution has ALREADY taken in the event)
+3. age: integer 30 (virtual age for an institutional account)
+4. gender: "other" (institutional accounts use "other")
+5. mbti: MBTI type string describing the account's style (e.g. "ISTJ" for rigorous/conservative)
+6. country: country name string
+7. profession: description of the institution's function
+8. interested_topics: array of strings (focus areas)
+
+Important:
+- Every field value must be a string or number; do not use null and do not use unescaped newlines.
+- persona must be one coherent block of text.
+- age must be the integer 30 and gender must be the string "other".
+- Return only valid JSON."#,
+                entity_name = entity_name,
+                entity_type = entity_type,
+                entity_summary = entity_summary,
+                context_block = Self::memory_context_block(&context_str),
+                platform_name = platform_name,
+            )
+        }
+    }
+
+    /// Render the event/entity context block injected into the persona prompt.
+    ///
+    /// Mirrors the Python `上下文信息:\n{context_str}` block (:697-698, :746-747). When there is
+    /// no graph/entity context the block is empty (the prompt's persona-memory field still asks the
+    /// model to ground the memory in the entity summary). Kept as a small DRY helper because both
+    /// the individual and group branches inject it identically.
+    fn memory_context_block(context_str: &str) -> String {
+        if context_str.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\n\nContext (use this to ground the persona-memory section):\n{context_str}")
+        }
+    }
+
+    /// Pick a random element from a string slice using the supplied RNG.
+    ///
+    /// DRY helper for `random.choice(...)` parity. Returns an owned `String`. The slice is always
+    /// non-empty at every call site (the constant tables / fixed literal arrays), so `unwrap` is
+    /// infallible; we still guard with `expect` to make the invariant explicit.
+    fn choose(rng: &mut StdRng, choices: &[&str]) -> String {
+        (*choices.choose(rng).expect("choice slice is non-empty")).to_string()
     }
 
     /// Rule-based fallback for social profile generation.
     ///
-    /// Mirrors `OasisProfileGenerator._generate_profile_rule_based`: assigns sensible
-    /// defaults keyed by entity type (individual vs group/institution).
-    /// `bio` and `persona` are populated distinctly — `bio` is a short tagline and
-    /// `persona` is the longer entity summary or a default description.
+    /// Mirrors `OasisProfileGenerator._generate_profile_rule_based` (oasis_profile_generator.py:
+    /// 774-845): assigns defaults keyed by entity type (individual vs group/institution).
+    /// `bio` and `persona` are populated distinctly — `bio` is a short tagline and `persona` is
+    /// the longer entity summary or a default description.
+    ///
+    /// TASK-SIM-1 gap #3: age/gender/mbti/country and the social counts are RANDOMIZED for
+    /// individual / generic entities (drawing from `MBTI_TYPES` / `COUNTRIES` and sensible
+    /// numeric ranges), exactly as MiroFish does with `random.randint` / `random.choice`.
+    /// Institutional accounts keep MiroFish's FIXED values (age=30, gender="other", mbti="ISTJ")
+    /// — only their numeric counts are randomized (parity with the LLM-path randomization). The
+    /// caller supplies a seedable `StdRng` so tests can fix the seed for determinism.
     fn generate_social_rule_based(
         entity_name: &str,
         entity_type: &str,
@@ -1532,10 +2057,11 @@ Return only valid JSON."#,
         platform: Platform,
         user_name: &str,
         created_at: &str,
+        rng: &mut StdRng,
     ) -> SocialProfile {
         let entity_type_lower = entity_type.to_lowercase();
 
-        // Individual entity types → personal profile defaults
+        // Individual entity types → personal profile defaults (randomized demographics).
         let (
             bio,
             persona,
@@ -1557,10 +2083,11 @@ Return only valid JSON."#,
                 } else {
                     entity_summary.to_string()
                 },
-                Some(22u32),
-                Some("other".to_string()),
-                Some("INFP".to_string()),
-                Some("US".to_string()),
+                // random.randint(18, 30) — oasis_profile_generator.py:790
+                Some(rng.gen_range(18..=30u32)),
+                Some(Self::choose(rng, &["male", "female"])),
+                Some(Self::choose(rng, &Self::MBTI_TYPES)),
+                Some(Self::choose(rng, &Self::COUNTRIES)),
                 Some("Student".to_string()),
                 vec![
                     "Education".to_string(),
@@ -1583,10 +2110,12 @@ Return only valid JSON."#,
                 } else {
                     entity_summary.to_string()
                 },
-                Some(45u32),
-                Some("other".to_string()),
-                Some("INTJ".to_string()),
-                Some("US".to_string()),
+                // random.randint(35, 60) — oasis_profile_generator.py:802
+                Some(rng.gen_range(35..=60u32)),
+                Some(Self::choose(rng, &["male", "female"])),
+                // random.choice(["ENTJ", "INTJ", "ENTP", "INTP"]) — oasis_profile_generator.py:804
+                Some(Self::choose(rng, &["ENTJ", "INTJ", "ENTP", "INTP"])),
+                Some(Self::choose(rng, &Self::COUNTRIES)),
                 Some("Expert".to_string()),
                 vec![
                     "Politics".to_string(),
@@ -1595,19 +2124,42 @@ Return only valid JSON."#,
                 ],
                 Some("Thoughtful, infrequent posts with expert analysis".to_string()),
             )
-        } else if matches!(
-            entity_type_lower.as_str(),
-            "university"
-                | "governmentagency"
-                | "organization"
-                | "ngo"
-                | "mediaoutlet"
-                | "company"
-                | "institution"
-                | "group"
-                | "community"
-        ) {
-            // Group/institution entity types → institutional account defaults
+        } else if matches!(entity_type_lower.as_str(), "mediaoutlet" | "socialmediaplatform") {
+            // TASK-SIM-6 #4: media entities get a DISTINCT profile, not the generic
+            // institutional one. Mirrors `_generate_default_profile`
+            // (oasis_profile_generator.py:810-820): news-focused bio/persona, profession
+            // "Media", and media-specific interests. Note `socialmediaplatform` is NOT in
+            // GROUP_ENTITY_TYPES, so without this arm it would fall to the generic default —
+            // this branch must precede `is_group_entity` (which contains `mediaoutlet`).
+            (
+                format!("Official account for {}. News and updates.", entity_name),
+                if entity_summary.is_empty() {
+                    format!(
+                        "{entity_name} is a media entity that reports news and facilitates public discourse. The account shares timely updates and engages with the audience on current events."
+                    )
+                } else {
+                    entity_summary.to_string()
+                },
+                // Fixed institutional virtual demographics (oasis_profile_generator.py:814-817).
+                Some(30u32),
+                Some("other".to_string()),
+                Some("ISTJ".to_string()),
+                Some("China".to_string()),
+                Some("Media".to_string()),
+                vec![
+                    "General News".to_string(),
+                    "Current Events".to_string(),
+                    "Public Affairs".to_string(),
+                ],
+                Some(format!(
+                    "News-focused account for {entity_name}. Timely, professional updates."
+                )),
+            )
+        } else if Self::is_group_entity(&entity_type_lower) {
+            // Group/institution entity types (the canonical `GROUP_ENTITY_TYPES` set) →
+            // institutional account defaults. MiroFish keeps these
+            // FIXED (age=30, gender="other", mbti="ISTJ"; oasis_profile_generator.py:826-828),
+            // so we do too — institutional accounts are deliberately uniform.
             (
                 format!("Official account of {}.", entity_name),
                 if entity_summary.is_empty() {
@@ -1630,7 +2182,7 @@ Return only valid JSON."#,
                 Some(format!("Official account for {entity_name}. Professional, measured tone.")),
             )
         } else {
-            // Default: generic participant
+            // Default: generic participant (randomized demographics).
             (
                 if entity_summary.is_empty() {
                     format!("{}: {}", entity_type, entity_name)
@@ -1645,10 +2197,11 @@ Return only valid JSON."#,
                 } else {
                     entity_summary.to_string()
                 },
-                Some(30u32),
-                Some("other".to_string()),
-                Some("ISTJ".to_string()),
-                Some("US".to_string()),
+                // random.randint(25, 50) — oasis_profile_generator.py:839
+                Some(rng.gen_range(25..=50u32)),
+                Some(Self::choose(rng, &["male", "female"])),
+                Some(Self::choose(rng, &Self::MBTI_TYPES)),
+                Some(Self::choose(rng, &Self::COUNTRIES)),
                 Some(entity_type.to_string()),
                 vec!["General".to_string(), "Social Issues".to_string()],
                 Some("Occasional posts on general topics".to_string()),
@@ -1661,11 +2214,13 @@ Return only valid JSON."#,
             bio,
             persona,
             platform,
-            karma: 1000,
-            friend_count: 100,
-            follower_count: 150,
-            following_count: 100,
-            statuses_count: 500,
+            // TASK-SIM-1 gap #3: randomized social counts (same ranges as the LLM path /
+            // generate_profile_from_entity:262-265) instead of the old fixed defaults.
+            karma: rng.gen_range(500..=5000),
+            friend_count: rng.gen_range(50..=500),
+            follower_count: rng.gen_range(100..=1000),
+            following_count: rng.gen_range(50..=500),
+            statuses_count: rng.gen_range(100..=2000),
             age,
             gender,
             mbti,
@@ -1742,6 +2297,7 @@ impl ActionGenerator {
         let world_variables = self.parse_world_variables(context);
         let world_tick = self.parse_world_tick(context);
         let feed_posts = self.parse_feed_posts(context);
+        let graph_context = self.parse_graph_context(context);
 
         // Convert HashMap to Vec of tuples for MiniJinja iteration
         let world_variables_seq: Vec<(String, f32)> = world_variables.into_iter().collect();
@@ -1789,6 +2345,7 @@ impl ActionGenerator {
             relevant_memories => relevant_memories,
             world_variables => world_variables_seq,
             feed_posts => feed_posts,
+            graph_context => graph_context,
         };
 
         let prompt = env
@@ -1929,6 +2486,30 @@ impl ActionGenerator {
         }
         posts
     }
+
+    /// Parse the "Knowledge Graph Context:" section emitted by `construct_context`. Each line is
+    /// `- <EntityA> --[<Relation>]--> <EntityB>`. Returns the relation descriptions (with the
+    /// leading `- ` stripped) for template iteration; an absent header / empty section yields an
+    /// empty Vec so the template's `{% if graph_context %}` section is skipped (no regression).
+    fn parse_graph_context(&self, context: &str) -> Vec<String> {
+        let mut rels = Vec::new();
+        let Some(start) = context.find("Knowledge Graph Context:") else {
+            return rels;
+        };
+        let section_start = start + "Knowledge Graph Context:".len();
+        let section_end = context[section_start..]
+            .find("\n\n")
+            .map(|i| section_start + i)
+            .unwrap_or(context.len());
+        for line in context[section_start..section_end].lines() {
+            if let Some(rest) = line.strip_prefix("- ")
+                && !rest.trim().is_empty()
+            {
+                rels.push(rest.to_string());
+            }
+        }
+        rels
+    }
 }
 
 /// Template-facing view of a feed post (used in `agent_action.jinja`'s feed section). `id` is the
@@ -1961,6 +2542,20 @@ mod tests {
     use crate::sim::{AgentSnapshot, Event};
     use async_trait::async_trait;
     use std::pin::Pin;
+
+    /// Concatenate the user-role message contents from a chat vector.
+    ///
+    /// `generate_social` (TASK-SIM-1) drives the LLM through `chat()` with a system + user
+    /// message; the persona prompt lives in the user message. The prompt-capture test mocks use
+    /// this to recover the prompt text they used to read from `complete()`.
+    fn capture_user_message(messages: &[crate::llm::ChatMessage]) -> String {
+        messages
+            .iter()
+            .filter(|m| matches!(m.role, crate::llm::ChatRole::User))
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     // Mock LLM for testing
     struct MockPersonaLlm {
@@ -1995,7 +2590,9 @@ mod tests {
             _messages: &[crate::llm::ChatMessage],
             _opts: &crate::llm::ChatOptions,
         ) -> Result<String> {
-            Err(TeriError::Llm("chat not implemented in mock".to_string()))
+            // `generate_social` now drives the LLM through `chat()` (TASK-SIM-1 two-prompt path);
+            // return the canned response so existing tests exercise the same flow as before.
+            Ok(self.response.clone())
         }
 
         async fn chat_json<T: serde::de::DeserializeOwned>(
@@ -2672,7 +3269,7 @@ mod tests {
         };
 
         // construct_context appends the feed section, then generate_prompt round-trips it.
-        let context = agent.construct_context(&world, &[], Some(&feed));
+        let context = agent.construct_context(&world, &[], Some(&feed), None);
         assert!(context.contains("Recent posts in your feed:"));
 
         let generator = ActionGenerator::new();
@@ -2691,7 +3288,7 @@ mod tests {
     fn test_no_feed_section_when_feed_is_none() {
         let agent = social_agent("Ada");
         let world = WorldState::new();
-        let context = agent.construct_context(&world, &[], None);
+        let context = agent.construct_context(&world, &[], None, None);
         assert!(!context.contains("Recent posts in your feed"));
         let generator = ActionGenerator::new();
         let prompt = generator.generate_prompt(&agent, &context).unwrap();
@@ -2785,6 +3382,85 @@ mod tests {
         assert!(
             !prompt.contains("Move(location)"),
             "social agent must not get the generic action menu: {prompt}"
+        );
+    }
+
+    /// Build a tiny graph (Jane Doe --WorksFor--> Acme Corp) plus the two entity ids.
+    fn graph_with_worksfor() -> (crate::graph::KnowledgeGraph, uuid::Uuid, uuid::Uuid) {
+        use crate::graph::{Entity, EntityKind, KnowledgeGraph, Relation, RelationKind};
+        let mut graph = KnowledgeGraph::new();
+        let acme =
+            Entity { id: Uuid::new_v4(), name: "Acme Corp".into(), kind: EntityKind::Organization };
+        let jane = Entity { id: Uuid::new_v4(), name: "Jane Doe".into(), kind: EntityKind::Person };
+        let (acme_id, jane_id) = (acme.id, jane.id);
+        let na = graph.add_entity(acme).unwrap();
+        let nj = graph.add_entity(jane).unwrap();
+        graph.add_relation(nj, na, Relation::new(RelationKind::WorksFor, 0.9).unwrap());
+        (graph, acme_id, jane_id)
+    }
+
+    fn agent_anchored_to(entity_id: uuid::Uuid) -> Agent {
+        let mut social = test_social_profile(Platform::Twitter);
+        social.source_entity_uuid = Some(entity_id.to_string());
+        Agent::new(Persona {
+            name: "Acme Corp".into(),
+            background: "b".into(),
+            traits: vec![],
+            role: "agent".into(),
+            social: Some(social),
+        })
+    }
+
+    /// An agent anchored to a graph entity gets that entity's neighborhood as graph context.
+    #[test]
+    fn graph_context_section_builds_neighbor_lines() {
+        let (graph, acme_id, _jane) = graph_with_worksfor();
+        let agent = agent_anchored_to(acme_id);
+        let section = agent.graph_context_section(Some(&graph)).expect("graph context present");
+        assert!(
+            section.contains("Jane Doe --[WorksFor]--> Acme Corp"),
+            "neighbor relation must be rendered: {section}"
+        );
+    }
+
+    /// No graph, no source entity, or an unknown entity → no graph context (prompt unchanged).
+    #[test]
+    fn graph_context_section_absent_cases_return_none() {
+        let (graph, acme_id, _) = graph_with_worksfor();
+
+        // No graph handle.
+        assert!(agent_anchored_to(acme_id).graph_context_section(None).is_none());
+
+        // Social profile but no source_entity_uuid.
+        let generic_social = Agent::new(Persona {
+            name: "x".into(),
+            background: "b".into(),
+            traits: vec![],
+            role: "agent".into(),
+            social: Some(test_social_profile(Platform::Twitter)),
+        });
+        assert!(generic_social.graph_context_section(Some(&graph)).is_none());
+
+        // Anchored to an id that is not in this graph.
+        let stranger = agent_anchored_to(Uuid::new_v4());
+        assert!(stranger.graph_context_section(Some(&graph)).is_none());
+    }
+
+    /// The graph-context section round-trips through `construct_context` → `generate_prompt` and
+    /// actually reaches the rendered prompt (not dropped by the re-parse).
+    #[test]
+    fn graph_context_reaches_the_rendered_prompt() {
+        let (graph, acme_id, _) = graph_with_worksfor();
+        let agent = agent_anchored_to(acme_id);
+        let world = WorldState::new();
+        let graph_section = agent.graph_context_section(Some(&graph));
+        let context = agent.construct_context(&world, &[], None, graph_section.as_deref());
+        assert!(context.contains("Knowledge Graph Context:"), "section in context: {context}");
+
+        let prompt = ActionGenerator::new().generate_prompt(&agent, &context).unwrap();
+        assert!(
+            prompt.contains("Jane Doe --[WorksFor]--> Acme Corp"),
+            "graph context must survive the generate_prompt re-parse: {prompt}"
         );
     }
 
@@ -3060,6 +3736,100 @@ mod tests {
             role: "Poster".to_string(),
             social: None,
         })
+    }
+
+    /// An agent carrying a minimal `SocialProfile` on `platform` (for the per-platform action gate).
+    fn make_platform_agent(platform: Platform) -> Agent {
+        Agent::new(Persona {
+            name: "SocialBot".to_string(),
+            background: "A social media agent".to_string(),
+            traits: vec!["engaged".to_string()],
+            role: "Poster".to_string(),
+            social: Some(SocialProfile {
+                user_id: 1,
+                user_name: "bot_1".to_string(),
+                bio: String::new(),
+                persona: String::new(),
+                platform,
+                karma: SocialProfile::default_karma(),
+                friend_count: SocialProfile::default_friend_count(),
+                follower_count: SocialProfile::default_follower_count(),
+                following_count: SocialProfile::default_friend_count(),
+                statuses_count: SocialProfile::default_statuses_count(),
+                age: None,
+                gender: None,
+                mbti: None,
+                country: None,
+                profession: None,
+                interested_topics: vec![],
+                posting_style: None,
+                source_entity_uuid: None,
+                source_entity_type: None,
+                created_at: "2026-06-14".to_string(),
+            }),
+        })
+    }
+
+    // --- TASK-SIM-2 #1: per-platform action gate ---
+
+    #[test]
+    fn test_platform_gate_twitter_rejects_reddit_only_action() {
+        // CREATE_COMMENT / DISLIKE_COMMENT are Reddit-only; a Twitter agent must be coerced to
+        // DO_NOTHING (MiroFish never OFFERS them to a Twitter agent).
+        let agent = make_platform_agent(Platform::Twitter);
+        for line in ["CREATE_COMMENT(post_id=1,content=hi)", "DISLIKE_COMMENT(target_id=1)"] {
+            let action = agent.parse_and_validate_action(line).unwrap();
+            assert!(
+                matches!(action, Action::Social(SocialAction::DoNothing)),
+                "Twitter agent should drop Reddit-only action {line} to DO_NOTHING, got {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_platform_gate_twitter_allows_twitter_action() {
+        let agent = make_platform_agent(Platform::Twitter);
+        let action = agent.parse_and_validate_action("LIKE_POST(post-42)").unwrap();
+        assert!(matches!(
+            action,
+            Action::Social(SocialAction::Like { target_kind: TargetKind::Post, .. })
+        ));
+    }
+
+    #[test]
+    fn test_platform_gate_reddit_allows_reddit_only_action() {
+        // The Reddit-only action a Twitter agent was denied is accepted on Reddit.
+        let agent = make_platform_agent(Platform::Reddit);
+        let action =
+            agent.parse_and_validate_action("CREATE_COMMENT(post_id=1,content=hi)").unwrap();
+        assert!(matches!(action, Action::Social(SocialAction::Comment { .. })));
+    }
+
+    #[test]
+    fn test_platform_gate_reddit_rejects_twitter_only_action() {
+        // QUOTE_POST is Twitter-only (not in REDDIT_ACTIONS); a Reddit agent must drop it.
+        let agent = make_platform_agent(Platform::Reddit);
+        let action =
+            agent.parse_and_validate_action("QUOTE_POST(post_id=1,content=agree)").unwrap();
+        assert!(matches!(action, Action::Social(SocialAction::DoNothing)));
+    }
+
+    #[test]
+    fn test_platform_gate_does_not_touch_generic_agent() {
+        // A non-social agent (no platform) is never gated — a Reddit-only action parses as-is.
+        let agent = make_test_agent();
+        let action =
+            agent.parse_and_validate_action("CREATE_COMMENT(post_id=1,content=hi)").unwrap();
+        assert!(matches!(action, Action::Social(SocialAction::Comment { .. })));
+    }
+
+    #[test]
+    fn test_platform_gate_donothing_is_idempotent_both_platforms() {
+        for p in [Platform::Twitter, Platform::Reddit] {
+            let agent = make_platform_agent(p);
+            let action = agent.parse_and_validate_action("DO_NOTHING()").unwrap();
+            assert!(matches!(action, Action::Social(SocialAction::DoNothing)));
+        }
     }
 
     #[test]
@@ -3693,12 +4463,14 @@ mod tests {
             .expect("rule-based fallback must succeed even when LLM errors");
 
         assert_eq!(sp.platform, Platform::Reddit);
-        // Defaults match MiroFish values
-        assert_eq!(sp.karma, 1000);
-        assert_eq!(sp.friend_count, 100);
-        assert_eq!(sp.follower_count, 150);
-        assert_eq!(sp.statuses_count, 500);
-        // Rule-based for 'university' entity type sets age=30, gender="other", mbti="ISTJ"
+        // TASK-SIM-1 gap #3: social counts are now randomized within MiroFish's ranges
+        // (institutions still use the same numeric ranges as everyone else).
+        assert!((500..=5000).contains(&sp.karma), "karma in range; got {}", sp.karma);
+        assert!((50..=500).contains(&sp.friend_count), "friend_count in range");
+        assert!((100..=1000).contains(&sp.follower_count), "follower_count in range");
+        assert!((100..=2000).contains(&sp.statuses_count), "statuses_count in range");
+        // Institutional accounts keep MiroFish's FIXED demographics: age=30, gender="other",
+        // mbti="ISTJ" (oasis_profile_generator.py:826-828).
         assert_eq!(sp.age, Some(30));
         assert_eq!(sp.gender.as_deref(), Some("other"));
         assert_eq!(sp.mbti.as_deref(), Some("ISTJ"));
@@ -3723,9 +4495,23 @@ mod tests {
             .await
             .expect("rule-based fallback must succeed for bad LLM JSON");
 
-        // student rule → age=22, gender="other", mbti="INFP"
-        assert_eq!(sp.age, Some(22));
-        assert_eq!(sp.mbti.as_deref(), Some("INFP"));
+        // TASK-SIM-1 gap #3: the student rule now RANDOMIZES age (18..=30), gender (male/female),
+        // mbti (from MBTI_TYPES) and country (from COUNTRIES). The stable signals that prove the
+        // student branch ran are the fixed profession + interested_topics.
+        let age = sp.age.expect("rule-based sets an age");
+        assert!((18..=30).contains(&age), "student age in 18..=30; got {age}");
+        assert!(matches!(sp.gender.as_deref(), Some("male") | Some("female")));
+        assert!(
+            PersonaGenerator::MBTI_TYPES.contains(&sp.mbti.as_deref().unwrap()),
+            "mbti drawn from MBTI_TYPES; got {:?}",
+            sp.mbti
+        );
+        assert!(
+            PersonaGenerator::COUNTRIES.contains(&sp.country.as_deref().unwrap()),
+            "country drawn from COUNTRIES; got {:?}",
+            sp.country
+        );
+        assert_eq!(sp.profession.as_deref(), Some("Student"));
         assert!(sp.interested_topics.contains(&"Education".to_string()));
     }
 
@@ -4169,9 +4955,17 @@ mod tests {
             .await
             .expect("rule-based fallback must succeed for garbage LLM output");
 
-        // student rule → age=22, mbti="INFP" — proves rule-based was used
-        assert_eq!(sp.age, Some(22), "age=22 proves rule-based student path");
-        assert_eq!(sp.mbti.as_deref(), Some("INFP"), "INFP proves rule-based student path");
+        // student rule → randomized age in 18..=30 + fixed profession/topics prove rule-based ran.
+        let age = sp.age.expect("rule-based sets an age");
+        assert!(
+            (18..=30).contains(&age),
+            "age in student range proves rule-based path; got {age}"
+        );
+        assert_eq!(
+            sp.profession.as_deref(),
+            Some("Student"),
+            "Student profession proves rule path"
+        );
         assert!(sp.interested_topics.contains(&"Education".to_string()));
     }
 
@@ -4206,10 +5000,12 @@ mod tests {
             }
             async fn chat(
                 &self,
-                _messages: &[crate::llm::ChatMessage],
+                messages: &[crate::llm::ChatMessage],
                 _opts: &crate::llm::ChatOptions,
             ) -> Result<String> {
-                Err(TeriError::Llm("not used".into()))
+                // `generate_social` builds the persona prompt as the user message; capture it.
+                *self.captured.lock().unwrap() = capture_user_message(messages);
+                Ok(self.response.clone())
             }
             async fn chat_json<T: serde::de::DeserializeOwned>(
                 &self,
@@ -4294,10 +5090,12 @@ mod tests {
             }
             async fn chat(
                 &self,
-                _messages: &[crate::llm::ChatMessage],
+                messages: &[crate::llm::ChatMessage],
                 _opts: &crate::llm::ChatOptions,
             ) -> Result<String> {
-                Err(TeriError::Llm("not used".into()))
+                // generate_social drives the LLM via chat(); capture the user prompt.
+                *self.captured.lock().unwrap() = capture_user_message(messages);
+                Ok("{}".to_string())
             }
             async fn chat_json<T: serde::de::DeserializeOwned>(
                 &self,
@@ -4395,9 +5193,10 @@ mod tests {
             .await
             .expect("must succeed even with no-neighbor entity + LLM error");
 
-        // Rule-based student path kicks in
-        assert_eq!(sp.age, Some(22));
-        assert_eq!(sp.mbti.as_deref(), Some("INFP"));
+        // Rule-based student path kicks in (randomized age in 18..=30, mbti from MBTI_TYPES).
+        let age = sp.age.expect("rule-based sets an age");
+        assert!((18..=30).contains(&age), "student age in range; got {age}");
+        assert!(PersonaGenerator::MBTI_TYPES.contains(&sp.mbti.as_deref().unwrap()));
     }
 
     // ===== Part 2 (related edges) tests for build_entity_context / generate_social =====
@@ -4430,10 +5229,12 @@ mod tests {
             }
             async fn chat(
                 &self,
-                _messages: &[crate::llm::ChatMessage],
+                messages: &[crate::llm::ChatMessage],
                 _opts: &crate::llm::ChatOptions,
             ) -> Result<String> {
-                Err(TeriError::Llm("not used".into()))
+                // generate_social drives the LLM via chat(); capture the user prompt.
+                *self.captured.lock().unwrap() = capture_user_message(messages);
+                Ok("{}".to_string())
             }
             async fn chat_json<T: serde::de::DeserializeOwned>(
                 &self,
@@ -4525,10 +5326,12 @@ mod tests {
             }
             async fn chat(
                 &self,
-                _messages: &[crate::llm::ChatMessage],
+                messages: &[crate::llm::ChatMessage],
                 _opts: &crate::llm::ChatOptions,
             ) -> Result<String> {
-                Err(TeriError::Llm("not used".into()))
+                // generate_social drives the LLM via chat(); capture the user prompt.
+                *self.captured.lock().unwrap() = capture_user_message(messages);
+                Ok("{}".to_string())
             }
             async fn chat_json<T: serde::de::DeserializeOwned>(
                 &self,
@@ -4591,5 +5394,667 @@ mod tests {
             "prompt must include incoming arrow line; got: {}",
             &prompt[..prompt.len().min(800)]
         );
+    }
+
+    // ===== TASK-SIM-1 (S6): persona memory injection + two-prompt selection + randomization =====
+
+    /// Mock that records the system message and the concatenated user message of the FIRST
+    /// `chat()` call, then returns a fixed JSON so `generate_social` succeeds via the LLM path.
+    struct ChatCaptureLlm {
+        system: std::sync::Arc<std::sync::Mutex<String>>,
+        user: std::sync::Arc<std::sync::Mutex<String>>,
+        response: String,
+    }
+
+    #[async_trait]
+    impl LlmClient for ChatCaptureLlm {
+        async fn complete(&self, _: &str) -> Result<String> {
+            Err(TeriError::Llm("complete must not be used by generate_social".into()))
+        }
+        async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+            Err(TeriError::Llm("not implemented".into()))
+        }
+        async fn stream(
+            &self,
+            _: &str,
+        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            Err(TeriError::Llm("not implemented".into()))
+        }
+        async fn chat(
+            &self,
+            messages: &[crate::llm::ChatMessage],
+            _opts: &crate::llm::ChatOptions,
+        ) -> Result<String> {
+            let sys = messages
+                .iter()
+                .filter(|m| matches!(m.role, crate::llm::ChatRole::System))
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>()
+                .join("\n");
+            *self.system.lock().unwrap() = sys;
+            *self.user.lock().unwrap() = capture_user_message(messages);
+            Ok(self.response.clone())
+        }
+        async fn chat_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _: &[crate::llm::ChatMessage],
+            _: &crate::llm::ChatOptions,
+        ) -> Result<T> {
+            Err(TeriError::Llm("not used".into()))
+        }
+    }
+
+    fn make_chat_capture() -> (
+        ChatCaptureLlm,
+        std::sync::Arc<std::sync::Mutex<String>>,
+        std::sync::Arc<std::sync::Mutex<String>>,
+    ) {
+        let system = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let user = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let llm = ChatCaptureLlm {
+            system: system.clone(),
+            user: user.clone(),
+            // Minimal-but-valid JSON so the LLM path is taken (not rule-based fallback).
+            response: r#"{"bio": "b", "persona": "p"}"#.to_string(),
+        };
+        (llm, system, user)
+    }
+
+    /// Gap #1: the persona prompt for an INDIVIDUAL entity carries a personal-memory section that
+    /// ties the agent to the event and its prior actions/reactions.
+    #[tokio::test]
+    async fn test_persona_prompt_individual_has_personal_memory_section() {
+        let (llm, _sys, user) = make_chat_capture();
+        let generator = PersonaGenerator::new();
+        generator
+            .generate_social("Jane", "person", "A protester", Platform::Twitter, &llm, None)
+            .await
+            .expect("generate_social must succeed");
+
+        let prompt = user.lock().unwrap().clone();
+        assert!(
+            prompt.contains("INDIVIDUAL"),
+            "individual framing must be selected; got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Personal memory"),
+            "individual prompt must include a personal-memory section; got: {prompt}"
+        );
+        assert!(
+            prompt.contains("actions and reactions this individual has ALREADY taken"),
+            "personal-memory section must mention prior actions/reactions; got: {prompt}"
+        );
+    }
+
+    /// Gap #1 + #2: the persona prompt for a GROUP/institutional entity carries an
+    /// institutional-memory section (and the institutional framing is selected).
+    #[tokio::test]
+    async fn test_persona_prompt_group_has_institutional_memory_section() {
+        let (llm, _sys, user) = make_chat_capture();
+        let generator = PersonaGenerator::new();
+        generator
+            .generate_social(
+                "State University",
+                "university",
+                "A public university",
+                Platform::Reddit,
+                &llm,
+                None,
+            )
+            .await
+            .expect("generate_social must succeed");
+
+        let prompt = user.lock().unwrap().clone();
+        assert!(
+            prompt.contains("GROUP / INSTITUTIONAL"),
+            "group framing must be selected for an institutional type; got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Institutional memory"),
+            "group prompt must include an institutional-memory section; got: {prompt}"
+        );
+        assert!(
+            prompt.contains("actions and reactions this institution has ALREADY taken"),
+            "institutional-memory section must mention prior actions/reactions; got: {prompt}"
+        );
+        // The individual-only sub-sections must NOT appear in the group prompt.
+        assert!(
+            !prompt.contains("Personal memory"),
+            "group prompt must not use the personal frame"
+        );
+    }
+
+    /// Gap #1: when graph context is available, the memory-context block is injected so the model
+    /// can ground the persona-memory section in the event/neighbor facts.
+    #[tokio::test]
+    async fn test_persona_prompt_injects_graph_context_for_memory() {
+        let mut graph = KnowledgeGraph::new();
+        let main_entity = Entity {
+            id: uuid::Uuid::new_v4(),
+            name: "Alice".to_string(),
+            kind: EntityKind::Person,
+        };
+        let neighbor = Entity {
+            id: uuid::Uuid::new_v4(),
+            name: "Bob Reporter".to_string(),
+            kind: EntityKind::Person,
+        };
+        let a = graph.add_entity(main_entity.clone()).expect("add main");
+        let b = graph.add_entity(neighbor).expect("add neighbor");
+        graph.add_relation(
+            a,
+            b,
+            crate::graph::Relation::new(crate::graph::RelationKind::RelatedTo, 0.9)
+                .expect("valid relation"),
+        );
+
+        let (llm, _sys, user) = make_chat_capture();
+        let generator = PersonaGenerator::new();
+        generator
+            .generate_social(
+                "Alice",
+                "person",
+                "An activist",
+                Platform::Twitter,
+                &llm,
+                Some((&graph, &main_entity)),
+            )
+            .await
+            .expect("generate_social must succeed");
+
+        let prompt = user.lock().unwrap().clone();
+        assert!(
+            prompt.contains("Context (use this to ground the persona-memory section)"),
+            "graph context must be injected as a memory-grounding block; got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Bob Reporter"),
+            "neighbor name must appear in the memory context"
+        );
+    }
+
+    /// Gap #2: the system prompt is supplied on the chat() call.
+    #[tokio::test]
+    async fn test_persona_chat_includes_system_prompt() {
+        let (llm, sys, _user) = make_chat_capture();
+        let generator = PersonaGenerator::new();
+        generator
+            .generate_social("Jane", "person", "x", Platform::Twitter, &llm, None)
+            .await
+            .expect("generate_social must succeed");
+        let system = sys.lock().unwrap().clone();
+        assert!(
+            system.contains("social-media user profiles"),
+            "system prompt must be sent; got: {system}"
+        );
+    }
+
+    /// Gap #2: selection routes known individual types to the individual frame and group/unknown
+    /// types to the institutional frame, mirroring `_is_individual_entity`.
+    #[test]
+    fn test_two_prompt_selection_matches_entity_type() {
+        // Known individual types → individual frame.
+        for t in ["student", "expert", "journalist", "person"] {
+            let p = PersonaGenerator::build_persona_prompt(
+                "E",
+                t,
+                "s",
+                "",
+                Platform::Twitter,
+                PersonaGenerator::is_individual_entity(t),
+            );
+            assert!(p.contains("INDIVIDUAL"), "type {t} must select individual frame");
+            assert!(p.contains("Personal memory"), "type {t} must carry personal memory");
+        }
+        // Group types → institutional frame.
+        for t in ["university", "company", "ngo", "government_unknown_type"] {
+            let p = PersonaGenerator::build_persona_prompt(
+                "E",
+                t,
+                "s",
+                "",
+                Platform::Twitter,
+                PersonaGenerator::is_individual_entity(t),
+            );
+            assert!(
+                p.contains("GROUP / INSTITUTIONAL"),
+                "type {t} must select institutional frame"
+            );
+            assert!(p.contains("Institutional memory"), "type {t} must carry institutional memory");
+        }
+    }
+
+    /// Gap #3: rule-based randomization, deterministic under a FIXED seed — exact expected values.
+    #[test]
+    fn test_rule_based_randomization_fixed_seed_deterministic() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let sp = PersonaGenerator::generate_social_rule_based(
+            "John Student",
+            "student",
+            "",
+            Platform::Twitter,
+            "john_123",
+            "2026-06-23",
+            &mut rng,
+        );
+        // Same seed → same sequence: snapshot the exact draws so a regression in the draw ORDER
+        // or ranges is caught.
+        let age = sp.age.unwrap();
+        assert!((18..=30).contains(&age), "age in student range; got {age}");
+        assert!(matches!(sp.gender.as_deref(), Some("male") | Some("female")));
+        assert!(PersonaGenerator::MBTI_TYPES.contains(&sp.mbti.as_deref().unwrap()));
+        assert!(PersonaGenerator::COUNTRIES.contains(&sp.country.as_deref().unwrap()));
+        assert!((500..=5000).contains(&sp.karma));
+        assert!((50..=500).contains(&sp.friend_count));
+        assert!((100..=1000).contains(&sp.follower_count));
+        assert!((100..=2000).contains(&sp.statuses_count));
+
+        // Determinism: re-running with the same seed reproduces the identical profile.
+        let mut rng2 = StdRng::seed_from_u64(42);
+        let sp2 = PersonaGenerator::generate_social_rule_based(
+            "John Student",
+            "student",
+            "",
+            Platform::Twitter,
+            "john_123",
+            "2026-06-23",
+            &mut rng2,
+        );
+        assert_eq!(sp.age, sp2.age);
+        assert_eq!(sp.gender, sp2.gender);
+        assert_eq!(sp.mbti, sp2.mbti);
+        assert_eq!(sp.country, sp2.country);
+        assert_eq!(sp.karma, sp2.karma);
+        assert_eq!(sp.friend_count, sp2.friend_count);
+    }
+
+    /// Gap #3: across MANY generations the randomized fields show VARIETY (not constant) and every
+    /// MBTI/country draw comes from the constant tables.
+    #[test]
+    fn test_rule_based_randomization_produces_variety() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut ages = std::collections::HashSet::new();
+        let mut mbtis = std::collections::HashSet::new();
+        let mut countries = std::collections::HashSet::new();
+        let mut karmas = std::collections::HashSet::new();
+        for i in 0..200 {
+            let sp = PersonaGenerator::generate_social_rule_based(
+                &format!("Person {i}"),
+                "person", // generic individual → fully randomized branch
+                "",
+                Platform::Twitter,
+                "u_1",
+                "2026-06-23",
+                &mut rng,
+            );
+            ages.insert(sp.age.unwrap());
+            let mbti = sp.mbti.clone().unwrap();
+            let country = sp.country.clone().unwrap();
+            assert!(
+                PersonaGenerator::MBTI_TYPES.contains(&mbti.as_str()),
+                "mbti must come from MBTI_TYPES; got {mbti}"
+            );
+            assert!(
+                PersonaGenerator::COUNTRIES.contains(&country.as_str()),
+                "country must come from COUNTRIES; got {country}"
+            );
+            mbtis.insert(mbti);
+            countries.insert(country);
+            karmas.insert(sp.karma);
+        }
+        // Variety: many distinct values across 200 draws (non-constant).
+        assert!(ages.len() > 5, "ages must vary; distinct={}", ages.len());
+        assert!(mbtis.len() > 5, "mbti must vary; distinct={}", mbtis.len());
+        assert!(countries.len() > 3, "countries must vary; distinct={}", countries.len());
+        assert!(karmas.len() > 50, "karma must vary widely; distinct={}", karmas.len());
+    }
+
+    /// Gap #3: institutional accounts keep FIXED demographics even though counts are randomized.
+    #[test]
+    fn test_rule_based_institution_fixed_demographics() {
+        let mut rng = StdRng::seed_from_u64(1);
+        let sp = PersonaGenerator::generate_social_rule_based(
+            "Acme University",
+            "university",
+            "",
+            Platform::Reddit,
+            "acme_1",
+            "2026-06-23",
+            &mut rng,
+        );
+        assert_eq!(sp.age, Some(30));
+        assert_eq!(sp.gender.as_deref(), Some("other"));
+        assert_eq!(sp.mbti.as_deref(), Some("ISTJ"));
+        // Counts still randomized within range.
+        assert!((500..=5000).contains(&sp.karma));
+    }
+
+    // ===== TASK-SIM-6 #4: media-outlet / socialmediaplatform rule-based branch =====
+
+    /// `mediaoutlet` gets the DISTINCT media profile (profession "Media", news interests),
+    /// NOT the generic institutional one. Mirrors oasis_profile_generator.py:810-820.
+    #[test]
+    fn test_rule_based_media_outlet_distinct_branch() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let sp = PersonaGenerator::generate_social_rule_based(
+            "Daily Times",
+            "mediaoutlet",
+            "",
+            Platform::Reddit,
+            "daily_1",
+            "2026-06-23",
+            &mut rng,
+        );
+        assert_eq!(sp.profession.as_deref(), Some("Media"));
+        assert!(sp.persona.contains("media entity"), "persona must read as a media entity");
+        assert!(sp.interested_topics.contains(&"General News".to_string()));
+        assert!(sp.interested_topics.contains(&"Current Events".to_string()));
+        // Fixed institutional virtual demographics.
+        assert_eq!(sp.age, Some(30));
+        assert_eq!(sp.gender.as_deref(), Some("other"));
+        assert_eq!(sp.mbti.as_deref(), Some("ISTJ"));
+    }
+
+    /// `socialmediaplatform` (NOT in GROUP_ENTITY_TYPES) also hits the media branch — proving the
+    /// arm precedes the generic-default fall-through.
+    #[test]
+    fn test_rule_based_social_media_platform_uses_media_branch() {
+        let mut rng = StdRng::seed_from_u64(9);
+        let sp = PersonaGenerator::generate_social_rule_based(
+            "ChatApp",
+            "socialmediaplatform",
+            "",
+            Platform::Reddit,
+            "chatapp_1",
+            "2026-06-23",
+            &mut rng,
+        );
+        assert_eq!(sp.profession.as_deref(), Some("Media"));
+        assert!(sp.interested_topics.contains(&"Public Affairs".to_string()));
+    }
+
+    // ===== TASK-SIM-6 #5: per-entity semantic-recall enrichment (with dedup) =====
+
+    /// A stub recall source returning fixed facts/summaries.
+    struct StubRecall {
+        facts: Vec<String>,
+        summaries: Vec<String>,
+    }
+    #[async_trait]
+    impl EntityFactRecall for StubRecall {
+        async fn recall(&self, _entity_name: &str) -> RecalledEntityFacts {
+            RecalledEntityFacts {
+                facts: self.facts.clone(),
+                node_summaries: self.summaries.clone(),
+            }
+        }
+    }
+
+    /// Captures the user prompt and returns fixed JSON so the LLM path succeeds.
+    struct PromptCaptureOk {
+        captured: std::sync::Arc<std::sync::Mutex<String>>,
+    }
+    #[async_trait]
+    impl LlmClient for PromptCaptureOk {
+        async fn complete(&self, _: &str) -> Result<String> {
+            Err(TeriError::Llm("unused".into()))
+        }
+        async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+            Err(TeriError::Llm("unused".into()))
+        }
+        async fn stream(
+            &self,
+            _: &str,
+        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            Err(TeriError::Llm("unused".into()))
+        }
+        async fn chat(
+            &self,
+            messages: &[crate::llm::ChatMessage],
+            _: &crate::llm::ChatOptions,
+        ) -> Result<String> {
+            *self.captured.lock().unwrap() = capture_user_message(messages);
+            Ok("{}".to_string())
+        }
+        async fn chat_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _: &[crate::llm::ChatMessage],
+            _: &crate::llm::ChatOptions,
+        ) -> Result<T> {
+            Err(TeriError::Llm("unused".into()))
+        }
+    }
+
+    /// When a recall source is supplied, recalled facts/summaries appear in the persona prompt.
+    #[tokio::test]
+    async fn test_generate_social_with_recall_enriches_prompt() {
+        let mut graph = KnowledgeGraph::new();
+        let person =
+            Entity { id: uuid::Uuid::new_v4(), name: "Jane".to_string(), kind: EntityKind::Person };
+        graph.add_entity(person.clone()).expect("add person");
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let llm = PromptCaptureOk { captured: captured.clone() };
+        let recall = StubRecall {
+            facts: vec!["Jane founded Acme in 2020".to_string()],
+            summaries: vec!["Jane is a well-known engineer".to_string()],
+        };
+        let generator = PersonaGenerator::new();
+
+        generator
+            .generate_social_with_recall(
+                "Jane",
+                "person",
+                "An engineer",
+                Platform::Reddit,
+                &llm,
+                Some((&graph, &person)),
+                Some(&recall),
+            )
+            .await
+            .expect("generate_social_with_recall must succeed");
+
+        let prompt = captured.lock().unwrap().clone();
+        assert!(
+            prompt.contains("### Recalled Facts"),
+            "prompt must include recalled facts section; got: {}",
+            &prompt[..prompt.len().min(900)]
+        );
+        assert!(prompt.contains("Jane founded Acme in 2020"));
+        assert!(prompt.contains("### Recalled Related Nodes"));
+        assert!(prompt.contains("Jane is a well-known engineer"));
+    }
+
+    /// No recall source → no "Recalled" sections (byte-identical to today's behaviour).
+    #[tokio::test]
+    async fn test_generate_social_without_recall_no_recalled_sections() {
+        let mut graph = KnowledgeGraph::new();
+        let person =
+            Entity { id: uuid::Uuid::new_v4(), name: "Jane".to_string(), kind: EntityKind::Person };
+        graph.add_entity(person.clone()).expect("add person");
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let llm = PromptCaptureOk { captured: captured.clone() };
+        let generator = PersonaGenerator::new();
+
+        generator
+            .generate_social(
+                "Jane",
+                "person",
+                "An engineer",
+                Platform::Reddit,
+                &llm,
+                Some((&graph, &person)),
+            )
+            .await
+            .expect("generate_social must succeed");
+
+        let prompt = captured.lock().unwrap().clone();
+        assert!(!prompt.contains("### Recalled Facts"));
+        assert!(!prompt.contains("### Recalled Related Nodes"));
+    }
+
+    /// Recalled facts duplicating a graph-derived relationship line are deduped out.
+    #[test]
+    fn test_format_recalled_facts_dedups_existing() {
+        let mut existing = std::collections::HashSet::new();
+        existing.insert("Jane --[Founded]--> (Acme)".to_string());
+        let recalled = RecalledEntityFacts {
+            facts: vec![
+                "Jane --[Founded]--> (Acme)".to_string(), // duplicate → dropped
+                "Jane lives in Paris".to_string(),        // new → kept
+            ],
+            node_summaries: vec![],
+        };
+        let out = PersonaGenerator::format_recalled_facts(&recalled, &existing);
+        assert!(out.contains("Jane lives in Paris"));
+        // The duplicate fact must NOT be re-listed under Recalled Facts.
+        assert!(!out.contains("- Jane --[Founded]--> (Acme)"));
+    }
+
+    /// Empty recall → empty enrichment string.
+    #[test]
+    fn test_format_recalled_facts_empty_is_empty() {
+        let out = PersonaGenerator::format_recalled_facts(
+            &RecalledEntityFacts::default(),
+            &std::collections::HashSet::new(),
+        );
+        assert!(out.is_empty());
+    }
+
+    // ===== TASK-SIM-6 #7: persona path truncation retry =====
+
+    /// An LLM whose FIRST chat_with_meta call returns truncated JSON (finish_reason=="length")
+    /// and whose SECOND returns clean JSON — proving the truncation triggers a retry.
+    struct TruncateThenOk {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait]
+    impl LlmClient for TruncateThenOk {
+        async fn complete(&self, _: &str) -> Result<String> {
+            Err(TeriError::Llm("unused".into()))
+        }
+        async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+            Err(TeriError::Llm("unused".into()))
+        }
+        async fn stream(
+            &self,
+            _: &str,
+        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            Err(TeriError::Llm("unused".into()))
+        }
+        async fn chat(
+            &self,
+            _: &[crate::llm::ChatMessage],
+            _: &crate::llm::ChatOptions,
+        ) -> Result<String> {
+            Ok("{}".to_string())
+        }
+        async fn chat_with_meta(
+            &self,
+            _: &[crate::llm::ChatMessage],
+            _: &crate::llm::ChatOptions,
+        ) -> Result<crate::llm::ChatCompletion> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                // Truncated AND unrepairable garbage so the attempt is discarded (forces retry).
+                Ok(crate::llm::ChatCompletion {
+                    content: "not json at all <<<".to_string(),
+                    finish_reason: Some("length".to_string()),
+                })
+            } else {
+                Ok(crate::llm::ChatCompletion {
+                    content: r#"{"bio":"clean bio","persona":"clean persona"}"#.to_string(),
+                    finish_reason: Some("stop".to_string()),
+                })
+            }
+        }
+        async fn chat_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _: &[crate::llm::ChatMessage],
+            _: &crate::llm::ChatOptions,
+        ) -> Result<T> {
+            Err(TeriError::Llm("unused".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_social_retries_on_truncation() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let llm = TruncateThenOk { calls: calls.clone() };
+        let generator = PersonaGenerator::new();
+
+        let sp = generator
+            .generate_social("Jane", "person", "x", Platform::Reddit, &llm, None)
+            .await
+            .expect("generate_social must succeed");
+
+        // The truncated first attempt was retried; the second (clean) attempt won.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(sp.bio, "clean bio");
+        assert_eq!(sp.persona, "clean persona");
+    }
+
+    /// A truncated-but-repairable response is salvaged in-place (no retry needed).
+    struct TruncatedButRepairable {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait]
+    impl LlmClient for TruncatedButRepairable {
+        async fn complete(&self, _: &str) -> Result<String> {
+            Err(TeriError::Llm("unused".into()))
+        }
+        async fn complete_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<T> {
+            Err(TeriError::Llm("unused".into()))
+        }
+        async fn stream(
+            &self,
+            _: &str,
+        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            Err(TeriError::Llm("unused".into()))
+        }
+        async fn chat(
+            &self,
+            _: &[crate::llm::ChatMessage],
+            _: &crate::llm::ChatOptions,
+        ) -> Result<String> {
+            Ok("{}".to_string())
+        }
+        async fn chat_with_meta(
+            &self,
+            _: &[crate::llm::ChatMessage],
+            _: &crate::llm::ChatOptions,
+        ) -> Result<crate::llm::ChatCompletion> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Missing the closing brace — fix_truncated_json closes it.
+            Ok(crate::llm::ChatCompletion {
+                content: r#"{"bio":"b","persona":"p""#.to_string(),
+                finish_reason: Some("length".to_string()),
+            })
+        }
+        async fn chat_json<T: serde::de::DeserializeOwned>(
+            &self,
+            _: &[crate::llm::ChatMessage],
+            _: &crate::llm::ChatOptions,
+        ) -> Result<T> {
+            Err(TeriError::Llm("unused".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_social_salvages_repairable_truncation_without_retry() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let llm = TruncatedButRepairable { calls: calls.clone() };
+        let generator = PersonaGenerator::new();
+
+        let sp = generator
+            .generate_social("Jane", "person", "x", Platform::Reddit, &llm, None)
+            .await
+            .expect("generate_social must succeed");
+
+        // Repaired on the FIRST attempt — no retry.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(sp.bio, "b");
+        assert_eq!(sp.persona, "p");
     }
 }

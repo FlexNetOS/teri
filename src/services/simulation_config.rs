@@ -1225,7 +1225,11 @@ impl<L: LlmClient> SimulationConfigGenerator<L> {
         for attempt in 0..max_attempts {
             let temperature = 0.7 - (attempt as f32 * 0.1);
             let messages = [ChatMessage::system(system_prompt), ChatMessage::user(prompt)];
-            let opts = ChatOptions { temperature: Some(temperature), max_tokens: None };
+            let opts = ChatOptions {
+                temperature: Some(temperature),
+                max_tokens: None,
+                response_format: None,
+            };
 
             match self.client.chat(&messages, &opts).await {
                 Ok(raw) => {

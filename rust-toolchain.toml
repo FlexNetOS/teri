@@ -1,3 +1,17 @@
 [toolchain]
-channel = "1.94.1"
+# Floating nightly — the single resolved toolchain for teri (owner standing rule:
+# "for Rust ALWAYS nightly"). cuda-oxide *requires* nightly, so nightly is mandatory,
+# not a choice weighed against stable. No date-pin (always-latest, refreshed on the
+# meta cadence) and no stable fallback toolchain kept alongside it.
+channel = "nightly"
 edition = "2024"
+# Only always-available components are HARD requirements here: a component listed in
+# rust-toolchain.toml that a given floating nightly didn't build is a fatal rustup error,
+# so pinning a sometimes-missing component would randomly break every `cargo` call (and CI)
+# on the days it's absent. rustfmt + clippy ship with every nightly.
+components = ["rustfmt", "clippy"]
+# rustc-codegen-gcc is an optional codegen *backend* on this one nightly toolchain (perf
+# builds) — NOT a second toolchain, and deliberately not pinned above (it isn't built for
+# every nightly). LLVM stays the default codegen so cargo/CI stay portable. Enable a perf
+# build on demand: `rustup component add rustc-codegen-gcc` then
+# `RUSTFLAGS="-Zcodegen-backend=gcc" cargo build --release`. See RUNBOOK.md §Toolchain.

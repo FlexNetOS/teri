@@ -18,6 +18,7 @@ skip = [
 ]
 
 [licenses]
-# We're using MIT license
-allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "Unicode-DFS-2016", "Unicode-3.0", "MPL-2.0", "ISC", "CC0-1.0"]
+# teri itself is AGPL-3.0-or-later (copyleft / reciprocity — see LICENSE); its dependencies are the
+# usual permissive set. teri's own license must be in this allow-list too or the check rejects it.
+allow = ["AGPL-3.0-or-later", "MIT", "Apache-2.0", "BSD-3-Clause", "Unicode-DFS-2016", "Unicode-3.0", "MPL-2.0", "ISC", "CC0-1.0"]
 confidence-threshold = 0.8

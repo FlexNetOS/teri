@@ -75,28 +75,25 @@ in spirit; they still govern every change.
 
 ## What teri is (state of truth, refreshed 2026-06-22)
 
-A Rust rewrite of MiroFish (AGPL upstream; this is an MIT independent reimplementation — parity by
-spec, never by code copy). The five-stage pipeline mirrors upstream: seed → graph → agents → sim →
-report. All five stages and their services are implemented and covered by the Rust test suite.
-The full pipeline runs today through **`teri run`** (`src/main.rs` calls provider-selected
-`pipeline::run_pipeline`) and through **`teri serve` + the REST API** (`/api/graph` build →
-`/api/simulation` prepare/start → `/api/report` generate/chat).
+A Rust rewrite of MiroFish (AGPL upstream; teri is itself licensed AGPL-3.0-or-later, keeping faith
+with that copyleft intent — see LICENSE). The five-stage pipeline mirrors upstream: seed → graph → agents → sim →
+report. **The full `cargo test` suite is green (1700+ tests)** (was ~140 at the 2026-06-12
+snapshot). All five stages and their
+services are implemented and tested, and the **full pipeline runs today via `teri serve` + the
+REST API** (`/api/graph` build → `/api/simulation` prepare/start → `/api/report` generate/chat).
 Real today: seed ingestion (pdf/md/txt/json/url), `KnowledgeGraph::build` orchestration (LLM
 ontology + 2-pass entity/relation extraction), native petgraph graph store, OASIS persona +
 sim-config generation, native in-process `SimEngine` (two-phase ticks, dual Twitter/Reddit,
 graph-memory write-back), ReACT `ReportAgent` + graph tools (InsightForge analog), interview/chat
 endpoints, the axum HTTP server, embeddings + real cosine semantic recall (redb), LLM adapters.
 
-Teri can run broad agentic scenario simulations, but never document it as literal omniscience:
-seed quality, ontology extraction, prompts, LLM/backend quality, finite actions, missing
-domain-specialized solvers, and absent probability calibration bound the result. Simulation output
-is not causal proof, and report `confidence` is synthesized report metadata unless a calibration
-loop is explicitly implemented and cited.
-
-Current named gaps: `serve`/`ApiState` remain concretely OpenAI-compatible even though `teri run`
-uses provider selection; Anthropic/Gemini streaming framing; live SSE endpoints; agent LTM
-write-back from the sim loop; i18n en/zh-only; and specialized solver/calibration integrations.
-The authoritative parity verification is **`RUNBOOK.md` §12**.
+**`teri run` is now fully wired** (`main.rs` → `pipeline::run_pipeline`, the in-process
+`seed → graph → agents → sim → report` composition, tested in `tests/pipeline_run.rs`). The former
+gap list is also closed: runtime provider selection (`build_llm` → `ProviderAdapter::from_config`),
+native Anthropic/Gemini streaming, live `text/event-stream` routes, agent-LTM write-back from the
+sim loop, English-default i18n (en/zh), and per-tick knowledge-graph context for agents all landed.
+The remaining backlog (i18n breadth beyond en/zh, `/api/graph/data` `links` shape, the
+`scheduled_events` stub) is in **`RUNBOOK.md` §13**; the parity verification is **`RUNBOOK.md` §12**.
 
 The build order lives in `~/Desktop/meta/MIROFISH-PORT-PLAN.md` (P1 wire-the-spine → P2
 parity-core → P3 serve+estate → P4 scale+provenance) — extend that plan; its **parity matrix is

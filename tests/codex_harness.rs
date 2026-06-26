@@ -127,7 +127,7 @@ fn truth_hook_emits_valid_session_context_for_current_repo() {
         "cannot literally simulate or predict anything",
         "not a calibrated probability",
         "Source truth: teri run is wired",
-        "serve/API still builds an OpenAiAdapter-backed ApiState",
+        "serve/API builds a provider-polymorphic ApiState (SimulationRunner<ProviderAdapter>); run uses provider selection via build_provider_llm.",
         "No known stale teri-run/provider/test-count phrases found",
     ] {
         assert!(context.contains(phrase), "missing hook context phrase: {phrase}");

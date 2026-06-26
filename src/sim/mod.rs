@@ -127,12 +127,17 @@ impl SocialAction {
         }
     }
 
-    /// `action_args` object for the `actions.jsonl` record — teri's native representation,
-    /// keyed exactly as `Agent::parse_social_action` parses them (so a record round-trips
-    /// through teri's own action parser). teri has no OASIS `trace` DB, so the DB-fetched
-    /// enrichment keys (`post_content`, `author_name`, `quote_content`, …,
-    /// `run_parallel_simulation.py:_enrich_action_context`) are `[≠]U028-OASIS-INTERNALS`;
-    /// the structural fields below ARE emitted faithfully.
+    /// Structural `action_args` object for the `actions.jsonl` record — teri's native
+    /// representation, keyed exactly as `Agent::parse_social_action` parses them (so a record
+    /// round-trips through teri's own action parser). This is the no-world path: callers that have
+    /// no `SocialWorld` (e.g. unit tests, the round-0 seed) emit exactly these structural fields.
+    ///
+    /// The richer keys (`post_content`, `author_name`, `comment_content`, `quote_content`,
+    /// `target_user_name`) that `run_parallel_simulation.py:_enrich_action_context` resolves out of
+    /// the OASIS `post`/`comment`/`user` tables are added by [`SocialAction::oasis_action_args_enriched`],
+    /// which resolves them from teri's [`crate::sim::social_world::SocialWorld`] (teri DOES hold the
+    /// post/comment/user graph — see `social_world.rs` — so the enrichment is real, not a DB
+    /// internal we lack).
     pub fn oasis_action_args(&self) -> serde_json::Value {
         match self {
             SocialAction::CreatePost { content } => serde_json::json!({ "content": content }),
@@ -153,6 +158,86 @@ impl SocialAction {
             SocialAction::Mute { user_id } => serde_json::json!({ "user_id": user_id }),
             SocialAction::Trend | SocialAction::DoNothing => serde_json::json!({}),
         }
+    }
+
+    /// Enriched `action_args`: the structural fields from [`SocialAction::oasis_action_args`] PLUS
+    /// the context fields `run_parallel_simulation.py:_enrich_action_context` resolves out of the
+    /// social tables, looked up from `world`:
+    /// - actions targeting a post (`Like`/`Dislike` on a post, `Repost`, `Quote`, `Comment`):
+    ///   `post_content` + `author_name` of the targeted post (author resolved via the user
+    ///   registry).
+    /// - actions targeting a comment (`Like`/`Dislike` on a comment): `comment_content`.
+    /// - `Quote`: `quote_content` (the quote's own text — already present as `content`, mirrored
+    ///   under the dedicated key MiroFish writes).
+    /// - `Follow`/`Mute`: `target_user_name` of the targeted user (resolved via the registry when
+    ///   the arg is a numeric id; otherwise the raw handle the agent emitted).
+    ///
+    /// Fail-soft like MiroFish: an unresolved post/comment/user simply omits the key it could not
+    /// resolve (MiroFish's `_get_post_info`/`_get_user_name` return `None`/`''` and skip the
+    /// assignment). The structural keys are always identical to [`SocialAction::oasis_action_args`].
+    pub fn oasis_action_args_enriched(
+        &self,
+        world: &crate::sim::social_world::SocialWorld,
+    ) -> serde_json::Value {
+        use crate::sim::social_world::parse_target_id;
+        let mut args = self.oasis_action_args();
+        let obj = match args.as_object_mut() {
+            Some(obj) => obj,
+            None => return args, // {} for Trend/DoNothing — nothing to enrich.
+        };
+
+        // Resolve a post's content + author display name into the arg object (no-op if unresolved).
+        let enrich_post = |obj: &mut serde_json::Map<String, serde_json::Value>, raw: &str| {
+            if let Some(post) = parse_target_id(raw).and_then(|id| world.post_by_id(id)) {
+                obj.insert("post_content".into(), post.content.clone().into());
+                if let Some(name) = world.user_name(post.author_user_id) {
+                    obj.insert("author_name".into(), name.to_string().into());
+                }
+            }
+        };
+        // Resolve the target user's display name into `target_user_name`. A numeric arg is looked
+        // up in the registry; a non-numeric arg IS the handle the agent emitted, so it is used
+        // directly (MiroFish keeps the raw handle when it cannot resolve a numeric id).
+        let enrich_user = |obj: &mut serde_json::Map<String, serde_json::Value>, raw: &str| {
+            let name = parse_target_id(raw)
+                .and_then(|id| world.user_name(id).map(str::to_string))
+                .unwrap_or_else(|| raw.to_string());
+            if !name.is_empty() {
+                obj.insert("target_user_name".into(), name.into());
+            }
+        };
+
+        match self {
+            SocialAction::Like { target_kind: TargetKind::Post, target_id }
+            | SocialAction::Dislike { target_kind: TargetKind::Post, target_id } => {
+                enrich_post(obj, target_id);
+            }
+            SocialAction::Like { target_kind: TargetKind::Comment, target_id }
+            | SocialAction::Dislike { target_kind: TargetKind::Comment, target_id } => {
+                if let Some(comment) =
+                    parse_target_id(target_id).and_then(|id| world.comment_by_id(id))
+                {
+                    obj.insert("comment_content".into(), comment.content.clone().into());
+                }
+            }
+            SocialAction::Repost { post_id } | SocialAction::Comment { post_id, .. } => {
+                enrich_post(obj, post_id);
+            }
+            SocialAction::Quote { post_id, content } => {
+                enrich_post(obj, post_id);
+                obj.insert("quote_content".into(), content.clone().into());
+            }
+            SocialAction::Follow { user_id } | SocialAction::Mute { user_id } => {
+                enrich_user(obj, user_id);
+            }
+            // No targeted entity: structural args only.
+            SocialAction::CreatePost { .. }
+            | SocialAction::SearchPosts { .. }
+            | SocialAction::SearchUser { .. }
+            | SocialAction::Trend
+            | SocialAction::DoNothing => {}
+        }
+        args
     }
 }
 
@@ -854,6 +939,19 @@ impl SimEngine {
         self.completion_tx.subscribe()
     }
 
+    /// Fire the terminal completion signal on an **aborted** run (engine error).
+    ///
+    /// The normal completion send lives at the success tail of `run_with_boost` and is skipped
+    /// when the run returns `Err` (a per-round log write / `flush_final` / extraction failure).
+    /// Without a signal the monitor — whose only loop-exit is the completion watch — polls forever
+    /// and the run is stuck `Running`. The runner calls this on the engine's error path so the
+    /// monitor unblocks, runs its cleanup, and (seeing no `simulation_end` record) marks the run
+    /// `Failed`. `total_ticks` is the snapshots committed so far (best-effort; the run is partial).
+    pub fn signal_aborted(&self) {
+        let total_ticks = self.snapshot_history.lock().len() as u32;
+        let _ = self.completion_tx.send(Some(SimCompletion { total_ticks }));
+    }
+
     pub async fn run<L: crate::llm::LlmClient>(
         &self,
         pool: &mut crate::agent::AgentPool,
@@ -874,10 +972,11 @@ impl SimEngine {
     pub async fn run_with_boost<L: crate::llm::LlmClient>(
         &self,
         pool: &mut crate::agent::AgentPool,
-        // TODO(graph-context): pass per-agent subgraph slices once Agent::prepare_action
-        // accepts a graph reference. Tracked: _graph param intentionally kept so callers
-        // do not need an API change when the feature lands.
-        _graph: &crate::graph::KnowledgeGraph,
+        // Each agent's `prepare_action` reads this read-only graph to build per-tick "Knowledge
+        // Graph Context" from its source entity's neighborhood (an agent without a source entity
+        // simply gets no graph section). `&KnowledgeGraph` is `Sync`, shared across the parallel
+        // Phase-1 reads.
+        graph: &crate::graph::KnowledgeGraph,
         llm: &L,
         boost_llm: Option<&L>,
     ) -> crate::error::Result<SimulationResult> {
@@ -979,6 +1078,9 @@ impl SimEngine {
                         if let Some(social) = &self.social {
                             let mut set = social.lock();
                             if let Some(world) = set.world_mut(platform) {
+                                // Register the poster's name so a round-1 LIKE/COMMENT against this
+                                // seed post resolves `author_name` (TASK-SIM-2 enrichment).
+                                world.register_user(poster_id, &agent.persona.name);
                                 world.create_post(poster_id, content, &python_isoformat_local());
                             }
                         }
@@ -1115,7 +1217,7 @@ impl SimEngine {
                         let agent_platform =
                             pool.agents[idx].persona.social.as_ref().map(|s| s.platform);
                         let feed = feed_for(agent_platform);
-                        Box::pin(pool.agents[idx].prepare_action(&world, feed, client))
+                        Box::pin(pool.agents[idx].prepare_action(&world, feed, Some(graph), client))
                             as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send + '_>>
                     })
                     .collect();
@@ -1155,7 +1257,18 @@ impl SimEngine {
                         .and_then(|s| producer.loggers.get(s.platform).map(|l| (s.platform, l)))
                     {
                         let agent_id = social.map(|s| s.user_id as i64).unwrap_or(0);
-                        let args = sa.oasis_action_args();
+                        // Enriched args (post_content/author_name/comment_content/quote_content/
+                        // target_user_name) when this platform's social world is installed — it
+                        // holds the post/comment/user graph the enrichment resolves against
+                        // (TASK-SIM-2). Falls back to structural-only when no world is present, so
+                        // the no-world record is byte-identical to before.
+                        let args = match &self.social {
+                            Some(set) => match set.lock().world(platform) {
+                                Some(world) => sa.oasis_action_args_enriched(world),
+                                None => sa.oasis_action_args(),
+                            },
+                            None => sa.oasis_action_args(),
+                        };
                         logger
                             .log_action(
                                 round,
@@ -1182,6 +1295,9 @@ impl SimEngine {
                     let created_at = python_isoformat_local();
                     let mut set = social.lock();
                     if let Some(world) = set.world_mut(profile.platform) {
+                        // Register the actor's display name so a LATER action targeting this
+                        // agent's post resolves `author_name` (TASK-SIM-2 enrichment).
+                        world.register_user(profile.user_id as i64, &pool.agents[idx].persona.name);
                         world.apply(profile.user_id as i64, sa, &created_at);
                     }
                 }
@@ -1263,6 +1379,137 @@ impl SimEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::social_world::SocialWorld;
+
+    // --- TASK-SIM-2 #2: enriched action_args ---
+
+    /// A world seeded with one post (id 1, author 7 "Alice") + one comment (id 1, author 8 "Bob").
+    fn enriched_world() -> SocialWorld {
+        let mut w = SocialWorld::new(crate::agent::Platform::Reddit);
+        w.register_user(7, "Alice");
+        w.register_user(8, "Bob");
+        let pid = w.create_post(7, "the original post", "2025-12-01T10:00:00");
+        assert_eq!(pid, 1);
+        let cid = w.apply(
+            8,
+            &SocialAction::Comment { post_id: "1".into(), content: "a comment".into() },
+            "2025-12-01T10:01:00",
+        );
+        assert_eq!(cid, crate::sim::social_world::ApplyOutcome::CreatedComment(1));
+        w
+    }
+
+    #[test]
+    fn test_enriched_args_like_post_resolves_content_and_author() {
+        let w = enriched_world();
+        let sa = SocialAction::Like { target_kind: TargetKind::Post, target_id: "post-1".into() };
+        let args = sa.oasis_action_args_enriched(&w);
+        assert_eq!(args["target_id"], "post-1"); // structural field preserved
+        assert_eq!(args["post_content"], "the original post");
+        assert_eq!(args["author_name"], "Alice");
+    }
+
+    #[test]
+    fn test_enriched_args_like_comment_resolves_comment_content() {
+        let w = enriched_world();
+        let sa = SocialAction::Like { target_kind: TargetKind::Comment, target_id: "1".into() };
+        let args = sa.oasis_action_args_enriched(&w);
+        assert_eq!(args["comment_content"], "a comment");
+        // A comment target has no post_content / author_name keys.
+        assert!(args.get("post_content").is_none());
+    }
+
+    #[test]
+    fn test_enriched_args_comment_resolves_target_post() {
+        let w = enriched_world();
+        let sa = SocialAction::Comment { post_id: "1".into(), content: "reply".into() };
+        let args = sa.oasis_action_args_enriched(&w);
+        assert_eq!(args["content"], "reply"); // structural
+        assert_eq!(args["post_content"], "the original post");
+        assert_eq!(args["author_name"], "Alice");
+    }
+
+    #[test]
+    fn test_enriched_args_quote_carries_quote_content_and_target() {
+        let w = enriched_world();
+        let sa = SocialAction::Quote { post_id: "1".into(), content: "I agree!".into() };
+        let args = sa.oasis_action_args_enriched(&w);
+        assert_eq!(args["post_content"], "the original post");
+        assert_eq!(args["author_name"], "Alice");
+        assert_eq!(args["quote_content"], "I agree!");
+    }
+
+    #[test]
+    fn test_enriched_args_follow_resolves_target_user_name_by_id() {
+        let w = enriched_world();
+        // Numeric id 7 → registered name "Alice".
+        let sa = SocialAction::Follow { user_id: "7".into() };
+        let args = sa.oasis_action_args_enriched(&w);
+        assert_eq!(args["target_user_name"], "Alice");
+    }
+
+    #[test]
+    fn test_enriched_args_follow_keeps_raw_handle_when_not_numeric() {
+        let w = enriched_world();
+        // A non-numeric handle is kept verbatim (MiroFish keeps the raw target when unresolved).
+        let sa = SocialAction::Follow { user_id: "charlie".into() };
+        let args = sa.oasis_action_args_enriched(&w);
+        assert_eq!(args["target_user_name"], "charlie");
+    }
+
+    #[test]
+    fn test_enriched_args_unresolved_post_omits_enrichment_keys() {
+        let w = enriched_world();
+        // Hallucinated post id 999 — fail-soft: no post_content / author_name added.
+        let sa = SocialAction::Like { target_kind: TargetKind::Post, target_id: "999".into() };
+        let args = sa.oasis_action_args_enriched(&w);
+        assert_eq!(args["target_id"], "999");
+        assert!(args.get("post_content").is_none());
+        assert!(args.get("author_name").is_none());
+    }
+
+    #[test]
+    fn test_enriched_author_name_omitted_when_user_unregistered() {
+        // Post by an author with no registered name — content resolves, author_name is omitted
+        // (mirrors MiroFish's empty-author fallback skipping the assignment).
+        let mut w = SocialWorld::new(crate::agent::Platform::Reddit);
+        w.create_post(42, "anon post", "2025-12-01T10:00:00");
+        let sa = SocialAction::Like { target_kind: TargetKind::Post, target_id: "1".into() };
+        let args = sa.oasis_action_args_enriched(&w);
+        assert_eq!(args["post_content"], "anon post");
+        assert!(args.get("author_name").is_none());
+    }
+
+    #[test]
+    fn test_structural_args_unchanged_no_world_path() {
+        // The no-world structural path must be byte-identical to before (no-downgrade): every
+        // variant emits exactly its structural keys and nothing more.
+        assert_eq!(
+            SocialAction::Like { target_kind: TargetKind::Post, target_id: "1".into() }
+                .oasis_action_args(),
+            serde_json::json!({ "target_id": "1" })
+        );
+        assert_eq!(
+            SocialAction::Comment { post_id: "1".into(), content: "hi".into() }.oasis_action_args(),
+            serde_json::json!({ "post_id": "1", "content": "hi" })
+        );
+        assert_eq!(
+            SocialAction::Quote { post_id: "1".into(), content: "q".into() }.oasis_action_args(),
+            serde_json::json!({ "post_id": "1", "content": "q" })
+        );
+        assert_eq!(
+            SocialAction::Follow { user_id: "7".into() }.oasis_action_args(),
+            serde_json::json!({ "user_id": "7" })
+        );
+        assert_eq!(SocialAction::Trend.oasis_action_args(), serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_enriched_trend_donothing_stay_empty() {
+        let w = enriched_world();
+        assert_eq!(SocialAction::Trend.oasis_action_args_enriched(&w), serde_json::json!({}));
+        assert_eq!(SocialAction::DoNothing.oasis_action_args_enriched(&w), serde_json::json!({}));
+    }
 
     #[test]
     fn test_world_state_creation() {

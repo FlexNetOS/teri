@@ -33,6 +33,13 @@ World State:
 {% endfor %}
 {% endif %}
 
+{% if graph_context %}
+Knowledge Graph Context (what the world's knowledge graph says about the entity you represent — use it to stay in character and reason about your relationships):
+{% for rel in graph_context %}
+- {{ rel }}
+{% endfor %}
+{% endif %}
+
 ## Available Actions
 {% if is_social %}
 You are an active user on the **{{ platform }}** social network. Choose ONE action that this
