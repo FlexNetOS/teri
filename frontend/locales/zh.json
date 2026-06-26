@@ -91,7 +91,18 @@
     "promptPlaceholder": "// 用自然语言输入模拟或预测需求（例.武大若发布撤销肖某处分的公告，会引发什么舆情走向）",
     "engineBadge": "引擎: Teri-V1.0",
     "startEngine": "启动引擎",
-    "initializing": "初始化中..."
+    "initializing": "初始化中...",
+    "templatesLabel": ">_ 00 / 模板",
+    "templatePlaceholder": "加载已保存的模板…",
+    "saveTemplate": "+ 保存当前…",
+    "templateNamePlaceholder": "模板名称",
+    "save": "保存",
+    "cancel": "取消",
+    "templateSaved": "已保存模板 \"{name}\"",
+    "templateLoaded": "已加载 \"{name}\" — {count} 个种子文件",
+    "templateNeedsPromptSeed": "保存前请先填写提示词并上传至少一个种子文件",
+    "templateSaveError": "无法保存模板",
+    "templateLoadError": "无法加载模板"
   },
   "main": {
     "layoutGraph": "图谱",
