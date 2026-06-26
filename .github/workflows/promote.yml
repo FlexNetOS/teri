@@ -1,16 +1,23 @@
 name: Promote develop → main
 
-# Promotes the green develop tip to main. The pipeline everywhere else is
-# push → PR → self-merge on green; main is the released line, so promotion is
-# deliberate: trigger it by hand (workflow_dispatch) or let the weekly schedule
-# fast-forward main once develop is verified. develop is the integration branch
-# and is always a strict ancestor-or-ahead of main, so the promotion is a
-# fast-forward — never a divergent merge.
+# Auto-resync: keeps main in sync with develop with ZERO manual steps.
+# Fires on every push to develop (i.e. every merge into the gated integration branch); this
+# workflow re-verifies the develop tip and fast-forwards main to it. Also runnable by hand
+# (workflow_dispatch) and on a weekly safety-net schedule.
+#
+# Branch model (confirmed by branch protection): develop is the GATED integration branch
+# (required status checks); main is the released line (unprotected promotion target). Work lands
+# on develop via PR → CI gates it → this workflow promotes it to main. develop is always a strict
+# ancestor-or-ahead of main, so promotion is a fast-forward — never a divergent merge. The
+# `--ff-only` guard below is the safety valve: if develop ever diverges, promotion refuses rather
+# than papering over it. No PAT needed (main is unprotected; GITHUB_TOKEN + contents:write pushes).
 
 on:
+  push:
+    branches: [develop]
   workflow_dispatch:
   schedule:
-    # Weekly promotion window (Mondays 07:00 UTC) — only acts if develop is ahead AND verifies clean.
+    # Weekly safety-net (Mondays 07:00 UTC) — only acts if develop is ahead AND verifies clean.
     - cron: "0 7 * * 1"
 
 concurrency:

@@ -66,9 +66,14 @@ in spirit; they still govern every change.
 
 ## How work lands here (meta workspace discipline)
 
-- Fresh git worktree per change (`git worktree add .worktrees/<slug> -b <slug> origin/main`);
+- Fresh git worktree per change (`git worktree add .worktrees/<slug> -b <slug> origin/develop`);
   never on the shared checkout (another session may hold it).
-- One vertical slice per PR; PRs to `main` with auto-merge on green checks. Never merge red.
+- One vertical slice per PR; **PRs target `develop`** — the gated integration branch (branch
+  protection: required status checks). Auto-merge on green; never merge red. **`main` is the
+  released line and tracks develop automatically**: every green push to develop fast-forwards
+  main via `.github/workflows/promote.yml` (the auto-resync). main is unprotected *by design* —
+  it is a promotion target, never a direct PR target. This keeps main and develop permanently in
+  sync with zero manual steps; do not hand-sync them.
 - Witness milestones in the handoff kernel (`/checkpoint`) and use `/handoff` to close segments —
   hand-written handoff markdown at repo root is guard-denied workspace-wide (ADR-0004).
 - Full unfiltered test summaries in PR bodies (`cargo test` count, failures verbatim).
