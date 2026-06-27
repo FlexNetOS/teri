@@ -168,6 +168,51 @@ fn parse_valid_at_from_json(item: &Value) -> Option<(u64, Option<u64>)> {
     None
 }
 
+fn parse_llm_json_array_value(raw: &str) -> std::result::Result<Value, serde_json::Error> {
+    let normalized = normalize_llm_json_array(raw);
+    serde_json::from_str(&normalized)
+}
+
+fn normalize_llm_json_array(raw: &str) -> String {
+    let stripped = crate::llm::strip_json_fence(&crate::llm::strip_think(raw));
+    let trimmed = stripped.trim();
+
+    let candidate = if let Some(start) = trimmed.find('[') {
+        let tail = &trimmed[start..];
+        if let Some(end) = tail.rfind(']') { &tail[..=end] } else { tail }
+    } else {
+        trimmed
+    };
+
+    repair_truncated_json(candidate)
+}
+
+fn repair_truncated_json(content: &str) -> String {
+    let mut content = content.trim().trim_end_matches(',').to_string();
+    if content.is_empty() {
+        return content;
+    }
+
+    let last = content.chars().last().unwrap();
+    if last != '"' && last != ',' && last != '}' && last != ']' {
+        content.push('"');
+    }
+
+    let open_braces = content.chars().filter(|&c| c == '{').count() as isize
+        - content.chars().filter(|&c| c == '}').count() as isize;
+    let open_brackets = content.chars().filter(|&c| c == '[').count() as isize
+        - content.chars().filter(|&c| c == ']').count() as isize;
+
+    for _ in 0..open_braces.max(0) {
+        content.push('}');
+    }
+    for _ in 0..open_brackets.max(0) {
+        content.push(']');
+    }
+
+    content
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerializableKnowledgeGraph {
     entities: Vec<Entity>,
@@ -702,7 +747,7 @@ impl KnowledgeGraph {
             let relation_json = llm.complete(&relation_prompt).await?;
 
             // Parse relations; skip any referencing an unknown entity name.
-            let value: Value = serde_json::from_str(&relation_json)
+            let value = parse_llm_json_array_value(&relation_json)
                 .map_err(|e| TeriError::Graph(format!("Invalid relation JSON from LLM: {e}")))?;
 
             if let Some(arr) = value.as_array() {
@@ -1088,7 +1133,7 @@ Document text:
         json: &str,
         custom_kinds: &[String],
     ) -> Result<Vec<Entity>> {
-        let value: Value = serde_json::from_str(json)
+        let value = parse_llm_json_array_value(json)
             .map_err(|e| TeriError::Graph(format!("Invalid entity JSON: {e}")))?;
 
         let arr = value
@@ -1137,7 +1182,7 @@ Document text:
         json: &str,
         index: &HashMap<String, NodeIndex>,
     ) -> Result<Vec<(NodeIndex, NodeIndex, Relation)>> {
-        let value: Value = serde_json::from_str(json)
+        let value = parse_llm_json_array_value(json)
             .map_err(|e| TeriError::Graph(format!("Invalid relation JSON: {e}")))?;
 
         let arr = value
@@ -1597,6 +1642,20 @@ mod tests {
         assert_eq!(entities.len(), 2);
         assert_eq!(entities[0].name, "Alice");
         assert_eq!(entities[1].kind, EntityKind::Organization);
+    }
+
+    #[test]
+    fn test_parse_entities_json_accepts_fenced_prefaced_array() {
+        let json = r#"Here is the extracted JSON:
+```json
+[
+  {"name": "Alice", "kind": "Person"}
+]
+```"#;
+
+        let entities = KnowledgeGraph::parse_entities_json(json).expect("parse entities");
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].name, "Alice");
     }
 
     #[test]

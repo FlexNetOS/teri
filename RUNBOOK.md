@@ -147,6 +147,11 @@ a command needs them. Defaults below are the **actual code defaults** on `main`.
 | `EMBED_MODEL` | `all-MiniLM-L6-v2` (384-dim) | embedding model for semantic recall |
 | `LLM_MAX_RETRIES` | *(adapter default)* | retry budget for transient LLM errors |
 | `LLM_TIMEOUT_SECS` | `300` | per-request timeout; local inferrs CUDA ontology/report calls can exceed 30s |
+| `LLM_MAX_TOKENS` | `2048` | OpenAI-compatible generation cap/default; enough for ontology JSON while clamping 4096-token calls (`0` opts out) |
+| `LLM_MAX_CONCURRENT_REQUESTS` | `1` for local inferrs, otherwise unset | In-flight OpenAI-compatible request cap; prevents local CUDA queue timeouts |
+
+`teri run` intentionally uses a concise one-section report budget so the foreground CLI can finish
+against local inferrs CUDA; use the REST/report studio path for the richer multi-section analyst report.
 
 ### Graph backend
 | Variable | Default | Purpose |

@@ -948,6 +948,10 @@ pub struct ReportAgent {
     /// `Drop` on `ReportConsoleLogger` calls `close()` as a safety net; `generate_report`
     /// also calls it explicitly for faithful Python ordering.
     pub console_logger: Option<console_logger::ReportConsoleLogger>,
+    section_limit: Option<usize>,
+    section_max_iterations: usize,
+    section_min_tool_calls: usize,
+    section_max_tokens: u32,
 }
 
 impl ReportAgent {
@@ -963,6 +967,10 @@ impl ReportAgent {
             simulation_requirement: String::new(),
             report_logger: None,
             console_logger: None,
+            section_limit: None,
+            section_max_iterations: 5,
+            section_min_tool_calls: 3,
+            section_max_tokens: 4096,
         }
     }
 
@@ -992,7 +1000,24 @@ impl ReportAgent {
             simulation_requirement,
             report_logger: None,
             console_logger: None,
+            section_limit: None,
+            section_max_iterations: 5,
+            section_min_tool_calls: 3,
+            section_max_tokens: 4096,
         }
+    }
+
+    /// Bound the ReACT report workload for `teri run`'s synchronous CLI health gate.
+    ///
+    /// The REST/report studio path keeps the rich multi-section defaults. The CLI path needs a
+    /// complete verdict in one foreground process against a local single-lane CUDA backend, so it
+    /// generates a concise first-section report with fewer ReACT turns and smaller completions.
+    pub fn with_cli_report_budget(mut self) -> Self {
+        self.section_limit = Some(1);
+        self.section_max_iterations = 2;
+        self.section_min_tool_calls = 1;
+        self.section_max_tokens = 1024;
+        self
     }
 
     // -----------------------------------------------------------------------
@@ -1335,8 +1360,8 @@ impl ReportAgent {
             vec![ChatMessage::system(system_prompt), ChatMessage::user(user_prompt)];
 
         // ── ReACT counters ───────────────────────────────────────────────────
-        let max_iterations: usize = 5;
-        let min_tool_calls: usize = 3;
+        let max_iterations: usize = self.section_max_iterations.max(1);
+        let min_tool_calls: usize = self.section_min_tool_calls.min(max_iterations);
         const MAX_TOOL_CALLS_PER_SECTION: usize = 5;
         let mut tool_calls_count: usize = 0;
         let mut conflict_retries: usize = 0;
@@ -1357,8 +1382,11 @@ impl ReportAgent {
         let report_context =
             format!("章节标题: {}\n模拟需求: {}", section.title, self.simulation_requirement);
 
-        let opts =
-            ChatOptions { temperature: Some(0.5), max_tokens: Some(4096), response_format: None };
+        let opts = ChatOptions {
+            temperature: Some(0.5),
+            max_tokens: Some(self.section_max_tokens.max(1)),
+            response_format: None,
+        };
 
         // ── Main ReACT loop ──────────────────────────────────────────────────
         for iteration in 0..max_iterations {
@@ -2113,6 +2141,12 @@ impl ReportAgent {
             // plan_outline takes &self (immutable). plan_outline only reads graph_id,
             // simulation_requirement, and report_logger, so the immutable reborrow is valid.
             let mut outline = self.plan_outline(tools, llm, Some(&plan_cb)).await;
+            if let Some(limit) = self.section_limit
+                && limit > 0
+                && outline.sections.len() > limit
+            {
+                outline.sections.truncate(limit);
+            }
             // Pre-loop assignment: outline has empty section content (matches Python
             // py:1615 reference semantics at this point, before the loop runs).
             // The intermediate save_report at manager.save_report(&report) below writes
@@ -3159,6 +3193,16 @@ mod tests {
         assert_eq!(agent.graph_id, "graph1");
         assert_eq!(agent.simulation_id, "sim1");
         assert_eq!(agent.simulation_requirement, "do something");
+    }
+
+    #[test]
+    fn test_cli_report_budget_bounds_sections_and_react_loop() {
+        let agent =
+            ReportAgent::new_react("graph1", "sim1", "do something").with_cli_report_budget();
+        assert_eq!(agent.section_limit, Some(1));
+        assert_eq!(agent.section_max_iterations, 2);
+        assert_eq!(agent.section_min_tool_calls, 1);
+        assert_eq!(agent.section_max_tokens, 1024);
     }
 
     #[test]

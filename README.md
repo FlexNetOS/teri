@@ -152,6 +152,8 @@ All configuration is via environment variables (no config files required):
 | `LLM_BASE_URL` | `http://127.0.0.1:11435/v1` | OpenAI-compatible LLM API endpoint |
 | `LLM_API_KEY` | *(optional for keyless local)* | API key for hosted LLM backends |
 | `LLM_MODEL_NAME` / `LLM_MODEL` | `Qwen/Qwen3-4B` | Completion model (`LLM_MODEL_NAME` wins) |
+| `LLM_MAX_TOKENS` | `2048` | Generation cap/default for OpenAI-compatible calls; set `0` to use backend defaults |
+| `LLM_MAX_CONCURRENT_REQUESTS` | `1` for local inferrs, otherwise unset | In-flight OpenAI-compatible request cap; prevents local CUDA queue timeouts |
 | `EMBED_MODEL` | `all-MiniLM-L6-v2` | Embedding model |
 | `DEFAULT_AGENT_COUNT` | `100` | Default agents per simulation |
 | `SIM_MAX_TICKS` | `50` | Maximum ticks per run |

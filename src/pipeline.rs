@@ -366,7 +366,8 @@ where
         edges = graph_edge_count,
         "pipeline: generating report over post-simulation graph"
     );
-    let mut report_agent = crate::report::ReportAgent::new_react(&graph_id, &simulation_id, query);
+    let mut report_agent = crate::report::ReportAgent::new_react(&graph_id, &simulation_id, query)
+        .with_cli_report_budget();
     // Attach the search lens (same store the sim's agent-LTM write-back populated) so the report's
     // `recall_agent_discussion` tool can surface what the swarm actually said. The lens also
     // upgrades quick_search/panorama to semantic cosine where graph vectors exist (keyword
