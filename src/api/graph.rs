@@ -2480,6 +2480,36 @@ mod tests {
         (status, json)
     }
 
+    /// Helper: wait until a project JSON file is fully readable and reaches the expected status.
+    ///
+    /// The graph-build worker marks its task terminal separately from the `ProjectCompletion`
+    /// hook's filesystem write. Under CI parallelism, a test that reads immediately after the
+    /// task terminal can observe an in-progress JSON write and get EOF. Polling the actual
+    /// project state is the invariant the completion-hook tests are trying to prove.
+    async fn wait_for_project_status(
+        pm: &ProjectManager,
+        project_id: &str,
+        expected: PS,
+        label: &str,
+    ) -> crate::models::project::Project {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let last_seen = match pm.get_project(project_id) {
+                Ok(Some(project)) if project.status == expected => return project,
+                Ok(Some(project)) => format!("{:?}", project.status),
+                Ok(None) => "missing project".to_string(),
+                Err(err) => format!("read error: {err}"),
+            };
+
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "{label} timed out waiting for project {project_id} to reach {expected:?}; last seen {last_seen}"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     /// Helper: seed a project with extracted text + ontology so it is ready for /build.
     fn seed_project_ready_for_build(state: &Arc<ApiState>) -> String {
         let pm = ProjectManager::from_config(&state.config);
@@ -2926,10 +2956,16 @@ mod tests {
             }
         });
 
+        // After completion, project must be GraphCompleted with graph_id = task_id. Poll the
+        // project state too: TaskManager terminal status can lead the completion-hook file write.
+        let saved = rt.block_on(wait_for_project_status(
+            &pm,
+            &project_id,
+            PS::GraphCompleted,
+            "completion hook success",
+        ));
         rt.shutdown_background();
 
-        // After completion, project must be GraphCompleted with graph_id = task_id
-        let saved = pm.get_project(&project_id).expect("get ok").expect("found");
         assert_eq!(
             saved.status,
             PS::GraphCompleted,
@@ -3045,9 +3081,14 @@ mod tests {
             }
         });
 
+        let saved = rt.block_on(wait_for_project_status(
+            &pm,
+            &project_id,
+            PS::Failed,
+            "completion hook failure",
+        ));
         rt.shutdown_background();
 
-        let saved = pm.get_project(&project_id).expect("get ok").expect("found");
         assert_eq!(saved.status, PS::Failed, "hook must set status=Failed on LLM error: {saved:?}");
         let err = saved.error.as_deref().unwrap_or("");
         assert!(
