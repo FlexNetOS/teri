@@ -47,7 +47,7 @@ report is browsable and re-openable.
 ## Two front doors
 
 - **CLI** (`teri run --seed … --query …`) — scriptable, one-shot, returns the report + `verdict.json`.
-- **Web UI** (`teri serve` + the Vue studio on :3000) — the guided 5-step experience above, with
+- **Web UI** (`teri serve` + the Vue studio on :8374) — the guided 5-step experience above, with
   live graph, tick, and log streaming over SSE.
 
 ## The community loop (steward story)

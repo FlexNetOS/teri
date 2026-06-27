@@ -61,7 +61,7 @@ tested (the full `cargo test` suite is green, 1700+ tests), and reachable both o
 | Requirement | Notes |
 |-------------|-------|
 | **Rust toolchain** | **floating `nightly`** (pinned by `rust-toolchain.toml`; auto-selected — no `+nightly` needed). The single resolved toolchain for teri; see §3.1. |
-| **A real OpenAI-compatible LLM backend** | local (shimmy/ruvllm/Ollama/LM Studio/vLLM) or hosted (OpenAI/Anthropic/Gemini). **Stub/canned backends are refused** — see §6. |
+| **A real OpenAI-compatible LLM backend** | local (inferrs/shimmy/ruvllm/Ollama/LM Studio/vLLM) or hosted (OpenAI/Anthropic/Gemini). **Stub/canned backends are refused** — see §6. |
 | **An LLM API key** *(for hosted backends)* | injected via envctl or a dev `.env`; **never** exported in a shell profile. Local keyless backends need none. |
 | **envctl** *(recommended)* | vault-held secret injection — `envctl run -- teri …` |
 | **`OPENAI_API_KEY`/`ZEP_API_KEY`** | only when using those backends; the default **Native** graph backend is keyless. |
@@ -135,18 +135,18 @@ Teri keeps **no config files and no secrets on disk**. All knobs are env vars, r
 a command needs them. Defaults below are the **actual code defaults** on `main`.
 
 > ⚠️ The README's config table is stale (it lists `https://api.openai.com/v1` / `gpt-4o`). The
-> real defaults point at a local shimmy endpoint, per the owner decision of 2026-06-17. Trust
+> real defaults point at a local inferrs endpoint, per the owner upgrade of 2026-06-27. Trust
 > this table.
 
 ### LLM / embeddings
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `LLM_BASE_URL` | `http://127.0.0.1:11435/v1` | OpenAI-compatible endpoint (shimmy's local bind) |
-| `LLM_MODEL` / `LLM_MODEL_NAME` | `OpenThinker3-7B` | completion model (`LLM_MODEL_NAME` wins, then `LLM_MODEL`, then default) |
+| `LLM_BASE_URL` | `http://127.0.0.1:11435/v1` | OpenAI-compatible endpoint (inferrs local bind) |
+| `LLM_MODEL` / `LLM_MODEL_NAME` | `Qwen/Qwen3-4B` | completion model (`LLM_MODEL_NAME` wins, then `LLM_MODEL`, then default) |
 | `LLM_API_KEY` | *(unset; optional for keyless local)* | API key; arrives via envctl injection in production |
 | `EMBED_MODEL` | `all-MiniLM-L6-v2` (384-dim) | embedding model for semantic recall |
 | `LLM_MAX_RETRIES` | *(adapter default)* | retry budget for transient LLM errors |
-| `LLM_TIMEOUT_SECS` | *(adapter default)* | per-request timeout |
+| `LLM_TIMEOUT_SECS` | `300` | per-request timeout; local inferrs CUDA ontology/report calls can exceed 30s |
 
 ### Graph backend
 | Variable | Default | Purpose |
@@ -228,7 +228,7 @@ Refusal messages (all exit 1, before any work):
 | reachable but no models | `backend at … lists no models …` |
 | canned stub probe | `REFUSING stub inference backend at …: the probe returned canned text (matched "…")` |
 
-**If you hit one:** serve a real GGUF model (e.g. `shimmy serve` with a GGUF registered) or
+**If you hit one:** serve a real model (prefer `inferrs serve --device cuda …`, or `shimmy serve` with a GGUF registered) or
 repoint `LLM_BASE_URL` at a real OpenAI-compatible API. **Never weaken the guard to make a run
 proceed** — extend `STUB_MARKERS` when a new stub engine appears.
 
@@ -244,7 +244,7 @@ env-ctl run --provider <p> -- teri serve
 # Explicit bind (--addr supersedes the env contract):
 env-ctl run --provider <p> -- teri serve --addr 0.0.0.0:8080
 
-# Fully keyless local (Native graph backend + local shimmy/ruvllm):
+# Fully local (Native graph backend + local inferrs/shimmy/ruvllm):
 GRAPH_BACKEND=native LLM_BASE_URL=http://127.0.0.1:11435/v1 \
   teri serve --addr 127.0.0.1:5610
 ```
@@ -282,7 +282,7 @@ cargo build --release -p inferrs --features cuda     # cudarc ≥0.19.8 (on main
 ```bash
 # Recommended: Qwen3-4B (enables inferrs' TurboQuant KV-cache compression). Staged + Q4K-cached.
 inferrs serve --device cpu  --host 127.0.0.1 --port 11435 Qwen/Qwen3-4B   # works today (slow on CPU)
-inferrs serve --device cuda --host 127.0.0.1 --port 11435 Qwen/Qwen3-4B   # GPU — see driver gate below
+inferrs serve --device cuda --host 127.0.0.1 --port 11435 Qwen/Qwen3-4B   # preferred GPU mode
 ```
 For a GGUF-only repo, add `--gguf-file <name>.gguf --tokenizer-source <source-model-repo>`.
 
@@ -292,12 +292,16 @@ LLM_BASE_URL=http://127.0.0.1:11435/v1 LLM_MODEL_NAME=Qwen/Qwen3-4B LLM_API_KEY=
   teri run --seed ./examples/seed.txt --query "…" --agents 100
 ```
 
-**GPU driver gate (current).** inferrs *builds and loads* on `--device cuda`, but at the first
-kernel launch a **CUDA-13.2 driver** (`595.71.05`; `cuDriverGetVersion=13020`) rejects the
-`nvcc`-13.3 PTX (`.version 9.3`) with `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`. Unlock by **strict-
-upgrading the driver to a CUDA-13.3 driver** — then the same release binary runs on GPU with no
-code change (weights + Q4K cache already staged). The alternative (no driver change) is
-cuda-oxide-authored kernels emitting PTX ≤9.2 (§3.1) — a larger follow-up.
+**Upgrade mode (current).** The prior driver gate is cleared on this workstation: NVIDIA
+`610.43.02`, CUDA toolkit `13.3`, Rust nightly, `llc-21`, and NVlabs/cuda-oxide are the expected
+stack. Use `scripts/verify-inferrs-stack.sh` to prove the mode before claiming the GPU path is
+healthy. If `cargo oxide doctor` reports a missing `include/stddef.h`, run with `/usr/bin:/bin`
+first in `PATH`; meta-local clang shims can point at an incomplete resource dir.
+
+The older `595.71.05` failure mode was `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` from `nvcc` 13.3 PTX
+JIT. Do not solve that by weakening Teri's honesty guard or falling back to Ollama. The strict
+upgrade path is inferrs on CUDA first, with cuda-oxide-authored kernels as the Rust GPU compute
+follow-up where kernel work is needed.
 
 ---
 
@@ -386,7 +390,7 @@ backgrounding. Launch with the Bash tool's `run_in_background: true` **and**
 |---------|-------|-----|
 | `teri: configuration unavailable — key may not be set` | `Config::load` hit `ConfigMissing` | inject via `env-ctl run -- teri …`, or set `LLM_API_KEY` / use a keyless local backend |
 | `REFUSING stub inference backend at … (matched "…")` | guard's 1-token probe returned canned stub text (§6) | serve a real GGUF model or repoint `LLM_BASE_URL`; **don't** weaken the guard |
-| `inference backend unreachable at …/models: …` | backend down or wrong `LLM_BASE_URL` (refused fail-closed) | start the backend (`shimmy serve` with a GGUF) or fix `LLM_BASE_URL` |
+| `inference backend unreachable at …/models: …` | backend down or wrong `LLM_BASE_URL` (refused fail-closed) | start the backend (`inferrs serve --device cuda …`, or shimmy/ruvllm as a fallback) or fix `LLM_BASE_URL` |
 | `backend at … lists no models` | backend reachable but serves nothing | load a real model before running/serving |
 | `teri run` produces no `verdict.json` | `--out` not passed | `teri run` prints its summary to stdout; pass `-o/--out <path>` to also persist `verdict.json`. The one-shot `seed → graph → agents → sim → report` pipeline is fully wired (`main.rs` → `pipeline::run_pipeline`); for the interactive studio use `teri serve` + the API sequence (§1, §8) |
 | `--help` needs a key / fails keyless | regression: config loaded before arg-parse | config must load **inside** the command; fix and re-probe `teri --help` |

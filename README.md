@@ -81,7 +81,7 @@ the **web UI** (Vue 3 SPA — the 5-step prediction studio).
 | Tool | Version | Description | Check |
 | --- | --- | --- | --- |
 | **Rust** | stable (edition 2024) | Engine runtime | `cargo --version` |
-| **Node.js** | 18+ | Web UI runtime (includes npm/pnpm) | `node -v` |
+| **Bun** | current | Web UI package manager/runtime | `bun --version` |
 | **LLM endpoint** | OpenAI-compatible | Any OpenAI-SDK-format LLM API or local backend | — |
 
 ### 1. Configure secrets
@@ -95,7 +95,7 @@ cp .env.example .env   # local dev only
 # LLM API (any OpenAI-SDK-compatible endpoint)
 #   LLM_API_KEY=...                # optional for keyless local backends
 #   LLM_BASE_URL=http://127.0.0.1:11435/v1
-#   LLM_MODEL_NAME=OpenThinker3-7B
+#   LLM_MODEL_NAME=Qwen/Qwen3-4B
 ```
 
 > Teri has **no Zep Cloud dependency** — temporal graph memory is reimplemented natively in-process.
@@ -127,7 +127,7 @@ cd frontend && bun install && bun run dev
 ```
 
 **Service URLs:**
-- Web UI: `http://localhost:3000`
+- Web UI: `http://localhost:8374`
 - Engine API: `http://localhost:5001`
 
 ## 🖥️ Web UI
@@ -151,7 +151,7 @@ All configuration is via environment variables (no config files required):
 | --- | --- | --- |
 | `LLM_BASE_URL` | `http://127.0.0.1:11435/v1` | OpenAI-compatible LLM API endpoint |
 | `LLM_API_KEY` | *(optional for keyless local)* | API key for hosted LLM backends |
-| `LLM_MODEL_NAME` / `LLM_MODEL` | `OpenThinker3-7B` | Completion model (`LLM_MODEL_NAME` wins) |
+| `LLM_MODEL_NAME` / `LLM_MODEL` | `Qwen/Qwen3-4B` | Completion model (`LLM_MODEL_NAME` wins) |
 | `EMBED_MODEL` | `all-MiniLM-L6-v2` | Embedding model |
 | `DEFAULT_AGENT_COUNT` | `100` | Default agents per simulation |
 | `SIM_MAX_TICKS` | `50` | Maximum ticks per run |
