@@ -159,6 +159,23 @@ All configuration is via environment variables (no config files required):
 | `SIM_MAX_TICKS` | `50` | Maximum ticks per run |
 | `RUST_LOG` | `teri=debug,tower_http=info` | Logging level |
 
+### inferrs verification and benchmarks
+
+Use these repo-local gates before claiming the local GPU backend is healthy:
+
+```bash
+scripts/verify-inferrs-no-downgrade.sh
+scripts/verify-inferrs-runtime.sh
+scripts/benchmark-inferrs-local.sh
+CODEX_SMOKE=1 scripts/verify-cloud-codex-coexistence.sh
+```
+
+The no-downgrade gate proves the defaults still target local inferrs
+(`Qwen/Qwen3-4B`, `127.0.0.1:11435`), the Rust toolchain is nightly, the NVIDIA
+610/CUDA 13.3/cuda-oxide stack is present, and `FlexNetOS/inferrs` builds with
+CUDA. The benchmark script writes fresh per-model logs plus a `summary.md` under
+`/tmp/teri-inferrs-benchmarks/<timestamp>/`.
+
 ## 🏗️ Architecture
 
 The engine is a typed five-stage pipeline: `seed → graph → agent → sim → report`, exposed through a

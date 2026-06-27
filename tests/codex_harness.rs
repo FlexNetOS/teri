@@ -67,6 +67,17 @@ fn run_truth_hook(root: &Path) -> Value {
 fn hooks_json_wires_truth_hook_for_session_and_compaction() {
     let hooks: Value = serde_json::from_str(&read_repo(".codex/hooks.json"))
         .expect(".codex/hooks.json must parse as JSON");
+    let top_level_keys: HashSet<&str> = hooks
+        .as_object()
+        .expect(".codex/hooks.json top-level object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        top_level_keys,
+        HashSet::from(["hooks"]),
+        ".codex/hooks.json must stay on the current Codex schema; top-level description fields make Codex warn and skip clean hook loading"
+    );
 
     let hook_table = hooks["hooks"].as_object().expect("hooks object");
     for event_name in ["SessionStart", "PreCompact"] {
