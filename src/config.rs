@@ -134,16 +134,12 @@ pub struct LlmConfig {
     pub embed_model: String,
     pub timeout_secs: u64,
     pub max_retries: u32,
-    /// FIX-4 (max_tokens): the explicit completion token cap sent on the legacy
-    /// `complete()` / `complete_json()` paths (env `LLM_MAX_TOKENS`, default 2048).
+    /// FIX-4 / inferrs upgrade: generation token cap sent on the legacy
+    /// `complete()` / `complete_json()` paths and used as a ceiling/default for
+    /// parameterized `chat()` / `chat_json()` paths (env `LLM_MAX_TOKENS`, default 2048).
     ///
-    /// Without this, those requests omitted `max_tokens` entirely and inherited the
-    /// shimmy backend's 256-token default, silently truncating persona generation
-    /// (`agent/mod.rs` `generate_social`) and graph entity/relation extraction
-    /// (`graph/mod.rs` `extract_and_merge_into`). 2048 is a sensible default for the
-    /// JSON-shaped extraction/persona outputs; the parameterized `chat`/`chat_json`
-    /// paths continue to honor their per-call `ChatOptions.max_tokens` and are
-    /// unaffected.
+    /// Without this, local OpenAI-compatible engines can inherit backend defaults or
+    /// caller-supplied 4096-token budgets. `0` opts out and preserves server-default behavior.
     pub max_tokens: u32,
     /// FIX-3 (provider selection): which adapter `build_llm` / the run pipeline select.
     /// `openai` (the default; also covers ollama/lmstudio/vllm — all OpenAI-compatible,
@@ -309,9 +305,9 @@ impl Config {
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(3),
-                // FIX-4: explicit completion token cap for complete()/complete_json().
-                // Default 2048 (vs shimmy's truncating 256 default). 0 is treated as
-                // "omit the cap" downstream (server default), so a user can opt out.
+                // FIX-4 / inferrs upgrade: explicit generation token cap for all
+                // OpenAI-compatible chat paths. Default 2048 is large enough for ontology JSON
+                // while still clamping 4096-token report/config requests; 0 opts out.
                 max_tokens: std::env::var("LLM_MAX_TOKENS")
                     .ok()
                     .and_then(|v| v.parse().ok())
@@ -1021,6 +1017,22 @@ mod tests {
         match prev {
             Ok(v) => unsafe { std::env::set_var("LLM_TIMEOUT_SECS", v) },
             Err(_) => unsafe { std::env::remove_var("LLM_TIMEOUT_SECS") },
+        }
+    }
+
+    #[test]
+    fn test_default_llm_max_tokens_preserves_ontology_budget() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("LLM_MAX_TOKENS");
+        unsafe { std::env::remove_var("LLM_MAX_TOKENS") };
+        let c = Config::build(Some("key"));
+        assert_eq!(
+            c.llm.max_tokens, 2048,
+            "default LLM token cap should preserve enough budget for inferrs ontology JSON"
+        );
+        match prev {
+            Ok(v) => unsafe { std::env::set_var("LLM_MAX_TOKENS", v) },
+            Err(_) => unsafe { std::env::remove_var("LLM_MAX_TOKENS") },
         }
     }
 
