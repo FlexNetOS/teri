@@ -9,8 +9,8 @@ Teri is a Rust 2024 workspace with the main engine in `src/` and integration tes
 - `cargo clippy --all-targets --all-features -- -D warnings` — enforce Rust lints.
 - `cargo fmt` or `rustfmt` — format Rust code according to `.rustfmt.toml`.
 - `cargo run -- --help` — inspect the CLI; use `cargo run --release -- run --seed examples/seed.txt --query "..."` for a local simulation.
-- `cd frontend && npm install && npm run dev` — start the Vue development server.
-- `cd frontend && npm run build` — build the web UI.
+- `cd frontend && bun install && bun run dev` — start the Vue development server.
+- `cd frontend && bun run build` — build the web UI.
 
 ## Coding Style & Naming Conventions
 Use Rust 2024 idioms, four-space indentation, and the repository rustfmt settings (`max_width = 100`). Keep modules focused and name files after their domain (`pipeline.rs`, `preflight.rs`, `src/memory/*`). Prefer descriptive snake_case for Rust functions and modules, PascalCase for types, and SCREAMING_SNAKE_CASE for constants. Frontend code follows Vue single-file component conventions under `frontend/src`.
