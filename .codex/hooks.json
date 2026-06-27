@@ -1,5 +1,4 @@
 {
-  "description": "Codex hooks for teri; keep simulation/prediction claims and operational docs grounded in current source truth.",
   "hooks": {
     "PreCompact": [
       {

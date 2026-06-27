@@ -303,6 +303,33 @@ stack. Use `scripts/verify-inferrs-stack.sh` to prove the mode before claiming t
 healthy. If `cargo oxide doctor` reports a missing `include/stddef.h`, run with `/usr/bin:/bin`
 first in `PATH`; meta-local clang shims can point at an incomplete resource dir.
 
+**Strict no-downgrade proof:**
+```bash
+scripts/verify-inferrs-no-downgrade.sh
+```
+This gate checks source defaults, nightly-only `rust-toolchain.toml`, NVIDIA 610.x, CUDA 13.3,
+NVlabs/cuda-oxide identity + `cargo oxide doctor`, FlexNetOS/inferrs identity + CUDA build, and
+focused tests for inferrs defaults, request limiting, provider selection, and backend honesty.
+
+**Fresh local benchmark run:**
+```bash
+scripts/benchmark-inferrs-local.sh
+# Override if needed:
+# BENCH_MODELS="Qwen/Qwen3-4B Qwen/Qwen2.5-0.5B-Instruct" BENCH_RUNS=5 scripts/benchmark-inferrs-local.sh
+```
+The script benchmarks cached local models with `inferrs bench --device cuda`, writes raw logs and a
+machine-readable TSV, then summarizes prefill tok/s, decode tok/s, TTFT, and end-to-end latency in
+`/tmp/teri-inferrs-benchmarks/<timestamp>/summary.md`.
+
+**Local + cloud/Codex coexistence:**
+```bash
+CODEX_SMOKE=1 scripts/verify-cloud-codex-coexistence.sh
+```
+This runs provider-selection tests for OpenAI-compatible local inferrs plus Anthropic/Gemini
+adapters, re-proves local defaults, runs the live inferrs/Teri runtime smoke, and performs a
+read-only ephemeral `codex exec` smoke so the cloud Codex surface is known to work alongside local
+model execution.
+
 The older `595.71.05` failure mode was `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` from `nvcc` 13.3 PTX
 JIT. Do not solve that by weakening Teri's honesty guard or falling back to Ollama. The strict
 upgrade path is inferrs on CUDA first, with cuda-oxide-authored kernels as the Rust GPU compute
