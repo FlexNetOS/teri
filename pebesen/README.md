@@ -152,9 +152,9 @@ The retention model is not engagement loops. It is accumulated, structured, irre
 | Database | PostgreSQL + pgvector | Relational integrity + semantic search from day one |
 | Cache / PubSub | Redis | Session state, fan-out, ephemeral presence |
 | Search | Meilisearch | Self-hostable, fast, typo-tolerant |
-| Frontend | TypeScript + SvelteKit (pnpm) | Lightweight, fast, component-scoped CSS |
+| Frontend | TypeScript + SvelteKit (Bun) | Lightweight, fast, component-scoped CSS |
 | Self-host | Docker Compose | Single-command deployment |
-| Package managers | pnpm (TS), uv (Python tools), Cargo (Rust) | Per-language best-in-class |
+| Package managers | Bun (TS), uv (Python tools), Cargo (Rust) | Per-language best-in-class |
 
 ---
 
@@ -163,8 +163,7 @@ The retention model is not engagement loops. It is accumulated, structured, irre
 ### Prerequisites
 
 - Rust 1.85+ (2024 edition)
-- Node.js 22+ (latest LTS)
-- pnpm 9+
+- Workspace-managed Bun 1.3+ (`/home/flexnetos/FlexNetOS/usr/bin/bun`)
 - Docker & Docker Compose
 - Python 3.8+ (for pre-commit hooks)
 - uv
@@ -185,6 +184,12 @@ make test          # Run all tests
 make lint          # Run all linters
 make check         # Run all checks (format + lint + test)
 make db-reset      # Reset database
+```
+
+For the vendored frontend in this workspace, use:
+
+```bash
+meta exec --include teri -- bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri/pebesen/frontend && bun install && bun run dev'
 ```
 
 ---
