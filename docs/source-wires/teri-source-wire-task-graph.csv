@@ -1,0 +1,11 @@
+id,phase,title,status,source,teri_surface,depends_on,acceptance_gate,evidence_required
+TSW-000,evidence_audit,Inspect Teri and external source evidence,completed,all_selected,docs,,L2 registry + validation,repo docs and PR metadata listed in issue 86
+TSW-010,registry_scaffold,Implement source wire registry and CLI,completed,all_selected,backend,TSW-000,L2 registry + validation,checked source IDs evidence paths and adoption gates
+TSW-020,required_add_wires,Write required Add wire coverage,completed,brain_in_the_fish;mirofish_guide,docs,TSW-000,L2 registry + validation,required source file inspection
+TSW-030,fish_lineage_optional_wires,Write fish lineage optional wire coverage,completed,mirofish_pr_325;bettafish,docs,TSW-000,L1 documented crosswalk,PR metadata and lineage repo inspection
+TSW-040,local_inference_wires,Write local backend wire coverage,completed,inferrs;cluaiz,backend,TSW-000,L2 registry + validation,backend README license and endpoint evidence
+TSW-050,browser_mobile_wires,Write browser and mobile wire coverage,completed,cellm;web_rwkv,frontend,TSW-000,L1 documented crosswalk,browser/mobile README and architecture evidence
+TSW-060,observability_optimizer_wires,Write observability and optimizer coverage,completed,splitrail;openevolve,observability,TSW-000,L1 documented crosswalk,README license and research-bound evidence
+TSW-070,docs_index_updates,Update repo indexes and task/file maps,completed,all_selected,docs,TSW-010,L2 registry + validation,local repo docs plus issue deliverable list
+TSW-080,validation_gates,Run source-wire validation and targeted tests,completed,all_selected,backend,TSW-010,L2 registry + validation,registry test results CLI help endpoint tests and full cargo test proof
+TSW-090,followup_candidates,Capture future implementation candidates and open questions,completed,all_selected,docs,TSW-020,L1 documented crosswalk,compiled questions and blocked conditions

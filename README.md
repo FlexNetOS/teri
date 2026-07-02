@@ -187,6 +187,19 @@ CLI (`teri run`) and a REST/SSE server (`teri serve`). See [`ARCHITECTURE.md`](.
 for module contracts and [`RUNBOOK.md`](./RUNBOOK.md) for the authoritative parity-verification
 surface.
 
+## Source Wires
+
+Issue 86 adds a checked-in source-wire surface so external evidence, lineage, backend, browser,
+observability, and optimizer references are inspectable inside the repo instead of living only in
+issue text.
+
+- Docs: [`docs/source-wires/README.md`](./docs/source-wires/README.md)
+- Registry: `src/source_wires.rs`
+- CLI:
+  - `cargo run -- wires list`
+  - `cargo run -- wires show brain_in_the_fish`
+  - `cargo run -- wires validate`
+
 ## 🛡️ Backend honesty guard
 
 `run` and `serve` both preflight the configured backend fail-closed: `GET /models` (identity) and a

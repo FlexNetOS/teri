@@ -568,6 +568,7 @@ stale** (2026-06-12); §12 here is the current verification — extend the plan,
 - **OASIS** (simulation design, CAMEL-AI): https://github.com/camel-ai/oasis — reimplemented
   natively in teri (`sim/`, `social_world.rs`), not depended on.
 - **teri docs**: `README.md`, `ARCHITECTURE.md`, `CLAUDE.md`, `docs/adr/`, `agent-env.toml`.
+- **source wires**: `src/source_wires.rs`, `docs/source-wires/`, `teri wires validate`.
 - **Port plan**: `~/Desktop/meta/MIROFISH-PORT-PLAN.md` (build order valid; its parity matrix is
   superseded by §12).
 

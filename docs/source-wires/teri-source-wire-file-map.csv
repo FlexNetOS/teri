@@ -1,0 +1,11 @@
+file,owner_task,purpose,source_refs,validation
+src/source_wires.rs,TSW-010,static registry and validation logic,all selected and deferred source refs,cargo test source_wires and teri wires validate
+docs/source-wires/README.md,TSW-070,top-level source-wire guide,issue 86 and registry ids,manual review plus teri wires list/show linkage
+docs/source-wires/fish-lineage-wire.md,TSW-030,fish lineage and upstream delta crosswalk,mirofish_guide;mirofish_pr_325;bettafish,manual review against inspected evidence
+docs/source-wires/evidence-and-report-wire.md,TSW-020,evidence scoring and report audit crosswalk,brain_in_the_fish;mirofish_guide,manual review against inspected evidence
+docs/source-wires/inference-backend-wire.md,TSW-040,backend compatibility and no-downgrade crosswalk,inferrs;cluaiz,manual review against inspected evidence
+docs/source-wires/browser-mobile-inference-wire.md,TSW-050,browser/mobile research crosswalk,cellm;web_rwkv,manual review against inspected evidence
+docs/source-wires/observability-and-optimizer-wire.md,TSW-060,observability and optimizer bounds,splitrail;openevolve,manual review against inspected evidence
+docs/source-wires/deferred-sources.md,TSW-070,deferred/not-selected record,issue 86 deferred list,manual review
+docs/source-wires/adoption-gates.md,TSW-080,adoption-level policy and blocking conditions,issue 86 adoption gate rules,manual review plus registry consistency
+docs/source-wires/evidence-ledger.md,TSW-020,compact evidence table for selected wires,all selected sources,manual review against inspected evidence

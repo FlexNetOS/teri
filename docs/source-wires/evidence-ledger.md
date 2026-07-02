@@ -1,0 +1,14 @@
+# Evidence Ledger
+
+| Source | Evidence inspected | Confirmed facts | Inferences | Questions / gaps | Teri target surface |
+| --- | --- | --- | --- | --- | --- |
+| `fabio-rovai/brain-in-the-fish` | `README.md`, `LICENSE`, core module/test paths | MIT license; quote verification and verdict model are explicit | likely future report-evidence seam | exact Teri insertion point still open | `seed`, `report`, `docs` |
+| `MOZARTINOS/mirofish-guide` | `README.md`, `SKILL.md`, workflow/debugging/report/evaluation/model-proxy refs | MIT license; operator-playbook role is explicit | strongest issue-86 stage crosswalk source | which checks should become scripts/tests later | `seed`, `graph`, `agent`, `sim`, `report`, `docs` |
+| `666ghj/MiroFish#325` | PR metadata, changed files, summary, test plan | open upstream delta; covers Vertex, CSV/XLSX, localization, bug fixes | valuable adoption-question source | none of it is merged-truth yet | `seed`, `graph`, `frontend`, `backend`, `docs` |
+| `666ghj/BettaFish` | `README.md`, `README-EN.md`, engine directories, `LICENSE` | GPL-2.0; forum/report/insight engines present | useful lineage and coordination reference | no direct Teri parity claim without local proof | `agent`, `sim`, `report`, `docs` |
+| `ericcurtin/inferrs` | `README.md`, `LICENSE`, server/test paths, local Teri docs | Apache-2.0; OpenAI/Anthropic/Ollama-compatible surfaces documented | best backend reference for current Teri defaults | richer compatibility matrix still open | `backend`, `api`, `docs` |
+| `FlexNetOS/cellm` | `README.md`, `docs/project_architecture.md`, `docs/wasm-backend.md`, `docs/benchmarks/README.md` | dual MIT/Apache-2.0; mobile/WASM/scheduler research lane explicit | strong first-party offline/mobile research source | no proven Teri runtime seam yet | `backend`, `frontend`, `docs` |
+| `cryscan/web-rwkv` | `README.md`, `src/lib.rs`, WASM/example paths | dual MIT/Apache-2.0; browser/WebGPU runtime explicit; no OpenAI API | browser feasibility only | future Teri browser experiment shape still open | `frontend`, `backend`, `docs` |
+| `cluaiz/cluaiz` | `README.md`, `docs/reference/terminal-commands.md`, engine/api docs, `LICENSE` | Apache-2.0; alpha-stage OpenAI-compatible server and orchestration model | useful orchestration comparison, not default-candidate proof | interoperability surface still open | `backend`, `api`, `docs` |
+| `Piebald-AI/splitrail` | `README.md`, `LICENSE`, MCP/tool descriptions, analyzer paths | MIT; local token/cost tracker with MCP and optional cloud upload | useful observability reference | safe telemetry boundary still open | `observability`, `docs` |
+| `algorithmicsuperintelligence/openevolve@80945ed...` | pinned `README.md`, pinned `examples/README.md`, `LICENSE` | Apache-2.0; evaluator-driven optimizer/research workflow explicit | useful bounded-optimizer reference only | no approved Teri optimizer lane exists yet | `optimizer`, `docs` |
