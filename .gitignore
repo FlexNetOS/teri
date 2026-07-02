@@ -89,3 +89,9 @@ pebesen/**/__pycache__/
 .handoff/**/*.rvf
 .handoff/**/*.rvf.lock
 .handoff/**/*.sqlite.bak
+
+# GitKB
+.kb/.cache/
+.kb/store/
+.kb/workspace/
+.kb/workspaces/

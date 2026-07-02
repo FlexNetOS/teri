@@ -60,10 +60,10 @@ tested (the full `cargo test` suite is green, 1700+ tests), and reachable both o
 
 | Requirement | Notes |
 |-------------|-------|
-| **Rust toolchain** | **floating `nightly`** (pinned by `rust-toolchain.toml`; auto-selected — no `+nightly` needed). The single resolved toolchain for teri; see §3.1. |
+| **Rust toolchain** | **floating `nightly`**, entered via `nix develop /home/flexnetos/FlexNetOS/src/yazelix#ci` in this workspace. The single resolved toolchain for teri; see §3.1. |
 | **A real OpenAI-compatible LLM backend** | local (inferrs/shimmy/ruvllm/Ollama/LM Studio/vLLM) or hosted (OpenAI/Anthropic/Gemini). **Stub/canned backends are refused** — see §6. |
-| **An LLM API key** *(for hosted backends)* | injected via envctl or a dev `.env`; **never** exported in a shell profile. Local keyless backends need none. |
-| **envctl** *(recommended)* | vault-held secret injection — `envctl run -- teri …` |
+| **An LLM API key** *(for hosted backends)* | use a dev `.env` or child-process injection; **never** export it in a shell profile. Local keyless backends need none. |
+| **Workspace Bun** | use `meta exec --include teri -- bun …` for both frontend trees; do not use the stale `pnpm` examples under `pebesen/`. |
 | **`OPENAI_API_KEY`/`ZEP_API_KEY`** | only when using those backends; the default **Native** graph backend is keyless. |
 
 ---
@@ -71,8 +71,8 @@ tested (the full `cargo test` suite is green, 1700+ tests), and reachable both o
 ## 3. Build
 
 ```bash
-cd ~/Desktop/meta/teri
-cargo build --release            # binary at ./target/release/teri
+cd /home/flexnetos/FlexNetOS/src/teri
+nix develop /home/flexnetos/FlexNetOS/src/yazelix#ci -c cargo build --release
 ./target/release/teri --help     # MUST exit 0 keyless — regression probe after any CLI change
 ```
 
@@ -190,18 +190,16 @@ against local inferrs CUDA; use the REST/report studio path for the richer multi
 
 ---
 
-## 5. Secrets contract (envctl)
+## 5. Secrets contract
 
-Teri **never** documents or expects a raw `export LLM_API_KEY` workflow. The key arrives via
-**envctl injection** — vault-held, child-env only:
+Teri **never** documents or expects a raw `export LLM_API_KEY` workflow. The key should stay in a
+child process or a gitignored local dev file, never in a shell profile:
 
 ```bash
-# One-time vault registration:
-env-ctl secret add teri-llm --provider <p> --value-stdin
-
-# Canonical invocation (key injected into teri's child env only):
-env-ctl run --provider <p> -- teri serve
-env-ctl run --provider <p> -- teri run --seed ./seed.txt --query "..."
+# Working local invocation in this workspace:
+cp .env.example .env
+nix develop /home/flexnetos/FlexNetOS/src/yazelix#ci -c bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri && cargo run -- serve'
+nix develop /home/flexnetos/FlexNetOS/src/yazelix#ci -c bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri && cargo run -- run --seed ./examples/seed.txt --query "..."'
 ```
 
 `agent-env.toml` declares teri's required secrets. For **local development only**, a gitignored
@@ -244,10 +242,10 @@ proceed** — extend `STUB_MARKERS` when a new stub engine appears.
 ### Serve the REST API (supported runtime today)
 ```bash
 # Default bind 0.0.0.0:5001 (FLASK_HOST/FLASK_PORT):
-env-ctl run --provider <p> -- teri serve
+nix develop /home/flexnetos/FlexNetOS/src/yazelix#ci -c bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri && cargo run -- serve'
 
 # Explicit bind (--addr supersedes the env contract):
-env-ctl run --provider <p> -- teri serve --addr 0.0.0.0:8080
+nix develop /home/flexnetos/FlexNetOS/src/yazelix#ci -c bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri && cargo run -- serve --addr 0.0.0.0:8080'
 
 # Fully local (Native graph backend + local inferrs/shimmy/ruvllm):
 GRAPH_BACKEND=native LLM_BASE_URL=http://127.0.0.1:11435/v1 \
@@ -257,10 +255,10 @@ Bind precedence: `--addr` → `FLASK_HOST`:`FLASK_PORT` → `0.0.0.0:5001`.
 
 ### Run a simulation (full in-process pipeline)
 ```bash
-env-ctl run --provider <p> -- teri run \
+nix develop /home/flexnetos/FlexNetOS/src/yazelix#ci -c bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri && cargo run -- run \
   --seed ./examples/seed.txt \
   --query "How will this policy affect public sentiment in 30 days?" \
-  --agents 100
+  --agents 100'
 ```
 Flags: `-s/--seed <path|url>` (required), `-q/--query <text>` (required),
 `-a/--agents <n>` (default `100`), `-o/--out <path>` (optional `verdict.json`). This validates
@@ -420,7 +418,7 @@ backgrounding. Launch with the Bash tool's `run_in_background: true` **and**
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `teri: configuration unavailable — key may not be set` | `Config::load` hit `ConfigMissing` | inject via `env-ctl run -- teri …`, or set `LLM_API_KEY` / use a keyless local backend |
+| `teri: configuration unavailable — key may not be set` | `Config::load` hit `ConfigMissing` | create a local `.env` for development or use child-process injection; either way, do not export the key in your shell profile |
 | `REFUSING stub inference backend at … (matched "…")` | guard's 1-token probe returned canned stub text (§6) | serve a real GGUF model or repoint `LLM_BASE_URL`; **don't** weaken the guard |
 | `inference backend unreachable at …/models: …` | backend down or wrong `LLM_BASE_URL` (refused fail-closed) | start the backend (`inferrs serve --device cuda …`, or shimmy/ruvllm as a fallback) or fix `LLM_BASE_URL` |
 | `backend at … lists no models` | backend reachable but serves nothing | load a real model before running/serving |

@@ -64,11 +64,11 @@ possible to predict anything.
 
 | Concern | MiroFish (Python) | Teri (Rust) |
 | --- | --- | --- |
-| Backend runtime | Python ≥3.11, uv, Docker + venv | Single static binary (`cargo build --release`) |
+| Backend runtime | Rust nightly via Yazelix Nix shell | Single static binary (`cargo build --release`) |
 | Agent concurrency | GIL-limited threads | `tokio` bounded concurrency + `rayon` CPU parallelism |
 | Temporal memory / graph | External **Zep Cloud** (`ZEP_API_KEY`) | **Native, in-process** temporal graph memory (petgraph + redb) — no external service, no extra key |
 | Type safety | Runtime errors | Compile-time guarantees |
-| Secrets | `.env` API keys on disk | envctl vault injection (child-env only); `.env` for local dev |
+| Secrets | `.env` API keys on disk | child-process injection by contract; `.env` for local dev in this workspace |
 | Backend honesty | — | Preflight guard refuses stub/canned inference backends before any run |
 
 ## 🚀 Quick Start
@@ -80,14 +80,15 @@ the **web UI** (Vue 3 SPA — the 5-step prediction studio).
 
 | Tool | Version | Description | Check |
 | --- | --- | --- | --- |
-| **Rust** | stable (edition 2024) | Engine runtime | `cargo --version` |
-| **Bun** | current | Web UI package manager/runtime | `bun --version` |
+| **Rust** | nightly (via Yazelix Nix shell) | Engine runtime | `nix develop /home/flexnetos/FlexNetOS/src/yazelix#ci -c cargo --version` |
+| **Bun** | workspace-managed | Web UI package manager/runtime | `meta exec --include teri -- bun --version` |
 | **LLM endpoint** | OpenAI-compatible | Any OpenAI-SDK-format LLM API or local backend | — |
 
 ### 1. Configure secrets
 
-Teri never expects raw `export LLM_API_KEY` in your shell profile. The key arrives via **envctl**
-injection (vault-held, child-env only). For local development a gitignored `.env` is accepted.
+Teri never expects raw `export LLM_API_KEY` in your shell profile. The long-term contract is
+`agent-env.toml` plus child-process secret injection. In this workspace, the immediately working
+local path is a gitignored `.env` for development plus the Yazelix Nix shell for Rust commands.
 
 ```bash
 cp .env.example .env   # local dev only
@@ -104,13 +105,13 @@ cp .env.example .env   # local dev only
 ### 2. Run a simulation (CLI)
 
 ```bash
-# Via envctl (recommended — auto-injects the vault-held key):
-envctl run -- teri run \
+# Working local frontdoor in this workspace:
+nix develop /home/flexnetos/FlexNetOS/src/yazelix#ci -c bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri && cargo run --release -- run \
   --seed ./examples/seed.txt \
-  --query "How will this policy affect public sentiment in 30 days?"
+  --query "How will this policy affect public sentiment in 30 days?"'
 
 # The CLI surface works without any secrets:
-cargo run --release -- --help
+nix develop /home/flexnetos/FlexNetOS/src/yazelix#ci -c bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri && cargo run --release -- --help'
 ```
 
 The `run` path preflights the inference backend, then composes seed → graph → agents → sim →
@@ -120,10 +121,13 @@ report.
 
 ```bash
 # Engine (REST + SSE), preflights the backend before binding:
-envctl run -- teri serve --addr 0.0.0.0:5001
+nix develop /home/flexnetos/FlexNetOS/src/yazelix#ci -c bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri && cargo run --release -- serve --addr 0.0.0.0:5001'
 
 # Web UI (separate dev server):
-cd frontend && bun install && bun run dev
+meta exec --include teri -- bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri/frontend && bun install && bun run dev'
+
+# Vendored pebesen UI (SvelteKit):
+meta exec --include teri -- bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri/pebesen/frontend && bun install && bun run dev'
 ```
 
 **Service URLs:**

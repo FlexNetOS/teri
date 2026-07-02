@@ -1,42 +1,21 @@
-# sv
+# Pebesen Frontend
 
-Everything you need to build a Svelte project, powered by [`sv`](https://github.com/sveltejs/cli).
+This vendored SvelteKit app is developed with the FlexNetOS workspace-managed Bun toolchain.
 
-## Creating a project
-
-If you're seeing this, you've probably already done this step. Congrats!
+## Working commands in this workspace
 
 ```sh
-# create a new project
-npx sv create my-app
+# install dependencies
+meta exec --include teri -- bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri/pebesen/frontend && bun install'
+
+# start the dev server
+meta exec --include teri -- bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri/pebesen/frontend && bun run dev'
+
+# build the app
+meta exec --include teri -- bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri/pebesen/frontend && bun run build'
+
+# preview the production build
+meta exec --include teri -- bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri/pebesen/frontend && bun run preview'
 ```
 
-To recreate this project with the same configuration:
-
-```sh
-# recreate this project
-pnpm dlx sv@0.14.0 create --template minimal --types ts --install pnpm frontend
-```
-
-## Developing
-
-Once you've created a project and installed dependencies with `npm install` (or `pnpm install` or `yarn`), start a development server:
-
-```sh
-npm run dev
-
-# or start the server and open the app in a new browser tab
-npm run dev -- --open
-```
-
-## Building
-
-To create a production version of your app:
-
-```sh
-npm run build
-```
-
-You can preview the production build with `npm run preview`.
-
-> To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+Do not use the older `npm` or `pnpm` scaffold examples in this checkout.

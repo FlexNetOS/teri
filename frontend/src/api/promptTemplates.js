@@ -1,4 +1,4 @@
-import service from './index'
+import { apiDelete, apiGet, apiRequest } from './index'
 
 /**
  * Prompt-template store API (`/api/prompt-templates`).
@@ -13,7 +13,7 @@ import service from './index'
  * @returns {Promise<Array>}
  */
 export function listPromptTemplates() {
-  return service({ url: '/api/prompt-templates', method: 'get' })
+  return apiGet('/api/prompt-templates')
 }
 
 /**
@@ -22,7 +22,7 @@ export function listPromptTemplates() {
  * @returns {Promise<Object>}
  */
 export function getPromptTemplate(id) {
-  return service({ url: `/api/prompt-templates/${encodeURIComponent(id)}`, method: 'get' })
+  return apiGet(`/api/prompt-templates/${encodeURIComponent(id)}`)
 }
 
 /**
@@ -39,7 +39,7 @@ export function savePromptTemplate(name, prompt, files) {
   for (const file of files) {
     formData.append('files', file, file.name)
   }
-  return service({
+  return apiRequest({
     url: '/api/prompt-templates',
     method: 'post',
     data: formData,
@@ -53,7 +53,7 @@ export function savePromptTemplate(name, prompt, files) {
  * @returns {Promise<Object>} { success }
  */
 export function deletePromptTemplate(id) {
-  return service({ url: `/api/prompt-templates/${encodeURIComponent(id)}`, method: 'delete' })
+  return apiDelete(`/api/prompt-templates/${encodeURIComponent(id)}`)
 }
 
 /**
@@ -64,7 +64,7 @@ export function deletePromptTemplate(id) {
  * @returns {Promise<File>}
  */
 export async function seedAsFile(id, filename) {
-  const blob = await service({
+  const blob = await apiRequest({
     url: `/api/prompt-templates/${encodeURIComponent(id)}/seeds/${encodeURIComponent(filename)}`,
     method: 'get',
     responseType: 'blob'

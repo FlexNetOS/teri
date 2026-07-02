@@ -1,4 +1,4 @@
-import service from './index'
+import { apiGet } from './index'
 
 /**
  * 获取驱动各流水线阶段的 LLM 提示词模板
@@ -12,5 +12,5 @@ import service from './index'
  * @returns {Promise<Array>} prompt template descriptors, ordered by stage
  */
 export const getTemplates = () => {
-  return service.get('/api/templates')
+  return apiGet('/api/templates')
 }
