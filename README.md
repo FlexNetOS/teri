@@ -64,11 +64,11 @@ possible to predict anything.
 
 | Concern | MiroFish (Python) | Teri (Rust) |
 | --- | --- | --- |
-| Backend runtime | Python ≥3.11, uv, Docker + venv | Single static binary (`cargo build --release`) |
+| Backend runtime | Rust nightly via Yazelix Nix shell | Single static binary (`cargo build --release`) |
 | Agent concurrency | GIL-limited threads | `tokio` bounded concurrency + `rayon` CPU parallelism |
 | Temporal memory / graph | External **Zep Cloud** (`ZEP_API_KEY`) | **Native, in-process** temporal graph memory (petgraph + redb) — no external service, no extra key |
 | Type safety | Runtime errors | Compile-time guarantees |
-| Secrets | `.env` API keys on disk | envctl vault injection (child-env only); `.env` for local dev |
+| Secrets | `.env` API keys on disk | child-process injection by contract; `.env` for local dev in this workspace |
 | Backend honesty | — | Preflight guard refuses stub/canned inference backends before any run |
 
 ## 🚀 Quick Start
@@ -80,14 +80,15 @@ the **web UI** (Vue 3 SPA — the 5-step prediction studio).
 
 | Tool | Version | Description | Check |
 | --- | --- | --- | --- |
-| **Rust** | stable (edition 2024) | Engine runtime | `cargo --version` |
-| **Node.js** | 18+ | Web UI runtime (includes npm/pnpm) | `node -v` |
+| **Rust** | nightly (via Yazelix Nix shell) | Engine runtime | `nix develop /home/flexnetos/FlexNetOS/src/yazelix#ci -c cargo --version` |
+| **Bun** | workspace-managed | Web UI package manager/runtime | `meta exec --include teri -- bun --version` |
 | **LLM endpoint** | OpenAI-compatible | Any OpenAI-SDK-format LLM API or local backend | — |
 
 ### 1. Configure secrets
 
-Teri never expects raw `export LLM_API_KEY` in your shell profile. The key arrives via **envctl**
-injection (vault-held, child-env only). For local development a gitignored `.env` is accepted.
+Teri never expects raw `export LLM_API_KEY` in your shell profile. The long-term contract is
+`agent-env.toml` plus child-process secret injection. In this workspace, the immediately working
+local path is a gitignored `.env` for development plus the Yazelix Nix shell for Rust commands.
 
 ```bash
 cp .env.example .env   # local dev only
@@ -95,7 +96,7 @@ cp .env.example .env   # local dev only
 # LLM API (any OpenAI-SDK-compatible endpoint)
 #   LLM_API_KEY=...                # optional for keyless local backends
 #   LLM_BASE_URL=http://127.0.0.1:11435/v1
-#   LLM_MODEL_NAME=OpenThinker3-7B
+#   LLM_MODEL_NAME=Qwen/Qwen3-4B
 ```
 
 > Teri has **no Zep Cloud dependency** — temporal graph memory is reimplemented natively in-process.
@@ -104,13 +105,13 @@ cp .env.example .env   # local dev only
 ### 2. Run a simulation (CLI)
 
 ```bash
-# Via envctl (recommended — auto-injects the vault-held key):
-envctl run -- teri run \
+# Working local frontdoor in this workspace:
+nix develop /home/flexnetos/FlexNetOS/src/yazelix#ci -c bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri && cargo run --release -- run \
   --seed ./examples/seed.txt \
-  --query "How will this policy affect public sentiment in 30 days?"
+  --query "How will this policy affect public sentiment in 30 days?"'
 
 # The CLI surface works without any secrets:
-cargo run --release -- --help
+nix develop /home/flexnetos/FlexNetOS/src/yazelix#ci -c bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri && cargo run --release -- --help'
 ```
 
 The `run` path preflights the inference backend, then composes seed → graph → agents → sim →
@@ -120,14 +121,17 @@ report.
 
 ```bash
 # Engine (REST + SSE), preflights the backend before binding:
-envctl run -- teri serve --addr 0.0.0.0:5001
+nix develop /home/flexnetos/FlexNetOS/src/yazelix#ci -c bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri && cargo run --release -- serve --addr 0.0.0.0:5001'
 
 # Web UI (separate dev server):
-cd frontend && bun install && bun run dev
+meta exec --include teri -- bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri/frontend && bun install && bun run dev'
+
+# Vendored pebesen UI (SvelteKit):
+meta exec --include teri -- bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri/pebesen/frontend && bun install && bun run dev'
 ```
 
 **Service URLs:**
-- Web UI: `http://localhost:3000`
+- Web UI: `http://localhost:8374`
 - Engine API: `http://localhost:5001`
 
 ## 🖥️ Web UI
@@ -151,11 +155,30 @@ All configuration is via environment variables (no config files required):
 | --- | --- | --- |
 | `LLM_BASE_URL` | `http://127.0.0.1:11435/v1` | OpenAI-compatible LLM API endpoint |
 | `LLM_API_KEY` | *(optional for keyless local)* | API key for hosted LLM backends |
-| `LLM_MODEL_NAME` / `LLM_MODEL` | `OpenThinker3-7B` | Completion model (`LLM_MODEL_NAME` wins) |
+| `LLM_MODEL_NAME` / `LLM_MODEL` | `Qwen/Qwen3-4B` | Completion model (`LLM_MODEL_NAME` wins) |
+| `LLM_MAX_TOKENS` | `2048` | Generation cap/default for OpenAI-compatible calls; set `0` to use backend defaults |
+| `LLM_MAX_CONCURRENT_REQUESTS` | `1` for local inferrs, otherwise unset | In-flight OpenAI-compatible request cap; prevents local CUDA queue timeouts |
 | `EMBED_MODEL` | `all-MiniLM-L6-v2` | Embedding model |
 | `DEFAULT_AGENT_COUNT` | `100` | Default agents per simulation |
 | `SIM_MAX_TICKS` | `50` | Maximum ticks per run |
 | `RUST_LOG` | `teri=debug,tower_http=info` | Logging level |
+
+### inferrs verification and benchmarks
+
+Use these repo-local gates before claiming the local GPU backend is healthy:
+
+```bash
+scripts/verify-inferrs-no-downgrade.sh
+scripts/verify-inferrs-runtime.sh
+scripts/benchmark-inferrs-local.sh
+CODEX_SMOKE=1 scripts/verify-cloud-codex-coexistence.sh
+```
+
+The no-downgrade gate proves the defaults still target local inferrs
+(`Qwen/Qwen3-4B`, `127.0.0.1:11435`), the Rust toolchain is nightly, the NVIDIA
+610/CUDA 13.3/cuda-oxide stack is present, and `FlexNetOS/inferrs` builds with
+CUDA. The benchmark script writes fresh per-model logs plus a `summary.md` under
+`/tmp/teri-inferrs-benchmarks/<timestamp>/`.
 
 ## 🏗️ Architecture
 

@@ -118,33 +118,28 @@ pub struct LlmConfig {
     pub base_url: String,
     pub api_key: String,
     /// Populated from env `LLM_MODEL_NAME` (MiroFish name) with fallback to `LLM_MODEL`
-    /// (teri legacy name), then to the default top-reasoning model `"OpenThinker3-7B"`.
+    /// (teri legacy name), then to the default inferrs model `"Qwen/Qwen3-4B"`.
     ///
     /// **Owner-resolved (2026-06-17, replaces the prior `gpt-4o`/`gpt-4o-mini` divergence flag):**
-    /// MiroFish targeted Ollama models; teri replaces that backend with **shimmy** (local,
-    /// OpenAI-compatible — see `base_url`). The default is therefore a shimmy-served top
-    /// reasoning model rather than an OpenAI cloud model. Model selection guidance:
-    /// - **`OpenThinker3-7B`** (teri default) — 8–16 GB VRAM; highest raw intelligence for
-    ///   pure text, math, and code reasoning. Matches teri's text-only swarm-prediction workload.
-    /// - **`Gemma 4 (12B)`** — 16–24 GB VRAM; multimodal (vision/audio) reasoner with native
-    ///   tool-calling for AI agents. Set `LLM_MODEL_NAME=Gemma-4-12B` if you have the VRAM and
-    ///   need multimodal or tool-calling.
+    /// MiroFish targeted Ollama models; teri now defaults to **inferrs** (local,
+    /// OpenAI-compatible — see `base_url`) as the meta-native Rust/CUDA backend.
     ///
-    /// The model name must match a GGUF model shimmy has registered/discovered.
+    /// - **`Qwen/Qwen3-4B`** (teri default) — supported by inferrs, staged in the
+    ///   local Hugging Face cache, and compatible with TurboQuant KV-cache compression.
+    /// - Override with `LLM_MODEL_NAME` for another inferrs-supported architecture
+    ///   (Qwen2/3/3.5, Gemma2/3/4, or Phi3).
+    ///
+    /// The model name must match a model inferrs can load and serve.
     pub model: String,
     pub embed_model: String,
     pub timeout_secs: u64,
     pub max_retries: u32,
-    /// FIX-4 (max_tokens): the explicit completion token cap sent on the legacy
-    /// `complete()` / `complete_json()` paths (env `LLM_MAX_TOKENS`, default 2048).
+    /// FIX-4 / inferrs upgrade: generation token cap sent on the legacy
+    /// `complete()` / `complete_json()` paths and used as a ceiling/default for
+    /// parameterized `chat()` / `chat_json()` paths (env `LLM_MAX_TOKENS`, default 2048).
     ///
-    /// Without this, those requests omitted `max_tokens` entirely and inherited the
-    /// shimmy backend's 256-token default, silently truncating persona generation
-    /// (`agent/mod.rs` `generate_social`) and graph entity/relation extraction
-    /// (`graph/mod.rs` `extract_and_merge_into`). 2048 is a sensible default for the
-    /// JSON-shaped extraction/persona outputs; the parameterized `chat`/`chat_json`
-    /// paths continue to honor their per-call `ChatOptions.max_tokens` and are
-    /// unaffected.
+    /// Without this, local OpenAI-compatible engines can inherit backend defaults or
+    /// caller-supplied 4096-token budgets. `0` opts out and preserves server-default behavior.
     pub max_tokens: u32,
     /// FIX-3 (provider selection): which adapter `build_llm` / the run pipeline select.
     /// `openai` (the default; also covers ollama/lmstudio/vllm — all OpenAI-compatible,
@@ -153,13 +148,13 @@ pub struct LlmConfig {
 }
 
 /// FIX-3: the LLM provider selector. OpenAI-compatible backends (OpenAI, Ollama,
-/// LM Studio, vLLM, Together, Groq, shimmy) all map to [`LlmProvider::Openai`] and are
+/// LM Studio, vLLM, Together, Groq, shimmy, inferrs) all map to [`LlmProvider::Openai`] and are
 /// distinguished by `base_url`; Anthropic and Gemini use their own (non-OpenAI) wire
 /// formats and adapters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum LlmProvider {
-    /// OpenAI chat-completions wire format (also Ollama / LM Studio / vLLM / shimmy).
+    /// OpenAI chat-completions wire format (also Ollama / LM Studio / vLLM / shimmy / inferrs).
     #[default]
     Openai,
     /// Anthropic Messages API.
@@ -177,7 +172,7 @@ impl LlmProvider {
         match s.trim().to_ascii_lowercase().as_str() {
             "anthropic" | "claude" => LlmProvider::Anthropic,
             "gemini" | "google" => LlmProvider::Gemini,
-            // openai / ollama / lmstudio / vllm / together / groq / shimmy / unknown
+            // openai / ollama / lmstudio / vllm / together / groq / shimmy / inferrs / unknown
             _ => LlmProvider::Openai,
         }
     }
@@ -284,35 +279,35 @@ impl Config {
 
         // MiroFish U-001 (S-008 / S-007): model name — check LLM_MODEL_NAME (MiroFish env name)
         // first, then LLM_MODEL (teri legacy env name), then fall back to default.
-        // Owner-resolved 2026-06-17: default to a shimmy-served top reasoning model
-        // (MiroFish's Ollama backend is replaced by shimmy). See LlmConfig::model docs.
+        // Owner-upgraded 2026-06-27: default to inferrs as the meta-native Rust/CUDA backend.
+        // MiroFish's Ollama backend is replaced by an OpenAI-compatible local engine. See
+        // LlmConfig::model docs.
         let model = std::env::var("LLM_MODEL_NAME")
             .or_else(|_| std::env::var("LLM_MODEL"))
-            .unwrap_or_else(|_| "OpenThinker3-7B".to_string());
+            .unwrap_or_else(|_| "Qwen/Qwen3-4B".to_string());
 
         Self {
             llm: LlmConfig {
-                // shimmy's local OpenAI-compatible endpoint (default bind 127.0.0.1:11435).
+                // inferrs' local OpenAI-compatible endpoint (default bind 127.0.0.1:11435).
                 base_url: std::env::var("LLM_BASE_URL")
                     .unwrap_or_else(|_| "http://127.0.0.1:11435/v1".to_string()),
                 api_key: api_key.unwrap_or_default().to_string(),
                 model,
-                // Default targets shimmy's POST /v1/embeddings (candle BERT
-                // sentence-transformer, default served model all-MiniLM-L6-v2, 384-dim).
+                // Default targets the local OpenAI-compatible embedding endpoint when served.
                 // Override with env EMBED_MODEL to select a different model.
                 embed_model: std::env::var("EMBED_MODEL")
                     .unwrap_or_else(|_| "all-MiniLM-L6-v2".to_string()),
                 timeout_secs: std::env::var("LLM_TIMEOUT_SECS")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(30),
+                    .unwrap_or(300),
                 max_retries: std::env::var("LLM_MAX_RETRIES")
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(3),
-                // FIX-4: explicit completion token cap for complete()/complete_json().
-                // Default 2048 (vs shimmy's truncating 256 default). 0 is treated as
-                // "omit the cap" downstream (server default), so a user can opt out.
+                // FIX-4 / inferrs upgrade: explicit generation token cap for all
+                // OpenAI-compatible chat paths. Default 2048 is large enough for ontology JSON
+                // while still clamping 4096-token report/config requests; 0 opts out.
                 max_tokens: std::env::var("LLM_MAX_TOKENS")
                     .ok()
                     .and_then(|v| v.parse().ok())
@@ -983,10 +978,10 @@ mod tests {
         }
     }
 
-    // --- Owner-resolved default model/endpoint (2026-06-17): shimmy top-reasoning model ---
+    // --- Owner-upgraded default model/endpoint (2026-06-27): inferrs local engine ---
 
     #[test]
-    fn test_default_model_is_openthinker_when_no_env() {
+    fn test_default_model_is_qwen3_inferrs_when_no_env() {
         let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_name = std::env::var("LLM_MODEL_NAME");
         let prev_model = std::env::var("LLM_MODEL");
@@ -996,8 +991,8 @@ mod tests {
         }
         let c = Config::build(Some("key"));
         assert_eq!(
-            c.llm.model, "OpenThinker3-7B",
-            "default model should be the shimmy-served top reasoning model (owner decision 2026-06-17)"
+            c.llm.model, "Qwen/Qwen3-4B",
+            "default model should be the inferrs-served local model (owner upgrade 2026-06-27)"
         );
         match prev_name {
             Ok(v) => unsafe { std::env::set_var("LLM_MODEL_NAME", v) },
@@ -1010,14 +1005,46 @@ mod tests {
     }
 
     #[test]
-    fn test_default_base_url_is_shimmy_when_no_env() {
+    fn test_default_llm_timeout_allows_local_inferrs_latency() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("LLM_TIMEOUT_SECS");
+        unsafe { std::env::remove_var("LLM_TIMEOUT_SECS") };
+        let c = Config::build(Some("key"));
+        assert_eq!(
+            c.llm.timeout_secs, 300,
+            "default LLM timeout should allow local inferrs CUDA ontology/report calls"
+        );
+        match prev {
+            Ok(v) => unsafe { std::env::set_var("LLM_TIMEOUT_SECS", v) },
+            Err(_) => unsafe { std::env::remove_var("LLM_TIMEOUT_SECS") },
+        }
+    }
+
+    #[test]
+    fn test_default_llm_max_tokens_preserves_ontology_budget() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("LLM_MAX_TOKENS");
+        unsafe { std::env::remove_var("LLM_MAX_TOKENS") };
+        let c = Config::build(Some("key"));
+        assert_eq!(
+            c.llm.max_tokens, 2048,
+            "default LLM token cap should preserve enough budget for inferrs ontology JSON"
+        );
+        match prev {
+            Ok(v) => unsafe { std::env::set_var("LLM_MAX_TOKENS", v) },
+            Err(_) => unsafe { std::env::remove_var("LLM_MAX_TOKENS") },
+        }
+    }
+
+    #[test]
+    fn test_default_base_url_is_inferrs_when_no_env() {
         let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("LLM_BASE_URL");
         unsafe { std::env::remove_var("LLM_BASE_URL") };
         let c = Config::build(Some("key"));
         assert_eq!(
             c.llm.base_url, "http://127.0.0.1:11435/v1",
-            "default base_url should point at shimmy's local OpenAI-compatible endpoint"
+            "default base_url should point at inferrs' local OpenAI-compatible endpoint"
         );
         match prev {
             Ok(v) => unsafe { std::env::set_var("LLM_BASE_URL", v) },

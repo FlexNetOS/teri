@@ -1,4 +1,4 @@
-import service, { requestWithRetry } from './index'
+import { apiRequest, requestWithRetry } from './index'
 
 /**
  * 生成本体（上传文档和模拟需求）
@@ -7,7 +7,7 @@ import service, { requestWithRetry } from './index'
  */
 export function generateOntology(formData) {
   return requestWithRetry(() => 
-    service({
+    apiRequest({
       url: '/api/graph/ontology/generate',
       method: 'post',
       data: formData,
@@ -25,7 +25,7 @@ export function generateOntology(formData) {
  */
 export function buildGraph(data) {
   return requestWithRetry(() =>
-    service({
+    apiRequest({
       url: '/api/graph/build',
       method: 'post',
       data
@@ -39,7 +39,7 @@ export function buildGraph(data) {
  * @returns {Promise}
  */
 export function getTaskStatus(taskId) {
-  return service({
+  return apiRequest({
     url: `/api/graph/task/${taskId}`,
     method: 'get'
   })
@@ -51,7 +51,7 @@ export function getTaskStatus(taskId) {
  * @returns {Promise}
  */
 export function getGraphData(graphId) {
-  return service({
+  return apiRequest({
     url: `/api/graph/data/${graphId}`,
     method: 'get'
   })
@@ -63,7 +63,7 @@ export function getGraphData(graphId) {
  * @returns {Promise}
  */
 export function getProject(projectId) {
-  return service({
+  return apiRequest({
     url: `/api/graph/project/${projectId}`,
     method: 'get'
   })

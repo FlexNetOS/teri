@@ -1,11 +1,11 @@
-import service, { requestWithRetry } from './index'
+import { apiGet, apiPost, requestWithRetry } from './index'
 
 /**
  * 创建模拟
  * @param {Object} data - { project_id, graph_id?, enable_twitter?, enable_reddit? }
  */
 export const createSimulation = (data) => {
-  return requestWithRetry(() => service.post('/api/simulation/create', data), 3, 1000)
+  return requestWithRetry(() => apiPost('/api/simulation/create', data), 3, 1000)
 }
 
 /**
@@ -13,7 +13,7 @@ export const createSimulation = (data) => {
  * @param {Object} data - { simulation_id, entity_types?, use_llm_for_profiles?, parallel_profile_count?, force_regenerate? }
  */
 export const prepareSimulation = (data) => {
-  return requestWithRetry(() => service.post('/api/simulation/prepare', data), 3, 1000)
+  return requestWithRetry(() => apiPost('/api/simulation/prepare', data), 3, 1000)
 }
 
 /**
@@ -21,7 +21,7 @@ export const prepareSimulation = (data) => {
  * @param {Object} data - { task_id?, simulation_id? }
  */
 export const getPrepareStatus = (data) => {
-  return service.post('/api/simulation/prepare/status', data)
+  return apiPost('/api/simulation/prepare/status', data)
 }
 
 /**
@@ -29,7 +29,7 @@ export const getPrepareStatus = (data) => {
  * @param {string} simulationId
  */
 export const getSimulation = (simulationId) => {
-  return service.get(`/api/simulation/${simulationId}`)
+  return apiGet(`/api/simulation/${simulationId}`)
 }
 
 /**
@@ -38,7 +38,7 @@ export const getSimulation = (simulationId) => {
  * @param {string} platform - 'reddit' | 'twitter'
  */
 export const getSimulationProfiles = (simulationId, platform = 'reddit') => {
-  return service.get(`/api/simulation/${simulationId}/profiles`, { params: { platform } })
+  return apiGet(`/api/simulation/${simulationId}/profiles`, { params: { platform } })
 }
 
 /**
@@ -47,7 +47,7 @@ export const getSimulationProfiles = (simulationId, platform = 'reddit') => {
  * @param {string} platform - 'reddit' | 'twitter'
  */
 export const getSimulationProfilesRealtime = (simulationId, platform = 'reddit') => {
-  return service.get(`/api/simulation/${simulationId}/profiles/realtime`, { params: { platform } })
+  return apiGet(`/api/simulation/${simulationId}/profiles/realtime`, { params: { platform } })
 }
 
 /**
@@ -55,7 +55,7 @@ export const getSimulationProfilesRealtime = (simulationId, platform = 'reddit')
  * @param {string} simulationId
  */
 export const getSimulationConfig = (simulationId) => {
-  return service.get(`/api/simulation/${simulationId}/config`)
+  return apiGet(`/api/simulation/${simulationId}/config`)
 }
 
 /**
@@ -64,7 +64,7 @@ export const getSimulationConfig = (simulationId) => {
  * @returns {Promise} 返回配置信息，包含元数据和配置内容
  */
 export const getSimulationConfigRealtime = (simulationId) => {
-  return service.get(`/api/simulation/${simulationId}/config/realtime`)
+  return apiGet(`/api/simulation/${simulationId}/config/realtime`)
 }
 
 /**
@@ -73,7 +73,7 @@ export const getSimulationConfigRealtime = (simulationId) => {
  */
 export const listSimulations = (projectId) => {
   const params = projectId ? { project_id: projectId } : {}
-  return service.get('/api/simulation/list', { params })
+  return apiGet('/api/simulation/list', { params })
 }
 
 /**
@@ -81,7 +81,7 @@ export const listSimulations = (projectId) => {
  * @param {Object} data - { simulation_id, platform?, max_rounds?, enable_graph_memory_update? }
  */
 export const startSimulation = (data) => {
-  return requestWithRetry(() => service.post('/api/simulation/start', data), 3, 1000)
+  return requestWithRetry(() => apiPost('/api/simulation/start', data), 3, 1000)
 }
 
 /**
@@ -89,7 +89,7 @@ export const startSimulation = (data) => {
  * @param {Object} data - { simulation_id }
  */
 export const stopSimulation = (data) => {
-  return service.post('/api/simulation/stop', data)
+  return apiPost('/api/simulation/stop', data)
 }
 
 /**
@@ -100,7 +100,7 @@ export const stopSimulation = (data) => {
  * @param {number} value - numeric value
  */
 export const injectVariable = (simulationId, variable, value) => {
-  return service.post(`/api/simulation/${simulationId}/inject`, { variable, value })
+  return apiPost(`/api/simulation/${simulationId}/inject`, { variable, value })
 }
 
 /**
@@ -108,7 +108,7 @@ export const injectVariable = (simulationId, variable, value) => {
  * @param {string} simulationId
  */
 export const getRunStatus = (simulationId) => {
-  return service.get(`/api/simulation/${simulationId}/run-status`)
+  return apiGet(`/api/simulation/${simulationId}/run-status`)
 }
 
 /**
@@ -116,7 +116,7 @@ export const getRunStatus = (simulationId) => {
  * @param {string} simulationId
  */
 export const getRunStatusDetail = (simulationId) => {
-  return service.get(`/api/simulation/${simulationId}/run-status/detail`)
+  return apiGet(`/api/simulation/${simulationId}/run-status/detail`)
 }
 
 /**
@@ -127,7 +127,7 @@ export const getRunStatusDetail = (simulationId) => {
  * @param {number} offset - 偏移量
  */
 export const getSimulationPosts = (simulationId, platform = 'reddit', limit = 50, offset = 0) => {
-  return service.get(`/api/simulation/${simulationId}/posts`, {
+  return apiGet(`/api/simulation/${simulationId}/posts`, {
     params: { platform, limit, offset }
   })
 }
@@ -143,7 +143,7 @@ export const getSimulationTimeline = (simulationId, startRound = 0, endRound = n
   if (endRound !== null) {
     params.end_round = endRound
   }
-  return service.get(`/api/simulation/${simulationId}/timeline`, { params })
+  return apiGet(`/api/simulation/${simulationId}/timeline`, { params })
 }
 
 /**
@@ -151,7 +151,7 @@ export const getSimulationTimeline = (simulationId, startRound = 0, endRound = n
  * @param {string} simulationId
  */
 export const getAgentStats = (simulationId) => {
-  return service.get(`/api/simulation/${simulationId}/agent-stats`)
+  return apiGet(`/api/simulation/${simulationId}/agent-stats`)
 }
 
 /**
@@ -160,7 +160,7 @@ export const getAgentStats = (simulationId) => {
  * @param {Object} params - { limit, offset, platform, agent_id, round_num }
  */
 export const getSimulationActions = (simulationId, params = {}) => {
-  return service.get(`/api/simulation/${simulationId}/actions`, { params })
+  return apiGet(`/api/simulation/${simulationId}/actions`, { params })
 }
 
 /**
@@ -168,7 +168,7 @@ export const getSimulationActions = (simulationId, params = {}) => {
  * @param {Object} data - { simulation_id, timeout? }
  */
 export const closeSimulationEnv = (data) => {
-  return service.post('/api/simulation/close-env', data)
+  return apiPost('/api/simulation/close-env', data)
 }
 
 /**
@@ -176,7 +176,7 @@ export const closeSimulationEnv = (data) => {
  * @param {Object} data - { simulation_id }
  */
 export const getEnvStatus = (data) => {
-  return service.post('/api/simulation/env-status', data)
+  return apiPost('/api/simulation/env-status', data)
 }
 
 /**
@@ -184,7 +184,7 @@ export const getEnvStatus = (data) => {
  * @param {Object} data - { simulation_id, interviews: [{ agent_id, prompt }] }
  */
 export const interviewAgents = (data) => {
-  return requestWithRetry(() => service.post('/api/simulation/interview/batch', data), 3, 1000)
+  return requestWithRetry(() => apiPost('/api/simulation/interview/batch', data), 3, 1000)
 }
 
 /**
@@ -193,6 +193,5 @@ export const interviewAgents = (data) => {
  * @param {number} limit - 返回数量限制
  */
 export const getSimulationHistory = (limit = 20) => {
-  return service.get('/api/simulation/history', { params: { limit } })
+  return apiGet('/api/simulation/history', { params: { limit } })
 }
-

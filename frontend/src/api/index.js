@@ -68,4 +68,9 @@ export const requestWithRetry = async (requestFn, maxRetries = 3, delay = 1000) 
   }
 }
 
+export const apiRequest = (config) => service(config)
+export const apiGet = (url, config) => service.get(url, config)
+export const apiPost = (url, data, config) => service.post(url, data, config)
+export const apiDelete = (url, config) => service.delete(url, config)
+
 export default service

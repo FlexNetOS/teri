@@ -16,18 +16,18 @@ Teri is a Rust-native swarm intelligence prediction engine. The core architectur
 ## Dev Commands
 
 ```bash
-cargo check        # Fast compilation check
-cargo test         # Run all tests
-cargo clippy       # Linting
-cargo build --release  # Release binary at ./target/release/teri
+nix develop /home/flexnetos/FlexNetOS/src/yazelix#ci -c bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri && cargo check'
+nix develop /home/flexnetos/FlexNetOS/src/yazelix#ci -c bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri && cargo test'
+nix develop /home/flexnetos/FlexNetOS/src/yazelix#ci -c bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri && cargo clippy'
+nix develop /home/flexnetos/FlexNetOS/src/yazelix#ci -c bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri && cargo build --release'
 ```
 
 ## Envctl Integration
 
-For secret injection, use envctl:
+For local execution in this workspace, use the Yazelix Nix shell:
 ```bash
-envctl run -- teri run --seed ... --query ...
-envctl run -- teri serve --addr ...
+nix develop /home/flexnetos/FlexNetOS/src/yazelix#ci -c bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri && cargo run -- run --seed ... --query ...'
+nix develop /home/flexnetos/FlexNetOS/src/yazelix#ci -c bash -lc 'cd /home/flexnetos/FlexNetOS/src/teri && cargo run -- serve --addr ...'
 ```
 
 The `agent-env.toml` file declares teri's required secrets.
@@ -106,11 +106,10 @@ stale** (superseded by `RUNBOOK.md` §12).
 
 ## Secrets contract (owner architecture intent)
 
-teri NEVER documents or expects raw `export LLM_API_KEY` workflows. The key arrives via **envctl
-injection**: canonical form `env-ctl run --provider <p> -- teri run …` (vault-held key, child-env
-only; envctl's data-plane phase). Until that phase lands, the vault registration is
-`env-ctl secret add teri-llm --provider <p> --value-stdin`; local development may use `.env`
-(gitignored). The missing-key error message points at this contract — keep it that way.
+teri NEVER documents or expects raw `export LLM_API_KEY` workflows. The intended long-term
+contract is still child-process injection via `agent-env.toml`, but in this workspace the working
+local path is a gitignored `.env` plus the Yazelix Nix shell. The missing-key error message points
+at this contract — keep it that way.
 
 ## Inference backend guard
 

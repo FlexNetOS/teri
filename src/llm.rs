@@ -6,6 +6,8 @@ use futures::{Stream, StreamExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::pin::Pin;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 // ============================================================================
 // Post-processing helpers (MiroFish parity — llm_client.py:67,94-97)
@@ -385,6 +387,10 @@ pub struct OpenAiAdapter {
     /// FIX-4: explicit completion token cap for `complete`/`complete_json`. `0` means
     /// "omit `max_tokens`" (fall back to the server default — the prior behavior).
     max_tokens: u32,
+    /// Optional local-backend request limiter. inferrs currently serves the default model with
+    /// `max_batch_size=1`; without this, Teri's profile fan-out queues multiple long generations
+    /// behind one CUDA lane and callers time out before the engine reaches them.
+    request_limit: Option<Arc<Semaphore>>,
 }
 
 impl OpenAiAdapter {
@@ -398,14 +404,17 @@ impl OpenAiAdapter {
             timeout_secs: config.timeout_secs,
             max_retries: config.max_retries,
             max_tokens: config.max_tokens,
+            request_limit: openai_request_limit(&config.base_url)
+                .map(|limit| Arc::new(Semaphore::new(limit))),
         }
     }
 
     /// Build the `/chat/completions` request body from a message vector + options.
     ///
-    /// DRY: shared by `chat_with_meta` and `chat_json`. No-downgrade: optional keys
-    /// (`temperature` / `max_tokens` / `response_format`) are emitted ONLY when set,
-    /// so `ChatOptions::default()` produces the exact pre-S11 `{model, messages}` body.
+    /// DRY: shared by `chat_with_meta` and `chat_json`. The configured `LLM_MAX_TOKENS`
+    /// is a safety ceiling for local OpenAI-compatible engines: it fills in missing
+    /// `ChatOptions.max_tokens` and clamps larger per-call requests. Set
+    /// `LLM_MAX_TOKENS=0` to preserve the server default/no-ceiling behavior.
     fn build_chat_payload(
         &self,
         messages: &[ChatMessage],
@@ -418,8 +427,14 @@ impl OpenAiAdapter {
         if let Some(temp) = opts.temperature {
             payload["temperature"] = serde_json::json!(temp);
         }
-        if let Some(max) = opts.max_tokens {
-            payload["max_tokens"] = serde_json::json!(max);
+        let effective_max_tokens = match (opts.max_tokens, self.max_tokens) {
+            (Some(requested), configured) if configured > 0 => requested.min(configured),
+            (Some(requested), _) => requested,
+            (None, configured) if configured > 0 => configured,
+            (None, _) => 0,
+        };
+        if effective_max_tokens > 0 {
+            payload["max_tokens"] = serde_json::json!(effective_max_tokens);
         }
         // TASK-SIM-6 #7: structured-output request shape (OpenAI's `response_format`).
         if let Some(fmt) = opts.response_format {
@@ -433,6 +448,13 @@ impl OpenAiAdapter {
         let mut retries = 0;
 
         loop {
+            let permit =
+                match &self.request_limit {
+                    Some(limit) => Some(limit.acquire().await.map_err(|e| {
+                        TeriError::Http(format!("LLM request limiter closed: {e}"))
+                    })?),
+                    None => None,
+                };
             let response = self
                 .client
                 .post(&url)
@@ -450,6 +472,7 @@ impl OpenAiAdapter {
                     } else if resp.status().is_server_error() && retries < self.max_retries {
                         retries += 1;
                         let delay = (2_u64.pow(retries)).min(MAX_BACKOFF_SECS);
+                        drop(permit);
                         tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                         continue;
                     } else {
@@ -461,6 +484,7 @@ impl OpenAiAdapter {
                 Err(e) if retries < self.max_retries && e.is_timeout() => {
                     retries += 1;
                     let delay = (2_u64.pow(retries)).min(MAX_BACKOFF_SECS);
+                    drop(permit);
                     tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                     continue;
                 }
@@ -468,6 +492,23 @@ impl OpenAiAdapter {
             }
         }
     }
+}
+
+fn openai_request_limit(base_url: &str) -> Option<usize> {
+    if let Ok(raw) = std::env::var("LLM_MAX_CONCURRENT_REQUESTS") {
+        return raw.parse::<usize>().ok().filter(|v| *v > 0);
+    }
+
+    default_openai_request_limit(base_url)
+}
+
+fn default_openai_request_limit(base_url: &str) -> Option<usize> {
+    // Default only the local inferrs bind to one in-flight request. Hosted and explicitly remote
+    // OpenAI-compatible endpoints remain unconstrained unless the env var above is set.
+    let local_inferrs = base_url.contains("127.0.0.1:11435")
+        || base_url.contains("localhost:11435")
+        || base_url.contains("[::1]:11435");
+    local_inferrs.then_some(1)
 }
 
 #[async_trait]
@@ -483,8 +524,8 @@ impl LlmClient for OpenAiAdapter {
             ],
             "temperature": 0.7,
         });
-        // FIX-4: send an explicit max_tokens so the backend (shimmy default 256) does not
-        // truncate persona generation / graph extraction. `0` opts out (server default).
+        // FIX-4: send an explicit max_tokens so local backends do not run unbounded or
+        // inherit an unsuitable server default. `0` opts out (server default).
         if self.max_tokens > 0 {
             payload["max_tokens"] = serde_json::json!(self.max_tokens);
         }
@@ -1649,6 +1690,13 @@ mod tests {
         mock.assert();
     }
 
+    #[test]
+    fn test_openai_request_limit_defaults_for_local_inferrs_only() {
+        assert_eq!(default_openai_request_limit("http://127.0.0.1:11435/v1"), Some(1));
+        assert_eq!(default_openai_request_limit("http://localhost:11435/v1"), Some(1));
+        assert_eq!(default_openai_request_limit("https://api.openai.com/v1"), None);
+    }
+
     /// FIX-4: `complete()` must send an explicit `max_tokens` (default 2048) so the
     /// shimmy backend does not truncate at its 256-token default. The mock matches ONLY
     /// when the request body carries `"max_tokens": 2048`.
@@ -2383,12 +2431,14 @@ data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" Gemini\"}]}}]}\n",
         mock.assert();
     }
 
-    /// chat: temperature and max_tokens are absent when None — response still received.
+    /// chat: when max_tokens is None, the configured cap is sent so local backends stay bounded.
     #[tokio::test]
-    async fn test_openai_chat_opts_absent_when_none() {
+    async fn test_openai_chat_uses_configured_cap_when_none() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
-            when.method(POST).path("/chat/completions");
+            when.method(POST)
+                .path("/chat/completions")
+                .json_body_partial(r#"{"max_tokens": 2048}"#);
             then.status(200)
                 .header("Content-Type", "application/json")
                 .body(r#"{"choices":[{"message":{"content":"default response"}}]}"#);
@@ -2397,6 +2447,53 @@ data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" Gemini\"}]}}]}\n",
         let client = OpenAiAdapter::new(&openai_config(&server, 0));
         let resp = client.chat(&[ChatMessage::user("hi")], &ChatOptions::default()).await.unwrap();
         assert_eq!(resp, "default response");
+        mock.assert();
+    }
+
+    /// chat: explicit per-call token budgets are clamped by LLM_MAX_TOKENS.
+    #[tokio::test]
+    async fn test_openai_chat_clamps_to_configured_cap() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .json_body_partial(r#"{"max_tokens": 2048}"#);
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"choices":[{"message":{"content":"clamped"}}]}"#);
+        });
+
+        let client = OpenAiAdapter::new(&openai_config(&server, 0));
+        let resp = client
+            .chat(
+                &[ChatMessage::user("hi")],
+                &ChatOptions { temperature: None, max_tokens: Some(4096), response_format: None },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp, "clamped");
+        mock.assert();
+    }
+
+    /// chat: LLM_MAX_TOKENS=0 preserves the prior server-default/no-ceiling behavior.
+    #[tokio::test]
+    async fn test_openai_chat_max_tokens_zero_omits_default_cap() {
+        let server = MockServer::start();
+        let mut cfg = openai_config(&server, 0);
+        cfg.max_tokens = 0;
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/chat/completions").matches(|req| {
+                let body = String::from_utf8_lossy(req.body.as_deref().unwrap_or_default());
+                !body.contains("max_tokens")
+            });
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(r#"{"choices":[{"message":{"content":"uncapped"}}]}"#);
+        });
+
+        let client = OpenAiAdapter::new(&cfg);
+        let resp = client.chat(&[ChatMessage::user("hi")], &ChatOptions::default()).await.unwrap();
+        assert_eq!(resp, "uncapped");
         mock.assert();
     }
 

@@ -1754,12 +1754,12 @@ impl PersonaGenerator {
             let temperature = 0.7 - (attempt as f32) * 0.1;
             let messages =
                 [ChatMessage::system(system_prompt), ChatMessage::user(user_prompt.clone())];
-            // TASK-SIM-6 #7: request the structured-output (JSON-object) shape — mirrors
-            // `response_format={"type":"json_object"}` (oasis_profile_generator.py:536). No
-            // max_tokens (let the model run free, like MiroFish :538).
+            // TASK-SIM-6 #7: request the structured-output (JSON-object) shape. The profile
+            // schema is small, so cap this fan-out path below the global ontology/report budget;
+            // otherwise local inferrs spends minutes per profile generating unused verbosity.
             let opts = ChatOptions {
                 temperature: Some(temperature),
-                max_tokens: None,
+                max_tokens: Some(512),
                 response_format: Some(ResponseFormat::JsonObject),
             };
             // TASK-SIM-6 #7: use the truncation-aware entry point so we can detect a

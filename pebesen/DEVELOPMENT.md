@@ -32,8 +32,7 @@ make dev
 ### Prerequisites
 
 - **Rust 1.85+** (2024 edition)
-- **Node.js 22+** (latest LTS)
-- **pnpm 9+**
+- **Workspace-managed Bun 1.3+**
 - **Docker & Docker Compose**
 - **Python 3.8+** (for pre-commit hooks)
 - **uv** (recommended Python package manager)
@@ -46,8 +45,8 @@ make dev
 rustup update stable
 rustup component add rustfmt clippy
 
-# pnpm
-npm install -g pnpm
+# Bun (provided by the FlexNetOS workspace)
+meta exec --include teri -- bun --version
 
 # Python tools
 uv tool install pre-commit
@@ -138,7 +137,7 @@ make db-reset
 ```bash
 make test                        # All tests
 cargo test --all-features        # Rust only
-cd frontend && pnpm test         # Frontend only
+cd frontend && bun run test      # Frontend only
 cargo test --all-features --watch# Watch mode
 ```
 
@@ -156,7 +155,7 @@ cargo install tarpaulin
 cargo tarpaulin --all-features --workspace
 
 # Frontend
-cd frontend && pnpm test --coverage
+cd frontend && bun run test --coverage
 ```
 
 ## Database Management
@@ -203,7 +202,7 @@ curl http://localhost:7701/health
 ```bash
 make format        # Format all code
 make lint          # Run all linters
-make check-security# cargo audit + pnpm audit
+make check-security# cargo audit + frontend dependency review
 make deps          # Update dependencies
 ```
 
@@ -275,9 +274,9 @@ RUST_LOG=debug cargo test your_test
 ### Frontend
 
 ```bash
-cd frontend && pnpm dev --debug
-cd frontend && pnpm check         # Type checking
-cd frontend && pnpm build --analyze
+cd frontend && bun run dev -- --host 127.0.0.1 --port 4174
+cd frontend && bun run check      # Type checking
+cd frontend && bun run build
 ```
 
 ### Database
@@ -298,7 +297,7 @@ cargo install cargo-flamegraph
 cargo flamegraph --bin pebesen
 
 # Frontend bundle
-cd frontend && pnpm build --analyze
+cd frontend && bun run build
 npx lighthouse http://localhost:5173
 ```
 
@@ -355,7 +354,7 @@ make migrate
 **Frontend build errors:**
 ```bash
 cd frontend && rm -rf .svelte-kit build dist
-pnpm install
+bun install
 ```
 
 **Rust compilation errors:**
