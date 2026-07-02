@@ -29,6 +29,33 @@ enum Commands {
         #[arg(short, long)]
         addr: Option<String>,
     },
+    /// Inspect the checked-in source wire registry
+    Wires {
+        #[command(subcommand)]
+        command: WireCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum WireCommands {
+    /// List wired sources
+    List {
+        #[arg(long)]
+        include_deferred: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one wired source
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Validate the source wire registry
+    Validate {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -41,6 +68,7 @@ async fn main() -> Result<()> {
     match &cli.command {
         Commands::Run { .. } => run_cmd().await,
         Commands::Serve { .. } => serve_cmd().await,
+        Commands::Wires { .. } => wires_cmd(),
     }
 }
 
@@ -158,6 +186,81 @@ async fn serve_cmd() -> Result<()> {
 
     // Delegate to teri::server::serve which carries the full U-002/U-003 logic.
     teri::server::serve(config, addr.as_deref()).await
+}
+
+fn wires_cmd() -> Result<()> {
+    let cli = Cli::parse();
+    let Commands::Wires { command } = cli.command else { unreachable!() };
+
+    match command {
+        WireCommands::List { include_deferred, json } => {
+            if json {
+                let wires: Vec<_> = teri::source_wires::all_source_wires()
+                    .iter()
+                    .filter(|wire| {
+                        include_deferred
+                            || wire.selection != teri::source_wires::WireSelection::Deferred
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&wires).map_err(|e| {
+                        TeriError::Unknown(format!("failed to serialize source wires: {e}"))
+                    })?
+                );
+            } else {
+                println!("{}", teri::source_wires::format_wire_list(include_deferred));
+            }
+            Ok(())
+        }
+        WireCommands::Show { id, json } => {
+            let wire = teri::source_wires::get_source_wire(&id)
+                .ok_or_else(|| TeriError::Unknown(format!("unknown source wire id: {id}")))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(wire).map_err(|e| {
+                        TeriError::Unknown(format!("failed to serialize source wire: {e}"))
+                    })?
+                );
+            } else {
+                println!("{}", teri::source_wires::format_wire_details(wire));
+            }
+            Ok(())
+        }
+        WireCommands::Validate { json } => match teri::source_wires::validate_source_wires() {
+            Ok(()) => {
+                if json {
+                    println!(r#"{{"ok":true,"errors":[]}}"#);
+                } else {
+                    println!("source wire registry is valid");
+                }
+                Ok(())
+            }
+            Err(errors) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "ok": false,
+                            "errors": errors,
+                        }))
+                        .map_err(|e| {
+                            TeriError::Unknown(format!(
+                                "failed to serialize validation result: {e}"
+                            ))
+                        })?
+                    );
+                } else {
+                    eprintln!("source wire registry is invalid:");
+                    for error in errors {
+                        eprintln!("- {error}");
+                    }
+                }
+                Err(TeriError::Unknown("source wire registry validation failed".to_string()))
+            }
+        },
+    }
 }
 
 /// Backend honesty guard shared by `run` and `serve`. Drives the configured

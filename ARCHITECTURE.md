@@ -135,6 +135,16 @@
 | Errors | `thiserror` (`TeriError`) / `anyhow` | lib / bin |
 | Seed parsing | `pdfium-render`, `scraper`, `encoding_rs` | pdf / html / encodings |
 
+## 6. Source wire registry
+
+Issue 86 adds a checked-in external-source registry in `src/source_wires.rs`. It is intentionally
+read-only and exists to answer which upstream repos or PRs matter to Teri, which Teri surfaces
+they map to, which evidence was inspected, and which adoption gate blocks deeper integration.
+
+The registry is surfaced through `teri wires list/show/validate` and is cross-linked from
+`docs/source-wires/`.
+
 See [`README.md`](./README.md) for usage, [`FEATURE-PARITY.md`](./FEATURE-PARITY.md) for the
-MiroFish parity ledger, and [`docs/USER-STORY.md`](./docs/USER-STORY.md) /
+MiroFish parity ledger, [`docs/source-wires/README.md`](./docs/source-wires/README.md) for the
+issue-86 wire estate, and [`docs/USER-STORY.md`](./docs/USER-STORY.md) /
 [`docs/AGENTIC-STORY.md`](./docs/AGENTIC-STORY.md) for the product + autonomy narratives.

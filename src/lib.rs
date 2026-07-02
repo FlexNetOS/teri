@@ -16,6 +16,7 @@ pub mod seed;
 pub mod server;
 pub mod services;
 pub mod sim;
+pub mod source_wires;
 pub mod task;
 
 pub mod pipeline;
