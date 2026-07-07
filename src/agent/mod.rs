@@ -10,6 +10,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+const AGENT_CHAT_TEMPLATE: &str = include_str!("../../templates/agent_chat.jinja");
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Persona {
     pub name: String,
@@ -145,14 +147,42 @@ impl Agent {
         Ok(validated_action)
     }
 
+    /// Answer a free-form chat message, drawing on this agent's persona and memory.
+    /// Unlike `step`, this does not consult world state or produce an `Action` — it's
+    /// for direct conversational interaction with the agent.
+    pub async fn chat<L: LlmClient>(&self, message: &str, llm: &L) -> Result<String> {
+        let relevant_memories = self.retrieve_relevant_memories_for_message(message);
+        let memories_json: Vec<serde_json::Value> = relevant_memories
+            .iter()
+            .map(|m| serde_json::json!({ "content": m.content, "importance": m.importance }))
+            .collect();
+
+        let env = Environment::new();
+        let template = env
+            .template_from_str(AGENT_CHAT_TEMPLATE)
+            .map_err(|e| TeriError::Agent(format!("Template parsing error: {}", e)))?;
+
+        let ctx = context! {
+            agent_name => &self.persona.name,
+            agent_role => &self.persona.role,
+            agent_background => &self.persona.background,
+            agent_traits => &self.persona.traits,
+            relevant_memories => memories_json,
+            has_simulation_context => false,
+            message => message,
+        };
+
+        let prompt = template
+            .render(ctx)
+            .map_err(|e| TeriError::Agent(format!("Failed to render chat template: {}", e)))?;
+
+        llm.complete(&prompt).await
+    }
+
     /// Retrieve relevant memories based on current world state
     /// Uses keyword-overlap scoring: ranks memories by word overlap with recent events and world variables.
     /// Falls back to recency if no overlaps found.
     fn retrieve_relevant_memories(&self, world: &WorldState) -> Vec<&MemoryEntry> {
-        if self.memory.short_term.is_empty() {
-            return Vec::new();
-        }
-
         // Build a set of context keywords from recent events and variables
         let mut context_words = std::collections::HashSet::new();
 
@@ -176,7 +206,33 @@ impl Agent {
             }
         }
 
-        // Score each memory by word overlap with context
+        self.score_memories_by_keywords(&context_words)
+    }
+
+    /// Retrieve relevant memories based on a free-form chat message.
+    /// Uses the same keyword-overlap scoring as `retrieve_relevant_memories`, but
+    /// draws context keywords from the message text instead of world state.
+    fn retrieve_relevant_memories_for_message(&self, message: &str) -> Vec<&MemoryEntry> {
+        let context_words: std::collections::HashSet<String> = message
+            .to_lowercase()
+            .split_whitespace()
+            .filter(|word| word.len() > 2)
+            .map(|word| word.to_string())
+            .collect();
+
+        self.score_memories_by_keywords(&context_words)
+    }
+
+    /// Score short-term memories by word overlap with `context_words`, ranking by
+    /// overlap count (descending) and breaking ties by recency (most recent first).
+    fn score_memories_by_keywords(
+        &self,
+        context_words: &std::collections::HashSet<String>,
+    ) -> Vec<&MemoryEntry> {
+        if self.memory.short_term.is_empty() {
+            return Vec::new();
+        }
+
         let mut scored_memories: Vec<(usize, &MemoryEntry)> = self
             .memory
             .short_term
@@ -799,6 +855,101 @@ mod tests {
         ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
             Err(TeriError::Llm("Streaming not implemented in mock".to_string()))
         }
+    }
+
+    // Mock LLM for chat tests; captures the rendered prompt for assertions.
+    struct MockChatLlm {
+        response: String,
+        captured_prompt: std::sync::Mutex<Option<String>>,
+    }
+
+    impl MockChatLlm {
+        fn new(response: &str) -> Self {
+            Self { response: response.to_string(), captured_prompt: std::sync::Mutex::new(None) }
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for MockChatLlm {
+        async fn complete(&self, prompt: &str) -> Result<String> {
+            *self.captured_prompt.lock().unwrap() = Some(prompt.to_string());
+            Ok(self.response.clone())
+        }
+
+        async fn complete_json<T: serde::de::DeserializeOwned>(&self, _prompt: &str) -> Result<T> {
+            Err(TeriError::Llm("Not implemented in mock".to_string()))
+        }
+
+        async fn stream(
+            &self,
+            _prompt: &str,
+        ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+            Err(TeriError::Llm("Streaming not implemented in mock".to_string()))
+        }
+    }
+
+    fn test_persona() -> Persona {
+        Persona {
+            name: "Alice".to_string(),
+            background: "A seasoned negotiator.".to_string(),
+            traits: vec!["curious".to_string(), "calm".to_string()],
+            role: "Diplomat".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_agent_chat_returns_llm_response() {
+        let agent = Agent::new(test_persona());
+        let llm = MockChatLlm::new("The negotiation is progressing well.");
+
+        let response = agent
+            .chat("How is the negotiation going?", &llm)
+            .await
+            .expect("chat should succeed");
+
+        assert_eq!(response, "The negotiation is progressing well.");
+    }
+
+    #[tokio::test]
+    async fn test_agent_chat_includes_persona_in_prompt() {
+        let agent = Agent::new(test_persona());
+        let llm = MockChatLlm::new("Response");
+
+        agent.chat("Tell me about yourself", &llm).await.expect("chat should succeed");
+
+        let prompt = llm.captured_prompt.lock().unwrap().clone().expect("prompt captured");
+        assert!(prompt.contains("Alice"));
+        assert!(prompt.contains("Diplomat"));
+        assert!(prompt.contains("A seasoned negotiator."));
+        assert!(prompt.contains("curious"));
+        assert!(prompt.contains("calm"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_chat_includes_relevant_memories_in_prompt() {
+        let mut agent = Agent::new(test_persona());
+        agent.add_memory("Alice met Bob at the summit".to_string(), 0.8);
+        let llm = MockChatLlm::new("Response");
+
+        agent
+            .chat("What happened at the summit?", &llm)
+            .await
+            .expect("chat should succeed");
+
+        let prompt = llm.captured_prompt.lock().unwrap().clone().expect("prompt captured");
+        assert!(prompt.contains("## Relevant Memories"));
+        assert!(prompt.contains("Alice met Bob at the summit"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_chat_omits_simulation_context() {
+        let agent = Agent::new(test_persona());
+        let llm = MockChatLlm::new("Response");
+
+        agent.chat("Any thoughts?", &llm).await.expect("chat should succeed");
+
+        let prompt = llm.captured_prompt.lock().unwrap().clone().expect("prompt captured");
+        assert!(!prompt.contains("## Simulation Context"));
     }
 
     #[test]
