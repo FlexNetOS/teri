@@ -483,6 +483,84 @@ mod tests {
         assert_eq!(agent_summaries[0]["name"], "Bob");
     }
 
+    fn snapshot_with_agents(tick: u32, agents: Vec<(Uuid, &str, &str)>) -> WorldSnapshot {
+        let mut agent_map = std::collections::HashMap::new();
+        for (id, name, state) in agents {
+            agent_map
+                .insert(id, AgentSnapshot { id, name: name.to_string(), state: state.to_string() });
+        }
+        WorldSnapshot {
+            tick,
+            agents: agent_map,
+            events: vec![],
+            variables: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_summarize_agents_selects_all_present_agents() {
+        let alice = Uuid::new_v4();
+        let bob = Uuid::new_v4();
+        let carol = Uuid::new_v4();
+
+        let history = vec![
+            snapshot_with_agents(1, vec![(alice, "Alice", "Idle"), (bob, "Bob", "Idle")]),
+            snapshot_with_agents(2, vec![(alice, "Alice", "Idle"), (carol, "Carol", "Idle")]),
+        ];
+        let result = SimulationResult { id: Uuid::new_v4(), history };
+
+        let agent_summaries = ReportAgent::summarize_agents(&result);
+        let names: std::collections::HashSet<&str> =
+            agent_summaries.iter().map(|a| a["name"].as_str().unwrap()).collect();
+
+        assert_eq!(agent_summaries.len(), 3);
+        assert_eq!(names, std::collections::HashSet::from(["Alice", "Bob", "Carol"]));
+    }
+
+    #[test]
+    fn test_summarize_agents_orders_by_activity_descending() {
+        let alice = Uuid::new_v4();
+        let bob = Uuid::new_v4();
+        let carol = Uuid::new_v4();
+
+        // Alice appears in 3 snapshots, Bob in 2, Carol in 1 — distinct activity levels.
+        let history = vec![
+            snapshot_with_agents(
+                1,
+                vec![(alice, "Alice", "Idle"), (bob, "Bob", "Idle"), (carol, "Carol", "Idle")],
+            ),
+            snapshot_with_agents(2, vec![(alice, "Alice", "Idle"), (bob, "Bob", "Idle")]),
+            snapshot_with_agents(3, vec![(alice, "Alice", "Idle")]),
+        ];
+        let result = SimulationResult { id: Uuid::new_v4(), history };
+
+        let agent_summaries = ReportAgent::summarize_agents(&result);
+
+        assert_eq!(agent_summaries[0]["name"], "Alice");
+        assert_eq!(agent_summaries[0]["action_count"], 3);
+        assert_eq!(agent_summaries[1]["name"], "Bob");
+        assert_eq!(agent_summaries[1]["action_count"], 2);
+        assert_eq!(agent_summaries[2]["name"], "Carol");
+        assert_eq!(agent_summaries[2]["action_count"], 1);
+    }
+
+    #[test]
+    fn test_summarize_agents_reflects_most_recent_final_state() {
+        let alice = Uuid::new_v4();
+
+        let history = vec![
+            snapshot_with_agents(1, vec![(alice, "Alice", "Idle")]),
+            snapshot_with_agents(2, vec![(alice, "Alice", "Active")]),
+            snapshot_with_agents(3, vec![(alice, "Alice", "Resting")]),
+        ];
+        let result = SimulationResult { id: Uuid::new_v4(), history };
+
+        let agent_summaries = ReportAgent::summarize_agents(&result);
+
+        assert_eq!(agent_summaries.len(), 1);
+        assert_eq!(agent_summaries[0]["final_state"], "Resting");
+    }
+
     // Mock LLM client for generate() tests; returns a fixed JSON response for both
     // `complete` and `complete_json` so tests can exercise the real parsing path.
     struct MockJsonLlm {
