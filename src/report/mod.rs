@@ -480,6 +480,138 @@ mod tests {
         assert_eq!(agent_summaries[0]["name"], "Bob");
     }
 
+    // Mock LLM client for generate() tests; returns a fixed JSON response for both
+    // `complete` and `complete_json` so tests can exercise the real parsing path.
+    struct MockJsonLlm {
+        response: String,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for MockJsonLlm {
+        async fn complete(&self, _prompt: &str) -> Result<String> {
+            Ok(self.response.clone())
+        }
+
+        async fn complete_json<T: serde::de::DeserializeOwned>(&self, _prompt: &str) -> Result<T> {
+            serde_json::from_str(&self.response)
+                .map_err(|e| TeriError::Llm(format!("JSON parsing error: {}", e)))
+        }
+
+        async fn stream(
+            &self,
+            _prompt: &str,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+            Err(TeriError::Llm("Not implemented".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_returns_populated_report_from_mock_llm() {
+        let result = build_test_simulation_result();
+        let agent_id = Uuid::new_v4();
+        let mock_response = serde_json::json!({
+            "summary": "The negotiation concluded successfully.",
+            "timeline": [
+                { "tick": 2, "description": "Alice proposed terms", "significance": 0.6 },
+                { "tick": 5, "description": "Bob accepted the deal", "significance": 0.9 }
+            ],
+            "agent_highlights": [
+                { "agent_id": agent_id.to_string(), "agent_name": "Alice", "summary": "Led the negotiation" }
+            ],
+            "confidence": 0.85
+        })
+        .to_string();
+        let llm = MockJsonLlm { response: mock_response };
+
+        let report = ReportAgent::generate(&result, "Will the negotiation succeed?", &llm)
+            .await
+            .expect("generate should succeed");
+
+        assert_eq!(report.summary, "The negotiation concluded successfully.");
+        assert_eq!(report.raw_query, "Will the negotiation succeed?");
+        assert_eq!(report.timeline.len(), 2);
+        assert_eq!(report.agent_highlights.len(), 1);
+        assert_eq!(report.agent_highlights[0].agent_name, "Alice");
+    }
+
+    #[tokio::test]
+    async fn test_generate_extracts_timeline_events_correctly() {
+        let result = build_test_simulation_result();
+        let mock_response = serde_json::json!({
+            "summary": "Summary",
+            "timeline": [
+                { "tick": 3, "description": "A key event occurred", "significance": 0.75 }
+            ],
+            "agent_highlights": [],
+            "confidence": 0.5
+        })
+        .to_string();
+        let llm = MockJsonLlm { response: mock_response };
+
+        let report = ReportAgent::generate(&result, "query", &llm)
+            .await
+            .expect("generate should succeed");
+
+        assert_eq!(report.timeline.len(), 1);
+        assert_eq!(report.timeline[0].tick, 3);
+        assert_eq!(report.timeline[0].description, "A key event occurred");
+        assert_eq!(report.timeline[0].significance, 0.75);
+    }
+
+    #[tokio::test]
+    async fn test_generate_calculates_confidence_from_llm_response() {
+        let result = build_test_simulation_result();
+        let mock_response = serde_json::json!({
+            "summary": "Summary",
+            "timeline": [],
+            "agent_highlights": [],
+            "confidence": 0.42
+        })
+        .to_string();
+        let llm = MockJsonLlm { response: mock_response };
+
+        let report = ReportAgent::generate(&result, "query", &llm)
+            .await
+            .expect("generate should succeed");
+
+        assert_eq!(report.confidence, 0.42);
+    }
+
+    #[tokio::test]
+    async fn test_generate_defaults_confidence_to_zero_when_missing() {
+        let result = build_test_simulation_result();
+        let mock_response = serde_json::json!({
+            "summary": "Summary",
+            "timeline": [],
+            "agent_highlights": []
+        })
+        .to_string();
+        let llm = MockJsonLlm { response: mock_response };
+
+        let report = ReportAgent::generate(&result, "query", &llm)
+            .await
+            .expect("generate should succeed");
+
+        assert_eq!(report.confidence, 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_generate_returns_error_when_llm_response_missing_summary() {
+        let result = build_test_simulation_result();
+        let mock_response = serde_json::json!({
+            "timeline": [],
+            "agent_highlights": [],
+            "confidence": 0.5
+        })
+        .to_string();
+        let llm = MockJsonLlm { response: mock_response };
+
+        let err = ReportAgent::generate(&result, "query", &llm)
+            .await
+            .expect_err("generate should fail");
+        assert!(matches!(err, TeriError::Report(_)));
+    }
+
     // Mock LLM client for streaming tests
     struct MockStreamingLlm {
         chunks: Vec<String>,
