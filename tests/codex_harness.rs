@@ -1,82 +1,56 @@
-//! Regression tests for the repo-local Codex harness surface.
+//! Regression tests for the Codex guidance surface.
 //!
-//! These tests keep `.codex` from becoming a hand-checked config island. The harness is part of
-//! the repository contract: it must emit valid hook JSON, flag stale simulation docs, and preserve
-//! the bounded "simulate/predict anything" counterargument in prompts.
+//! FlexNetOS owns lifecycle hook enforcement at the workspace root, so this repo must not
+//! reactivate repo-local Codex lifecycle hooks. Teri still keeps the previous hook payload archived
+//! as evidence, and these tests make sure the archive remains parseable and useful.
 
 use serde_json::Value;
 use std::collections::HashSet;
-use std::ffi::OsString;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn archive_dir() -> PathBuf {
+    repo_root().join(".codex/archive/lifecycle-hooks-20260703T024950Z")
 }
 
 fn read_repo(path: &str) -> String {
     std::fs::read_to_string(repo_root().join(path)).expect(path)
 }
 
-fn host_rtk_available() -> bool {
-    Command::new("rtk").arg("--version").output().is_ok()
-}
-
-fn rtk_path_env() -> Option<(tempfile::TempDir, OsString)> {
-    if host_rtk_available() {
-        return None;
-    }
-
-    let tmp = tempfile::tempdir().expect("rtk shim tempdir");
-    let shim = tmp.path().join("rtk");
-    std::fs::write(&shim, "#!/usr/bin/env bash\nexec \"$@\"\n").expect("write rtk shim");
-    let mut perms = std::fs::metadata(&shim).expect("rtk shim metadata").permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&shim, perms).expect("chmod rtk shim");
-
-    let old_path = std::env::var_os("PATH").unwrap_or_default();
-    let mut paths = vec![tmp.path().to_path_buf()];
-    paths.extend(std::env::split_paths(&old_path));
-    let path = std::env::join_paths(paths).expect("join PATH with rtk shim");
-    Some((tmp, path))
-}
-
-fn run_truth_hook(root: &Path) -> Value {
-    let rtk_env = rtk_path_env();
-    let mut command = Command::new("rtk");
-    command.arg("bash").arg(".codex/hooks/teri-context-session-start.sh");
-    if let Some((_tmp, path)) = &rtk_env {
-        command.env("PATH", path);
-    }
-
-    let output = command.current_dir(root).output().expect("run teri truth hook");
-
-    assert!(
-        output.status.success(),
-        "hook failed: status={:?}\nstdout={}\nstderr={}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    serde_json::from_slice(&output.stdout).expect("hook stdout must be valid JSON")
+fn read_archive(path: &str) -> String {
+    std::fs::read_to_string(archive_dir().join(path)).expect(path)
 }
 
 #[test]
-fn hooks_json_wires_truth_hook_for_session_and_compaction() {
-    let hooks: Value = serde_json::from_str(&read_repo(".codex/hooks.json"))
-        .expect(".codex/hooks.json must parse as JSON");
+fn repo_local_lifecycle_hooks_are_archived_not_active() {
+    assert!(
+        !repo_root().join(".codex/hooks.json").exists(),
+        "repo-local Codex lifecycle hooks must stay inactive; root workspace hooks own enforcement"
+    );
+    assert!(
+        !repo_root().join(".codex/hooks").exists(),
+        "repo-local Codex hook scripts must stay inactive; archived evidence lives under .codex/archive"
+    );
+    assert!(
+        archive_dir().join("hooks.zip").exists(),
+        "archive must preserve the removed lifecycle hook payload"
+    );
+
+    let hooks: Value = serde_json::from_str(&read_archive("hooks.json.md"))
+        .expect("archived hooks.json must parse as JSON");
     let top_level_keys: HashSet<&str> = hooks
         .as_object()
-        .expect(".codex/hooks.json top-level object")
+        .expect("archived hooks.json top-level object")
         .keys()
         .map(String::as_str)
         .collect();
     assert_eq!(
         top_level_keys,
         HashSet::from(["hooks"]),
-        ".codex/hooks.json must stay on the current Codex schema; top-level description fields make Codex warn and skip clean hook loading"
+        "archived hooks.json should preserve the schema that used to be active"
     );
 
     let hook_table = hooks["hooks"].as_object().expect("hooks object");
@@ -90,26 +64,26 @@ fn hooks_json_wires_truth_hook_for_session_and_compaction() {
 
         assert!(
             command.contains(".codex/hooks/teri-context-session-start.sh"),
-            "{event_name} should run the teri truth hook, got {command:?}"
+            "{event_name} archive should preserve the teri truth hook command, got {command:?}"
         );
         assert!(
             command.starts_with("rtk bash -lc "),
-            "{event_name} should route through rtk bash, got {command:?}"
+            "{event_name} archive should preserve rtk bash routing, got {command:?}"
         );
         assert!(
             command.contains("rtk git rev-parse --show-toplevel"),
-            "{event_name} should resolve the repo through rtk git, got {command:?}"
+            "{event_name} archive should preserve rtk git repo resolution, got {command:?}"
         );
         assert!(
             !command.contains("/home/"),
-            "hook command should be repo-relative, got {command:?}"
+            "archived hook command should remain repo-relative, got {command:?}"
         );
     }
 }
 
 #[test]
-fn codex_runtime_files_route_commands_through_rtk() {
-    let hooks_script = read_repo(".codex/hooks/teri-context-session-start.sh");
+fn archived_runtime_files_route_commands_through_rtk() {
+    let hooks_script = read_archive("hooks/teri-context-session-start.sh.md");
     assert!(hooks_script.contains("rtk git rev-parse --show-toplevel"));
     assert!(hooks_script.contains("rtk python3 - <<'PY'"));
     assert!(!hooks_script.contains("$(git rev-parse"));
@@ -125,31 +99,18 @@ fn codex_runtime_files_route_commands_through_rtk() {
 }
 
 #[test]
-fn truth_hook_emits_valid_session_context_for_current_repo() {
-    let root = repo_root();
-    let json = run_truth_hook(&root);
-    let output = &json["hookSpecificOutput"];
-
-    assert_eq!(output["hookEventName"], "SessionStart");
-
-    let context = output["additionalContext"].as_str().expect("additional context");
+fn archived_truth_hook_preserves_session_context_contract() {
+    let hooks_script = read_archive("hooks/teri-context-session-start.sh.md");
     for phrase in [
         "Teri truth guardrails:",
         "cannot literally simulate or predict anything",
         "not a calibrated probability",
-        "Source truth: teri run is wired",
+        "Source truth: teri run is wired to provider-selected run_pipeline",
         "serve/API builds a provider-polymorphic ApiState (SimulationRunner<ProviderAdapter>); run uses provider selection via build_provider_llm.",
         "No known stale teri-run/provider/test-count phrases found",
     ] {
-        assert!(context.contains(phrase), "missing hook context phrase: {phrase}");
+        assert!(hooks_script.contains(phrase), "archived hook missing context phrase: {phrase}");
     }
-
-    let watch_paths: HashSet<&str> = output["watchPaths"]
-        .as_array()
-        .expect("watchPaths array")
-        .iter()
-        .map(|v| v.as_str().expect("watch path string"))
-        .collect();
 
     for expected in [
         "src/main.rs",
@@ -161,48 +122,28 @@ fn truth_hook_emits_valid_session_context_for_current_repo() {
         "RUNBOOK.md",
         "CLAUDE.md",
     ] {
-        assert!(watch_paths.contains(expected), "missing watch path: {expected}");
+        assert!(hooks_script.contains(expected), "archived hook missing watch path: {expected}");
     }
 }
 
 #[test]
-fn truth_hook_flags_stale_docs_in_a_minimal_repo_fixture() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let root = tmp.path();
+fn archived_truth_hook_retains_stale_doc_detection_logic() {
+    let hooks_script = read_archive("hooks/teri-context-session-start.sh.md");
 
-    std::fs::create_dir_all(root.join(".codex/hooks")).unwrap();
-    std::fs::create_dir_all(root.join("src/api")).unwrap();
-
-    std::fs::copy(
-        repo_root().join(".codex/hooks/teri-context-session-start.sh"),
-        root.join(".codex/hooks/teri-context-session-start.sh"),
-    )
-    .unwrap();
-
-    std::fs::write(root.join("README.md"), "Pipeline not yet implemented\n").unwrap();
-    std::fs::write(root.join("RUNBOOK.md"), "preflights, then bails\n").unwrap();
-    std::fs::write(root.join("CLAUDE.md"), "1629 tests\n").unwrap();
-    std::fs::write(
-        root.join("src/main.rs"),
-        "fn main() { build_provider_llm(); run_pipeline(); }\n",
-    )
-    .unwrap();
-    std::fs::write(root.join("src/pipeline.rs"), "pub async fn run_pipeline() {}\n").unwrap();
-    std::fs::write(
-        root.join("src/api/mod.rs"),
-        "pub(crate) fn build_llm() -> OpenAiAdapter {} struct OpenAiAdapter; type X = SimulationRunner<OpenAiAdapter>;\n",
-    )
-    .unwrap();
-
-    let json = run_truth_hook(root);
-    let context = json["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .expect("additional context");
-
-    assert!(context.contains("Stale doc markers found"), "context was: {context}");
-    assert!(context.contains("README.md: contains stale phrase"));
-    assert!(context.contains("RUNBOOK.md: contains stale phrase"));
-    assert!(context.contains("CLAUDE.md: contains stale phrase"));
+    for phrase in [
+        "Pipeline not yet implemented",
+        "preflights, then bails",
+        "Skeleton with real organs",
+        "hardcoded OpenAI",
+        "1629 tests",
+        "Stale doc markers found",
+        "contains stale phrase",
+    ] {
+        assert!(
+            hooks_script.contains(phrase),
+            "archived hook missing stale-doc detection phrase: {phrase}"
+        );
+    }
 }
 
 #[test]
