@@ -598,4 +598,71 @@ mod tests {
         assert_eq!(original.content, deserialized.content);
         assert!(deserialized.agent_id.is_none());
     }
+
+    const AGENT_CHAT_TEMPLATE: &str = include_str!("../../templates/agent_chat.jinja");
+
+    #[test]
+    fn test_agent_chat_template_renders_with_persona_memory_and_context() {
+        let env = Environment::new();
+        let template = env.template_from_str(AGENT_CHAT_TEMPLATE).expect("Template parsing error");
+
+        let ctx = context! {
+            agent_name => "Alice",
+            agent_role => "Diplomat",
+            agent_background => "A seasoned negotiator.",
+            agent_traits => vec!["curious", "calm"],
+            relevant_memories => vec![serde_json::json!({
+                "content": "Alice met Bob at the summit",
+                "importance": 0.8,
+            })],
+            query => "What will happen next?",
+            total_ticks => 10,
+            agent_count => 2,
+            total_events => 5,
+            key_events => vec![serde_json::json!({
+                "tick": 3,
+                "description": "Alice initiates dialogue",
+                "actor": "Alice",
+            })],
+            agents => vec![serde_json::json!({
+                "name": "Alice",
+                "action_count": 4,
+                "final_state": "Active",
+            })],
+            conversation_history => vec![serde_json::json!({
+                "sender": "user",
+                "content": "How is the negotiation going?",
+            })],
+            message => "Will the negotiation succeed?",
+        };
+
+        let rendered = template.render(ctx).expect("Template rendering error");
+
+        assert!(rendered.contains("Alice"));
+        assert!(rendered.contains("Diplomat"));
+        assert!(rendered.contains("Alice met Bob at the summit"));
+        assert!(rendered.contains("What will happen next?"));
+        assert!(rendered.contains("Alice initiates dialogue"));
+        assert!(rendered.contains("How is the negotiation going?"));
+        assert!(rendered.contains("Will the negotiation succeed?"));
+    }
+
+    #[test]
+    fn test_agent_chat_template_renders_with_message_only() {
+        let env = Environment::new();
+        let template = env.template_from_str(AGENT_CHAT_TEMPLATE).expect("Template parsing error");
+
+        let ctx = context! {
+            message => "Hello there",
+        };
+
+        let rendered =
+            template.render(ctx).expect("Template should render with no optional context");
+
+        assert!(rendered.contains("Hello there"));
+        assert!(!rendered.contains("## Your Persona"));
+        assert!(!rendered.contains("## Relevant Memories"));
+        assert!(!rendered.contains("## Simulation Context"));
+        assert!(!rendered.contains("## Conversation So Far"));
+    }
 }
