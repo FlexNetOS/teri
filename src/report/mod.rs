@@ -199,7 +199,7 @@ impl ReportAgent {
         query: &str,
     ) -> Option<PredictionReport> {
         let summary = response.get("summary")?.as_str()?.to_string();
-        let timeline = response
+        let mut timeline: Vec<TimelineEvent> = response
             .get("timeline")
             .and_then(|v| v.as_array())?
             .iter()
@@ -210,6 +210,9 @@ impl ReportAgent {
                 Some(TimelineEvent { tick, description, significance })
             })
             .collect();
+        timeline.sort_by(|a, b| {
+            b.significance.partial_cmp(&a.significance).unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let agent_highlights = response
             .get("agent_highlights")
@@ -610,6 +613,77 @@ mod tests {
             .await
             .expect_err("generate should fail");
         assert!(matches!(err, TeriError::Report(_)));
+    }
+
+    #[test]
+    fn test_parse_report_extracts_all_timeline_event_fields() {
+        let response = serde_json::json!({
+            "summary": "Summary",
+            "timeline": [
+                { "tick": 1, "description": "First event", "significance": 0.2 },
+                { "tick": 4, "description": "Second event", "significance": 0.7 },
+                { "tick": 9, "description": "Third event", "significance": 0.5 }
+            ],
+            "agent_highlights": [],
+            "confidence": 0.5
+        });
+
+        let report = ReportAgent::parse_report_from_json(&response, "query")
+            .expect("parsing should succeed");
+
+        assert_eq!(report.timeline.len(), 3);
+        for (tick, description) in [(1, "First event"), (4, "Second event"), (9, "Third event")] {
+            let event = report
+                .timeline
+                .iter()
+                .find(|e| e.tick == tick)
+                .unwrap_or_else(|| panic!("missing event for tick {tick}"));
+            assert_eq!(event.description, description);
+        }
+    }
+
+    #[test]
+    fn test_parse_report_sorts_timeline_by_significance_descending() {
+        let response = serde_json::json!({
+            "summary": "Summary",
+            "timeline": [
+                { "tick": 1, "description": "Low", "significance": 0.2 },
+                { "tick": 2, "description": "High", "significance": 0.9 },
+                { "tick": 3, "description": "Medium", "significance": 0.5 }
+            ],
+            "agent_highlights": [],
+            "confidence": 0.5
+        });
+
+        let report = ReportAgent::parse_report_from_json(&response, "query")
+            .expect("parsing should succeed");
+
+        let significances: Vec<f32> = report.timeline.iter().map(|e| e.significance).collect();
+        assert_eq!(significances, vec![0.9, 0.5, 0.2]);
+        assert_eq!(report.timeline[0].description, "High");
+        assert_eq!(report.timeline[1].description, "Medium");
+        assert_eq!(report.timeline[2].description, "Low");
+    }
+
+    #[test]
+    fn test_parse_report_preserves_relative_order_for_equal_significance() {
+        let response = serde_json::json!({
+            "summary": "Summary",
+            "timeline": [
+                { "tick": 1, "description": "Alpha", "significance": 0.5 },
+                { "tick": 2, "description": "Beta", "significance": 0.5 },
+                { "tick": 3, "description": "Gamma", "significance": 0.5 }
+            ],
+            "agent_highlights": [],
+            "confidence": 0.5
+        });
+
+        let report = ReportAgent::parse_report_from_json(&response, "query")
+            .expect("parsing should succeed");
+
+        let descriptions: Vec<&str> =
+            report.timeline.iter().map(|e| e.description.as_str()).collect();
+        assert_eq!(descriptions, vec!["Alpha", "Beta", "Gamma"]);
     }
 
     // Mock LLM client for streaming tests
