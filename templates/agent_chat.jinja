@@ -15,9 +15,8 @@ Traits: {{ agent_traits|join(", ") }}
 {% endfor %}
 {% endif %}
 
-{% if query %}
+{% if has_simulation_context %}
 ## Simulation Context
-User Query: {{ query }}
 - Total Ticks: {{ total_ticks }}
 - Unique Agents: {{ agent_count }}
 - Total Events: {{ total_events }}

@@ -56,6 +56,8 @@ Generate a JSON object with the following structure:
 Respond with only the JSON object:
 "#;
 
+const AGENT_CHAT_TEMPLATE: &str = include_str!("../../templates/agent_chat.jinja");
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineEvent {
     pub tick: u32,
@@ -88,6 +90,16 @@ pub struct ChatMessage {
     pub content: String,
     pub timestamp: chrono::DateTime<chrono::Utc>,
     pub agent_id: Option<Uuid>,
+}
+
+/// Intent categories used by `ReportAgent::chat` to decide which simulation
+/// context is relevant to a given message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatIntent {
+    Timeline,
+    AgentSummary,
+    Confidence,
+    General,
 }
 
 pub struct ReportAgent;
@@ -309,6 +321,69 @@ impl ReportAgent {
         });
 
         agents
+    }
+
+    /// Classify a chat message so `chat()` retrieves only the context relevant to it.
+    fn parse_intent(message: &str) -> ChatIntent {
+        let lower = message.to_lowercase();
+        if lower.contains("confiden") || lower.contains("certain") || lower.contains("how sure") {
+            ChatIntent::Confidence
+        } else if lower.contains("agent") || lower.contains("who") {
+            ChatIntent::AgentSummary
+        } else if lower.contains("timeline")
+            || lower.contains("when")
+            || lower.contains("event")
+            || lower.contains("happened")
+        {
+            ChatIntent::Timeline
+        } else {
+            ChatIntent::General
+        }
+    }
+
+    /// Answer a free-form question about a simulation's results.
+    ///
+    /// Routes `message` to an intent (timeline / agent activity / confidence / general),
+    /// retrieves only the simulation context relevant to that intent, renders
+    /// `agent_chat.jinja`, and returns the LLM's raw text response.
+    pub async fn chat<L: LlmClient + ?Sized>(
+        message: &str,
+        result: &SimulationResult,
+        llm: &L,
+    ) -> Result<String> {
+        let all_key_events = Self::extract_key_events(result);
+        let all_agents = Self::summarize_agents(result);
+        let total_ticks = result.final_snapshot().map(|s| s.tick).unwrap_or(0);
+        let total_events: usize = result.history.iter().map(|s| s.events.len()).sum();
+        let agent_count = all_agents.len();
+
+        let (key_events, agents) = match Self::parse_intent(message) {
+            ChatIntent::Timeline => (all_key_events, Vec::new()),
+            ChatIntent::AgentSummary => (Vec::new(), all_agents),
+            ChatIntent::Confidence => (Vec::new(), Vec::new()),
+            ChatIntent::General => (all_key_events, all_agents),
+        };
+
+        let env = Environment::new();
+        let template = env
+            .template_from_str(AGENT_CHAT_TEMPLATE)
+            .map_err(|e| TeriError::Report(format!("Template parsing error: {}", e)))?;
+
+        let template_context = context! {
+            has_simulation_context => true,
+            total_ticks => total_ticks,
+            agent_count => agent_count,
+            total_events => total_events,
+            key_events => key_events,
+            agents => agents,
+            message => message,
+        };
+
+        let prompt = template
+            .render(template_context)
+            .map_err(|e| TeriError::Report(format!("Failed to render chat template: {}", e)))?;
+
+        llm.complete(&prompt).await
     }
 }
 
@@ -599,8 +674,6 @@ mod tests {
         assert!(deserialized.agent_id.is_none());
     }
 
-    const AGENT_CHAT_TEMPLATE: &str = include_str!("../../templates/agent_chat.jinja");
-
     #[test]
     fn test_agent_chat_template_renders_with_persona_memory_and_context() {
         let env = Environment::new();
@@ -615,7 +688,7 @@ mod tests {
                 "content": "Alice met Bob at the summit",
                 "importance": 0.8,
             })],
-            query => "What will happen next?",
+            has_simulation_context => true,
             total_ticks => 10,
             agent_count => 2,
             total_events => 5,
@@ -641,7 +714,7 @@ mod tests {
         assert!(rendered.contains("Alice"));
         assert!(rendered.contains("Diplomat"));
         assert!(rendered.contains("Alice met Bob at the summit"));
-        assert!(rendered.contains("What will happen next?"));
+        assert!(rendered.contains("## Simulation Context"));
         assert!(rendered.contains("Alice initiates dialogue"));
         assert!(rendered.contains("How is the negotiation going?"));
         assert!(rendered.contains("Will the negotiation succeed?"));
@@ -664,5 +737,148 @@ mod tests {
         assert!(!rendered.contains("## Relevant Memories"));
         assert!(!rendered.contains("## Simulation Context"));
         assert!(!rendered.contains("## Conversation So Far"));
+    }
+
+    #[test]
+    fn test_parse_intent_detects_timeline_questions() {
+        assert_eq!(ReportAgent::parse_intent("What happened at tick 5?"), ChatIntent::Timeline);
+        assert_eq!(ReportAgent::parse_intent("Can I see the timeline?"), ChatIntent::Timeline);
+    }
+
+    #[test]
+    fn test_parse_intent_detects_agent_questions() {
+        assert_eq!(
+            ReportAgent::parse_intent("Which agent was most active?"),
+            ChatIntent::AgentSummary
+        );
+        assert_eq!(
+            ReportAgent::parse_intent("Who did the most talking?"),
+            ChatIntent::AgentSummary
+        );
+    }
+
+    #[test]
+    fn test_parse_intent_detects_confidence_questions() {
+        assert_eq!(
+            ReportAgent::parse_intent("How confident are you in this outcome?"),
+            ChatIntent::Confidence
+        );
+        assert_eq!(
+            ReportAgent::parse_intent("Are you certain about that?"),
+            ChatIntent::Confidence
+        );
+    }
+
+    #[test]
+    fn test_parse_intent_defaults_to_general() {
+        assert_eq!(ReportAgent::parse_intent("Tell me more about this."), ChatIntent::General);
+    }
+
+    // Mock LLM client for chat tests; captures the rendered prompt for assertions.
+    struct MockChatLlm {
+        response: String,
+        captured_prompt: std::sync::Mutex<Option<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for MockChatLlm {
+        async fn complete(&self, prompt: &str) -> Result<String> {
+            *self.captured_prompt.lock().unwrap() = Some(prompt.to_string());
+            Ok(self.response.clone())
+        }
+
+        async fn complete_json<T: serde::de::DeserializeOwned>(&self, _prompt: &str) -> Result<T> {
+            Err(TeriError::Llm("Not implemented".to_string()))
+        }
+
+        async fn stream(
+            &self,
+            _prompt: &str,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+            Err(TeriError::Llm("Not implemented".to_string()))
+        }
+    }
+
+    fn build_test_simulation_result() -> SimulationResult {
+        let agent_id = Uuid::new_v4();
+        let mut agents = std::collections::HashMap::new();
+        agents.insert(
+            agent_id,
+            AgentSnapshot { id: agent_id, name: "Alice".to_string(), state: "Active".to_string() },
+        );
+
+        let event = Event {
+            agent_id,
+            action: Action::Speak("Hello world".to_string()),
+            timestamp: chrono::Utc::now(),
+        };
+
+        let snapshot = WorldSnapshot {
+            tick: 1,
+            agents,
+            events: vec![event],
+            variables: std::collections::HashMap::new(),
+        };
+
+        SimulationResult { id: Uuid::new_v4(), history: vec![snapshot] }
+    }
+
+    #[tokio::test]
+    async fn test_chat_with_mock_llm_and_simulation_context() {
+        let result = build_test_simulation_result();
+        let mock_llm = MockChatLlm {
+            response: "The negotiation looks promising.".to_string(),
+            captured_prompt: std::sync::Mutex::new(None),
+        };
+
+        let response =
+            ReportAgent::chat("What happened during the negotiation?", &result, &mock_llm)
+                .await
+                .expect("chat should succeed");
+
+        assert_eq!(response, "The negotiation looks promising.");
+
+        let prompt = mock_llm.captured_prompt.lock().unwrap().clone().expect("prompt captured");
+        assert!(prompt.contains("What happened during the negotiation?"));
+        assert!(prompt.contains("## Simulation Context"));
+        // Timeline intent: key events included, agent activity list omitted.
+        assert!(prompt.contains("Spoke: Hello world"));
+        assert!(!prompt.contains("Agent Activity:"));
+    }
+
+    #[tokio::test]
+    async fn test_chat_routes_agent_summary_intent_context() {
+        let result = build_test_simulation_result();
+        let mock_llm = MockChatLlm {
+            response: "Alice was the most active.".to_string(),
+            captured_prompt: std::sync::Mutex::new(None),
+        };
+
+        ReportAgent::chat("Which agent was most active?", &result, &mock_llm)
+            .await
+            .expect("chat should succeed");
+
+        let prompt = mock_llm.captured_prompt.lock().unwrap().clone().expect("prompt captured");
+        assert!(prompt.contains("Agent Activity:"));
+        assert!(!prompt.contains("Key Events:"));
+    }
+
+    #[tokio::test]
+    async fn test_chat_routes_confidence_intent_context() {
+        let result = build_test_simulation_result();
+        let mock_llm = MockChatLlm {
+            response: "Fairly confident.".to_string(),
+            captured_prompt: std::sync::Mutex::new(None),
+        };
+
+        ReportAgent::chat("How confident are you?", &result, &mock_llm)
+            .await
+            .expect("chat should succeed");
+
+        let prompt = mock_llm.captured_prompt.lock().unwrap().clone().expect("prompt captured");
+        assert!(!prompt.contains("Key Events:"));
+        assert!(!prompt.contains("Agent Activity:"));
+        // Summary stats (ticks/agents/events) still present regardless of intent.
+        assert!(prompt.contains("Total Ticks"));
     }
 }
