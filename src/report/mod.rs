@@ -1165,4 +1165,56 @@ mod tests {
         // Summary stats (ticks/agents/events) still present regardless of intent.
         assert!(prompt.contains("Total Ticks"));
     }
+
+    #[tokio::test]
+    async fn test_chat_routes_general_intent_includes_all_context() {
+        let result = build_test_simulation_result();
+        let mock_llm = MockChatLlm {
+            response: "Here's an overview of the simulation.".to_string(),
+            captured_prompt: std::sync::Mutex::new(None),
+        };
+
+        let response = ReportAgent::chat("Tell me about this.", &result, &mock_llm)
+            .await
+            .expect("chat should succeed");
+
+        assert_eq!(response, "Here's an overview of the simulation.");
+
+        let prompt = mock_llm.captured_prompt.lock().unwrap().clone().expect("prompt captured");
+        // General intent (no keyword match) surfaces both timeline and agent context.
+        assert!(prompt.contains("Key Events:"));
+        assert!(prompt.contains("Agent Activity:"));
+        assert!(prompt.contains("Spoke: Hello world"));
+        assert!(prompt.contains("Alice"));
+    }
+
+    // Mock LLM client that always fails, for verifying chat() propagates LLM errors.
+    struct MockFailingLlm;
+
+    #[async_trait::async_trait]
+    impl LlmClient for MockFailingLlm {
+        async fn complete(&self, _prompt: &str) -> Result<String> {
+            Err(TeriError::Llm("simulated LLM failure".to_string()))
+        }
+
+        async fn complete_json<T: serde::de::DeserializeOwned>(&self, _prompt: &str) -> Result<T> {
+            Err(TeriError::Llm("Not implemented".to_string()))
+        }
+
+        async fn stream(
+            &self,
+            _prompt: &str,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+            Err(TeriError::Llm("Not implemented".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_propagates_llm_error() {
+        let result = build_test_simulation_result();
+
+        let outcome = ReportAgent::chat("What happened?", &result, &MockFailingLlm).await;
+
+        assert!(outcome.is_err());
+    }
 }
