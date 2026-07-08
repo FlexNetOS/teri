@@ -342,40 +342,40 @@ This checklist tracks end-to-end development of Teri, organized by implementatio
 
 ### Report Agent
 
-- [ ] Define `ReportAgent` struct
-- [ ] Create report template in `templates/report_gen.jinja`
-- [ ] Implement `ReportAgent::generate(result: &SimulationResult, query: &str, llm: &dyn LlmClient) -> Result<PredictionReport>`
-  - [ ] Analyze simulation history
-  - [ ] Extract key timeline events
-  - [ ] Identify significant agents
-  - [ ] Generate summary using LLM
-  - [ ] Calculate confidence score
-  - [ ] Assemble report struct
+- [x] Define `ReportAgent` struct
+- [x] Create report template in `templates/report_gen.jinja`
+- [x] Implement `ReportAgent::generate(result: &SimulationResult, query: &str, llm: &dyn LlmClient) -> Result<PredictionReport>`
+  - [x] Analyze simulation history
+  - [x] Extract key timeline events
+  - [x] Identify significant agents
+  - [x] Generate summary using LLM
+  - [x] Calculate confidence score
+  - [x] Assemble report struct
 
 ### Streaming Report Generation
 
-- [ ] Implement `ReportAgent::generate_stream()` for SSE
-  - [ ] Stream LLM response chunks
-  - [ ] Yield partial report updates
+- [x] Implement `ReportAgent::generate_stream()` for SSE
+  - [x] Stream LLM response chunks
+  - [x] Yield partial report updates
 
 ### Interactive Chat
 
-- [ ] Define `ChatMessage` struct
-- [ ] Create chat template in `templates/agent_chat.jinja`
-- [ ] Implement `ReportAgent::chat(message: &str, context: &SimulationResult, llm: &dyn LlmClient) -> Result<String>`
-  - [ ] Parse user intent (query world, query agent, etc.)
-  - [ ] Retrieve relevant context
-  - [ ] Generate response using LLM
-- [ ] Implement agent-specific chat
-  - [ ] `Agent::chat(message: &str, llm: &dyn LlmClient) -> Result<String>`
-  - [ ] Include persona + memory in context
+- [x] Define `ChatMessage` struct
+- [x] Create chat template in `templates/agent_chat.jinja`
+- [x] Implement `ReportAgent::chat(message: &str, context: &SimulationResult, llm: &dyn LlmClient) -> Result<String>`
+  - [x] Parse user intent (query world, query agent, etc.)
+  - [x] Retrieve relevant context
+  - [x] Generate response using LLM
+- [x] Implement agent-specific chat
+  - [x] `Agent::chat(message: &str, llm: &dyn LlmClient) -> Result<String>`
+  - [x] Include persona + memory in context
 
 ### Testing
 
-- [ ] Unit tests for report generation
-- [ ] Test timeline extraction
-- [ ] Test agent highlight selection
-- [ ] Test chat with mock simulation result
+- [x] Unit tests for report generation
+- [x] Test timeline extraction
+- [x] Test agent highlight selection
+- [x] Test chat with mock simulation result
 
 ---
 
