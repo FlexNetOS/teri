@@ -135,15 +135,24 @@ impl PredictedEffect {
     }
 }
 
+/// The twin's authoritative knowledge of one path (the oracle Holmesian elimination consults).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PathState {
+    kind: FsKind,
+    exists: bool,
+}
+
 /// The compute twin: a typed, provenance-tracked graph of a compute environment.
 ///
-/// Mirrors `SocialWorld`. The graph is the durable structure (worldgraph-style); `index` maps a
-/// path to its node for O(log n) lookup during deduction.
+/// Mirrors `SocialWorld`. The graph is the durable provenance structure (worldgraph-style);
+/// `index` maps a path to its node for O(log n) lookup; `state` is the queryable existence
+/// oracle that Phase-2 elimination reasons over ("when you have eliminated the impossible…").
 #[derive(Debug)]
 pub struct ComputeWorld {
     pub root: PathBuf,
     graph: DiGraph<ComputeNode, ComputeRelation>,
     index: BTreeMap<String, NodeIndex>,
+    state: BTreeMap<String, PathState>,
 }
 
 impl ComputeWorld {
@@ -154,26 +163,66 @@ impl ComputeWorld {
             root,
             graph: DiGraph::new(),
             index: BTreeMap::new(),
+            state: BTreeMap::new(),
         }
     }
 
-    /// **Deduce** the effect of `action` and record its predicted mutations into the twin graph.
-    /// Does NOT run the command.
+    /// **Deduce** the effect of `action`, then **eliminate** impossible outcomes against the
+    /// twin's known state, then record the (surviving) predicted mutations. Does NOT run anything.
+    ///
+    /// This is the deductive loop made literal: Observe (the command) → Deduce (the rulebook) →
+    /// Eliminate (prune what the twin proves impossible) → record the truth that remains.
     pub fn apply(&mut self, action: &ComputeAction) -> PredictedEffect {
-        let effect = deduce_effect(&action.command);
+        let base = deduce_effect(&action.command);
+        let effect = self.eliminate(base);
         self.record(&effect);
         effect
     }
 
-    /// Fold a deduced effect's changes into the twin graph (predicted nodes + relation edges).
+    /// **Holmesian state elimination.** Consult the twin's `state` oracle to reject impossible
+    /// outcomes and refine confidence. Positive knowledge only — an unknown path leaves the
+    /// prediction untouched (honesty guard: eliminate the *impossible*, never invent facts).
+    fn eliminate(&self, mut effect: PredictedEffect) -> PredictedEffect {
+        for change in &effect.fs_changes {
+            // A delete/read/copy-source requires its target to exist.
+            let precondition_path = match change {
+                FsChange::Delete { path } | FsChange::Read { path } => Some(path),
+                _ => None,
+            };
+            let Some(path) = precondition_path else { continue };
+            let Some(st) = self.state.get(path) else { continue };
+            if st.exists {
+                // Precondition confirmed present → the success path survives; nudge confidence up.
+                effect.confidence = (effect.confidence + 0.05).min(0.99);
+                effect.provenance.evidence.push(format!("twin_state:{path}=present"));
+            } else {
+                // The impossible is eliminated: the target is known-absent, so this cannot succeed.
+                effect.predicted_exit = ExitPrediction::Failure {
+                    reason: format!("`{path}` is known-absent in the twin"),
+                };
+                effect.confidence = effect.confidence.max(0.9);
+                effect.rationale = format!(
+                    "{}; ELIMINATED — `{}` was already deleted/absent in the twin, so the operation cannot succeed",
+                    effect.rationale, path
+                );
+                effect.provenance.evidence.push(format!("twin_state:{path}=absent"));
+                effect.provenance.model = format!("{}+holmesian-elimination", effect.provenance.model);
+            }
+        }
+        effect
+    }
+
+    /// Fold a deduced effect into the twin: always record the *attempt* as provenance (nodes +
+    /// relation edges), but update the authoritative `state` oracle only when the op is predicted
+    /// to succeed — a predicted `Failure` (e.g. an eliminated delete) leaves reality unchanged.
     fn record(&mut self, effect: &PredictedEffect) {
         let proc = self.node(ComputeNode::Process {
             command: effect.command.clone(),
         });
+        let succeeds = !matches!(effect.predicted_exit, ExitPrediction::Failure { .. });
         for change in &effect.fs_changes {
-            let (path, node, rel) = match change {
+            let (node, rel) = match change {
                 FsChange::Create { path, kind } => (
-                    path.clone(),
                     match kind {
                         FsKind::File => ComputeNode::File { path: path.clone(), exists: true },
                         FsKind::Dir => ComputeNode::Dir { path: path.clone(), exists: true },
@@ -181,24 +230,36 @@ impl ComputeWorld {
                     ComputeRelation::Creates,
                 ),
                 FsChange::Write { path } => (
-                    path.clone(),
                     ComputeNode::File { path: path.clone(), exists: true },
                     ComputeRelation::Writes,
                 ),
                 FsChange::Delete { path } => (
-                    path.clone(),
                     ComputeNode::File { path: path.clone(), exists: false },
                     ComputeRelation::Deletes,
                 ),
                 FsChange::Read { path } => (
-                    path.clone(),
                     ComputeNode::File { path: path.clone(), exists: true },
                     ComputeRelation::Reads,
                 ),
             };
             let target = self.node(node);
             self.graph.add_edge(proc, target, rel);
-            let _ = path;
+
+            if succeeds {
+                match change {
+                    FsChange::Create { path, kind } => {
+                        self.state.insert(path.clone(), PathState { kind: *kind, exists: true });
+                    }
+                    FsChange::Write { path } => {
+                        self.state.insert(path.clone(), PathState { kind: FsKind::File, exists: true });
+                    }
+                    FsChange::Delete { path } => {
+                        let kind = self.state.get(path).map_or(FsKind::File, |s| s.kind);
+                        self.state.insert(path.clone(), PathState { kind, exists: false });
+                    }
+                    FsChange::Read { .. } => {}
+                }
+            }
         }
     }
 
@@ -514,6 +575,60 @@ mod tests {
         // interning: applying the same action again does not duplicate nodes
         world.apply(&act("mkdir data"));
         assert_eq!(world.node_count(), 2, "nodes are interned by key");
+    }
+
+    #[test]
+    fn deleting_a_known_absent_path_is_eliminated_to_failure() {
+        // Holmes: eliminate the impossible. Create x, delete it, delete it again —
+        // the second delete targets a path the twin KNOWS is gone, so it cannot succeed.
+        let mut world = ComputeWorld::new(PathBuf::from("/tmp/cell"));
+        world.apply(&act("touch x")); // x now present in the twin
+        let first_rm = world.apply(&act("rm x"));
+        assert_eq!(first_rm.predicted_exit, ExitPrediction::Success, "first rm succeeds");
+
+        let second_rm = world.apply(&act("rm x"));
+        assert!(
+            matches!(second_rm.predicted_exit, ExitPrediction::Failure { .. }),
+            "deleting a known-absent path must be eliminated to Failure"
+        );
+        assert!(second_rm.confidence >= 0.9, "elimination is high-confidence");
+        assert!(second_rm.rationale.contains("ELIMINATED"));
+        assert!(second_rm.provenance.model.contains("holmesian-elimination"));
+    }
+
+    #[test]
+    fn deleting_a_known_present_path_survives_with_raised_confidence() {
+        let mut world = ComputeWorld::new(PathBuf::from("/tmp/cell"));
+        world.apply(&act("touch data.bin"));
+        let rm = world.apply(&act("rm data.bin"));
+        assert_eq!(rm.predicted_exit, ExitPrediction::Success);
+        // baseline rm confidence is 0.85; a confirmed-present precondition nudges it up.
+        assert!(rm.confidence > 0.85, "confirmed precondition raises confidence");
+        assert!(rm.provenance.evidence.iter().any(|e| e.contains("present")));
+    }
+
+    #[test]
+    fn reading_a_known_absent_path_is_eliminated() {
+        let mut world = ComputeWorld::new(PathBuf::from("/tmp/cell"));
+        world.apply(&act("touch note.txt"));
+        world.apply(&act("rm note.txt"));
+        let read = world.apply(&act("cat note.txt"));
+        assert!(
+            matches!(read.predicted_exit, ExitPrediction::Failure { .. }),
+            "reading a known-absent path cannot succeed"
+        );
+    }
+
+    #[test]
+    fn elimination_does_not_fabricate_for_unknown_paths() {
+        // Honesty guard: a path the twin has never seen must NOT be eliminated.
+        let mut world = ComputeWorld::new(PathBuf::from("/tmp/cell"));
+        let rm = world.apply(&act("rm never-seen.txt"));
+        assert_eq!(
+            rm.predicted_exit,
+            ExitPrediction::Success,
+            "unknown path stays at the baseline prediction; the impossible is not fabricated"
+        );
     }
 
     #[test]
