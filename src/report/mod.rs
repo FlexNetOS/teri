@@ -1,62 +1,26 @@
 use crate::error::{Result, TeriError};
 use crate::llm::LlmClient;
 use crate::sim::SimulationResult;
+use crate::templates::{render_agent_chat, render_report_gen};
 use async_stream::try_stream;
 use futures::{Stream, StreamExt};
-use minijinja::{Environment, context};
+use minijinja::context;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use uuid::Uuid;
 
-const REPORT_TEMPLATE: &str = r#"You are a prediction analysis system that synthesizes simulation results into insightful reports.
-
-## User Query
-{{ query }}
-
-## Simulation Summary
-- Total Ticks: {{ total_ticks }}
-- Unique Agents: {{ agent_count }}
-- Total Events: {{ total_events }}
-
-## Key Events from Simulation
-{% for event in key_events %}
-- Tick {{ event.tick }}: {{ event.description }} ({{ event.actor }})
-{% endfor %}
-
-## Agent Activity
-{% for agent in agents %}
-- {{ agent.name }}: {{ agent.action_count }} actions, State: {{ agent.final_state }}
-{% endfor %}
-
-## Task
-Analyze the simulation to answer the user's query. Provide a structured prediction report.
-
-Generate a JSON object with the following structure:
-```json
-{
-    "summary": "string - 2-3 sentence synthesis of what happened and what it predicts for the query",
-    "timeline": [
-        {
-            "tick": number,
-            "description": "string - what happened at this tick that was significant",
-            "significance": 0.0-1.0
-        }
-    ],
-    "agent_highlights": [
-        {
-            "agent_id": "uuid string",
-            "agent_name": "string",
-            "summary": "string - 1-2 sentences about this agent's role and impact"
-        }
-    ],
-    "confidence": 0.0-1.0
+/// Extract the outermost `{...}` slice from `text`, tolerating markdown code
+/// fences (```json ... ```) and surrounding prose. Returns `None` when there is
+/// no `{` followed by a later `}` — i.e. no complete object is present yet.
+///
+/// This only ever returns a slice that spans from the first `{` to the last `}`,
+/// so a partial buffer (whose outer object has not closed) yields unbalanced —
+/// and thus unparseable — JSON rather than a truncated-but-valid object.
+fn extract_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    (end > start).then(|| &text[start..=end])
 }
-```
-
-Respond with only the JSON object:
-"#;
-
-const AGENT_CHAT_TEMPLATE: &str = include_str!("../../templates/agent_chat.jinja");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineEvent {
@@ -126,28 +90,7 @@ impl ReportAgent {
         query: &str,
         llm: &L,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<PredictionReport>> + Send>>> {
-        let env = Environment::new();
-        let template = env
-            .template_from_str(REPORT_TEMPLATE)
-            .map_err(|e| TeriError::Report(format!("Template parsing error: {}", e)))?;
-
-        let key_events = Self::extract_key_events(result);
-        let agents = Self::summarize_agents(result);
-        let total_ticks = result.final_snapshot().map(|s| s.tick).unwrap_or(0);
-        let total_events: usize = result.history.iter().map(|s| s.events.len()).sum();
-
-        let ctx = context! {
-            query => query,
-            total_ticks => total_ticks,
-            agent_count => agents.len(),
-            total_events => total_events,
-            key_events => key_events,
-            agents => agents,
-        };
-
-        let prompt = template
-            .render(ctx)
-            .map_err(|e| TeriError::Report(format!("Failed to render report template: {}", e)))?;
+        let prompt = Self::build_report_prompt(result, query)?;
 
         let mut stream = llm.stream(&prompt).await?;
         let query_owned = query.to_string();
@@ -155,76 +98,97 @@ impl ReportAgent {
         let result_stream = try_stream! {
             let mut buffer = String::new();
 
-            // Yield initial partial report to ensure ≥2 chunks
-            yield PredictionReport {
-                id: Uuid::new_v4(),
-                summary: String::from("[Generating...]"),
-                timeline: Vec::new(),
-                agent_highlights: Vec::new(),
-                confidence: 0.0,
-                raw_query: query_owned.clone(),
-                created_at: chrono::Utc::now(),
-            };
-
-            // Stream text chunks and accumulate
+            // Stream text deltas, accumulating into `buffer`. Each delta is
+            // surfaced as a progress chunk carrying the raw partial text so far,
+            // giving consumers genuine incremental output; the terminal chunk is
+            // the fully parsed, structured report.
             while let Some(chunk_result) = stream.next().await {
                 let chunk = chunk_result?;
                 buffer.push_str(&chunk);
 
-                // Try to parse complete JSON when buffer is large enough
-                if buffer.len() > 100 && buffer.contains("}")
-                    && let Ok(response) = serde_json::from_str::<serde_json::Value>(&buffer)
-                    && let Some(report) = Self::parse_report_from_json(&response, &query_owned) {
+                // Emit the partial text received so far as a progress update.
+                yield Self::streaming_progress_report(&buffer, &query_owned);
+
+                // Finalize as soon as the buffer holds a complete report. A real
+                // LLM may wrap its JSON in prose or ```json fences, so parse via
+                // extract_json_object rather than a strict whole-buffer parse.
+                if let Some(report) = Self::parse_report_from_buffer(&buffer, &query_owned) {
                     yield report;
                     return;
                 }
             }
 
-            // Final parsing with complete buffer
-            if let Ok(response) = serde_json::from_str::<serde_json::Value>(&buffer)
-                && let Some(report) = Self::parse_report_from_json(&response, &query_owned) {
-                yield report;
-                return;
-            }
-
-            // If we get here, return error
+            // Stream ended without a parseable report.
             Err(TeriError::Report("Failed to parse streaming response".to_string()))?;
         };
 
         Ok(Box::pin(result_stream))
     }
 
+    /// Build a progress chunk for streaming: the raw partial LLM output so far in
+    /// `summary`, with empty structured fields. Consumers display it as interim
+    /// progress; the final streamed chunk carries the parsed report.
+    fn streaming_progress_report(partial_text: &str, query: &str) -> PredictionReport {
+        PredictionReport {
+            id: Uuid::new_v4(),
+            summary: partial_text.to_string(),
+            timeline: Vec::new(),
+            agent_highlights: Vec::new(),
+            confidence: 0.0,
+            raw_query: query.to_string(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Parse a complete report out of a (possibly fenced or prose-wrapped) text
+    /// buffer. Returns `None` while the JSON object is still incomplete.
+    fn parse_report_from_buffer(buffer: &str, query: &str) -> Option<PredictionReport> {
+        let json_slice = extract_json_object(buffer)?;
+        let value = serde_json::from_str::<serde_json::Value>(json_slice).ok()?;
+        Self::parse_report_from_json(&value, query)
+    }
+
     fn parse_report_from_json(
         response: &serde_json::Value,
         query: &str,
     ) -> Option<PredictionReport> {
+        // `summary` is the one genuinely required field — a report without it is
+        // meaningless. `timeline` and `agent_highlights` are optional: a missing
+        // or non-array field defaults to an empty list (like `confidence` below)
+        // rather than failing the whole parse.
         let summary = response.get("summary")?.as_str()?.to_string();
         let mut timeline: Vec<TimelineEvent> = response
             .get("timeline")
-            .and_then(|v| v.as_array())?
-            .iter()
-            .filter_map(|v| {
-                let tick = v.get("tick")?.as_u64()? as u32;
-                let description = v.get("description")?.as_str()?.to_string();
-                let significance = v.get("significance")?.as_f64()? as f32;
-                Some(TimelineEvent { tick, description, significance })
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| {
+                        let tick = v.get("tick")?.as_u64()? as u32;
+                        let description = v.get("description")?.as_str()?.to_string();
+                        let significance = v.get("significance")?.as_f64()? as f32;
+                        Some(TimelineEvent { tick, description, significance })
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
         timeline.sort_by(|a, b| {
             b.significance.partial_cmp(&a.significance).unwrap_or(std::cmp::Ordering::Equal)
         });
 
         let agent_highlights = response
             .get("agent_highlights")
-            .and_then(|v| v.as_array())?
-            .iter()
-            .filter_map(|v| {
-                let agent_id = v.get("agent_id")?.as_str()?.parse::<Uuid>().ok()?;
-                let agent_name = v.get("agent_name")?.as_str()?.to_string();
-                let summary = v.get("summary")?.as_str()?.to_string();
-                Some(AgentHighlight { agent_id, agent_name, summary })
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| {
+                        let agent_id = v.get("agent_id")?.as_str()?.parse::<Uuid>().ok()?;
+                        let agent_name = v.get("agent_name")?.as_str()?.to_string();
+                        let summary = v.get("summary")?.as_str()?.to_string();
+                        Some(AgentHighlight { agent_id, agent_name, summary })
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
 
         let confidence = response.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
 
@@ -244,11 +208,19 @@ impl ReportAgent {
         query: &str,
         llm: &L,
     ) -> Result<PredictionReport> {
-        let env = Environment::new();
-        let template = env
-            .template_from_str(REPORT_TEMPLATE)
-            .map_err(|e| TeriError::Report(format!("Template parsing error: {}", e)))?;
+        let prompt = Self::build_report_prompt(result, query)?;
 
+        let response = llm.complete_json::<serde_json::Value>(&prompt).await?;
+
+        Self::parse_report_from_json(&response, query).ok_or_else(|| {
+            TeriError::Report("Failed to parse LLM response into report".to_string())
+        })
+    }
+
+    /// Render the report-generation prompt for `result` and `query` using the
+    /// shared, pre-parsed `report_gen` template. Shared by `generate` and
+    /// `generate_stream` so their prompt context can never drift apart.
+    fn build_report_prompt(result: &SimulationResult, query: &str) -> Result<String> {
         let key_events = Self::extract_key_events(result);
         let agents = Self::summarize_agents(result);
         let total_ticks = result.final_snapshot().map(|s| s.tick).unwrap_or(0);
@@ -263,15 +235,8 @@ impl ReportAgent {
             agents => agents,
         };
 
-        let prompt = template
-            .render(ctx)
-            .map_err(|e| TeriError::Report(format!("Failed to render report template: {}", e)))?;
-
-        let response = llm.complete_json::<serde_json::Value>(&prompt).await?;
-
-        Self::parse_report_from_json(&response, query).ok_or_else(|| {
-            TeriError::Report("Failed to parse LLM response into report".to_string())
-        })
+        render_report_gen(ctx)
+            .map_err(|e| TeriError::Report(format!("Failed to render report template: {}", e)))
     }
 
     fn extract_key_events(result: &SimulationResult) -> Vec<serde_json::Value> {
@@ -326,17 +291,46 @@ impl ReportAgent {
         agents
     }
 
+    /// Count distinct agents across the whole simulation history, without
+    /// building the (sorted, JSON) per-agent summaries. Used when a chat intent
+    /// doesn't need the full agent-activity list but the prompt still reports the
+    /// total unique-agent count.
+    fn count_unique_agents(result: &SimulationResult) -> usize {
+        let mut ids = std::collections::HashSet::new();
+        for snapshot in &result.history {
+            ids.extend(snapshot.agents.keys().copied());
+        }
+        ids.len()
+    }
+
     /// Classify a chat message so `chat()` retrieves only the context relevant to it.
+    ///
+    /// Matching is word-based (not raw substring) so unrelated words don't trip a
+    /// category — e.g. "whole" must not match "who", nor "certainly" match
+    /// "certain". Stemmed prefixes (`confiden`, `agent`) still match their family
+    /// (confident/confidence, agent/agents).
     fn parse_intent(message: &str) -> ChatIntent {
         let lower = message.to_lowercase();
-        if lower.contains("confiden") || lower.contains("certain") || lower.contains("how sure") {
+        let words: std::collections::HashSet<&str> =
+            lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+
+        let has = |w: &str| words.contains(w);
+        let has_prefix = |prefix: &str| words.iter().any(|w| w.starts_with(prefix));
+
+        if has_prefix("confiden")
+            || has("certain")
+            || has("certainty")
+            || lower.contains("how sure")
+        {
             ChatIntent::Confidence
-        } else if lower.contains("agent") || lower.contains("who") {
+        } else if has_prefix("agent") || has("who") || has("whom") {
             ChatIntent::AgentSummary
-        } else if lower.contains("timeline")
-            || lower.contains("when")
-            || lower.contains("event")
-            || lower.contains("happened")
+        } else if has("timeline")
+            || has("when")
+            || has("event")
+            || has("events")
+            || has("happened")
+            || has("happen")
         {
             ChatIntent::Timeline
         } else {
@@ -354,23 +348,27 @@ impl ReportAgent {
         result: &SimulationResult,
         llm: &L,
     ) -> Result<String> {
-        let all_key_events = Self::extract_key_events(result);
-        let all_agents = Self::summarize_agents(result);
         let total_ticks = result.final_snapshot().map(|s| s.tick).unwrap_or(0);
         let total_events: usize = result.history.iter().map(|s| s.events.len()).sum();
-        let agent_count = all_agents.len();
 
-        let (key_events, agents) = match Self::parse_intent(message) {
-            ChatIntent::Timeline => (all_key_events, Vec::new()),
-            ChatIntent::AgentSummary => (Vec::new(), all_agents),
-            ChatIntent::Confidence => (Vec::new(), Vec::new()),
-            ChatIntent::General => (all_key_events, all_agents),
+        // Compute only the context the matched intent actually needs: each of
+        // extract_key_events / summarize_agents is a full pass over the history,
+        // so we avoid the pass whose result would be discarded.
+        let intent = Self::parse_intent(message);
+        let key_events = match intent {
+            ChatIntent::Timeline | ChatIntent::General => Self::extract_key_events(result),
+            ChatIntent::AgentSummary | ChatIntent::Confidence => Vec::new(),
+        };
+        let agents = match intent {
+            ChatIntent::AgentSummary | ChatIntent::General => Self::summarize_agents(result),
+            ChatIntent::Timeline | ChatIntent::Confidence => Vec::new(),
         };
 
-        let env = Environment::new();
-        let template = env
-            .template_from_str(AGENT_CHAT_TEMPLATE)
-            .map_err(|e| TeriError::Report(format!("Template parsing error: {}", e)))?;
+        // `agent_count` is the total unique agents and is always shown in the
+        // prompt. Reuse the already-built agent list when we have it; otherwise
+        // count uniquely without building the (sorted, JSON) summaries.
+        let agent_count =
+            if agents.is_empty() { Self::count_unique_agents(result) } else { agents.len() };
 
         let template_context = context! {
             has_simulation_context => true,
@@ -382,8 +380,7 @@ impl ReportAgent {
             message => message,
         };
 
-        let prompt = template
-            .render(template_context)
+        let prompt = render_agent_chat(template_context)
             .map_err(|e| TeriError::Report(format!("Failed to render chat template: {}", e)))?;
 
         llm.complete(&prompt).await
@@ -764,6 +761,69 @@ mod tests {
         assert_eq!(descriptions, vec!["Alpha", "Beta", "Gamma"]);
     }
 
+    #[test]
+    fn test_parse_report_defaults_missing_timeline_to_empty() {
+        // A well-formed report that simply omits `timeline` must not fail the
+        // whole parse — it defaults to an empty list (like `confidence`).
+        let response = serde_json::json!({
+            "summary": "A summary with no timeline.",
+            "agent_highlights": [],
+            "confidence": 0.5
+        });
+
+        let report = ReportAgent::parse_report_from_json(&response, "query")
+            .expect("missing timeline should not fail the parse");
+
+        assert!(report.timeline.is_empty());
+        assert_eq!(report.summary, "A summary with no timeline.");
+    }
+
+    #[test]
+    fn test_parse_report_defaults_missing_agent_highlights_to_empty() {
+        let response = serde_json::json!({
+            "summary": "A summary with no highlights.",
+            "timeline": [
+                { "tick": 1, "description": "e", "significance": 0.4 }
+            ],
+            "confidence": 0.5
+        });
+
+        let report = ReportAgent::parse_report_from_json(&response, "query")
+            .expect("missing agent_highlights should not fail the parse");
+
+        assert!(report.agent_highlights.is_empty());
+        assert_eq!(report.timeline.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_report_null_arrays_default_to_empty() {
+        // Explicit JSON null (not just absent) also defaults rather than failing.
+        let response = serde_json::json!({
+            "summary": "Null arrays.",
+            "timeline": serde_json::Value::Null,
+            "agent_highlights": serde_json::Value::Null,
+            "confidence": 0.5
+        });
+
+        let report = ReportAgent::parse_report_from_json(&response, "query")
+            .expect("null arrays should not fail the parse");
+
+        assert!(report.timeline.is_empty());
+        assert!(report.agent_highlights.is_empty());
+    }
+
+    #[test]
+    fn test_parse_report_still_requires_summary() {
+        // `summary` remains mandatory — a report without it is meaningless.
+        let response = serde_json::json!({
+            "timeline": [],
+            "agent_highlights": [],
+            "confidence": 0.5
+        });
+
+        assert!(ReportAgent::parse_report_from_json(&response, "query").is_none());
+    }
+
     // Mock LLM client for streaming tests
     struct MockStreamingLlm {
         chunks: Vec<String>,
@@ -855,6 +915,57 @@ mod tests {
         let final_report = last_report.unwrap();
         assert_eq!(final_report.raw_query, "What happened?");
         assert!(!final_report.summary.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_generate_stream_parses_fenced_and_prose_wrapped_json() {
+        // A real streaming LLM (temperature 0.7, no json_object mode) commonly
+        // wraps its JSON in a prose lead-in and ```json fences, split across
+        // deltas. The stream must still recover the structured report rather than
+        // failing to parse the raw buffer.
+        let result = build_test_simulation_result();
+
+        let json_body = serde_json::json!({
+            "summary": "Fenced summary",
+            "timeline": [ { "tick": 1, "description": "e", "significance": 0.5 } ],
+            "agent_highlights": [],
+            "confidence": 0.6
+        })
+        .to_string();
+
+        let chunks = vec![
+            "Sure! Here is the report:\n```json\n".to_string(),
+            json_body,
+            "\n```".to_string(),
+        ];
+
+        let mock_llm = MockStreamingLlm { chunks };
+        let mut stream = ReportAgent::generate_stream(&result, "What happened?", &mock_llm)
+            .await
+            .expect("Failed to create stream");
+
+        let mut chunk_count = 0;
+        let mut last_report: Option<PredictionReport> = None;
+        while let Some(report_result) = stream.next().await {
+            last_report = Some(report_result.expect("Stream chunk failed"));
+            chunk_count += 1;
+        }
+
+        let final_report = last_report.expect("Expected a final report");
+        assert!(chunk_count >= 2, "Expected progress + final chunks, got {}", chunk_count);
+        assert_eq!(final_report.summary, "Fenced summary");
+        assert_eq!(final_report.timeline.len(), 1);
+        assert_eq!(final_report.raw_query, "What happened?");
+    }
+
+    #[test]
+    fn test_extract_json_object_ignores_fences_and_prose() {
+        let wrapped = "Here you go:\n```json\n{\"summary\":\"ok\"}\n```";
+        assert_eq!(extract_json_object(wrapped), Some("{\"summary\":\"ok\"}"));
+        // No complete object yet (open brace, no close) → None, so streaming keeps
+        // buffering instead of parsing a truncated fragment.
+        assert_eq!(extract_json_object("prose {\"summary\":"), None);
+        assert_eq!(extract_json_object("no braces at all"), None);
     }
 
     #[test]
@@ -960,9 +1071,6 @@ mod tests {
 
     #[test]
     fn test_agent_chat_template_renders_with_persona_memory_and_context() {
-        let env = Environment::new();
-        let template = env.template_from_str(AGENT_CHAT_TEMPLATE).expect("Template parsing error");
-
         let ctx = context! {
             agent_name => "Alice",
             agent_role => "Diplomat",
@@ -993,7 +1101,7 @@ mod tests {
             message => "Will the negotiation succeed?",
         };
 
-        let rendered = template.render(ctx).expect("Template rendering error");
+        let rendered = crate::templates::render_agent_chat(ctx).expect("Template rendering error");
 
         assert!(rendered.contains("Alice"));
         assert!(rendered.contains("Diplomat"));
@@ -1006,15 +1114,12 @@ mod tests {
 
     #[test]
     fn test_agent_chat_template_renders_with_message_only() {
-        let env = Environment::new();
-        let template = env.template_from_str(AGENT_CHAT_TEMPLATE).expect("Template parsing error");
-
         let ctx = context! {
             message => "Hello there",
         };
 
-        let rendered =
-            template.render(ctx).expect("Template should render with no optional context");
+        let rendered = crate::templates::render_agent_chat(ctx)
+            .expect("Template should render with no optional context");
 
         assert!(rendered.contains("Hello there"));
         assert!(!rendered.contains("## Your Persona"));
@@ -1056,6 +1161,31 @@ mod tests {
     #[test]
     fn test_parse_intent_defaults_to_general() {
         assert_eq!(ReportAgent::parse_intent("Tell me more about this."), ChatIntent::General);
+    }
+
+    #[test]
+    fn test_parse_intent_ignores_substring_false_positives() {
+        // "whole" must not match the "who" agent keyword — this is a timeline
+        // question and must keep its timeline context.
+        assert_eq!(
+            ReportAgent::parse_intent("Show me the whole timeline of events"),
+            ChatIntent::Timeline
+        );
+        // "certainly" must not match the "certain" confidence keyword.
+        assert_eq!(
+            ReportAgent::parse_intent("What happened, and did it certainly change things?"),
+            ChatIntent::Timeline
+        );
+        // Stemmed matches still work: "agents" matches the agent family.
+        assert_eq!(
+            ReportAgent::parse_intent("Which agents mattered most?"),
+            ChatIntent::AgentSummary
+        );
+        // "confidence" still matches via the confiden* stem.
+        assert_eq!(
+            ReportAgent::parse_intent("What is your confidence level?"),
+            ChatIntent::Confidence
+        );
     }
 
     // Mock LLM client for chat tests; captures the rendered prompt for assertions.

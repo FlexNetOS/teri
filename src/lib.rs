@@ -9,6 +9,7 @@ pub mod memory;
 pub mod report;
 pub mod seed;
 pub mod sim;
+pub mod templates;
 
 pub use config::Config;
 pub use error::{Result, TeriError};

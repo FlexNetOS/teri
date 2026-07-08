@@ -10,8 +10,6 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-const AGENT_CHAT_TEMPLATE: &str = include_str!("../../templates/agent_chat.jinja");
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Persona {
     pub name: String,
@@ -157,11 +155,6 @@ impl Agent {
             .map(|m| serde_json::json!({ "content": m.content, "importance": m.importance }))
             .collect();
 
-        let env = Environment::new();
-        let template = env
-            .template_from_str(AGENT_CHAT_TEMPLATE)
-            .map_err(|e| TeriError::Agent(format!("Template parsing error: {}", e)))?;
-
         let ctx = context! {
             agent_name => &self.persona.name,
             agent_role => &self.persona.role,
@@ -172,8 +165,7 @@ impl Agent {
             message => message,
         };
 
-        let prompt = template
-            .render(ctx)
+        let prompt = crate::templates::render_agent_chat(ctx)
             .map_err(|e| TeriError::Agent(format!("Failed to render chat template: {}", e)))?;
 
         llm.complete(&prompt).await
@@ -233,34 +225,31 @@ impl Agent {
             return Vec::new();
         }
 
-        let mut scored_memories: Vec<(usize, &MemoryEntry)> = self
+        // Carry each memory's original index so ties break by true position.
+        // `short_term` is append-ordered, so a larger index is more recent.
+        let mut scored_memories: Vec<(usize, usize, &MemoryEntry)> = self
             .memory
             .short_term
             .iter()
-            .map(|m| {
+            .enumerate()
+            .map(|(idx, m)| {
                 let overlap_count = m
                     .content
                     .to_lowercase()
                     .split_whitespace()
                     .filter(|word| context_words.contains(*word))
                     .count();
-                (overlap_count, m)
+                (overlap_count, idx, m)
             })
             .collect();
 
-        // Sort by overlap (descending), then by recency (index descending)
-        scored_memories.sort_by(|a, b| {
-            b.0.cmp(&a.0).then_with(|| {
-                let a_idx =
-                    self.memory.short_term.iter().position(|m| m.timestamp == a.1.timestamp);
-                let b_idx =
-                    self.memory.short_term.iter().position(|m| m.timestamp == b.1.timestamp);
-                b_idx.cmp(&a_idx)
-            })
-        });
+        // Sort by overlap (descending), then by recency (index descending). Using
+        // the captured index avoids an O(n^2) timestamp re-scan and correctly
+        // orders memories that share a timestamp.
+        scored_memories.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
 
         // Return top 10 memories
-        scored_memories.iter().take(10).map(|(_, m)| *m).collect()
+        scored_memories.iter().take(10).map(|(_, _, m)| *m).collect()
     }
 
     /// Construct context string from world state and memories
@@ -923,6 +912,34 @@ mod tests {
         assert!(prompt.contains("A seasoned negotiator."));
         assert!(prompt.contains("curious"));
         assert!(prompt.contains("calm"));
+    }
+
+    #[test]
+    fn test_memory_tie_break_prefers_more_recent_on_equal_timestamp() {
+        let mut agent = Agent::new(test_persona());
+        let ts = chrono::Utc::now();
+
+        // Two memories with identical timestamps and equal keyword overlap
+        // ("summit"). Inserted older-first, so "summit newer" has the higher index.
+        agent.memory.add_memory(MemoryEntry {
+            timestamp: ts,
+            content: "summit older".to_string(),
+            importance: 0.5,
+        });
+        agent.memory.add_memory(MemoryEntry {
+            timestamp: ts,
+            content: "summit newer".to_string(),
+            importance: 0.5,
+        });
+
+        let ranked = agent.retrieve_relevant_memories_for_message("summit");
+
+        // Both tie on overlap and share a timestamp; the more recently inserted
+        // memory (higher index) must rank first. The previous timestamp-rescan
+        // tie-break resolved both to the same index and left them in input order.
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].content, "summit newer");
+        assert_eq!(ranked[1].content, "summit older");
     }
 
     #[tokio::test]
