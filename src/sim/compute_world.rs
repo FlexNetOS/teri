@@ -83,7 +83,10 @@ pub enum ExitPrediction {
 }
 
 /// Reversibility/blast-radius of the action — feeds the execution gate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Declaration order is the severity order: derived `Ord` gives
+/// `Low < Medium < High < Irreversible`, so a plan's blast radius is `effects.max()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Risk {
     Low,
     Medium,
@@ -177,6 +180,14 @@ impl ComputeWorld {
         let effect = self.eliminate(base);
         self.record(&effect);
         effect
+    }
+
+    /// **Predict a whole command plan** against this twin, in order. Each step deduces against
+    /// the mutations of the prior steps (Holmesian carry-over: a `rm x` after `touch x` sees x
+    /// present; a second `rm x` sees it gone). This is the deductive, real-to-sim-to-real analog
+    /// of a `SimEngine` rollout — it forecasts an entire plan's effects WITHOUT executing any of it.
+    pub fn predict_plan(&mut self, actions: &[ComputeAction]) -> Vec<PredictedEffect> {
+        actions.iter().map(|a| self.apply(a)).collect()
     }
 
     /// **Holmesian state elimination.** Consult the twin's `state` oracle to reject impossible
@@ -476,6 +487,59 @@ fn effect(
     }
 }
 
+/// The forecast for a whole command plan against one cell's twin — the ComputeWorld analog of
+/// `SimulationResult`. Per RFC-001 it is a set of *constraints, not advice*: the ordered
+/// per-step effects plus the plan-level aggregates a gate reasons over.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ComputeRollout {
+    /// The cell/target this plan was predicted against.
+    pub cell: String,
+    /// One deduced effect per plan step, in order.
+    pub effects: Vec<PredictedEffect>,
+    /// The plan's blast radius — the highest risk any step reaches.
+    pub max_risk: Risk,
+    /// The plan's confidence — the weakest step (min), so one low-confidence step
+    /// honestly drags the whole plan down.
+    pub min_confidence: f32,
+    /// Index of the first step predicted to fail, if any: in reality the plan halts there
+    /// (`&&`/`set -e` semantics), so downstream steps are speculative past this point.
+    pub first_failure: Option<usize>,
+}
+
+impl ComputeRollout {
+    /// Aggregate an ordered list of per-step effects into a plan-level forecast.
+    #[must_use]
+    pub fn from_effects(cell: String, effects: Vec<PredictedEffect>) -> Self {
+        let max_risk = effects.iter().map(|e| e.risk).max().unwrap_or(Risk::Low);
+        let min_confidence = effects
+            .iter()
+            .map(|e| e.confidence)
+            .fold(1.0_f32, f32::min);
+        let first_failure = effects
+            .iter()
+            .position(|e| matches!(e.predicted_exit, ExitPrediction::Failure { .. }));
+        Self { cell, effects, max_risk, min_confidence, first_failure }
+    }
+
+    /// True when no step is predicted to fail (the plan runs to completion in the twin).
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.first_failure.is_none()
+    }
+
+    /// True when the plan reaches an irreversible step — the gate must require explicit authority.
+    #[must_use]
+    pub fn requires_authority(&self) -> bool {
+        self.max_risk == Risk::Irreversible
+    }
+
+    /// A conservative "safe to auto-execute" verdict: runs clean AND touches nothing irreversible.
+    #[must_use]
+    pub fn is_safe(&self) -> bool {
+        self.is_clean() && !self.requires_authority()
+    }
+}
+
 /// The container installed via [`crate::sim::SimEngine::with_compute`], mirroring `SocialWorldSet`.
 /// Keyed by a **cell/target id** (analogous to `SocialWorldSet`'s per-`Platform` keying).
 #[derive(Debug, Default)]
@@ -629,6 +693,48 @@ mod tests {
             ExitPrediction::Success,
             "unknown path stays at the baseline prediction; the impossible is not fabricated"
         );
+    }
+
+    #[test]
+    fn predict_plan_carries_state_across_steps() {
+        // The plan-level deductive rollout: step 3 (`rm x`) must see that step 2 already
+        // deleted x, and be eliminated to Failure — carry-over across the whole plan.
+        let mut world = ComputeWorld::new(PathBuf::from("/tmp/cell"));
+        let plan = [act("touch x"), act("rm x"), act("rm x")];
+        let effects = world.predict_plan(&plan);
+        assert_eq!(effects.len(), 3);
+        assert_eq!(effects[0].predicted_exit, ExitPrediction::Success);
+        assert_eq!(effects[1].predicted_exit, ExitPrediction::Success);
+        assert!(matches!(effects[2].predicted_exit, ExitPrediction::Failure { .. }));
+    }
+
+    #[test]
+    fn rollout_aggregates_blast_radius_and_first_failure() {
+        let mut world = ComputeWorld::new(PathBuf::from("/tmp/cell"));
+        let plan = [act("mkdir build"), act("rm -rf build"), act("rm build")];
+        let effects = world.predict_plan(&plan);
+        let rollout = ComputeRollout::from_effects("cell-a".to_string(), effects);
+
+        // rm -rf drives the blast radius to Irreversible → requires explicit authority.
+        assert_eq!(rollout.max_risk, Risk::Irreversible);
+        assert!(rollout.requires_authority());
+        // The third step (rm of the now-absent build) is the first predicted failure.
+        assert_eq!(rollout.first_failure, Some(2));
+        assert!(!rollout.is_clean());
+        assert!(!rollout.is_safe(), "irreversible + a failure is never auto-safe");
+    }
+
+    #[test]
+    fn a_clean_low_risk_plan_is_safe() {
+        let mut world = ComputeWorld::new(PathBuf::from("/tmp/cell"));
+        let plan = [act("mkdir src"), act("touch src/lib.rs")];
+        let rollout = ComputeRollout::from_effects(
+            "cell-a".to_string(),
+            world.predict_plan(&plan),
+        );
+        assert!(rollout.is_clean());
+        assert!(!rollout.requires_authority());
+        assert!(rollout.is_safe());
     }
 
     #[test]
