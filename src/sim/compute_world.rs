@@ -145,17 +145,54 @@ struct PathState {
     exists: bool,
 }
 
+/// The **observed real outcome** of actually running a command — the ground truth the twin
+/// calibrates against (Phase 4: sim-to-real residual). Kept minimal: the exit signal is what
+/// the baseline predicts, so it is what the reality-gap loop scores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActualOutcome {
+    /// Whether the command actually succeeded (exit 0) when run for real.
+    pub succeeded: bool,
+}
+
+/// The **reality gap** for one observed command: what the twin predicted vs. what reality did,
+/// and the calibration weight that resulted. Emitted by [`ComputeWorld::observe`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RealityGap {
+    /// The program whose calibration was updated (e.g. `cargo`).
+    pub program: String,
+    /// Did the twin's predicted success/failure match reality?
+    pub matched: bool,
+    pub predicted_success: bool,
+    pub actual_success: bool,
+    /// The program's calibration weight AFTER folding in this observation, in `[0.05, 1.0]`.
+    pub calibration: f32,
+}
+
+/// Learning rate for the residual calibration update (EWMA toward the observed hit-rate).
+const CALIB_LR: f32 = 0.25;
+/// Floor so a badly-calibrated program never collapses to zero confidence (stays recoverable).
+const CALIB_FLOOR: f32 = 0.05;
+
+/// The program token of a command (its first whitespace-delimited word).
+fn program_of(command: &str) -> &str {
+    command.split_whitespace().next().unwrap_or("")
+}
+
 /// The compute twin: a typed, provenance-tracked graph of a compute environment.
 ///
 /// Mirrors `SocialWorld`. The graph is the durable provenance structure (worldgraph-style);
 /// `index` maps a path to its node for O(log n) lookup; `state` is the queryable existence
-/// oracle that Phase-2 elimination reasons over ("when you have eliminated the impossible…").
+/// oracle that Phase-2 elimination reasons over ("when you have eliminated the impossible…");
+/// `calibration` is the Phase-4 per-program confidence weight the sim-to-real loop learns.
 #[derive(Debug)]
 pub struct ComputeWorld {
     pub root: PathBuf,
     graph: DiGraph<ComputeNode, ComputeRelation>,
     index: BTreeMap<String, NodeIndex>,
     state: BTreeMap<String, PathState>,
+    /// Per-program calibration weight in `[CALIB_FLOOR, 1.0]`. Absent ⇒ 1.0 (no adjustment),
+    /// so an un-calibrated twin behaves exactly like the pre-Phase-4 baseline.
+    calibration: BTreeMap<String, f32>,
 }
 
 impl ComputeWorld {
@@ -167,7 +204,14 @@ impl ComputeWorld {
             graph: DiGraph::new(),
             index: BTreeMap::new(),
             state: BTreeMap::new(),
+            calibration: BTreeMap::new(),
         }
+    }
+
+    /// The current calibration weight for `program` (1.0 when never observed).
+    #[must_use]
+    pub fn calibration_of(&self, program: &str) -> f32 {
+        self.calibration.get(program).copied().unwrap_or(1.0)
     }
 
     /// **Deduce** the effect of `action`, then **eliminate** impossible outcomes against the
@@ -177,9 +221,43 @@ impl ComputeWorld {
     /// Eliminate (prune what the twin proves impossible) → record the truth that remains.
     pub fn apply(&mut self, action: &ComputeAction) -> PredictedEffect {
         let base = deduce_effect(&action.command);
-        let effect = self.eliminate(base);
+        let mut effect = self.eliminate(base);
+        // Phase 4: scale the deduced confidence by what the sim-to-real loop has LEARNED about
+        // this program. Un-calibrated ⇒ factor 1.0 ⇒ identical to the pre-Phase-4 baseline.
+        let factor = self.calibration_of(program_of(&action.command));
+        effect.confidence = (effect.confidence * factor).clamp(0.0, 1.0);
+        effect.provenance.calibration = factor;
         self.record(&effect);
         effect
+    }
+
+    /// **Observe the real outcome** of a command and fold the residual into the twin's
+    /// calibration (Phase 4 — sim-to-real). Scores the twin's predicted success against reality
+    /// and nudges the program's calibration weight toward the observed hit-rate (EWMA at
+    /// [`CALIB_LR`], floored at [`CALIB_FLOOR`] so it stays recoverable). Returns the
+    /// [`RealityGap`]. This is the loop that closes the reality gap: the more a program's
+    /// deductions have diverged from reality, the lower the confidence future predictions carry.
+    pub fn observe(&mut self, action: &ComputeAction, actual: &ActualOutcome) -> RealityGap {
+        let predicted = deduce_effect(&action.command);
+        let predicted_success = matches!(
+            self.eliminate(predicted).predicted_exit,
+            ExitPrediction::Success
+        );
+        let matched = predicted_success == actual.succeeded;
+
+        let program = program_of(&action.command).to_string();
+        let prior = self.calibration_of(&program);
+        let reward = if matched { 1.0 } else { 0.0 };
+        let updated = (prior + CALIB_LR * (reward - prior)).clamp(CALIB_FLOOR, 1.0);
+        self.calibration.insert(program.clone(), updated);
+
+        RealityGap {
+            program,
+            matched,
+            predicted_success,
+            actual_success: actual.succeeded,
+            calibration: updated,
+        }
     }
 
     /// **Predict a whole command plan** against this twin, in order. Each step deduces against
@@ -735,6 +813,46 @@ mod tests {
         assert!(rollout.is_clean());
         assert!(!rollout.requires_authority());
         assert!(rollout.is_safe());
+    }
+
+    // ---- Phase 4: sim-to-real reality-gap calibration ----
+
+    #[test]
+    fn observing_a_divergence_lowers_future_confidence() {
+        // The twin predicts `mkdir` succeeds. Reality says it failed — a reality gap.
+        // The calibration loop must fold that in so FUTURE mkdir deductions carry less confidence.
+        let mut world = ComputeWorld::new(PathBuf::from("/tmp/cell"));
+        let gap = world.observe(&act("mkdir data"), &ActualOutcome { succeeded: false });
+        assert_eq!(gap.program, "mkdir");
+        assert!(!gap.matched, "predicted success but reality failed");
+        assert!(gap.predicted_success && !gap.actual_success);
+        assert!((gap.calibration - 0.75).abs() < 1e-6, "one miss: 1.0 -> 0.75");
+
+        // A subsequent mkdir now carries the learned (lower) confidence + calibration provenance.
+        let e = world.apply(&act("mkdir other"));
+        assert!((e.provenance.calibration - 0.75).abs() < 1e-6);
+        assert!(e.confidence < 0.9, "confidence scaled down by the reality gap: {}", e.confidence);
+    }
+
+    #[test]
+    fn a_matching_observation_keeps_full_confidence() {
+        let mut world = ComputeWorld::new(PathBuf::from("/tmp/cell"));
+        let gap = world.observe(&act("mkdir data"), &ActualOutcome { succeeded: true });
+        assert!(gap.matched);
+        assert!((gap.calibration - 1.0).abs() < 1e-6, "a match holds calibration at 1.0");
+        assert!((world.apply(&act("mkdir x")).confidence - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn calibration_recovers_after_a_miss() {
+        // A miss drops it; subsequent matches climb back toward 1.0 (residual recovery).
+        let mut world = ComputeWorld::new(PathBuf::from("/tmp/cell"));
+        let after_miss = world.observe(&act("mkdir d"), &ActualOutcome { succeeded: false }).calibration;
+        let after_hit1 = world.observe(&act("mkdir d"), &ActualOutcome { succeeded: true }).calibration;
+        let after_hit2 = world.observe(&act("mkdir d"), &ActualOutcome { succeeded: true }).calibration;
+        assert!(after_hit1 > after_miss, "a hit recovers calibration");
+        assert!(after_hit2 > after_hit1, "recovery is monotonic under repeated hits");
+        assert!(after_hit2 < 1.0, "but does not snap all the way back in one step");
     }
 
     #[test]

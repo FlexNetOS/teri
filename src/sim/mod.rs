@@ -907,6 +907,21 @@ impl SimEngine {
         Some(compute_world::ComputeRollout::from_effects(cell.to_string(), effects))
     }
 
+    /// **Feed a real outcome back** into `cell`'s twin (Phase 4 — sim-to-real): score what the
+    /// twin predicted against what actually happened and fold the residual into its calibration,
+    /// so future forecasts for that program carry the learned confidence. The engine-level driver
+    /// of [`compute_world::ComputeWorld::observe`]; `None` when no substrate/cell (not an error).
+    pub fn observe_compute(
+        &self,
+        cell: &str,
+        action: &compute_world::ComputeAction,
+        actual: &compute_world::ActualOutcome,
+    ) -> Option<compute_world::RealityGap> {
+        let mut set = self.compute.as_ref()?.lock();
+        let world = set.world_mut(cell)?;
+        Some(world.observe(action, actual))
+    }
+
     /// Install a cooperative-shutdown flag, checked at the top of every tick in `run()`.
     ///
     /// **Additive, opt-in.** When the shared `AtomicBool` is flipped to `true`, the next
@@ -1506,6 +1521,44 @@ mod tests {
         let touch = [ComputeAction { command: "touch x".to_string(), cwd: ".".to_string() }];
         assert!(engine.predict_compute_plan("missing", &touch).is_none());
         assert!(engine.predict_compute_plan("cell-a", &touch).is_some());
+    }
+
+    #[test]
+    fn compute_overlay_closes_the_reality_gap() {
+        use crate::sim::compute_world::{ActualOutcome, ComputeAction, ComputeWorldSet};
+
+        let mut engine = SimEngine::new(SimConfig::new(1, 1));
+        engine.with_compute(ComputeWorldSet::new([(
+            "cell-a".to_string(),
+            std::path::PathBuf::from("/tmp/cell-a"),
+        )]));
+        let mkdir = ComputeAction { command: "mkdir data".to_string(), cwd: ".".to_string() };
+
+        // Predict → high baseline confidence.
+        let before = engine.predict_compute_plan("cell-a", std::slice::from_ref(&mkdir)).unwrap();
+        let conf_before = before.effects[0].confidence;
+
+        // Observe a real DIVERGENCE (predicted success, reality failed) and feed it back.
+        let gap = engine
+            .observe_compute("cell-a", &mkdir, &ActualOutcome { succeeded: false })
+            .expect("observe on an installed cell");
+        assert!(!gap.matched);
+        assert!(gap.calibration < 1.0);
+
+        // Re-predict → the twin now carries LESS confidence for mkdir (it learned).
+        let after = engine.predict_compute_plan("cell-a", std::slice::from_ref(&mkdir)).unwrap();
+        assert!(
+            after.effects[0].confidence < conf_before,
+            "the reality gap must lower future confidence: {} !< {}",
+            after.effects[0].confidence,
+            conf_before
+        );
+
+        // Opt-in: no substrate ⇒ observe is a no-op None.
+        let bare = SimEngine::new(SimConfig::new(1, 1));
+        assert!(bare
+            .observe_compute("cell-a", &mkdir, &ActualOutcome { succeeded: true })
+            .is_none());
     }
 
     // --- TASK-SIM-2 #2: enriched action_args ---
