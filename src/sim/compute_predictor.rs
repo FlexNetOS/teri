@@ -410,10 +410,16 @@ impl EffectPredictor for TheoryPredictor {
 pub struct PredictorScore {
     /// Number of labeled commands scored.
     pub n: usize,
-    /// Fraction whose predicted success/failure matched reality, in `[0, 1]`.
+    /// Fraction whose predicted success/failure matched reality, in `[0, 1]` (a defer that falls
+    /// back to the rulebook still counts here).
     pub accuracy: f32,
     /// Mean Brier score of the success probability, in `[0, 1]` — LOWER is better-calibrated.
     pub brier: f32,
+    /// Fraction of commands the predictor actually ANSWERED (did not defer), in `[0, 1]`.
+    pub coverage: f32,
+    /// Accuracy restricted to the answered subset — "when it speaks, is it right?" A predictor can
+    /// have low coverage but high covered-accuracy (cautious but sharp), or the reverse (reckless).
+    pub covered_accuracy: f32,
 }
 
 /// Score a predictor against labeled `(command, ActualOutcome)` data. A `None` prediction falls
@@ -428,14 +434,17 @@ pub fn evaluate_predictor(
     dataset: &[(String, ActualOutcome)],
 ) -> PredictorScore {
     if dataset.is_empty() {
-        return PredictorScore { n: 0, accuracy: 0.0, brier: 0.0 };
+        return PredictorScore { n: 0, accuracy: 0.0, brier: 0.0, coverage: 0.0, covered_accuracy: 0.0 };
     }
     let mut correct = 0.0_f32;
     let mut brier_sum = 0.0_f32;
+    let mut covered = 0.0_f32;
+    let mut covered_correct = 0.0_f32;
     for (command, actual) in dataset {
-        let effect = predictor
-            .predict(command)
-            .unwrap_or_else(|| deduce_effect(command));
+        let answered = predictor.predict(command);
+        let is_covered = answered.is_some();
+        // A defer falls back to the rulebook, exactly as the real stack does.
+        let effect = answered.unwrap_or_else(|| deduce_effect(command));
         // Map the prediction to a success probability in [0, 1].
         let p_success = match effect.predicted_exit {
             ExitPrediction::Success => effect.confidence,
@@ -443,8 +452,15 @@ pub fn evaluate_predictor(
             ExitPrediction::Unknown => 0.5,
         };
         let y = if actual.succeeded { 1.0 } else { 0.0 };
-        if (p_success >= 0.5) == actual.succeeded {
+        let hit = (p_success >= 0.5) == actual.succeeded;
+        if hit {
             correct += 1.0;
+        }
+        if is_covered {
+            covered += 1.0;
+            if hit {
+                covered_correct += 1.0;
+            }
         }
         brier_sum += (p_success - y) * (p_success - y);
     }
@@ -453,6 +469,84 @@ pub fn evaluate_predictor(
         n,
         accuracy: correct / n as f32,
         brier: brier_sum / n as f32,
+        coverage: covered / n as f32,
+        covered_accuracy: if covered > 0.0 { covered_correct / covered } else { 0.0 },
+    }
+}
+
+/// A labeled command paired with the outcome it really had.
+pub type Labeled = (String, ActualOutcome);
+
+/// A train/test benchmark corpus for falsifying (or corroborating) a learned predictor.
+#[derive(Debug, Clone)]
+pub struct BenchmarkData {
+    /// Commands the predictor learns from.
+    pub train: Vec<Labeled>,
+    /// Held-out commands it is scored on (never seen during training).
+    pub test: Vec<Labeled>,
+}
+
+/// A deterministic synthetic corpus with STRUCTURE, built to actually discriminate predictors:
+/// several command *families* (a shared program + varying args) with a family-level outcome, split
+/// so the test set is entirely HELD-OUT members of known families (probing generalization) plus a
+/// couple of truly-unseen commands (probing defer-discipline). Mixed success AND failure families
+/// so over-generalization is penalized. No RNG — reproducible.
+#[must_use]
+pub fn synthetic_corpus() -> BenchmarkData {
+    // Distinct args per member so no test command is a verbatim training command.
+    let args = ["alpha", "beta", "gamma", "delta", "epsilon"];
+    // (program prefix, succeeds?) — two success families, two failure families.
+    let families: [(&str, bool); 4] = [
+        ("cargo build", true),
+        ("npm run", true),
+        ("wipe disk", false),
+        ("corrupt table", false),
+    ];
+
+    let mut train = Vec::new();
+    let mut test = Vec::new();
+    for (prefix, succeeds) in families {
+        for (i, arg) in args.iter().enumerate() {
+            let cmd = format!("{prefix} {arg}");
+            let label = (cmd, ActualOutcome { succeeded: succeeds });
+            // First 3 members train; last 2 are held out for the test.
+            if i < 3 {
+                train.push(label);
+            } else {
+                test.push(label);
+            }
+        }
+    }
+    // Truly-unseen commands: a disciplined predictor should DEFER (low coverage) here.
+    test.push(("frobnicate zop".to_string(), ActualOutcome { succeeded: true }));
+    test.push(("quux nib".to_string(), ActualOutcome { succeeded: false }));
+
+    BenchmarkData { train, test }
+}
+
+/// The three predictors scored on one corpus — the falsification report.
+#[derive(Debug, Clone, Copy)]
+pub struct BenchmarkReport {
+    pub rulebook: PredictorScore,
+    pub retrieval: PredictorScore,
+    pub theory: PredictorScore,
+}
+
+/// Train the learned predictors on `data.train`, score all three on the held-out `data.test`, and
+/// return the head-to-head report. The honest rig: identical training data, identical test set,
+/// one scoring function — so accuracy, calibration (Brier), and coverage are directly comparable.
+#[must_use]
+pub fn run_benchmark(data: &BenchmarkData) -> BenchmarkReport {
+    let mut retrieval = RetrievalPredictor::new();
+    let mut theory = TheoryPredictor::new();
+    for (cmd, out) in &data.train {
+        retrieval.observe(cmd, out);
+        theory.observe(cmd, out);
+    }
+    BenchmarkReport {
+        rulebook: evaluate_predictor(&RulebookPredictor, &data.test),
+        retrieval: evaluate_predictor(&retrieval, &data.test),
+        theory: evaluate_predictor(&theory, &data.test),
     }
 }
 
@@ -575,6 +669,50 @@ mod tests {
         // reported, not asserted (the point is to MEASURE, honestly, which generalizes better).
         assert!(s_retr.brier < s_rule.brier, "retrieval must beat the blind rulebook");
         assert!(s_theo.brier < s_rule.brier, "theory must beat the blind rulebook");
+    }
+
+    #[test]
+    fn falsification_benchmark_held_out_generalization() {
+        // The real test: train on 3 members of each family, score on HELD-OUT members (never seen)
+        // plus two truly-unseen commands. Mixed success/failure families penalize over-generalization.
+        let data = synthetic_corpus();
+        // 4 families × 3 = 12 train; 4 × 2 = 8 held-out + 2 unseen = 10 test.
+        assert_eq!(data.train.len(), 12);
+        assert_eq!(data.test.len(), 10);
+        // No test command is a verbatim training command (true generalization).
+        for (tc, _) in &data.test {
+            assert!(!data.train.iter().any(|(rc, _)| rc == tc), "leak: {tc} is in train");
+        }
+
+        let r = run_benchmark(&data);
+        eprintln!("\n=== FALSIFICATION BENCHMARK (n={}, held-out) ===", r.rulebook.n);
+        eprintln!("  predictor  |  acc  | brier | coverage | covered-acc");
+        eprintln!("  -----------+-------+-------+----------+------------");
+        let row = |name: &str, s: PredictorScore| {
+            eprintln!(
+                "  {name:<10} | {:.3} | {:.3} |  {:.3}   |   {:.3}",
+                s.accuracy, s.brier, s.coverage, s.covered_accuracy
+            );
+        };
+        row("rulebook", r.rulebook);
+        row("retrieval", r.retrieval);
+        row("theory", r.theory);
+        eprintln!("  (theory = conic-harmonic resonance; P10: retrieval on the conic metric)");
+
+        // Invariants that MUST hold for the harness to be meaningful (asserted); the theory-vs-
+        // retrieval margin is reported above, not asserted — the point is to measure it honestly.
+        // The rulebook never defers (it answers Unknown), so it is the blind baseline at Brier 0.25.
+        assert_eq!(r.rulebook.coverage, 1.0, "the rulebook always answers (with Unknown)");
+        assert!((r.rulebook.brier - 0.25).abs() < 1e-6, "blind rulebook scores Brier 0.25");
+        assert!(r.retrieval.brier < r.rulebook.brier, "retrieval must beat the blind rulebook on the known families");
+        assert!(r.theory.brier < r.rulebook.brier, "theory must beat the blind rulebook on the known families");
+        // Defer-discipline: a learned predictor should DEFER on the truly-unseen commands, not
+        // answer everything (a predictor that never defers is reckless).
+        assert!(r.retrieval.coverage < 1.0, "retrieval should defer on the truly-unseen commands");
+        assert!(r.theory.coverage < 1.0, "theory should defer on the truly-unseen commands");
+        // When a learned predictor DOES answer, it should be mostly right (sharp, not reckless).
+        assert!(r.retrieval.covered_accuracy >= 0.8, "retrieval is right when it speaks");
+        assert!(r.theory.covered_accuracy >= 0.8, "theory is right when it speaks");
     }
 
     #[test]
