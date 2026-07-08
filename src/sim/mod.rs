@@ -1,5 +1,6 @@
 pub mod action_logger;
 pub mod activation;
+pub mod compute_world;
 pub mod social_world;
 
 use crate::agent::Platform;
