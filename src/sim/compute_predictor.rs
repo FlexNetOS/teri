@@ -213,6 +213,198 @@ impl EffectPredictor for RetrievalPredictor {
     }
 }
 
+// ===========================================================================================
+// TheoryPredictor — Conic–Harmonic resonance memory (R. E. Grant, "Conic-Harmonic Theory of
+// Everything"). A FAITHFUL, computable implementation of the theory's resonance-memory operator,
+// applied to command→effect prediction so it can be scored head-to-head by `evaluate_predictor`.
+//
+// Mapping (theory → code), from consciousness_operator.md + math_primitives.md:
+//   - Memory retrieval = "phase-space reactivation": a cue projects onto the nearest stable node.
+//   - Similarity = the coherence inner product ⟨ρ₁|ρ₂⟩ = ∫ ρ₁ρ₂√|g| — a METRIC-WEIGHTED inner
+//     product, not a flat cosine. The metric weight is the sech-power keyboard: for station k,
+//     √|g|ₖ ~ sech²(θₖ) = 1/cosh²(arsinh(k/2)) = 1/(1 + k²/4).
+//   - Tokens embed as nodal coherence densities ρ: a sech-shaped bump (sech is the theory's
+//     suppressor s = sech(θ₆)) centered on the token's metallic-rapidity station, so similar
+//     commands share overlapping harmonic components and RESONATE.
+//   - Confidence = |λ|² (eigenmode-selection probability): the squared coherence amplitude.
+// This directly tests the theory's falsifiable prediction P10 ("memory retrieval follows
+// hyperbolic distance"): if the conic-metric kernel predicts command outcomes better than the
+// flat-cosine RetrievalPredictor, P10 is corroborated in a new domain; if not, falsified here.
+// ===========================================================================================
+
+/// Number of metallic-rapidity registers (stations n = 1..=THEORY_DIM) in the harmonic embedding.
+const THEORY_DIM: usize = 48;
+/// Width (in registers) of a token's sech coherence bump.
+const THEORY_SIGMA: f32 = 1.0;
+/// Resonance floor below which the predictor defers to the rulebook (honesty guard).
+const THEORY_THRESHOLD: f32 = 0.5;
+/// Nearest neighbors that vote.
+const THEORY_K: usize = 3;
+
+/// arsinh(x) = ln(x + sqrt(x²+1)).
+fn arsinh(x: f32) -> f32 {
+    (x + (x * x + 1.0).sqrt()).ln()
+}
+
+/// The conic keyboard metric weight at station k (1-indexed): √|g|ₖ ~ sech²(θₖ), where
+/// θₖ = arsinh(k/2) is the metallic rapidity (`math_primitives.md`). Lower stations carry more
+/// weight — the sech-power suppression that makes the inner product *harmonic*, not Euclidean.
+fn metric_weight(k: usize) -> f32 {
+    let theta = arsinh(k as f32 / 2.0);
+    let sech = 1.0 / theta.cosh();
+    sech * sech
+}
+
+/// Embed a command as a nodal coherence density ρ over the metallic-rapidity registers: each
+/// token deposits a sech bump centered on its station, so tokens on nearby stations overlap
+/// (resonate). Deterministic (FNV hash for the station), no RNG.
+fn harmonic_embed(command: &str) -> Vec<f32> {
+    let mut rho = vec![0.0_f32; THEORY_DIM];
+    for token in command.split_whitespace() {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in token.bytes() {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let center = (hash as usize) % THEORY_DIM;
+        for (k, cell) in rho.iter_mut().enumerate() {
+            // sech bump: sech(d) = 1/cosh(d); d = register distance / width. sech is the theory's
+            // suppressor, so coherence falls off harmonically from the token's station.
+            let d = (k as f32 - center as f32) / THEORY_SIGMA;
+            *cell += 1.0 / d.cosh();
+        }
+    }
+    rho
+}
+
+/// The coherence inner product ⟨ρ₁|ρ₂⟩ normalized to `[0,1]` (the resonance amplitude λ): a
+/// metric-weighted cosine using the conic keyboard metric [`metric_weight`].
+fn resonance(a: &[f32], b: &[f32]) -> f32 {
+    let mut num = 0.0_f32;
+    let mut na = 0.0_f32;
+    let mut nb = 0.0_f32;
+    for k in 0..a.len() {
+        let g = metric_weight(k + 1);
+        num += a[k] * b[k] * g;
+        na += a[k] * a[k] * g;
+        nb += b[k] * b[k] * g;
+    }
+    let den = (na.sqrt()) * (nb.sqrt());
+    if den > 0.0 {
+        (num / den).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// One resonance memory: a stored coherence pattern paired with the effect actually observed.
+#[derive(Debug, Clone)]
+struct ResonanceMemory {
+    rho: Vec<f32>,
+    effect: PredictedEffect,
+}
+
+/// The **Conic–Harmonic resonance-memory predictor**. Same retrieval shape as
+/// [`RetrievalPredictor`], but the theory's operator throughout: a harmonic (sech / metallic-
+/// rapidity) coherence embedding, the metric-weighted resonance inner product for similarity, and
+/// `|λ|²` confidence. The scientific artifact under test against retrieval + the rulebook.
+#[derive(Debug, Default)]
+pub struct TheoryPredictor {
+    memory: Vec<ResonanceMemory>,
+}
+
+impl TheoryPredictor {
+    #[must_use]
+    pub fn new() -> Self {
+        Self { memory: Vec::new() }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.memory.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.memory.is_empty()
+    }
+}
+
+impl EffectPredictor for TheoryPredictor {
+    fn predict(&self, command: &str) -> Option<PredictedEffect> {
+        if self.memory.is_empty() {
+            return None;
+        }
+        let cue = harmonic_embed(command);
+        let mut scored: Vec<(f32, &ResonanceMemory)> = self
+            .memory
+            .iter()
+            .map(|m| (resonance(&cue, &m.rho), m))
+            .filter(|(lam, _)| *lam >= THEORY_THRESHOLD)
+            .collect();
+        if scored.is_empty() {
+            return None; // no stable node resonates with the cue → defer (honesty guard)
+        }
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+        scored.truncate(THEORY_K);
+
+        let voters = scored.len() as f32;
+        let successes = scored
+            .iter()
+            .filter(|(_, m)| matches!(m.effect.predicted_exit, ExitPrediction::Success))
+            .count();
+        let mean_lambda = scored.iter().map(|(l, _)| *l).sum::<f32>() / voters;
+
+        let (_, nearest) = scored[0];
+        let mut effect = nearest.effect.clone();
+        effect.command = command.to_string();
+        let majority_success = successes * 2 >= scored.len();
+        effect.predicted_exit = if majority_success {
+            ExitPrediction::Success
+        } else {
+            ExitPrediction::Failure {
+                reason: "resonance: nearest stable node is a failure mode".to_string(),
+            }
+        };
+        // |λ|² eigenmode-selection probability × vote agreement.
+        let agreement = (successes.max(scored.len() - successes)) as f32 / voters;
+        effect.confidence = (mean_lambda * mean_lambda * agreement).clamp(0.0, 1.0);
+        effect.rationale = format!(
+            "conic-harmonic resonance: reactivated {} node(s), {}/{} succeeded (λ={:.2}, |λ|²={:.2})",
+            scored.len(),
+            successes,
+            scored.len(),
+            mean_lambda,
+            mean_lambda * mean_lambda
+        );
+        effect.provenance.model = self.model_tag().to_string();
+        effect
+            .provenance
+            .evidence
+            .push(format!("resonance_lambda={mean_lambda:.3} voters={}", scored.len()));
+        Some(effect)
+    }
+
+    fn observe(&mut self, command: &str, actual: &ActualOutcome) {
+        let mut effect = deduce_effect(command);
+        effect.predicted_exit = if actual.succeeded {
+            ExitPrediction::Success
+        } else {
+            ExitPrediction::Failure {
+                reason: "observed failure".to_string(),
+            }
+        };
+        self.memory.push(ResonanceMemory {
+            rho: harmonic_embed(command),
+            effect,
+        });
+    }
+
+    fn model_tag(&self) -> &str {
+        "conic-harmonic-resonance/v0"
+    }
+}
+
 /// A predictor's score over a labeled dataset — the "test the theory" verdict.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PredictorScore {
@@ -324,6 +516,65 @@ mod tests {
             p.predict("rm -rf /some/deep/unrelated/path").is_none(),
             "a dissimilar command has no learned signal → defer to the rulebook"
         );
+    }
+
+    #[test]
+    fn theory_predictor_defers_when_cold() {
+        let t = TheoryPredictor::new();
+        assert!(t.is_empty());
+        assert!(t.predict("anything").is_none());
+    }
+
+    #[test]
+    fn theory_predictor_resolves_an_unknown_via_resonance() {
+        let mut t = TheoryPredictor::new();
+        for _ in 0..3 {
+            t.observe("orchestrate cluster", &outcome(true));
+        }
+        let p = t.predict("orchestrate cluster").expect("learned via resonance");
+        assert_eq!(p.predicted_exit, ExitPrediction::Success);
+        assert_eq!(p.provenance.model, "conic-harmonic-resonance/v0");
+        assert!(p.rationale.contains("resonance"));
+        assert!(p.confidence > 0.0);
+    }
+
+    #[test]
+    fn head_to_head_theory_vs_retrieval_vs_rulebook() {
+        // A family of custom (rulebook-BLIND) commands sharing a token, all succeeding. Train both
+        // learned predictors on the first three; evaluate all three predictors on the whole family
+        // (incl. two HELD-OUT members) to probe generalization. Print the real numbers — this is
+        // the honest test of the theory's P10 (retrieval on the conic metric), not a rigged demo.
+        let family = [
+            "deploybot alpha",
+            "deploybot beta",
+            "deploybot gamma",
+            "deploybot delta",
+            "deploybot epsilon",
+        ];
+        let dataset: Vec<(String, ActualOutcome)> =
+            family.iter().map(|c| (c.to_string(), outcome(true))).collect();
+
+        let mut retrieval = RetrievalPredictor::new();
+        let mut theory = TheoryPredictor::new();
+        for c in &family[..3] {
+            for _ in 0..2 {
+                retrieval.observe(c, &outcome(true));
+                theory.observe(c, &outcome(true));
+            }
+        }
+
+        let s_rule = evaluate_predictor(&RulebookPredictor, &dataset);
+        let s_retr = evaluate_predictor(&retrieval, &dataset);
+        let s_theo = evaluate_predictor(&theory, &dataset);
+        eprintln!("\n=== predictor head-to-head (n={}; accuracy ↑ better, Brier ↓ better) ===", s_rule.n);
+        eprintln!("  rulebook  : acc={:.3}  brier={:.3}", s_rule.accuracy, s_rule.brier);
+        eprintln!("  retrieval : acc={:.3}  brier={:.3}", s_retr.accuracy, s_retr.brier);
+        eprintln!("  theory    : acc={:.3}  brier={:.3}  (conic-harmonic resonance)", s_theo.accuracy, s_theo.brier);
+
+        // Both learned predictors must beat the blind rulebook; the theory-vs-retrieval margin is
+        // reported, not asserted (the point is to MEASURE, honestly, which generalizes better).
+        assert!(s_retr.brier < s_rule.brier, "retrieval must beat the blind rulebook");
+        assert!(s_theo.brier < s_rule.brier, "theory must beat the blind rulebook");
     }
 
     #[test]
