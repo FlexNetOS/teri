@@ -193,6 +193,10 @@ pub struct ComputeWorld {
     /// Per-program calibration weight in `[CALIB_FLOOR, 1.0]`. Absent ⇒ 1.0 (no adjustment),
     /// so an un-calibrated twin behaves exactly like the pre-Phase-4 baseline.
     calibration: BTreeMap<String, f32>,
+    /// Optional **learned predictor** layered over the deterministic rulebook (additive, opt-in).
+    /// `None` ⇒ `apply` uses the rulebook exactly as before. `Some` ⇒ `apply` consults the learned
+    /// predictor first and falls back to the rulebook when it defers, and `observe` also trains it.
+    predictor: Option<Box<dyn crate::sim::compute_predictor::EffectPredictor>>,
 }
 
 impl ComputeWorld {
@@ -205,7 +209,19 @@ impl ComputeWorld {
             index: BTreeMap::new(),
             state: BTreeMap::new(),
             calibration: BTreeMap::new(),
+            predictor: None,
         }
+    }
+
+    /// Install a **learned predictor** over the rulebook (additive, opt-in). When set, `apply`
+    /// consults it first (falling back to the rulebook when it defers) and `observe` trains it.
+    #[must_use]
+    pub fn with_predictor(
+        mut self,
+        predictor: Box<dyn crate::sim::compute_predictor::EffectPredictor>,
+    ) -> Self {
+        self.predictor = Some(predictor);
+        self
     }
 
     /// The current calibration weight for `program` (1.0 when never observed).
@@ -214,13 +230,23 @@ impl ComputeWorld {
         self.calibration.get(program).copied().unwrap_or(1.0)
     }
 
+    /// The base (pre-elimination) prediction: the learned predictor if installed and it has a
+    /// signal, else the deterministic rulebook. This is the single funnel both `apply` and
+    /// `observe` deduce through, so a learned model and the calibration loop stay consistent.
+    fn base_prediction(&self, command: &str) -> PredictedEffect {
+        self.predictor
+            .as_ref()
+            .and_then(|p| p.predict(command))
+            .unwrap_or_else(|| deduce_effect(command))
+    }
+
     /// **Deduce** the effect of `action`, then **eliminate** impossible outcomes against the
     /// twin's known state, then record the (surviving) predicted mutations. Does NOT run anything.
     ///
     /// This is the deductive loop made literal: Observe (the command) → Deduce (the rulebook) →
     /// Eliminate (prune what the twin proves impossible) → record the truth that remains.
     pub fn apply(&mut self, action: &ComputeAction) -> PredictedEffect {
-        let base = deduce_effect(&action.command);
+        let base = self.base_prediction(&action.command);
         let mut effect = self.eliminate(base);
         // Phase 4: scale the deduced confidence by what the sim-to-real loop has LEARNED about
         // this program. Un-calibrated ⇒ factor 1.0 ⇒ identical to the pre-Phase-4 baseline.
@@ -238,7 +264,7 @@ impl ComputeWorld {
     /// [`RealityGap`]. This is the loop that closes the reality gap: the more a program's
     /// deductions have diverged from reality, the lower the confidence future predictions carry.
     pub fn observe(&mut self, action: &ComputeAction, actual: &ActualOutcome) -> RealityGap {
-        let predicted = deduce_effect(&action.command);
+        let predicted = self.base_prediction(&action.command);
         let predicted_success = matches!(
             self.eliminate(predicted).predicted_exit,
             ExitPrediction::Success
@@ -250,6 +276,12 @@ impl ComputeWorld {
         let reward = if matched { 1.0 } else { 0.0 };
         let updated = (prior + CALIB_LR * (reward - prior)).clamp(CALIB_FLOOR, 1.0);
         self.calibration.insert(program.clone(), updated);
+
+        // Train the learned predictor on the real outcome too (if installed), so the retrieval
+        // memory grows alongside the per-program calibration weight.
+        if let Some(p) = self.predictor.as_mut() {
+            p.observe(&action.command, actual);
+        }
 
         RealityGap {
             program,
@@ -853,6 +885,30 @@ mod tests {
         assert!(after_hit1 > after_miss, "a hit recovers calibration");
         assert!(after_hit2 > after_hit1, "recovery is monotonic under repeated hits");
         assert!(after_hit2 < 1.0, "but does not snap all the way back in one step");
+    }
+
+    #[test]
+    fn a_twin_with_a_learned_predictor_resolves_an_unknown_through_observation() {
+        use crate::sim::compute_predictor::RetrievalPredictor;
+
+        // The rulebook cannot predict a custom command: apply → Unknown.
+        let mut world = ComputeWorld::new(PathBuf::from("/tmp/cell"))
+            .with_predictor(Box::new(RetrievalPredictor::new()));
+        assert_eq!(
+            world.apply(&act("deploybot ship")).predicted_exit,
+            ExitPrediction::Unknown,
+            "cold: the learned predictor defers, the rulebook says Unknown"
+        );
+
+        // Observe it succeeding a few times — this trains the predictor (and calibration).
+        for _ in 0..3 {
+            world.observe(&act("deploybot ship"), &ActualOutcome { succeeded: true });
+        }
+
+        // Now apply resolves the once-Unknown command to a learned Success.
+        let learned = world.apply(&act("deploybot ship"));
+        assert_eq!(learned.predicted_exit, ExitPrediction::Success);
+        assert_eq!(learned.provenance.model, "retrieval-knn/v0");
     }
 
     #[test]
