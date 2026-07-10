@@ -1,6 +1,6 @@
 use crate::error::{Result, TeriError};
 use crate::sim::WorldSnapshot;
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
