@@ -62,9 +62,6 @@ perf.data.old
 .worktrees/
 Plans.md
 out/
-# Auto-generated research navigation map (regenerated each session by scripts/gen-research-map.sh)
-code-research/
-
 # Copilot Superpowers - installed skills (local only, not tracked by git)
 .agent/skills/
 .agent/skills-catalog.md

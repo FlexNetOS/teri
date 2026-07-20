@@ -14,12 +14,16 @@ fn read_repo(path: &str) -> String {
 }
 
 #[test]
-fn retired_lifecycle_hook_payloads_remain_absent() {
+fn retired_repo_lifecycle_hook_system_remains_absent() {
     for path in [
         ".codex/hooks.json",
         ".codex/hooks",
         ".codex/archive/lifecycle-hooks-20260703T024950Z",
         ".codex/archive/hooks-lifecycle.zip",
+        ".claude/settings.json",
+        ".claude/hooks",
+        ".handoff/hooks",
+        "scripts/gen-research-map.sh",
     ] {
         assert!(
             !repo_root().join(path).exists(),
