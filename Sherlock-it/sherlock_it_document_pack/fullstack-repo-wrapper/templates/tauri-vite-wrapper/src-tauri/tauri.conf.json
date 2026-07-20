@@ -1,0 +1,27 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "__PRODUCT_NAME__",
+  "version": "0.1.0",
+  "identifier": "__APP_ID__",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "__PRODUCT_NAME__",
+        "width": 1280,
+        "height": 860,
+        "resizable": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["appimage", "deb", "msi", "dmg"],
+    "icon": []
+  }
+}
