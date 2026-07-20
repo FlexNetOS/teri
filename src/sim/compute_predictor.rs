@@ -21,7 +21,7 @@
 //! - tier-3: `ruvllm` local inference for the residual long tail.
 
 use super::compute_world::{
-    deduce_effect, ActualOutcome, ExitPrediction, FsChange, PredictedEffect,
+    ActualOutcome, ExitPrediction, FsChange, PredictedEffect, deduce_effect,
 };
 
 /// A pluggable predictor of a command's raw effect (before the twin's state-elimination and
@@ -195,17 +195,12 @@ impl EffectPredictor for RetrievalPredictor {
         effect.predicted_exit = if actual.succeeded {
             ExitPrediction::Success
         } else {
-            ExitPrediction::Failure {
-                reason: "observed failure".to_string(),
-            }
+            ExitPrediction::Failure { reason: "observed failure".to_string() }
         };
         // If the rulebook could not predict fs changes (Unknown command), a bare observation still
         // teaches the exit — that alone resolves the rulebook's biggest blind spot.
         let _: &[FsChange] = &effect.fs_changes;
-        self.memory.push(Memory {
-            embedding: embed(command),
-            effect,
-        });
+        self.memory.push(Memory { embedding: embed(command), effect });
     }
 
     fn model_tag(&self) -> &str {
@@ -290,11 +285,7 @@ fn resonance(a: &[f32], b: &[f32]) -> f32 {
         nb += b[k] * b[k] * g;
     }
     let den = (na.sqrt()) * (nb.sqrt());
-    if den > 0.0 {
-        (num / den).clamp(0.0, 1.0)
-    } else {
-        0.0
-    }
+    if den > 0.0 { (num / den).clamp(0.0, 1.0) } else { 0.0 }
 }
 
 /// One resonance memory: a stored coherence pattern paired with the effect actually observed.
@@ -390,14 +381,9 @@ impl EffectPredictor for TheoryPredictor {
         effect.predicted_exit = if actual.succeeded {
             ExitPrediction::Success
         } else {
-            ExitPrediction::Failure {
-                reason: "observed failure".to_string(),
-            }
+            ExitPrediction::Failure { reason: "observed failure".to_string() }
         };
-        self.memory.push(ResonanceMemory {
-            rho: harmonic_embed(command),
-            effect,
-        });
+        self.memory.push(ResonanceMemory { rho: harmonic_embed(command), effect });
     }
 
     fn model_tag(&self) -> &str {
@@ -434,7 +420,13 @@ pub fn evaluate_predictor(
     dataset: &[(String, ActualOutcome)],
 ) -> PredictorScore {
     if dataset.is_empty() {
-        return PredictorScore { n: 0, accuracy: 0.0, brier: 0.0, coverage: 0.0, covered_accuracy: 0.0 };
+        return PredictorScore {
+            n: 0,
+            accuracy: 0.0,
+            brier: 0.0,
+            coverage: 0.0,
+            covered_accuracy: 0.0,
+        };
     }
     let mut correct = 0.0_f32;
     let mut brier_sum = 0.0_f32;
@@ -562,7 +554,10 @@ mod tests {
     fn rulebook_predictor_never_defers() {
         let p = RulebookPredictor;
         assert!(p.predict("mkdir x").is_some());
-        assert!(p.predict("frobnicate --quux").is_some(), "even an unknown gets an honest answer");
+        assert!(
+            p.predict("frobnicate --quux").is_some(),
+            "even an unknown gets an honest answer"
+        );
         assert_eq!(p.model_tag(), "baseline-rulebook/v0");
     }
 
@@ -660,10 +655,16 @@ mod tests {
         let s_rule = evaluate_predictor(&RulebookPredictor, &dataset);
         let s_retr = evaluate_predictor(&retrieval, &dataset);
         let s_theo = evaluate_predictor(&theory, &dataset);
-        eprintln!("\n=== predictor head-to-head (n={}; accuracy ↑ better, Brier ↓ better) ===", s_rule.n);
+        eprintln!(
+            "\n=== predictor head-to-head (n={}; accuracy ↑ better, Brier ↓ better) ===",
+            s_rule.n
+        );
         eprintln!("  rulebook  : acc={:.3}  brier={:.3}", s_rule.accuracy, s_rule.brier);
         eprintln!("  retrieval : acc={:.3}  brier={:.3}", s_retr.accuracy, s_retr.brier);
-        eprintln!("  theory    : acc={:.3}  brier={:.3}  (conic-harmonic resonance)", s_theo.accuracy, s_theo.brier);
+        eprintln!(
+            "  theory    : acc={:.3}  brier={:.3}  (conic-harmonic resonance)",
+            s_theo.accuracy, s_theo.brier
+        );
 
         // Both learned predictors must beat the blind rulebook; the theory-vs-retrieval margin is
         // reported, not asserted (the point is to MEASURE, honestly, which generalizes better).
@@ -704,11 +705,20 @@ mod tests {
         // The rulebook never defers (it answers Unknown), so it is the blind baseline at Brier 0.25.
         assert_eq!(r.rulebook.coverage, 1.0, "the rulebook always answers (with Unknown)");
         assert!((r.rulebook.brier - 0.25).abs() < 1e-6, "blind rulebook scores Brier 0.25");
-        assert!(r.retrieval.brier < r.rulebook.brier, "retrieval must beat the blind rulebook on the known families");
-        assert!(r.theory.brier < r.rulebook.brier, "theory must beat the blind rulebook on the known families");
+        assert!(
+            r.retrieval.brier < r.rulebook.brier,
+            "retrieval must beat the blind rulebook on the known families"
+        );
+        assert!(
+            r.theory.brier < r.rulebook.brier,
+            "theory must beat the blind rulebook on the known families"
+        );
         // Defer-discipline: a learned predictor should DEFER on the truly-unseen commands, not
         // answer everything (a predictor that never defers is reckless).
-        assert!(r.retrieval.coverage < 1.0, "retrieval should defer on the truly-unseen commands");
+        assert!(
+            r.retrieval.coverage < 1.0,
+            "retrieval should defer on the truly-unseen commands"
+        );
         assert!(r.theory.coverage < 1.0, "theory should defer on the truly-unseen commands");
         // When a learned predictor DOES answer, it should be mostly right (sharp, not reckless).
         assert!(r.retrieval.covered_accuracy >= 0.8, "retrieval is right when it speaks");
@@ -731,6 +741,11 @@ mod tests {
         }
         let warm = evaluate_predictor(&learned, &data);
         assert!(warm.accuracy >= cold.accuracy);
-        assert!(warm.brier < cold.brier, "learning improves calibration: {} !< {}", warm.brier, cold.brier);
+        assert!(
+            warm.brier < cold.brier,
+            "learning improves calibration: {} !< {}",
+            warm.brier,
+            cold.brier
+        );
     }
 }

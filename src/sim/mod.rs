@@ -1498,10 +1498,7 @@ mod tests {
         // rm -rf drives blast radius to Irreversible; the trailing rm hits a known-absent path.
         assert_eq!(rollout.max_risk, Risk::Irreversible);
         assert_eq!(rollout.first_failure, Some(2));
-        assert!(matches!(
-            rollout.effects[2].predicted_exit,
-            ExitPrediction::Failure { .. }
-        ));
+        assert!(matches!(rollout.effects[2].predicted_exit, ExitPrediction::Failure { .. }));
         assert!(!rollout.is_safe());
     }
 
@@ -1557,9 +1554,10 @@ mod tests {
 
         // Opt-in: no substrate ⇒ observe is a no-op None.
         let bare = SimEngine::new(SimConfig::new(1, 1));
-        assert!(bare
-            .observe_compute("cell-a", &mkdir, &ActualOutcome { succeeded: true })
-            .is_none());
+        assert!(
+            bare.observe_compute("cell-a", &mkdir, &ActualOutcome { succeeded: true })
+                .is_none()
+        );
     }
 
     // --- TASK-SIM-2 #2: enriched action_args ---

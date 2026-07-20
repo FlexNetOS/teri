@@ -132,9 +132,7 @@ impl PredictedEffect {
     /// True when the effect mutates the filesystem (a create/write/delete is predicted).
     #[must_use]
     pub fn is_mutating(&self) -> bool {
-        self.fs_changes
-            .iter()
-            .any(|c| !matches!(c, FsChange::Read { .. }))
+        self.fs_changes.iter().any(|c| !matches!(c, FsChange::Read { .. }))
     }
 }
 
@@ -265,10 +263,8 @@ impl ComputeWorld {
     /// deductions have diverged from reality, the lower the confidence future predictions carry.
     pub fn observe(&mut self, action: &ComputeAction, actual: &ActualOutcome) -> RealityGap {
         let predicted = self.base_prediction(&action.command);
-        let predicted_success = matches!(
-            self.eliminate(predicted).predicted_exit,
-            ExitPrediction::Success
-        );
+        let predicted_success =
+            matches!(self.eliminate(predicted).predicted_exit, ExitPrediction::Success);
         let matched = predicted_success == actual.succeeded;
 
         let program = program_of(&action.command).to_string();
@@ -327,7 +323,8 @@ impl ComputeWorld {
                     effect.rationale, path
                 );
                 effect.provenance.evidence.push(format!("twin_state:{path}=absent"));
-                effect.provenance.model = format!("{}+holmesian-elimination", effect.provenance.model);
+                effect.provenance.model =
+                    format!("{}+holmesian-elimination", effect.provenance.model);
             }
         }
         effect
@@ -337,9 +334,7 @@ impl ComputeWorld {
     /// relation edges), but update the authoritative `state` oracle only when the op is predicted
     /// to succeed — a predicted `Failure` (e.g. an eliminated delete) leaves reality unchanged.
     fn record(&mut self, effect: &PredictedEffect) {
-        let proc = self.node(ComputeNode::Process {
-            command: effect.command.clone(),
-        });
+        let proc = self.node(ComputeNode::Process { command: effect.command.clone() });
         let succeeds = !matches!(effect.predicted_exit, ExitPrediction::Failure { .. });
         for change in &effect.fs_changes {
             let (node, rel) = match change {
@@ -358,10 +353,9 @@ impl ComputeWorld {
                     ComputeNode::File { path: path.clone(), exists: false },
                     ComputeRelation::Deletes,
                 ),
-                FsChange::Read { path } => (
-                    ComputeNode::File { path: path.clone(), exists: true },
-                    ComputeRelation::Reads,
-                ),
+                FsChange::Read { path } => {
+                    (ComputeNode::File { path: path.clone(), exists: true }, ComputeRelation::Reads)
+                }
             };
             let target = self.node(node);
             self.graph.add_edge(proc, target, rel);
@@ -372,7 +366,8 @@ impl ComputeWorld {
                         self.state.insert(path.clone(), PathState { kind: *kind, exists: true });
                     }
                     FsChange::Write { path } => {
-                        self.state.insert(path.clone(), PathState { kind: FsKind::File, exists: true });
+                        self.state
+                            .insert(path.clone(), PathState { kind: FsKind::File, exists: true });
                     }
                     FsChange::Delete { path } => {
                         let kind = self.state.get(path).map_or(FsKind::File, |s| s.kind);
@@ -440,7 +435,9 @@ pub fn deduce_effect(command: &str) -> PredictedEffect {
     let base = match program {
         "mkdir" => effect(
             cmd,
-            args.iter().map(|p| FsChange::Create { path: (*p).to_string(), kind: FsKind::Dir }).collect(),
+            args.iter()
+                .map(|p| FsChange::Create { path: (*p).to_string(), kind: FsKind::Dir })
+                .collect(),
             ExitPrediction::Success,
             Risk::Low,
             0.9,
@@ -449,7 +446,9 @@ pub fn deduce_effect(command: &str) -> PredictedEffect {
         ),
         "touch" => effect(
             cmd,
-            args.iter().map(|p| FsChange::Create { path: (*p).to_string(), kind: FsKind::File }).collect(),
+            args.iter()
+                .map(|p| FsChange::Create { path: (*p).to_string(), kind: FsKind::File })
+                .collect(),
             ExitPrediction::Success,
             Risk::Low,
             0.9,
@@ -487,7 +486,10 @@ pub fn deduce_effect(command: &str) -> PredictedEffect {
             let dst = args[args.len() - 1].to_string();
             effect(
                 cmd,
-                vec![FsChange::Delete { path: src }, FsChange::Create { path: dst, kind: FsKind::File }],
+                vec![
+                    FsChange::Delete { path: src },
+                    FsChange::Create { path: dst, kind: FsKind::File },
+                ],
                 ExitPrediction::Success,
                 Risk::Medium,
                 0.8,
@@ -500,7 +502,10 @@ pub fn deduce_effect(command: &str) -> PredictedEffect {
             let dst = args[args.len() - 1].to_string();
             effect(
                 cmd,
-                vec![FsChange::Read { path: src }, FsChange::Create { path: dst, kind: FsKind::File }],
+                vec![
+                    FsChange::Read { path: src },
+                    FsChange::Create { path: dst, kind: FsKind::File },
+                ],
                 ExitPrediction::Success,
                 Risk::Low,
                 0.8,
@@ -521,7 +526,15 @@ pub fn deduce_effect(command: &str) -> PredictedEffect {
                 vec![format!("program={program} readonly=true")],
             )
         }
-        "true" => effect(cmd, vec![], ExitPrediction::Success, Risk::Low, 0.99, "`true` always exits 0", vec!["builtin=true".into()]),
+        "true" => effect(
+            cmd,
+            vec![],
+            ExitPrediction::Success,
+            Risk::Low,
+            0.99,
+            "`true` always exits 0",
+            vec!["builtin=true".into()],
+        ),
         "false" => effect(
             cmd,
             vec![],
@@ -621,10 +634,7 @@ impl ComputeRollout {
     #[must_use]
     pub fn from_effects(cell: String, effects: Vec<PredictedEffect>) -> Self {
         let max_risk = effects.iter().map(|e| e.risk).max().unwrap_or(Risk::Low);
-        let min_confidence = effects
-            .iter()
-            .map(|e| e.confidence)
-            .fold(1.0_f32, f32::min);
+        let min_confidence = effects.iter().map(|e| e.confidence).fold(1.0_f32, f32::min);
         let first_failure = effects
             .iter()
             .position(|e| matches!(e.predicted_exit, ExitPrediction::Failure { .. }));
@@ -694,7 +704,10 @@ mod tests {
     #[test]
     fn mkdir_is_deduced_as_a_low_risk_dir_create() {
         let e = deduce_effect("mkdir -p src/sim");
-        assert_eq!(e.fs_changes, vec![FsChange::Create { path: "src/sim".into(), kind: FsKind::Dir }]);
+        assert_eq!(
+            e.fs_changes,
+            vec![FsChange::Create { path: "src/sim".into(), kind: FsKind::Dir }]
+        );
         assert_eq!(e.predicted_exit, ExitPrediction::Success);
         assert_eq!(e.risk, Risk::Low);
         assert!(e.confidence >= 0.9);
@@ -838,10 +851,7 @@ mod tests {
     fn a_clean_low_risk_plan_is_safe() {
         let mut world = ComputeWorld::new(PathBuf::from("/tmp/cell"));
         let plan = [act("mkdir src"), act("touch src/lib.rs")];
-        let rollout = ComputeRollout::from_effects(
-            "cell-a".to_string(),
-            world.predict_plan(&plan),
-        );
+        let rollout = ComputeRollout::from_effects("cell-a".to_string(), world.predict_plan(&plan));
         assert!(rollout.is_clean());
         assert!(!rollout.requires_authority());
         assert!(rollout.is_safe());
@@ -863,7 +873,11 @@ mod tests {
         // A subsequent mkdir now carries the learned (lower) confidence + calibration provenance.
         let e = world.apply(&act("mkdir other"));
         assert!((e.provenance.calibration - 0.75).abs() < 1e-6);
-        assert!(e.confidence < 0.9, "confidence scaled down by the reality gap: {}", e.confidence);
+        assert!(
+            e.confidence < 0.9,
+            "confidence scaled down by the reality gap: {}",
+            e.confidence
+        );
     }
 
     #[test]
@@ -879,9 +893,12 @@ mod tests {
     fn calibration_recovers_after_a_miss() {
         // A miss drops it; subsequent matches climb back toward 1.0 (residual recovery).
         let mut world = ComputeWorld::new(PathBuf::from("/tmp/cell"));
-        let after_miss = world.observe(&act("mkdir d"), &ActualOutcome { succeeded: false }).calibration;
-        let after_hit1 = world.observe(&act("mkdir d"), &ActualOutcome { succeeded: true }).calibration;
-        let after_hit2 = world.observe(&act("mkdir d"), &ActualOutcome { succeeded: true }).calibration;
+        let after_miss =
+            world.observe(&act("mkdir d"), &ActualOutcome { succeeded: false }).calibration;
+        let after_hit1 =
+            world.observe(&act("mkdir d"), &ActualOutcome { succeeded: true }).calibration;
+        let after_hit2 =
+            world.observe(&act("mkdir d"), &ActualOutcome { succeeded: true }).calibration;
         assert!(after_hit1 > after_miss, "a hit recovers calibration");
         assert!(after_hit2 > after_hit1, "recovery is monotonic under repeated hits");
         assert!(after_hit2 < 1.0, "but does not snap all the way back in one step");
