@@ -43,7 +43,7 @@
 //! [`ContributorTrajectory`]: crate::seed::community::ContributorTrajectory
 
 use crate::error::{Result, TeriError};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
