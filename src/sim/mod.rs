@@ -1,5 +1,7 @@
 pub mod action_logger;
 pub mod activation;
+pub mod compute_predictor;
+pub mod compute_world;
 pub mod social_world;
 
 use crate::agent::Platform;
@@ -799,6 +801,15 @@ pub struct SimEngine {
     /// into the run future) but the world must be mutated (apply / flush) across the run. The lock
     /// is uncontended — `run_with_boost` is the sole accessor, single-threaded across ticks.
     social: Option<Mutex<social_world::SocialWorldSet>>,
+    /// Optional compute-world substrate (execution-effect twin, world-type #2). `None` → the
+    /// engine has no compute domain and every pre-existing caller is byte-identical. `Some` →
+    /// [`SimEngine::predict_compute_plan`] can forecast a command plan's filesystem effects,
+    /// exit, and risk against a cell's twin WITHOUT executing anything (the deductive
+    /// real-to-sim-to-real analog of `run_with_boost` for the compute domain).
+    ///
+    /// Wrapped in a `Mutex` for the same reason as `social`: the forecast mutates the twin
+    /// (applying predicted effects into its state oracle) while the engine is shared by `&self`.
+    compute: Option<Mutex<compute_world::ComputeWorldSet>>,
     /// God's-eye runtime injection queue (additive, opt-in). `None` → no runtime injection.
     /// `Some` → at each tick boundary `run()` drains the queue and applies every pending
     /// `(key, value)` via `WorldState::inject_variable` BEFORE the optional `inject_fn` runs, so
@@ -830,6 +841,7 @@ impl SimEngine {
             activation: None,
             producer: None,
             social: None,
+            compute: None,
             injections: None,
         }
     }
@@ -864,6 +876,51 @@ impl SimEngine {
     /// byte-identical to before this method existed (no post-graph, no DB file, no feed section).
     pub fn with_social(&mut self, set: social_world::SocialWorldSet) {
         self.social = Some(Mutex::new(set));
+    }
+
+    /// Install the compute-world substrate (execution-effect twin, world-type #2; additive,
+    /// opt-in — mirrors [`with_social`](Self::with_social)).
+    ///
+    /// When set, [`predict_compute_plan`](Self::predict_compute_plan) can forecast a command
+    /// plan against a cell's twin. When never called, the engine has no compute domain and
+    /// every pre-existing run is byte-identical to before this method existed.
+    pub fn with_compute(&mut self, set: compute_world::ComputeWorldSet) {
+        self.compute = Some(Mutex::new(set));
+    }
+
+    /// **Predict a command plan** for `cell` against its installed [`compute_world::ComputeWorld`]
+    /// twin, WITHOUT executing anything — the deductive analog of [`run_with_boost`](Self::run_with_boost)
+    /// for the compute domain. Each step deduces against the prior steps' predicted mutations
+    /// (Holmesian carry-over), and the result aggregates the plan's blast radius, weakest-link
+    /// confidence, and first predicted failure into a [`compute_world::ComputeRollout`].
+    ///
+    /// Returns `None` when no compute substrate is installed (no [`with_compute`](Self::with_compute))
+    /// or `cell` is unknown to the set — a missing domain is not an error, exactly as a missing
+    /// `social` substrate simply skips the social path.
+    pub fn predict_compute_plan(
+        &self,
+        cell: &str,
+        actions: &[compute_world::ComputeAction],
+    ) -> Option<compute_world::ComputeRollout> {
+        let mut set = self.compute.as_ref()?.lock();
+        let world = set.world_mut(cell)?;
+        let effects = world.predict_plan(actions);
+        Some(compute_world::ComputeRollout::from_effects(cell.to_string(), effects))
+    }
+
+    /// **Feed a real outcome back** into `cell`'s twin (Phase 4 — sim-to-real): score what the
+    /// twin predicted against what actually happened and fold the residual into its calibration,
+    /// so future forecasts for that program carry the learned confidence. The engine-level driver
+    /// of [`compute_world::ComputeWorld::observe`]; `None` when no substrate/cell (not an error).
+    pub fn observe_compute(
+        &self,
+        cell: &str,
+        action: &compute_world::ComputeAction,
+        actual: &compute_world::ActualOutcome,
+    ) -> Option<compute_world::RealityGap> {
+        let mut set = self.compute.as_ref()?.lock();
+        let world = set.world_mut(cell)?;
+        Some(world.observe(action, actual))
     }
 
     /// Install a cooperative-shutdown flag, checked at the top of every tick in `run()`.
@@ -1415,6 +1472,93 @@ impl SimEngine {
 mod tests {
     use super::*;
     use crate::sim::social_world::SocialWorld;
+
+    // --- ComputeWorld overlay (world-type #2) wiring ---
+
+    #[test]
+    fn compute_overlay_predicts_a_plan_against_a_cell() {
+        use crate::sim::compute_world::{ComputeAction, ComputeWorldSet, ExitPrediction, Risk};
+
+        let mut engine = SimEngine::new(SimConfig::new(1, 1));
+        engine.with_compute(ComputeWorldSet::new([(
+            "cell-a".to_string(),
+            std::path::PathBuf::from("/tmp/cell-a"),
+        )]));
+
+        let plan = |c: &str| ComputeAction { command: c.to_string(), cwd: ".".to_string() };
+        let rollout = engine
+            .predict_compute_plan(
+                "cell-a",
+                &[plan("mkdir build"), plan("rm -rf build"), plan("rm build")],
+            )
+            .expect("installed cell yields a rollout");
+
+        assert_eq!(rollout.cell, "cell-a");
+        assert_eq!(rollout.effects.len(), 3);
+        // rm -rf drives blast radius to Irreversible; the trailing rm hits a known-absent path.
+        assert_eq!(rollout.max_risk, Risk::Irreversible);
+        assert_eq!(rollout.first_failure, Some(2));
+        assert!(matches!(rollout.effects[2].predicted_exit, ExitPrediction::Failure { .. }));
+        assert!(!rollout.is_safe());
+    }
+
+    #[test]
+    fn compute_overlay_is_opt_in_and_cell_scoped() {
+        use crate::sim::compute_world::{ComputeAction, ComputeWorldSet};
+
+        // No with_compute → no compute domain → None (a missing substrate is not an error).
+        let engine = SimEngine::new(SimConfig::new(1, 1));
+        assert!(engine.predict_compute_plan("cell-a", &[]).is_none());
+
+        // Installed, but an unknown cell → None.
+        let mut engine = SimEngine::new(SimConfig::new(1, 1));
+        engine.with_compute(ComputeWorldSet::new([(
+            "cell-a".to_string(),
+            std::path::PathBuf::from("/tmp/cell-a"),
+        )]));
+        let touch = [ComputeAction { command: "touch x".to_string(), cwd: ".".to_string() }];
+        assert!(engine.predict_compute_plan("missing", &touch).is_none());
+        assert!(engine.predict_compute_plan("cell-a", &touch).is_some());
+    }
+
+    #[test]
+    fn compute_overlay_closes_the_reality_gap() {
+        use crate::sim::compute_world::{ActualOutcome, ComputeAction, ComputeWorldSet};
+
+        let mut engine = SimEngine::new(SimConfig::new(1, 1));
+        engine.with_compute(ComputeWorldSet::new([(
+            "cell-a".to_string(),
+            std::path::PathBuf::from("/tmp/cell-a"),
+        )]));
+        let mkdir = ComputeAction { command: "mkdir data".to_string(), cwd: ".".to_string() };
+
+        // Predict → high baseline confidence.
+        let before = engine.predict_compute_plan("cell-a", std::slice::from_ref(&mkdir)).unwrap();
+        let conf_before = before.effects[0].confidence;
+
+        // Observe a real DIVERGENCE (predicted success, reality failed) and feed it back.
+        let gap = engine
+            .observe_compute("cell-a", &mkdir, &ActualOutcome { succeeded: false })
+            .expect("observe on an installed cell");
+        assert!(!gap.matched);
+        assert!(gap.calibration < 1.0);
+
+        // Re-predict → the twin now carries LESS confidence for mkdir (it learned).
+        let after = engine.predict_compute_plan("cell-a", std::slice::from_ref(&mkdir)).unwrap();
+        assert!(
+            after.effects[0].confidence < conf_before,
+            "the reality gap must lower future confidence: {} !< {}",
+            after.effects[0].confidence,
+            conf_before
+        );
+
+        // Opt-in: no substrate ⇒ observe is a no-op None.
+        let bare = SimEngine::new(SimConfig::new(1, 1));
+        assert!(
+            bare.observe_compute("cell-a", &mkdir, &ActualOutcome { succeeded: true })
+                .is_none()
+        );
+    }
 
     // --- TASK-SIM-2 #2: enriched action_args ---
 
